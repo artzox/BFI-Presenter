@@ -10,6 +10,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 ## [1.0.2] — 2026-10
 
 - **[DX] `DX11Support=0` works again for the first swap chain.** The setting was checked before the ini was read, so the first DX11 swap chain of a session was always managed.
+- **[DX] NVIDIA Smooth Motion: the DX11 path stays off while it is active.** Smooth Motion (driver frame generation) presents through its own swap chain; with the DX11 presenter on top, Blasphemous closed and relaunched itself in a loop ("Another instance is already running"). The overlay and `ReShade.log` say so; turn Smooth Motion off for the game in the NVIDIA app. It adds nothing to 2-frame BFI, which shows 60 images a second at 120 Hz. `AllowSmoothMotion=1` in the ini manages the game anyway.
 - **[DX] Watchdog: "the game's window is not responding".** When Windows would call the game hung (no window messages for 5 s), `ReShade.log` gets the call stacks of the game's window thread, the presenter's window thread (DX11) and the game's present thread, to show where it is stuck.
 - **[Vulkan]** No changes.
 

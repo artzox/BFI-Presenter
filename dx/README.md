@@ -136,6 +136,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 | `TypedBackBufferDesc` (1) | Stand-in back buffers report the swap chain's typed format, as real ones do (The Last of Us Part I crashed without it) |
 | `Diagnostics` (1) | 1 = D3D12 DRED: on a device-removed crash, the last GPU operations go to `ReShade.log` and `BFIPresenter_dred.txt`. 2 = also the D3D12 debug layer into `BFIPresenter_debug.txt` (needs "Graphics Tools"; slower) |
 | `CrashLog` (1) | 1 = log serious exceptions anywhere in the game to `BFIPresenter_crash.txt` (runs after the game's own exception handlers). 0 = no crash logger |
+| `AllowSmoothMotion` (0) | 1 = manage DX11 games even while NVIDIA Smooth Motion is on (it conflicted in Blasphemous; by default the DX11 path stays off then) |
 | `AllowRTSS` (1) | 1 = manage games with RTSS hooked (with a warning); 0 = refuse |
 
 ## Hotkeys
@@ -164,6 +165,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 - **NVIDIA DLSS Frame Generation** relies on Reflex pacing, which can misread the presenter (Pragmata). OptiScaler FSR FG worked in Shadow of the Tomb Raider.
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR).
 - **Exclusive fullscreen in DX11 games** is not supported; use borderless.
+- **NVIDIA Smooth Motion** (driver frame generation): turn it off for BFI games. The DX11 path stays off while it is active.
 - 32-bit games: not supported by the add-on (use DXVK + the 32-bit Vulkan layer).
 
 ## Building

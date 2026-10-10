@@ -33,6 +33,7 @@
 #define NOMINMAX
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS   // MinGW: MSVC-compatible struct returns
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
@@ -3755,6 +3756,40 @@ static void DetectFrameGen()
     if (g_fgSeen[0]) LOGW("BFI Presenter: frame-generation components in this game: %s", g_fgSeen);
 }
 
+// NVIDIA Smooth Motion (driver frame generation for DX11/DX12) registers a
+// window class "InvisibleWindowClassNvPresent" in the game and presents
+// generated frames through a swap chain of its own. With the DX11 presenter
+// on top, Blasphemous (Unity) closed and relaunched itself in a loop. Smooth
+// Motion adds nothing to 2-frame BFI anyway (the strobe shows 60 images a
+// second at 120 Hz), so the DX11 path stays off while it is active.
+static bool SmoothMotionActive()
+{
+    static const char kCls[] = "InvisibleWindowClassNvPresent";
+    const DWORD me = GetCurrentProcessId();
+    for (HWND parent : { (HWND)nullptr, HWND_MESSAGE })
+    {
+        HWND w = nullptr;
+        while ((w = FindWindowExA(parent, w, kCls, nullptr)) != nullptr)
+        {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(w, &pid);
+            if (pid == me) return true;
+        }
+    }
+    // Registered but no window yet: look for the class in every loaded module.
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, me);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    MODULEENTRY32 me32 = { sizeof(me32) };
+    bool found = false;
+    for (BOOL ok = Module32First(snap, &me32); ok && !found; ok = Module32Next(snap, &me32))
+    {
+        WNDCLASSEXA wc = { sizeof(wc) };
+        if (GetClassInfoExA(me32.hModule, kCls, &wc)) found = true;
+    }
+    CloseHandle(snap);
+    return found;
+}
+
 static bool DetectPresentHooks()
 {
     static const struct { const char *dll; const char *name; } k[] = {
@@ -4484,6 +4519,14 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
         dx11 = g_shared.dx11;
         LeaveCriticalSection(&g_cfgLock);
         if (!dx11) { SetReason(0, "Not managed: Direct3D 11 support is off (DX11Support=0)."); return; }
+        if (SmoothMotionActive() && GetPrivateProfileIntA("BFI", "AllowSmoothMotion", 0, g_iniPath) == 0)
+        {
+            LOGW("BFI Presenter: NVIDIA Smooth Motion is active in this game -- the DX11 presenter stays off "
+                 "(it conflicts with Smooth Motion's own presentation). Turn Smooth Motion off for this game in the NVIDIA app.");
+            SetReason(0, "Not managed: NVIDIA Smooth Motion is on for this game. Turn it off in the NVIDIA app "
+                         "(BFI shows 60 images a second at 120 Hz, so it adds nothing).");
+            return;
+        }
         if (DetectPresentHooks() && !GetPrivateProfileIntA("BFI", "AllowRTSS", 1, g_iniPath))
         {
             SetReason(0, "Not managed: RTSS is hooked into this game (AllowRTSS=0).");
