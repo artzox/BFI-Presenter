@@ -7,6 +7,12 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.1] — 2026-10
+
+- **[DX] Unity (Mono) games no longer hang or quit while loading** (Blasphemous). The crash logger ran before every other exception handler and walked the stack of each first-seen access violation. Mono raises those on purpose, and asking Windows to unwind its JIT-compiled code can deadlock inside Mono. The logger now runs after the game's own handlers (exceptions the game handles never reach it) and stops a stack walk at JIT code. The watchdog's stack dumps stop there too.
+- **[DX] `CrashLog=0`** in `BFIPresenter.ini` turns the crash logger off completely.
+- **[Vulkan]** No changes.
+
 ## [1.0.0] — 2026-10
 
 First public release.

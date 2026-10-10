@@ -86,7 +86,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.0"
+#define BFI_ADDON_VERSION "1.0.1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -1469,6 +1469,18 @@ static void GameStage(int st) { g_gameStage.store(st); g_gameStageT.store(Now())
 
 static void ModuleOf(const void *addr, char *out, size_t n);
 
+// True when addr lies in a mapped image (an EXE or DLL). Uses VirtualQuery,
+// which takes no loader or runtime locks. Code outside images is JIT code
+// (Mono/.NET, scripting engines): those runtimes register their unwind data
+// through callbacks that take the runtime's own locks, so asking
+// RtlLookupFunctionEntry about such an address from an exception handler or a
+// suspended thread can deadlock the game. Stack walks stop there instead.
+static bool InImage(DWORD64 addr)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    return addr && VirtualQuery((const void *)(uintptr_t)addr, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.Type == MEM_IMAGE;
+}
+
 // Call stack of another thread, as "module+offset" frames. The thread is
 // suspended only while its context is captured and its stack unwound; module
 // names are resolved after it is resumed (that path takes the loader lock).
@@ -1487,6 +1499,7 @@ static void LogThreadStack(DWORD tid, const char *who)
             for (; nf < 32 && ctx.Rip; nf++)
             {
                 frames[nf] = ctx.Rip;
+                if (!InImage(ctx.Rip)) { nf++; break; }       // JIT code: don't ask the runtime to unwind
                 DWORD64 base = 0;
                 PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
                 if (!fn) { ctx.Rip = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; continue; }
@@ -1521,6 +1534,7 @@ static void LogThreadStack(DWORD tid, const char *who)
 // entry before the process dies is the crash).
 static char g_crashPath[MAX_PATH] = {};
 static PVOID g_crashHandler = nullptr;
+static bool  g_crashLogOn = true;          // CrashLog in the ini
 static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
 {
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -1557,6 +1571,7 @@ static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
     for (; nf < 24 && ctx.Rip; nf++)
     {
         frames[nf] = ctx.Rip;
+        if (!InImage(ctx.Rip)) { nf++; break; }               // JIT code: don't ask the runtime to unwind
         DWORD64 base = 0;
         PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
         if (!fn)
@@ -4975,7 +4990,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
     reshade::register_overlay("BFI Presenter", draw_overlay);
-    if (!g_crashHandler) g_crashHandler = AddVectoredExceptionHandler(1, CrashLogger);
+    if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
     return true;
 }
 
@@ -5007,7 +5022,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         if (char *cs = strrchr(g_crashPath, '\\')) cs[1] = '\0';
         strncat(g_crashPath, "BFIPresenter_crash.txt", MAX_PATH - strlen(g_crashPath) - 1);
         DeleteFileA(g_crashPath);                       // one record per game session
-        g_crashHandler = AddVectoredExceptionHandler(1, CrashLogger);
+        // Registered LAST: runtimes that use access violations on purpose
+        // (Mono in Unity games turns them into NullReferenceExceptions) handle
+        // theirs first, and only exceptions nobody resumed reach the logger.
+        // CrashLog=0 in the ini leaves it out entirely.
+        g_crashLogOn = GetPrivateProfileIntA("BFI", "CrashLog", 1, g_iniPath) != 0;
+        if (g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
         g_diagnostics = (int)GetPrivateProfileIntA("BFI", "Diagnostics", 1, g_iniPath);
         InitializeCriticalSection(&g_infoLock);
         strcpy(g_debugPath, g_crashPath);

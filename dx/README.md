@@ -135,6 +135,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 | `BypassOverlayResizeHooks` (1) | The add-on's own presents and resizes call DXGI directly, past overlay hooks (Steam's overlay hung Pragmata). Overlays then don't draw on the strobed frames |
 | `TypedBackBufferDesc` (1) | Stand-in back buffers report the swap chain's typed format, as real ones do (The Last of Us Part I crashed without it) |
 | `Diagnostics` (1) | 1 = D3D12 DRED: on a device-removed crash, the last GPU operations go to `ReShade.log` and `BFIPresenter_dred.txt`. 2 = also the D3D12 debug layer into `BFIPresenter_debug.txt` (needs "Graphics Tools"; slower) |
+| `CrashLog` (1) | 1 = log serious exceptions anywhere in the game to `BFIPresenter_crash.txt` (runs after the game's own exception handlers). 0 = no crash logger |
 | `AllowRTSS` (1) | 1 = manage games with RTSS hooked (with a warning); 0 = refuse |
 
 ## Hotkeys
