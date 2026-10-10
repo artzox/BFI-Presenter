@@ -166,6 +166,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR).
 - **Exclusive fullscreen in DX11 games** is not supported; use borderless.
 - **NVIDIA Smooth Motion** (driver frame generation): turn it off for BFI games. The DX11 path stays off while it is active.
+- **Epic Online Services overlay** (`EOSOVH-Win64-Shipping.dll`, loaded by games that use EOS, also on Steam): it hooks Direct3D 12 and crashed the DX11 presenter in Silt. `ReShade.log` names its path; rename the file to disable it.
 - 32-bit games: not supported by the add-on (use DXVK + the 32-bit Vulkan layer).
 
 ## Building

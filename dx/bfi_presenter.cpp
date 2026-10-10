@@ -3798,6 +3798,7 @@ static bool DetectPresentHooks()
         { "DiscordHook64.dll",                     "Discord overlay" },
         { "nvspcap64.dll",                         "NVIDIA overlay" },
         { "EOSOverlayRenderer-Win64-Shipping.dll", "Epic overlay" },
+        { "EOSOVH-Win64-Shipping.dll",             "Epic Online Services overlay" },
         { "SpecialK64.dll",                        "Special K" },
     };
     bool rtss = false;
@@ -3810,6 +3811,16 @@ static bool DetectPresentHooks()
         strncat(g_hooksSeen, e.name, sizeof(g_hooksSeen) - strlen(g_hooksSeen) - 1);
     }
     if (g_hooksSeen[0]) LOGW("BFI Presenter: other Present hooks in this game: %s", g_hooksSeen);
+    // Epic Online Services loads its overlay helper into games that use EOS
+    // (also on Steam, without the Epic launcher). It hooks D3D12 and crashed
+    // the DX11 presenter's own present in Silt. Say where it is.
+    if (HMODULE eos = GetModuleHandleA("EOSOVH-Win64-Shipping.dll"))
+    {
+        char path[MAX_PATH] = "";
+        GetModuleFileNameA(eos, path, MAX_PATH);
+        LOGW("BFI Presenter: the Epic Online Services overlay is loaded (%s). If the game crashes or freezes with "
+             "BFI Presenter, rename that file (e.g. to EOSOVH-Win64-Shipping.dll.off) -- EOS keeps working without it.", path);
+    }
     return rtss;
 }
 
