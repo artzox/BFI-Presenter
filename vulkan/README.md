@@ -18,7 +18,7 @@ The same presenter-clocked black frame insertion as the [DX add-on](../dx/README
    - It registers the layer for your Windows user.
    - It lists the Vulkan layers in load order. **ReShade must be listed before BFI Presenter.**
 2. If you install or reinstall ReShade later, run `install_vulkan_layer.bat` again so BFI Presenter is listed after ReShade.
-3. To update, run the new package's `install_vulkan_layer.bat` (or `Update-BFIPresenter.ps1`, which also updates the installed layer).
+3. To update, run the new package's `install_vulkan_layer.bat`. Games pick up the new layer on their next start; your `BFIPresenter.ini` files stay as they are.
 4. To remove it, run `uninstall_vulkan_layer.bat`.
 
 ## Use in a game
