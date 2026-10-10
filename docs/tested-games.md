@@ -50,6 +50,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Indiana Jones and the Great Circle | Partial (Vulkan) | Flashes persist with FG | VK 0.8.2 | Vulkan layer; GPU at its limit causes 10–20 flashes a minute |
 | shadPS4 | Working (Vulkan) | — | VK 0.7 | Vulkan layer; BFIPresenter.ini next to the emulator's .exe |
 | Blasphemous | Working (DX11) | NVIDIA Smooth Motion must be off | v1.0.2 | Smooth Motion off in the NVIDIA app (with it on, the game closed and relaunched itself) |
+| Guacamelee! 2 | Working (DX11) | Not tested | v1.0.2 | Standard setup; works with Special K (crashed at start before v1.0.2) |
 | BAJA: Edge of Control HD | Not supported | — | — | 32-bit game: the add-on doesn't load (try DXVK + the 32-bit Vulkan layer) |
 
 ## Per-game notes
