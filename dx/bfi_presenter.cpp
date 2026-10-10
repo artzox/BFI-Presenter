@@ -1,5 +1,8 @@
 // ============================================================================
-// BFI Presenter  --  ReShade add-on, v0.72 (Direct3D 12 and 11)
+// BFI Presenter  --  ReShade add-on (Direct3D 12 and 11); version: BFI_ADDON_VERSION below
+//
+// Copyright (C) 2026 artzox -- https://github.com/artzox/BFI-Presenter
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Presenter-clocked black frame insertion for games. The game (plus ReShade's
 // effects, e.g. CRT-Standalone with ENABLE_DECAY=0) renders into virtual back

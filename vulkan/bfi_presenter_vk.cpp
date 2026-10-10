@@ -1,5 +1,8 @@
 // ============================================================================
-// BFI Presenter (Vulkan)  --  implicit Vulkan layer + ReShade add-on, v0.7.3
+// BFI Presenter (Vulkan)  --  implicit Vulkan layer + ReShade add-on; version: BFI_VERSION below
+//
+// Copyright (C) 2026 artzox -- https://github.com/artzox/BFI-Presenter
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Presenter-clocked black frame insertion for Vulkan games (and DirectX 9-11
 // games through DXVK). Same idea as the Direct3D 12 add-on:

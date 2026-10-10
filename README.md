@@ -82,6 +82,10 @@ third_party/ ReShade, Dear ImGui and Vulkan headers
 BFIPresenter.example.ini   shared settings reference
 ```
 
+## Licence
+
+BFI Presenter is free software under the [GNU General Public License v3.0](LICENSE): you may use, study, share and modify it. If you distribute a modified version, you must release its source under the same licence. The vendored headers in [`third_party`](third_party/README.md) keep their own (permissive) licences.
+
 ## Safety
 
 BFI flickers at 60 Hz by design. If you are sensitive to flicker or flashing images, take care, and use the hotkey (Ctrl+Shift+B by default) to turn BFI off.
