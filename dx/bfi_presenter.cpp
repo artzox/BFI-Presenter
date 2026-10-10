@@ -4553,6 +4553,15 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
         dx11 = g_shared.dx11;
         LeaveCriticalSection(&g_cfgLock);
         if (!dx11) { SetReason(0, "Not managed: Direct3D 11 support is off (DX11Support=0)."); return; }
+        if (GetModuleHandleA("EOSOVH-Win64-Shipping.dll") && GetPrivateProfileIntA("BFI", "AllowEosOverlay", 0, g_iniPath) == 0)
+        {
+            DetectPresentHooks();                                // logs the overlay's full path
+            LOGW("BFI Presenter: the DX11 presenter stays off while the Epic Online Services overlay is loaded "
+                 "(it crashed the presenter's present in Silt). Rename EOSOVH-Win64-Shipping.dll (path above) to use BFI.");
+            SetReason(0, "Not managed: the Epic Online Services overlay is loaded (crashes the DX11 presenter). "
+                         "Rename EOSOVH-Win64-Shipping.dll -- ReShade.log has its path.");
+            return;
+        }
         if (SmoothMotionActive() && GetPrivateProfileIntA("BFI", "AllowSmoothMotion", 0, g_iniPath) == 0)
         {
             LOGW("BFI Presenter: NVIDIA Smooth Motion is active in this game -- the DX11 presenter stays off "
