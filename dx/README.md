@@ -165,7 +165,8 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 - **Game hitches and GPU stalls show as flashes.** A stall longer than a refresh holds the current refresh on screen. Realtime queue priority and GPU headroom help.
 - **NVIDIA DLSS Frame Generation** relies on Reflex pacing, which can misread the presenter (Pragmata). OptiScaler FSR FG worked in Shadow of the Tomb Raider.
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR).
-- **Exclusive fullscreen in DX11 games** is not supported; use borderless.
+- **Exclusive fullscreen in DX11 games** is not supported; use borderless (windowed) fullscreen. The Rogue Prince of Persia hung its presenter when it left exclusive fullscreen.
+- **A presenter that won't stop** (stuck in its present for 5 s while the game resizes or recreates its swap chain): BFI switches off for the rest of the session and the game continues on its own frames. Restart the game to use BFI again.
 - **NVIDIA Smooth Motion** (driver frame generation): turn it off for BFI games. The DX11 path stays off while it is active.
 - **Epic Online Services overlay** (`EOSOVH-Win64-Shipping.dll`, loaded by games that use EOS, also on Steam): it hooks Direct3D 12 and crashed the DX11 presenter in Silt, so the DX11 path stays off while it is loaded. `ReShade.log` names its path; rename the file to use BFI (`AllowEosOverlay=1` manages the game anyway).
 - 32-bit games: not supported by the add-on (use DXVK + the 32-bit Vulkan layer).

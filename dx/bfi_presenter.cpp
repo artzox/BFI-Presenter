@@ -2689,8 +2689,17 @@ static void StartPresenter()
     }
 }
 
-static void StopPresenter()
+// A presenter thread that would not stop. Nothing it uses is ever freed
+// after this (the resources are left to the process exit), and BFI stays off
+// until the game restarts. Freeing them under it crashed The Rogue Prince of
+// Persia (presenter thread on a released fence) when the game left exclusive
+// fullscreen.
+static std::atomic<bool> g_presenterStuck{false};
+
+// Returns false when the presenter thread is still running after the wait.
+static bool StopPresenter()
 {
+    if (g_presenterStuck.load()) return false;
     if (g_lrThread)
     {
         g_lrRun.store(false);
@@ -2714,7 +2723,15 @@ static void StopPresenter()
         for (;;)
         {
             const DWORD now = GetTickCount();
-            if ((LONG)(until - now) <= 0) { LOGW("BFI Presenter: presenter thread did not stop within 5 s"); break; }
+            if ((LONG)(until - now) <= 0)
+            {
+                // Keep everything it may touch alive and leave it be.
+                g_presenterStuck.store(true);
+                g_presenterFailed.store(true);
+                LOGE("BFI Presenter: presenter thread did not stop within 5 s -- BFI is off until the game restarts "
+                     "(its resources are kept so the game can continue)");
+                return false;
+            }
             const DWORD r = MsgWaitForMultipleObjects(1, &g_thread, FALSE, until - now, QS_SENDMESSAGE);
             if (r == WAIT_OBJECT_0 || r == WAIT_FAILED) break;
             MSG m;
@@ -2727,13 +2744,9 @@ static void StopPresenter()
     // also releases game-queue waits on presenter reads that never happened.
     if (g_presQueue && g_presFence)
     {
-        // Never block for good on the lock: if the presenter is stuck inside
-        // it, go on without it (the presenter is no longer running).
-        bool locked = false;
-        for (int i = 0; i < 200 && !(locked = TryEnterCriticalSection(&g_lock) != 0); i++) Sleep(10);
-        if (!locked) LOGW("BFI Presenter: presenter lock busy while stopping -- continuing without it");
+        EnterCriticalSection(&g_lock);
         const UINT64 v = ++g_presFenceVal;
-        if (locked) LeaveCriticalSection(&g_lock);
+        LeaveCriticalSection(&g_lock);
         g_presQueue->Signal(g_presFence, v);
         WaitFence(g_presFence, v, g_gameFenceEvent);
     }
@@ -2747,6 +2760,7 @@ static void StopPresenter()
     }
     TopUpGameSlots();
     g_releasedUpTo.store(g_frameId);            // every frame so far counts as given back
+    return true;
 }
 
 // ---------------------------------------------------------------- game side
@@ -3212,9 +3226,19 @@ static HRESULT STDMETHODCALLTYPE hk_GetMFL(IDXGISwapChain2 *sc, UINT *p)
 // the same thread go straight to the original (Steam's ResizeBuffers1 hook
 // did this in Pragmata: infinite recursion, stack overflow).
 
+// After the presenter got stuck the game may still wait on the frame-latency
+// semaphore it was given; with nobody else releasing it, each of its own
+// presents gives one slot back.
+static bool StuckPassThrough(void *sc)
+{
+    return g_presenterStuck.load() && !t_ownCall && !t_presenterThread && g_waitSem &&
+           (sc == (void *)g_sc || sc == (void *)g_sc11);
+}
+
 static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT flags)
 {
     if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
+    if (StuckPassThrough(sc)) { const HRESULT hr = o_Present(sc, sync, flags); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST)) return o_Present(sc, sync, flags);
     return SubmitGameFrame();
 }
@@ -3222,6 +3246,7 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT 
 static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p)
 {
     if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
+    if (StuckPassThrough(sc)) { const HRESULT hr = o_Present1(sc, sync, flags, p); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST)) return o_Present1(sc, sync, flags, p);
     return SubmitGameFrame();
 }
@@ -3574,13 +3599,25 @@ static HRESULT ResizeOnPresenterQueue(IDXGISwapChain3 *sc, UINT cnt, UINT w, UIN
     return hr;
 }
 
+// Presenter stuck (see g_presenterStuck): stop managing the swap chain and
+// pass the game's call through. Nothing is released.
+template <class F> static HRESULT StuckResize(void *sc, F orig)
+{
+    g_active.store(false);
+    SetReason(0, "BFI stopped: the presenter thread hung while the swap chain changed. The game continues without BFI; "
+                 "restart it to use BFI. If this repeats, use borderless (windowed) fullscreen instead of exclusive fullscreen.");
+    const HRESULT hr = orig();
+    LOGW("BFI Presenter: swap chain %p resized unmanaged (0x%08lX)", sc, (unsigned long)hr);
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMAT f, UINT fl)
 {
     if (!t_ownCall && IsGame11(sc)) return Resize11(sc, cnt, w, h, f, fl, nullptr, nullptr, false);
     if (t_ownCall || !IsManaged(sc)) return o_ResizeBuffers(sc, cnt, w, h, f, fl);
     if (cnt) g_virtCount = cnt;
     GameStage(ST_R_STOP);
-    StopPresenter();
+    if (!StopPresenter()) { GameStage(ST_G_OUTSIDE); return StuckResize(sc, [&] { OwnCall own; return o_ResizeBuffers(sc, cnt, w, h, f, fl); }); }
     GameStage(ST_R_RELEASE);
     ReleaseFrameResources();
     GameStage(ST_R_REBIND);
@@ -3609,7 +3646,7 @@ static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers1(IDXGISwapChain3 *sc, UINT cnt
     if (t_ownCall || !IsManaged(sc)) return o_ResizeBuffers1(sc, cnt, w, h, f, fl, mask, queues);
     if (cnt) g_virtCount = cnt;
     GameStage(ST_R_STOP);
-    StopPresenter();
+    if (!StopPresenter()) { GameStage(ST_G_OUTSIDE); return StuckResize(sc, [&] { OwnCall own; return o_ResizeBuffers1(sc, cnt, w, h, f, fl, mask, queues); }); }
     GameStage(ST_R_RELEASE);
     ReleaseFrameResources();
     GameStage(ST_R_REBIND);
@@ -3709,7 +3746,14 @@ static void RemoveHooks()
 // ---------------------------------------------------------------- ReShade events
 static void ReleaseAll()
 {
-    StopPresenter();
+    if (!StopPresenter())
+    {
+        // Keep g_sc set so no other swap chain is taken over in this run.
+        g_active.store(false);
+        SetReason(0, "BFI stopped: the presenter thread hung while the swap chain was destroyed. The game continues "
+                     "without BFI; restart it to use BFI. If this repeats, use borderless (windowed) fullscreen.");
+        return;
+    }
     g_active.store(false);
     ReleaseFrameResources();
     for (UINT s = 0; s < kStage; s++) SafeRelease(g_copyAlloc[s]);
@@ -4089,7 +4133,18 @@ static HRESULT STDMETHODCALLTYPE hk_SetCS1(IDXGISwapChain3 *sc, DXGI_COLOR_SPACE
 
 static void ReleaseDx11()
 {
-    StopPresenter();
+    if (!StopPresenter())
+    {
+        // Leave everything the presenter thread may still use alive, hide its
+        // window so the game's own frames show, and keep g_sc set so no other
+        // swap chain is taken over in this run.
+        g_active.store(false);
+        if (HWND h = g_childHwnd.load()) ShowWindowAsync(h, SW_HIDE);
+        SetReason(0, "BFI stopped: the presenter thread hung when the game changed display mode. The game continues "
+                     "without BFI; restart it to use BFI. Use borderless (windowed) fullscreen instead of exclusive "
+                     "fullscreen in this game.");
+        return;
+    }
     g_active.store(false);
     ReleaseStage11();
     if (g_sc) { OwnCall own; g_sc->Release(); }
@@ -4505,7 +4560,13 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
                         const UINT *mask, IUnknown *const *queues, bool one)
 {
     EnterCriticalSection(&g_submitLock);
-    StopPresenter();
+    if (!StopPresenter())
+    {
+        if (HWND h = g_childHwnd.load()) ShowWindowAsync(h, SW_HIDE);
+        LeaveCriticalSection(&g_submitLock);
+        return StuckResize(sc, [&] { OwnCall own;
+            return one ? o_ResizeBuffers1((IDXGISwapChain3 *)sc, cnt, w, h, f, fl, mask, queues) : o_ResizeBuffers(sc, cnt, w, h, f, fl); });
+    }
     ReleaseStage11();
     HRESULT hr;
     {

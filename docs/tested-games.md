@@ -54,6 +54,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Jusant | Not recommended | Not tested | v1.0.2 | Runs, but Unreal's frame pipeline delivers finished frames with a varying delay (10–33 ms), so a fixed 120 Hz strobe judders at any setting; play with VRR instead. Queue one refresh ahead removes the flashes |
 | Moons of Madness | Working (DX11) | Not tested | v1.0.2 | Holds a locked 120 fps, so the CRT shader's own BFI (decay) is the better fit; with the presenter use Half refresh + Lowest latency (Refresh + Smooth stutters) |
 | Silt | Working (DX11) | Not tested | v1.0.2 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
+| The Rogue Prince of Persia | Working (DX11) | Not tested | v1.0.2 | Borderless (windowed) fullscreen, not exclusive fullscreen: leaving exclusive fullscreen hung or crashed the presenter |
 | BAJA: Edge of Control HD | Not supported | — | — | 32-bit game: the add-on doesn't load (try DXVK + the 32-bit Vulkan layer) |
 
 ## Per-game notes
@@ -183,6 +184,11 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 - Unity game on Steam that uses Epic Online Services. The EOS SDK in the game folder loads Epic's overlay helper, `EOSOVH-Win64-Shipping.dll`, from a shared Epic folder elsewhere on the PC, even without the Epic launcher. The overlay hooks Direct3D 12 and crashed the DX11 presenter's own present about a second after BFI started.
 - Fix: rename that file (e.g. to `EOSOVH-Win64-Shipping.dll.off`). Since v1.0.2 `ReShade.log` prints its full path. EOS keeps working; only Epic's pop-ups are gone, in every game that uses them, until it is renamed back.
+
+### The Rogue Prince of Persia
+
+- DirectX 11. **Set the display mode to borderless (windowed) fullscreen.** In exclusive fullscreen the game switches to windowed and recreates its swap chain; the presenter got stuck in its present at that moment, which first hung the game and then (v1.0.2 test build) crashed it. Borderless works.
+- Since v1.0.2, if the presenter gets stuck like this in any game, BFI switches off for the rest of the session and the game continues; the overlay says so. Restart the game to use BFI.
 
 ### BAJA: Edge of Control HD
 
