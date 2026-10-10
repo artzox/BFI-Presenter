@@ -7,6 +7,12 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.2] — 2026-10
+
+- **[DX] `DX11Support=0` works again for the first swap chain.** The setting was checked before the ini was read, so the first DX11 swap chain of a session was always managed.
+- **[DX] Watchdog: "the game's window is not responding".** When Windows would call the game hung (no window messages for 5 s), `ReShade.log` gets the call stacks of the game's window thread, the presenter's window thread (DX11) and the game's present thread, to show where it is stuck.
+- **[Vulkan]** No changes.
+
 ## [1.0.1] — 2026-10
 
 - **[DX] Unity (Mono) games no longer hang or quit while loading** (Blasphemous). The crash logger ran before every other exception handler and walked the stack of each first-seen access violation. Mono raises those on purpose, and asking Windows to unwind its JIT-compiled code can deadlock inside Mono. The logger now runs after the game's own handlers (exceptions the game handles never reach it) and stops a stack walk at JIT code. The watchdog's stack dumps stop there too.

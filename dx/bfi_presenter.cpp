@@ -86,7 +86,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.1"
+#define BFI_ADDON_VERSION "1.0.2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -526,6 +526,8 @@ static const UINT kStage  = 6;
 static CRITICAL_SECTION       g_lock;
 static CRITICAL_SECTION       g_submitLock;      // serialises game-side Present calls (FG add-ons present from other threads)
 static DWORD                  g_presentThreads[4] = {};
+static std::atomic<HWND>      g_watchHwnd{nullptr};    // game window the watchdog checks for "not responding"
+static std::atomic<DWORD>     g_uiTid{0};              // DX11: thread that owns the presenter's child window
 static IDXGISwapChain3       *g_sc = nullptr;    // managed real swap chain (not AddRef'd)
 static reshade::api::swapchain *g_rsSwapchain = nullptr;
 static std::atomic<bool>      g_active{false};   // hooks redirect for g_sc
@@ -1647,6 +1649,28 @@ static DWORD WINAPI WatchdogThread(void *)
                      "oldest staged frame needs %llu", t - lp, g_dbgStaged.load(),
                      (unsigned long long)g_dbgDone.load(), (unsigned long long)g_dbgNeed.load());
                 lastPresT = t;
+            }
+        }
+        // The game's window stops responding (Windows' "not responding" test:
+        // no message processed for 5 s): log where its thread is, once per hang.
+        {
+            static bool hungLogged = false;
+            HWND gw = g_watchHwnd.load();
+            const bool hung = gw && IsWindow(gw) && IsHungAppWindow(gw);
+            if (hung && !hungLogged)
+            {
+                hungLogged = true;
+                const DWORD wt = GetWindowThreadProcessId(gw, nullptr);
+                LOGW("BFI Presenter: WATCHDOG -- the game's window is not responding (window thread %lu)", (unsigned long)wt);
+                if (wt) LogThreadStack(wt, "game window thread");
+                const DWORD ut = g_uiTid.load();
+                if (ut) LogThreadStack(ut, "presenter window thread");
+                if (g_presentThreads[0] && g_presentThreads[0] != wt) LogThreadStack(g_presentThreads[0], "game present thread");
+            }
+            else if (!hung && hungLogged)
+            {
+                hungLogged = false;
+                LOGI("BFI Presenter: WATCHDOG -- the game's window responds again");
             }
         }
         if (g_active.load() && g_gameStageT.load() > 0.0)
@@ -3833,7 +3857,7 @@ static bool CreateChildWindow()
     HANDLE ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
     g_childHwnd.store(nullptr);
     g_uiThread = CreateThread(nullptr, 0, UiThread, ev, 0, nullptr);
-    if (g_uiThread) WaitForSingleObject(ev, 5000);
+    if (g_uiThread) { g_uiTid.store(GetThreadId(g_uiThread)); WaitForSingleObject(ev, 5000); }
     CloseHandle(ev);
     if (!g_childHwnd.load())
     {
@@ -4214,6 +4238,7 @@ static bool InitDx11(reshade::api::swapchain *swapchain)
 
     // The presenter's window and swap chain.
     g_gameHwnd = hwnd;
+    g_watchHwnd.store(hwnd);
     ok = ok && CreateChildWindow();
     IDXGISwapChain1 *own1 = nullptr;
     Settings cur;
@@ -4449,10 +4474,12 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
     if (resize || g_sc) return;                                  // resizes are handled in the hook
+    if (!g_watchHwnd.load()) g_watchHwnd.store((HWND)swapchain->get_hwnd());
     const reshade::api::device_api api = swapchain->get_device()->get_api();
     if (api == reshade::api::device_api::d3d11 && !g_dx11.load())
     {
         int dx11 = 1;
+        LoadShared();                                            // read the ini first: DX11Support decides below
         EnterCriticalSection(&g_cfgLock);
         dx11 = g_shared.dx11;
         LeaveCriticalSection(&g_cfgLock);
