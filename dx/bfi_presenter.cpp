@@ -4517,18 +4517,18 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     static void *probeSc = nullptr;
     if (resize && swapchain != probeSc) return;
     {
-        const reshade::api::resource bb = swapchain->get_current_back_buffer();
-        if (bb.handle)
+        // Size from DXGI itself: ReShade's back-buffer accessors are not
+        // usable yet inside init_swapchain (ReShade 6.5.1 crashed in
+        // get_back_buffer there, Guacamelee 2).
+        IDXGISwapChain *nsc = reinterpret_cast<IDXGISwapChain *>(swapchain->get_native());
+        DXGI_SWAP_CHAIN_DESC sd = {};
+        if (nsc && SUCCEEDED(nsc->GetDesc(&sd)) && (sd.BufferDesc.Width < 64 || sd.BufferDesc.Height < 64))
         {
-            const reshade::api::resource_desc d = swapchain->get_device()->get_resource_desc(bb);
-            if (d.texture.width < 64 || d.texture.height < 64)
-            {
-                if (probeSc != swapchain)
-                    LOGI("BFI Presenter: ignoring a %ux%u swap chain (a probe by an overlay or injector, not the game's)",
-                         d.texture.width, d.texture.height);
-                probeSc = swapchain;
-                return;
-            }
+            if (probeSc != swapchain)
+                LOGI("BFI Presenter: ignoring a %ux%u swap chain (a probe by an overlay or injector, not the game's)",
+                     sd.BufferDesc.Width, sd.BufferDesc.Height);
+            probeSc = swapchain;
+            return;
         }
     }
     if (swapchain == probeSc) probeSc = nullptr;
