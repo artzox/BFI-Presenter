@@ -4508,7 +4508,30 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
-    if (resize || g_sc) return;                                  // resizes are handled in the hook
+    if (g_sc) return;                                            // resizes of ours are handled in the hook
+    // Overlays and injectors (Special K, Steam) create tiny throw-away swap
+    // chains on hidden windows to find DXGI's functions. Taking one of those
+    // left the game's real swap chain unmanaged and the presenter pointed at
+    // a swap chain about to be destroyed (Guacamelee 2 crashed). Skip them;
+    // if a skipped one is later resized to a real size, take it then.
+    static void *probeSc = nullptr;
+    if (resize && swapchain != probeSc) return;
+    {
+        const reshade::api::resource bb = swapchain->get_current_back_buffer();
+        if (bb.handle)
+        {
+            const reshade::api::resource_desc d = swapchain->get_device()->get_resource_desc(bb);
+            if (d.texture.width < 64 || d.texture.height < 64)
+            {
+                if (probeSc != swapchain)
+                    LOGI("BFI Presenter: ignoring a %ux%u swap chain (a probe by an overlay or injector, not the game's)",
+                         d.texture.width, d.texture.height);
+                probeSc = swapchain;
+                return;
+            }
+        }
+    }
+    if (swapchain == probeSc) probeSc = nullptr;
     if (!g_watchHwnd.load()) g_watchHwnd.store((HWND)swapchain->get_hwnd());
     const reshade::api::device_api api = swapchain->get_device()->get_api();
     if (api == reshade::api::device_api::d3d11 && !g_dx11.load())
