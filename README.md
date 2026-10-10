@@ -57,9 +57,14 @@ If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that
 
 `scripts/Find-BFIPresenter.ps1` finds every game folder with the add-on or an ini (Steam, Epic, GOG and Xbox folders, plus any `-Roots` you pass) and shows each one's version. `scripts/Update-BFIPresenter.ps1 -Source <extracted release>` copies a new build into all of them and updates the installed Vulkan layer; `-DryRun` previews. Your `BFIPresenter.ini` files are never changed.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Find-BFIPresenter.ps1
-powershell -ExecutionPolicy Bypass -File .\Update-BFIPresenter.ps1 -Source "D:\Downloads\BFIPresenter-1.0.0" -DryRun
+**Easiest:** double-click `Find-BFIPresenter.bat`, then `Update-BFIPresenter.bat`, from the extracted release folder (the new build next to the scripts). The `.bat` files start PowerShell with the right options, so Windows' script policy and the "downloaded from the internet" block don't stop them.
+
+From a command prompt, extra options pass through the `.bat` files:
+
+```bat
+Find-BFIPresenter.bat -Roots "D:\Games"
+Update-BFIPresenter.bat -DryRun
+Update-BFIPresenter.bat -Source "D:\Downloads\BFIPresenter-1.0.0" -Backup
 ```
 
 ## Building from source
