@@ -1,0 +1,18 @@
+{
+    "file_format_version": "1.2.1",
+    "layer": {
+        "name": "VK_LAYER_BFI_presenter",
+        "type": "GLOBAL",
+        "library_path": ".\\BFIPresenterVK.dll",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "BFI Presenter: presenter-clocked black frame insertion (active only where BFIPresenter.ini is next to the game's exe)",
+        "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+        },
+        "disable_environment": {
+            "DISABLE_BFI_PRESENTER_VK": "1"
+        },
+        "library_arch": "64"
+    }
+}
