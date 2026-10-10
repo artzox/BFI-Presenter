@@ -53,7 +53,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Guacamelee! 2 | Working (DX11) | Not tested | v1.0.2 | Standard setup; works with Special K (crashed at start before v1.0.2) |
 | Jusant | Not recommended | Not tested | v1.0.2 | Runs, but Unreal's frame pipeline delivers finished frames with a varying delay (10–33 ms), so a fixed 120 Hz strobe judders at any setting; play with VRR instead. Queue one refresh ahead removes the flashes |
 | Moons of Madness | Working (DX11) | Not tested | v1.0.2 | Holds a locked 120 fps, so the CRT shader's own BFI (decay) is the better fit; with the presenter use Half refresh + Lowest latency (Refresh + Smooth stutters) |
-| Silt | Working (DX11) | Not tested | v1.0.2 | Rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else the presenter crashes at start |
+| Silt | Working (DX11) | Not tested | v1.0.2 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
 | BAJA: Edge of Control HD | Not supported | — | — | 32-bit game: the add-on doesn't load (try DXVK + the 32-bit Vulkan layer) |
 
 ## Per-game notes
