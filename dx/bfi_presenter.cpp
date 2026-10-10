@@ -2704,7 +2704,22 @@ static void StopPresenter()
     {
         g_running.store(false);
         SetEvent(g_tickEvent);
-        WaitForSingleObject(g_thread, 5000);
+        // Wait while serving messages sent to this thread's windows. This is
+        // usually the game's window thread (a swap chain is being destroyed),
+        // and DXGI can send that window a message from inside the presenter's
+        // Present (DX11 path: the presenter's window is a child of the
+        // game's). A plain wait deadlocked The Rogue Prince of Persia when it
+        // left exclusive fullscreen and recreated its swap chain.
+        const DWORD until = GetTickCount() + 5000;
+        for (;;)
+        {
+            const DWORD now = GetTickCount();
+            if ((LONG)(until - now) <= 0) { LOGW("BFI Presenter: presenter thread did not stop within 5 s"); break; }
+            const DWORD r = MsgWaitForMultipleObjects(1, &g_thread, FALSE, until - now, QS_SENDMESSAGE);
+            if (r == WAIT_OBJECT_0 || r == WAIT_FAILED) break;
+            MSG m;
+            PeekMessageW(&m, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);   // dispatches sent messages only
+        }
         CloseHandle(g_thread);
         g_thread = nullptr;
     }
@@ -2712,9 +2727,13 @@ static void StopPresenter()
     // also releases game-queue waits on presenter reads that never happened.
     if (g_presQueue && g_presFence)
     {
-        EnterCriticalSection(&g_lock);
+        // Never block for good on the lock: if the presenter is stuck inside
+        // it, go on without it (the presenter is no longer running).
+        bool locked = false;
+        for (int i = 0; i < 200 && !(locked = TryEnterCriticalSection(&g_lock) != 0); i++) Sleep(10);
+        if (!locked) LOGW("BFI Presenter: presenter lock busy while stopping -- continuing without it");
         const UINT64 v = ++g_presFenceVal;
-        LeaveCriticalSection(&g_lock);
+        if (locked) LeaveCriticalSection(&g_lock);
         g_presQueue->Signal(g_presFence, v);
         WaitFence(g_presFence, v, g_gameFenceEvent);
     }
