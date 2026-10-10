@@ -1,0 +1,19 @@
+# Build outputs (attached to GitHub releases instead)
+*.addon64
+*.dll
+*.so
+*.spv
+*.obj
+*.o
+*.exp
+*.lib
+*.pdb
+dist/
+
+# Logs and per-user files a test run can leave behind
+*.log
+BFIPresenter_log_*.csv
+BFIPresenter_game_*.csv
+BFIPresenterVK_log_*.csv
+BFIPresenter_locations.*
+BFIPresenter.ini
