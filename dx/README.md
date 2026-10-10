@@ -22,7 +22,7 @@ The [Vulkan layer](../vulkan/README.md) covers Vulkan games and DirectX 9–11 g
 
 ## Install, update, uninstall
 
-1. Copy `BFIPresenter.addon64` and `BFIPresenter.ini` (from `BFIPresenter.example.ini`) into the game folder, next to ReShade's DLL.
+1. Copy `BFIPresenter.addon64` into the game folder, next to ReShade's DLL. It creates `BFIPresenter.ini` there on first start (`BFIPresenter.example.ini` explains every setting).
 2. In CRT-Standalone set **`ENABLE_DECAY=0`**. The add-on does the BFI; leaving both on doubles it.
 3. Start the game and open the ReShade overlay. The **BFI Presenter** tab shows the version, whether the swap chain is managed (and why not, if it isn't), and live timing.
 4. BFI starts at the game's first swap-chain resize (nearly all games resize at start-up). If it doesn't start, change resolution or display mode once.

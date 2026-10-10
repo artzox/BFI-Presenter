@@ -23,7 +23,7 @@ The same presenter-clocked black frame insertion as the [DX add-on](../dx/README
 
 ## Use in a game
 
-1. Copy `BFIPresenter.ini` (from `BFIPresenter.example.ini`) into the game folder, next to its `.exe`. The ini from a DX game works as-is. For emulators, put it next to the emulator's `.exe`.
+1. Copy `BFIPresenter.ini` from the package into the game folder, next to its `.exe` (the layer doesn't create it; it only switches on where the file exists). The ini from a DX game works as-is. For emulators, put it next to the emulator's `.exe`.
 2. Start the game. `BFIPresenterVK.log` appears next to the ini, and the ReShade overlay gets the **BFI Presenter (Vulkan)** tab.
 3. Use the same per-game setup as for DX games:
    - G-SYNC off in the game's NVIDIA profile if the display doesn't hold a fixed 120 Hz.
@@ -82,7 +82,7 @@ No log at all means the layer isn't active: check that `BFIPresenter.ini` is in 
 
 ## ini keys (Vulkan only)
 
-All other keys are shared with the DX add-on; see `BFIPresenter.example.ini` and the [DX reference](../dx/README.md).
+All other keys are shared with the DX add-on; see the comments in `BFIPresenter.ini` and the [DX reference](../dx/README.md).
 
 | Key | Default | Meaning |
 |---|---|---|
