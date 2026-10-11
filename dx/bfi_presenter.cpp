@@ -3347,20 +3347,26 @@ static void *PristineVtableEntry(void **vtbl, int idx)
             const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)buf.data();
             if (dos->e_magic == IMAGE_DOS_SIGNATURE && (size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) < buf.size())
             {
+                // PE32+ (64-bit) and PE32 (32-bit builds): slots of 8 or 4 bytes.
                 const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64 *)(buf.data() + dos->e_lfanew);
-                if (nt->Signature == IMAGE_NT_SIGNATURE && nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+                const bool pe64 = nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+                const bool pe32 = nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+                if (nt->Signature == IMAGE_NT_SIGNATURE && (pe64 ? sizeof(void *) == 8 : pe32 && sizeof(void *) == 4))
                 {
+                    const IMAGE_NT_HEADERS32 *nt32 = (const IMAGE_NT_HEADERS32 *)nt;
+                    const UINT64 base = pe64 ? nt->OptionalHeader.ImageBase : nt32->OptionalHeader.ImageBase;
+                    const UINT64 size = pe64 ? nt->OptionalHeader.SizeOfImage : nt32->OptionalHeader.SizeOfImage;
+                    const size_t slot = sizeof(void *);
                     const UINT64 rva = (UINT64)((BYTE *)&vtbl[idx] - (BYTE *)m);
-                    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+                    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);   // uses SizeOfOptionalHeader: right for both
                     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
                     {
                         const UINT64 va = sec->VirtualAddress, span = sec->SizeOfRawData;
-                        if (rva < va || rva + 8 > va + span) continue;
+                        if (rva < va || rva + slot > va + span) continue;
                         const UINT64 off = sec->PointerToRawData + (rva - va);
-                        if (off + 8 > buf.size()) break;
-                        UINT64 val;
-                        memcpy(&val, buf.data() + off, 8);
-                        const UINT64 base = nt->OptionalHeader.ImageBase, size = nt->OptionalHeader.SizeOfImage;
+                        if (off + slot > buf.size()) break;
+                        UINT64 val = 0;
+                        memcpy(&val, buf.data() + off, slot);
                         if (val >= base && val < base + size) result = (BYTE *)m + (val - base);
                         break;
                     }
@@ -4223,7 +4229,11 @@ BFI_TLS(int, t_inFsCs);      // re-entry from hooks below ours (Steam) goes stra
 struct FsCsDepth { FsCsDepth() { t_inFsCs++; } ~FsCsDepth() { t_inFsCs--; } };
 static HRESULT STDMETHODCALLTYPE hk_SetFS(IDXGISwapChain *sc, BOOL fs, IDXGIOutput *target)
 {
-    if (t_inFsCs) return ((PFN_SetFS)DirectSlot(*(void ***)sc, VT_SetFullscreenState))(sc, fs, target);
+    if (t_inFsCs)
+    {
+        PFN_SetFS f = (PFN_SetFS)DirectSlot(*(void ***)sc, VT_SetFullscreenState);
+        return (f == &hk_SetFS ? o_SetFS : f)(sc, fs, target);      // never back into this hook
+    }
     FsCsDepth depth;
     if (t_ownCall || !IsGame11(sc)) return o_SetFS(sc, fs, target);
     g_fsWanted = fs;
@@ -4242,7 +4252,11 @@ static HRESULT STDMETHODCALLTYPE hk_SetFS(IDXGISwapChain *sc, BOOL fs, IDXGIOutp
 }
 static HRESULT STDMETHODCALLTYPE hk_GetFSt(IDXGISwapChain *sc, BOOL *fs, IDXGIOutput **target)
 {
-    if (t_inFsCs) return ((PFN_GetFS2)DirectSlot(*(void ***)sc, VT_GetFullscreenState))(sc, fs, target);
+    if (t_inFsCs)
+    {
+        PFN_GetFS2 f = (PFN_GetFS2)DirectSlot(*(void ***)sc, VT_GetFullscreenState);
+        return (f == &hk_GetFSt ? o_GetFSt : f)(sc, fs, target);
+    }
     FsCsDepth depth;
     if (t_ownCall || !IsGame11(sc)) return o_GetFSt(sc, fs, target);
     if (fs) *fs = g_fsWanted;
@@ -4251,7 +4265,11 @@ static HRESULT STDMETHODCALLTYPE hk_GetFSt(IDXGISwapChain *sc, BOOL *fs, IDXGIOu
 }
 static HRESULT STDMETHODCALLTYPE hk_SetCS1(IDXGISwapChain3 *sc, DXGI_COLOR_SPACE_TYPE cs)
 {
-    if (t_inFsCs) return ((PFN_SetCS1)DirectSlot(*(void ***)sc, VT_SetColorSpace1))(sc, cs);
+    if (t_inFsCs)
+    {
+        PFN_SetCS1 f = (PFN_SetCS1)DirectSlot(*(void ***)sc, VT_SetColorSpace1);
+        return (f == &hk_SetCS1 ? o_SetCS1 : f)(sc, cs);
+    }
     FsCsDepth depth;
     const HRESULT hr = o_SetCS1(sc, cs);
     if (!t_ownCall && IsGame11(sc) && SUCCEEDED(hr) && g_cs11.exchange((int)cs) != (int)cs)
