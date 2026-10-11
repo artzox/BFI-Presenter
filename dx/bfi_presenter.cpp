@@ -4749,6 +4749,19 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
     if (g_sc) return;                                            // resizes of ours are handled in the hook
+    // Direct3D 11 and 12 only: in an OpenGL, Vulkan or D3D9 game the native
+    // handle is not a DXGI swap chain (Heretic II, OpenGL: crashed reading
+    // the HDC as one in the probe check below).
+    {
+        const reshade::api::device_api a = swapchain->get_device()->get_api();
+        if (a != reshade::api::device_api::d3d11 && a != reshade::api::device_api::d3d12)
+        {
+            SetReason(0, "Not managed: this game renders with %s; the add-on handles Direct3D 11 and 12 only.",
+                      a == reshade::api::device_api::opengl ? "OpenGL" : a == reshade::api::device_api::vulkan ? "Vulkan (use the Vulkan layer)" :
+                      a == reshade::api::device_api::d3d9 ? "Direct3D 9" : a == reshade::api::device_api::d3d10 ? "Direct3D 10" : "another API");
+            return;
+        }
+    }
     // Overlays and injectors (Special K, Steam) create tiny throw-away swap
     // chains on hidden windows to find DXGI's functions. Taking one of those
     // left the game's real swap chain unmanaged and the presenter pointed at
