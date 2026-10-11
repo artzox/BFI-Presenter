@@ -620,6 +620,11 @@ static std::atomic<HRESULT>   g_lastPresentHr{S_OK};
 // presenter shows it through a swap chain of its own on a child window that
 // covers the game's window.
 static std::atomic<bool> g_dx11{false};
+// DX11GamePresent=1: the game's own swap chain still presents each frame
+// (sync interval 0, under the presenter's window), so the game's driver sees
+// its frame boundaries. Off by default: the game's swap chain normally never
+// presents. For games that slow down more and more without it (Wreckfest).
+static std::atomic<int> g_gamePresent11{0};
 static IDXGISwapChain3 *g_sc11 = nullptr;          // the game's DX11 swap chain (not AddRef'd)
 static bool IsGame11(void *sc) { return g_dx11.load() && g_active.load() && sc == (void *)g_sc11; }
 static HRESULT SubmitGameFrame11(IDXGISwapChain *sc, UINT sync, UINT flags);
@@ -4403,6 +4408,7 @@ static bool InitDx11(reshade::api::swapchain *swapchain)
         snprintf(g_scOwner, sizeof(g_scOwner), "%s (Present in %s)", objMod, presMod);
         DetectFrameGen();
     }
+    g_gamePresent11.store(GetPrivateProfileIntA("BFI", "DX11GamePresent", 0, g_iniPath));
     LOGI("BFI Presenter: DX11 init 1/5 -- swap chain %p, %ux%u, format %u, %u buffers, swap effect %u, flags 0x%X",
          (void *)sc3, d.Width, d.Height, (unsigned)d.Format, d.BufferCount, (unsigned)d.SwapEffect, (unsigned)d.Flags);
 
@@ -4724,6 +4730,20 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
 }
 static HRESULT SubmitGameFrame11(IDXGISwapChain *sc, UINT sync, UINT flags)
 {
+    if (g_gamePresent11.load())
+    {
+        const HRESULT hr = SubmitFrame11Core(
+            [&]() -> ID3D11Texture2D * { ID3D11Texture2D *bb = nullptr; OwnCall own; o_GetBuffer(sc, 0, __uuidof(ID3D11Texture2D), (void **)&bb); return bb; },
+            [&]() -> HRESULT { OwnCall own; return o_Present(sc, sync, flags); });
+        if (g_running.load())
+        {
+            OwnCall own;
+            const HRESULT ph = o_Present(sc, 0, DXGI_PRESENT_DO_NOT_WAIT);
+            static bool logged = false;
+            if (!logged) { logged = true; LOGI("BFI Presenter: DX11: the game's own swap chain presents too (DX11GamePresent=1): 0x%08lX", (unsigned long)ph); }
+        }
+        return hr;
+    }
     return SubmitFrame11Core(
         [&]() -> ID3D11Texture2D * { ID3D11Texture2D *bb = nullptr; OwnCall own; o_GetBuffer(sc, 0, __uuidof(ID3D11Texture2D), (void **)&bb); return bb; },
         [&]() -> HRESULT { OwnCall own; return o_Present(sc, sync, flags); });
