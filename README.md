@@ -55,7 +55,7 @@ If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that
 
 ## Updating many games
 
-`scripts/Find-BFIPresenter.ps1` finds every game folder with the add-on or an ini (Steam, Epic, GOG and Xbox folders, plus any `-Roots` you pass) and shows each one's version. `scripts/Update-BFIPresenter.ps1 -Source <extracted release>` copies a new build into all of them and updates the installed Vulkan layer; `-DryRun` previews. Your `BFIPresenter.ini` files are never changed.
+`scripts/Find-BFIPresenter.ps1` finds every game folder with the add-on or an ini (Steam, Epic, GOG and Xbox folders, plus any `-Roots` you pass) and shows each one's version. `scripts/Update-BFIPresenter.ps1 -Source <extracted release>` copies a new build into all of them and updates the installed Vulkan layer; `-DryRun` previews. Your `BFIPresenter.ini` files are never changed. Every replaced file is kept in `BFIPresenter_backups` next to the script and listed, with its old and new version, in `BFIPresenter_update_log.csv`; if a new version misbehaves, `-Revert` puts back what the last update replaced (run it again to go one more update back).
 
 **Easiest:** double-click `Find-BFIPresenter.bat`, then `Update-BFIPresenter.bat`, from the extracted release folder (the new build next to the scripts). The `.bat` files start PowerShell with the right options, so Windows' script policy and the "downloaded from the internet" block don't stop them.
 
@@ -65,6 +65,7 @@ From a command prompt, extra options pass through the `.bat` files:
 Find-BFIPresenter.bat -Roots "D:\Games"
 Update-BFIPresenter.bat -DryRun
 Update-BFIPresenter.bat -Source "D:\Downloads\BFIPresenter-1.0.0" -Backup
+Update-BFIPresenter.bat -Revert
 ```
 
 ## Building from source
