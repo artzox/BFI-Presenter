@@ -21,7 +21,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-33 of 37 tested games run with BFI (five of them only with a setting, without frame generation or without a conflicting mod), six of them 32-bit. Two are partial, Jusant runs but isn't recommended, and Sifu hasn't been retested since DirectX 11 support arrived.
+84 of 88 tested games and emulators run with BFI: the 35 in the table below (five of them only with a setting, without frame generation or without a conflicting mod; six of them 32-bit) and 49 more listed after it. Two are partial, Jusant runs but isn't recommended, and Sifu hasn't been retested since DirectX 11 support arrived.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -62,6 +62,64 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Twelve Minutes | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade for DirectX 11 -- not through DXVK (flickered) |
 | Burnout Paradise Remastered | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; works with the Luma HDR add-on |
 | Dead Cells | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with ReShade 6.8 (6.5.1 with the Steam overlay crashed at start) |
+| PCSX2 | Working (Vulkan) | — | — | Vulkan layer; Vulkan renderer, `BFIPresenter.ini` next to the emulator's .exe |
+| RPCS3 | Working (Vulkan) | — | — | Vulkan layer; `BFIPresenter.ini` next to the emulator's .exe |
+
+### More games tested
+
+Also tested and working with the standard setup above. Their notes weren't recorded in detail, so the API, frame generation and first working version aren't listed.
+
+| Game | Notes |
+| --- | --- |
+| Ashen | Standard setup |
+| Assassin's Creed Unity | Standard setup |
+| Blade of Darkness | Standard setup |
+| Blair Witch | Standard setup |
+| Castlevania: Belmont's Curse (demo) | Standard setup |
+| Cocoon | Standard setup |
+| Crash Bandicoot N. Sane Trilogy | Standard setup |
+| Days Gone | Standard setup |
+| Dead Space (2023) | Standard setup |
+| Dishonored 2 | Standard setup |
+| FAR: Lone Sails | Standard setup |
+| GRIS | Standard setup |
+| Hades | Standard setup |
+| Hollow Knight | Standard setup |
+| Hotshot Racing | Standard setup |
+| ICO | Standard setup |
+| INSIDE | Standard setup |
+| Jotun | Standard setup |
+| Journey | Standard setup |
+| Layers of Fear 2 | Standard setup |
+| Legacy of Kain: Defiance Remastered | Standard setup |
+| Little Nightmares (Enhanced Edition) | Standard setup |
+| Little Nightmares II (Enhanced Edition) | Standard setup |
+| Mafia: Definitive Edition | Standard setup |
+| Mortal Shell | Standard setup |
+| Need for Speed (2015) | Standard setup |
+| Planet of Lana II | Standard setup |
+| Prodeus | Standard setup |
+| REANIMAL | Standard setup |
+| Return to Monkey Island | Standard setup |
+| RiME | Standard setup |
+| Shadow Man Remastered | Standard setup |
+| Silent Hill 2 (2024) | Standard setup |
+| South of Midnight | HDR: `AblGuardBudgetNits=250` (the sky flashed at 300) |
+| Split Fiction | Standard setup |
+| Spyro Reignited Trilogy | Standard setup |
+| Stray | Standard setup |
+| The Callisto Protocol | Standard setup |
+| The Dark Pictures Anthology: Directive 8020 | Standard setup |
+| The Elder Scrolls IV: Oblivion Remastered | Standard setup |
+| The Last of Us Part I | Needs `TypedBackBufferDesc=1` (the default; it crashed without it) |
+| The Vanishing of Ethan Carter Redux | Standard setup |
+| The Witcher 3: Wild Hunt (DirectX 12) | Standard setup |
+| Thief (2014) | Standard setup |
+| Tony Hawk's Pro Skater 1 + 2 | Standard setup |
+| Trine 5 | Standard setup |
+| Unto The End | Standard setup |
+| Until Dawn (2024) | Standard setup |
+| Untitled Goose Game | Standard setup |
 
 ## Per-game notes
 
