@@ -1,5 +1,5 @@
 // ============================================================================
-// BFI Presenter  --  ReShade add-on (Direct3D 12 and 11); version: BFI_ADDON_VERSION below
+// BFI Presenter  --  ReShade add-on (Direct3D 12, 11 and 9); version: BFI_ADDON_VERSION below
 //
 // Copyright (C) 2026 artzox -- https://github.com/artzox/BFI-Presenter
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -5557,7 +5557,7 @@ static void InitDx9(reshade::api::swapchain *swapchain)
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
     if (g_sc) return;                                            // resizes of ours are handled in the hook
-    // Direct3D 11 and 12 only: in an OpenGL, Vulkan or D3D9 game the native
+    // Direct3D 9 is handled above; 11 and 12 below. In an OpenGL or Vulkan game the native
     // handle is not a DXGI swap chain (Heretic II, OpenGL: crashed reading
     // the HDC as one in the probe check below).
     {
@@ -5565,7 +5565,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
         if (a == reshade::api::device_api::d3d9) { if (!g_dx9.load()) InitDx9(swapchain); return; }
         if (a != reshade::api::device_api::d3d11 && a != reshade::api::device_api::d3d12)
         {
-            SetReason(0, "Not managed: this game renders with %s; the add-on handles Direct3D 11 and 12 only.",
+            SetReason(0, "Not managed: this game renders with %s; the add-on handles Direct3D 12, 11 and 9.",
                       a == reshade::api::device_api::opengl ? "OpenGL" : a == reshade::api::device_api::vulkan ? "Vulkan (use the Vulkan layer)" :
                       a == reshade::api::device_api::d3d9 ? "Direct3D 9" : a == reshade::api::device_api::d3d10 ? "Direct3D 10" : "another API");
             return;
@@ -5633,7 +5633,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     if (g_dx11.load() || g_creatingOwn.load()) return;            // the DX11 presenter's own swap chain
     if (api != reshade::api::device_api::d3d12)
     {
-        SetReason(0, "Not managed: the game uses %s. BFI Presenter supports Direct3D 12 and 11 (Vulkan: use the Vulkan layer).",
+        SetReason(0, "Not managed: the game uses %s. BFI Presenter supports Direct3D 12, 11 and 9 (Vulkan: use the Vulkan layer).",
                   api == reshade::api::device_api::d3d11 ? "Direct3D 11" :
                   api == reshade::api::device_api::d3d10 ? "Direct3D 10" :
                   api == reshade::api::device_api::d3d9  ? "Direct3D 9"  :
@@ -5876,7 +5876,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
     const ImVec4 kRed(1.0f, 0.4f, 0.3f, 1.0f), kAmber(1.0f, 0.75f, 0.2f, 1.0f);
 
     // ================================================================ header
-    ImGui::TextDisabled("BFI Presenter v" BFI_ADDON_VERSION " (Direct3D 12 / 11)");
+    ImGui::TextDisabled("BFI Presenter v" BFI_ADDON_VERSION " (Direct3D 12 / 11 / 9)");
     if (st.deviceLost)
         ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Device removed -- report written to BFIPresenter_dred.txt");
     if (st.managed) ImGui::TextWrapped("%s", st.reason);

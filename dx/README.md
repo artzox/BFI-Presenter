@@ -128,6 +128,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 | Key (default) | What it does |
 |---|---|
 | `DX11Support` (1) | Manage Direct3D 11 games through the add-on's own D3D12 presenter |
+| `DX11GamePresent` (0) | 1 = the game's own DX11 swap chain still presents each frame (sync interval 0, hidden under the presenter's window, past overlay hooks). For games whose GPU frames get slower and slower while the presenter runs (Wreckfest) |
 | `DX9Support` (1) | Manage Direct3D 9 games: the device is created as 9Ex (ReShade 6.8+), kept windowed, and shown by the same presenter |
 | `DX9Ex` (1) | 0 = keep a plain Direct3D 9 device (windowed, no BFI); for checking whether 9Ex is what breaks a game |
 | `DX9Diag` (0) | 1 = log failing D3D9 and D3DX calls and resource creations to `ReShade.log` |

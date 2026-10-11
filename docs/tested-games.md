@@ -21,7 +21,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-32 of 36 tested games run with BFI (four of them only without frame generation or a conflicting mod), six of them 32-bit. Two are partial, Jusant runs but isn't recommended, and Sifu hasn't been retested since DirectX 11 support arrived.
+33 of 37 tested games run with BFI (five of them only with a setting, without frame generation or without a conflicting mod), six of them 32-bit. Two are partial, Jusant runs but isn't recommended, and Sifu hasn't been retested since DirectX 11 support arrived.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -53,10 +53,11 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Guacamelee! 2 | Working (DX11) | Not tested | v1.0.2 | Standard setup; works with Special K (crashed at start before v1.0.2) |
 | Jusant | Not recommended | Not tested | v1.0.2 | Runs, but Unreal's frame pipeline delivers finished frames with a varying delay (10–33 ms), so a fixed 120 Hz strobe judders at any setting; play with VRR instead. Queue one refresh ahead removes the flashes |
 | Moons of Madness | Working (DX11) | Not tested | v1.0.2 | Holds a locked 120 fps, so the CRT shader's own BFI (decay) is the better fit; with the presenter use Half refresh + Lowest latency (Refresh + Smooth stutters) |
+| Wreckfest | Working (DX11) | Not tested | v1.0.2 | `DX11GamePresent=1` in `BFIPresenter.ini`: without it the game slowed to 5 fps within a minute |
 | Silt | Working (DX11) | Not tested | v1.0.2 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
 | The Rogue Prince of Persia | Working (DX11) | Not tested | v1.0.2 | Borderless (windowed) fullscreen, not exclusive fullscreen: leaving exclusive fullscreen hung or crashed the presenter |
-| Alan Wake | Working (DX9, 32-bit) | — | v1.1.0 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+ (not DXVK: flickered); runs windowed |
-| Lara Croft and the Guardian of Light | Working (DX9, 32-bit) | — | v1.1.0 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+; runs windowed |
+| Alan Wake | Working (DX9, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+ (not DXVK: flickered); runs windowed |
+| Lara Croft and the Guardian of Light | Working (DX9, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+; runs windowed |
 | BAJA: Edge of Control HD | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade |
 | Twelve Minutes | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade for DirectX 11 -- not through DXVK (flickered) |
 | Burnout Paradise Remastered | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; works with the Luma HDR add-on |
@@ -197,8 +198,8 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ### Alan Wake
 
-- 32-bit DirectX 9. Works with `BFIPresenter.addon32` (v1.1.0) and the 32-bit ReShade 6.8 or newer, which creates the game's device as Direct3D 9Ex for the add-on. The game runs windowed (borderless at full size) even when set to fullscreen.
-- Before v1.1.0 the game showed "DEVICE_CREATE_ERROR - Invalid call" (9Ex in exclusive fullscreen) and then "D3DXCreateTextureFromFileInMemoryEx failed" (D3DX refusing managed textures on 9Ex); both are handled now.
+- 32-bit DirectX 9. Works with `BFIPresenter.addon32` (v1.0.2) and the 32-bit ReShade 6.8 or newer, which creates the game's device as Direct3D 9Ex for the add-on. The game runs windowed (borderless at full size) even when set to fullscreen.
+- Before v1.0.2 the game showed "DEVICE_CREATE_ERROR - Invalid call" (9Ex in exclusive fullscreen) and then "D3DXCreateTextureFromFileInMemoryEx failed" (D3DX refusing managed textures on 9Ex); both are handled now.
 - Don't use DXVK + the 32-bit Vulkan layer: BFI flickered (SDR) or the screen stayed black (HDR10), and the CRT shader's decay flickered the same way through DXVK. CRT-Standalone doesn't compile under ReShade's DirectX 9 path; use the presenter's BFI.
 
 ### BAJA: Edge of Control HD
@@ -217,6 +218,15 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 ### Dead Cells
 
 - 32-bit DirectX 11. With ReShade 6.5.1 the game crashed at start (a stack overflow inside the Steam overlay); it works with ReShade 6.8.
+
+### Lara Croft and the Guardian of Light
+
+- 32-bit DirectX 9. Works with `BFIPresenter.addon32` (v1.0.2) and the 32-bit ReShade 6.8 or newer; the game runs windowed (borderless at full size).
+
+### Wreckfest
+
+- DirectX 11. **Set `DX11GamePresent=1` in `BFIPresenter.ini`.** Without it the game's GPU frames got slower and slower while the presenter ran (14 ms to over 100 ms within a minute, down to 5 fps, with the GPU reported busy at only 70 W); the game ran fine without the add-on. With the setting the game's own swap chain presents each frame too (hidden under the presenter's window) and the game holds 120 fps.
+- An earlier test build presented through the overlay hooks and the game crashed when the Steam overlay set itself up; v1.0.2 presents past them.
 
 ## Known issues across games
 
