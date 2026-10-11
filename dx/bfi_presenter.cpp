@@ -4759,8 +4759,13 @@ static bool on_create_device9(reshade::api::device_api api, uint32_t &ver)
 {
     if (api != reshade::api::device_api::d3d9 || ver >= 0x9100) return false;
     if (GetPrivateProfileIntA("BFI", "DX9Support", 1, g_iniPath) == 0) return false;
+    g_dx9Upgrade.store(true);   // also gates the windowed override and the diagnostics
+    if (GetPrivateProfileIntA("BFI", "DX9TestEx", 1, g_iniPath) == 0)
+    {
+        LOGI("BFI Presenter: DX9 test: DX9TestEx=0 -- keeping plain Direct3D 9 (windowed + diagnostics only)");
+        return false;
+    }
     ver = 0x9100;
-    g_dx9Upgrade.store(true);
     LOGI("BFI Presenter: DX9 test: asking ReShade to create the game's device as Direct3D 9Ex");
     return true;
 }
@@ -4784,8 +4789,50 @@ static bool on_create_swapchain9(uintptr_t a, uintptr_t b, uintptr_t)
 }
 static void on_present9(reshade::api::command_queue *, reshade::api::swapchain *, const reshade::api::rect *, const reshade::api::rect *,
                         uint32_t, const reshade::api::rect *);
+// Diagnostics: a create_resource with no matching init_resource means the
+// D3D9 Create* call failed. Log the description of every failed one.
+static std::atomic<bool> g_t9Pending{false};
+static reshade::api::resource_desc g_t9PendingDesc{};
+static std::atomic<uint32_t> g_t9Creates{0}, g_t9Fails{0};
+static void LogT9Pending(const char *when)
+{
+    if (!g_t9Pending.exchange(false)) return;
+    const auto &d = g_t9PendingDesc;
+    g_t9Fails++;
+    LOGW("BFI Presenter: DX9 test: resource creation FAILED (%s): type %d, %ux%u x%u, levels %u, format %d, heap %d, usage 0x%x, flags 0x%x",
+         when, (int)d.type, d.texture.width, d.texture.height, (unsigned)d.texture.depth_or_layers, (unsigned)d.texture.levels,
+         (int)d.texture.format, (int)d.heap, (unsigned)d.usage, (unsigned)d.flags);
+}
+static bool on_create_resource9(reshade::api::device *dev, reshade::api::resource_desc &desc, reshade::api::subresource_data *, reshade::api::resource_usage)
+{
+    if (!g_dx9Upgrade.load() || !dev || dev->get_api() != reshade::api::device_api::d3d9) return false;
+    LogT9Pending("next create");
+    g_t9PendingDesc = desc;
+    g_t9Pending.store(true);
+    uint32_t n = ++g_t9Creates;
+    if (n <= 40 || (n % 500) == 0)
+        LOGI("BFI Presenter: DX9 test: create #%u type %d, %ux%u, levels %u, format %d, heap %d, usage 0x%x, flags 0x%x",
+             n, (int)desc.type, desc.texture.width, desc.texture.height, (unsigned)desc.texture.levels,
+             (int)desc.texture.format, (int)desc.heap, (unsigned)desc.usage, (unsigned)desc.flags);
+    return false;
+}
+static void on_init_resource9(reshade::api::device *dev, const reshade::api::resource_desc &, const reshade::api::subresource_data *,
+                              reshade::api::resource_usage, reshade::api::resource)
+{
+    if (dev && dev->get_api() == reshade::api::device_api::d3d9) g_t9Pending.store(false);
+}
 static void RegisterDx9Events(bool on)
 {
+    if (!on)
+    {
+        LogT9Pending("at shutdown");
+        if (g_dx9Upgrade.load())
+            LOGI("BFI Presenter: DX9 test: %u resource creations seen, %u failed", g_t9Creates.load(), g_t9Fails.load());
+    }
+    if (on) { reshade::register_event<reshade::addon_event::create_resource>(on_create_resource9);
+              reshade::register_event<reshade::addon_event::init_resource>(on_init_resource9); }
+    else    { reshade::unregister_event<reshade::addon_event::create_resource>(on_create_resource9);
+              reshade::unregister_event<reshade::addon_event::init_resource>(on_init_resource9); }
     // create_device is event 96 in newer ReShade (API 17+); older ReShade
     // ignores event numbers it doesn't know.
     HMODULE rs = reshade::internal::get_reshade_module_handle();
