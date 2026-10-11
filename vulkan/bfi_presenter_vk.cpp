@@ -2858,11 +2858,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_QueuePresentKHR(VkQueue queue, const V
     CheckCaller(BFI_RETADDR());
 
     const uint64_t *ids = nullptr;
+    const VkFence *presentFences = nullptr;     // swapchain maintenance1 (DXVK 3)
     for (const VkBaseInStructure *p = (const VkBaseInStructure *)pi->pNext; p; p = p->pNext)
         if (p->sType == VK_STRUCTURE_TYPE_PRESENT_ID_KHR)
         {
             const VkPresentIdKHR *pid = (const VkPresentIdKHR *)p;
             if (pid->swapchainCount == pi->swapchainCount) ids = pid->pPresentIds;
+        }
+        else if ((int)p->sType == 1000275001)   // VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR / _EXT
+        {
+            const VkSwapchainPresentFenceInfoEXT *pf = (const VkSwapchainPresentFenceInfoEXT *)p;
+            if (pf->swapchainCount == pi->swapchainCount) presentFences = pf->pFences;
         }
 
     // Other swap chains in the same call wait on our copy instead of the
@@ -2887,6 +2893,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_QueuePresentKHR(VkQueue queue, const V
         if (pi->pResults) pi->pResults[i] = r;
         merge(r);
         first = false;
+        // Present fence: the game waits on it before it reuses the semaphores
+        // and image of this present (DXVK 3 does). Those were consumed by the
+        // copy just submitted, so an empty submit behind it signals the fence
+        // at the right time. Never signalled, DXVK waited for good (Twelve
+        // Minutes froze right after BFI started).
+        if (presentFences && presentFences[i])
+        {
+            std::unique_lock<std::recursive_mutex> ql(d->qlock, std::defer_lock);
+            if (IsOurQueue(d, queue)) ql.lock();
+            const VkResult fr = d->QueueSubmit(queue, 0, nullptr, presentFences[i]);
+            if (fr != VK_SUCCESS) LOGW("BFI Presenter: present fence submit failed (%d)", (int)fr);
+            static bool logged = false;
+            if (!logged) { logged = true; LOGI("BFI Presenter: the game uses present fences (swapchain maintenance1) -- signalled after each frame's copy"); }
+        }
     }
     if (!others.empty())
     {
@@ -2901,6 +2921,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_QueuePresentKHR(VkQueue queue, const V
         p2.pSwapchains = scs.data();
         p2.pImageIndices = idx.data();
         p2.pResults = res.data();
+        std::vector<VkFence> otherFences;
+        VkSwapchainPresentFenceInfoEXT pf2 = { (VkStructureType)1000275001 };
+        if (presentFences)
+        {
+            for (uint32_t i : others) otherFences.push_back(presentFences[i]);
+            pf2.swapchainCount = (uint32_t)otherFences.size();
+            pf2.pFences = otherFences.data();
+            p2.pNext = &pf2;
+        }
         {
             std::unique_lock<std::recursive_mutex> ql(d->qlock, std::defer_lock);
             if (IsOurQueue(d, queue)) ql.lock();
