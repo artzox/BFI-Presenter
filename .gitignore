@@ -1,5 +1,6 @@
 # Build outputs (attached to GitHub releases instead)
 *.addon64
+*.addon32
 *.dll
 *.so
 *.spv
@@ -17,3 +18,5 @@ BFIPresenter_game_*.csv
 BFIPresenterVK_log_*.csv
 BFIPresenter_locations.*
 BFIPresenter.ini
+BFIPresenter_update_log.csv
+BFIPresenter_backups/

@@ -21,7 +21,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-21 of 25 tested games run with BFI (four of them only without frame generation or a conflicting mod). Two are partial, Sifu hasn't been retested since DirectX 11 support arrived, and one 32-bit game doesn't load the presenter.
+84 of 88 tested games and emulators run with BFI: the 35 in the table below (five of them only with a setting, without frame generation or without a conflicting mod; six of them 32-bit) and 49 more listed after it. Two are partial, Jusant runs but isn't recommended, and Sifu hasn't been retested since DirectX 11 support arrived.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -49,7 +49,77 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Hades II | Working | Not tested | v0.78 | GPU headroom for 120 fps (4K yes, 5K DSR no) |
 | Indiana Jones and the Great Circle | Partial (Vulkan) | Flashes persist with FG | VK 0.8.2 | Vulkan layer; GPU at its limit causes 10–20 flashes a minute |
 | shadPS4 | Working (Vulkan) | — | VK 0.7 | Vulkan layer; BFIPresenter.ini next to the emulator's .exe |
-| BAJA: Edge of Control HD | Not supported | — | — | 32-bit game: the add-on doesn't load (try DXVK + the 32-bit Vulkan layer) |
+| Blasphemous | Working (DX11) | NVIDIA Smooth Motion must be off | v1.0.2 | Smooth Motion off in the NVIDIA app (with it on, the game closed and relaunched itself) |
+| Guacamelee! 2 | Working (DX11) | Not tested | v1.0.2 | Standard setup; works with Special K (crashed at start before v1.0.2) |
+| Jusant | Not recommended | Not tested | v1.0.2 | Runs, but Unreal's frame pipeline delivers finished frames with a varying delay (10–33 ms), so a fixed 120 Hz strobe judders at any setting; play with VRR instead. Queue one refresh ahead removes the flashes |
+| Moons of Madness | Working (DX11) | Not tested | v1.0.2 | Holds a locked 120 fps, so the CRT shader's own BFI (decay) is the better fit; with the presenter use Half refresh + Lowest latency (Refresh + Smooth stutters) |
+| Wreckfest | Working (DX11) | Not tested | v1.0.2 | `DX11GamePresent=1` in `BFIPresenter.ini`: without it the game slowed to 5 fps within a minute |
+| Silt | Working (DX11) | Not tested | v1.0.2 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
+| The Rogue Prince of Persia | Working (DX11) | Not tested | v1.0.2 | Borderless (windowed) fullscreen, not exclusive fullscreen: leaving exclusive fullscreen hung or crashed the presenter |
+| Alan Wake | Working (DX9, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+ (not DXVK: flickered); runs windowed |
+| Lara Croft and the Guardian of Light | Working (DX9, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+; runs windowed |
+| BAJA: Edge of Control HD | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade |
+| Twelve Minutes | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade for DirectX 11 -- not through DXVK (flickered) |
+| Burnout Paradise Remastered | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; works with the Luma HDR add-on |
+| Dead Cells | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with ReShade 6.8 (6.5.1 with the Steam overlay crashed at start) |
+| PCSX2 | Working (Vulkan) | — | — | Vulkan layer; Vulkan renderer, `BFIPresenter.ini` next to the emulator's .exe |
+| RPCS3 | Working (Vulkan) | — | — | Vulkan layer; `BFIPresenter.ini` next to the emulator's .exe |
+
+### More games tested
+
+Also tested and working with the standard setup above. Their notes weren't recorded in detail, so the API, frame generation and first working version aren't listed.
+
+| Game | Notes |
+| --- | --- |
+| Ashen | Standard setup |
+| Assassin's Creed Unity | Standard setup |
+| Blade of Darkness | Standard setup |
+| Blair Witch | Standard setup |
+| Castlevania: Belmont's Curse (demo) | Standard setup |
+| Cocoon | Standard setup |
+| Crash Bandicoot N. Sane Trilogy | Standard setup |
+| Days Gone | Standard setup |
+| Dead Space (2023) | Standard setup |
+| Dishonored 2 | Standard setup |
+| FAR: Lone Sails | Standard setup |
+| GRIS | Standard setup |
+| Hades | Standard setup |
+| Hollow Knight | Standard setup |
+| Hotshot Racing | Standard setup |
+| ICO | Standard setup |
+| INSIDE | Standard setup |
+| Jotun | Standard setup |
+| Journey | Standard setup |
+| Layers of Fear 2 | Standard setup |
+| Legacy of Kain: Defiance Remastered | Standard setup |
+| Little Nightmares (Enhanced Edition) | Standard setup |
+| Little Nightmares II (Enhanced Edition) | Standard setup |
+| Mafia: Definitive Edition | Standard setup |
+| Mortal Shell | Standard setup |
+| Need for Speed (2015) | Standard setup |
+| Planet of Lana II | Standard setup |
+| Prodeus | Standard setup |
+| REANIMAL | Standard setup |
+| Return to Monkey Island | Standard setup |
+| RiME | Standard setup |
+| Shadow Man Remastered | Standard setup |
+| Silent Hill 2 (2024) | Standard setup |
+| South of Midnight | HDR: `AblGuardBudgetNits=250` (the sky flashed at 300) |
+| Split Fiction | Standard setup |
+| Spyro Reignited Trilogy | Standard setup |
+| Stray | Standard setup |
+| The Callisto Protocol | Standard setup |
+| The Dark Pictures Anthology: Directive 8020 | Standard setup |
+| The Elder Scrolls IV: Oblivion Remastered | Standard setup |
+| The Last of Us Part I | Needs `TypedBackBufferDesc=1` (the default; it crashed without it) |
+| The Vanishing of Ethan Carter Redux | Standard setup |
+| The Witcher 3: Wild Hunt (DirectX 12) | Standard setup |
+| Thief (2014) | Standard setup |
+| Tony Hawk's Pro Skater 1 + 2 | Standard setup |
+| Trine 5 | Standard setup |
+| Unto The End | Standard setup |
+| Until Dawn (2024) | Standard setup |
+| Untitled Goose Game | Standard setup |
 
 ## Per-game notes
 
@@ -174,9 +244,47 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 - Runs through the Vulkan layer: install the layer once and put `BFIPresenter.ini` (section `[BFI]`) next to the emulator's .exe.
 
+### Silt
+
+- Unity game on Steam that uses Epic Online Services. The EOS SDK in the game folder loads Epic's overlay helper, `EOSOVH-Win64-Shipping.dll`, from a shared Epic folder elsewhere on the PC, even without the Epic launcher. The overlay hooks Direct3D 12 and crashed the DX11 presenter's own present about a second after BFI started.
+- Fix: rename that file (e.g. to `EOSOVH-Win64-Shipping.dll.off`). Since v1.0.2 `ReShade.log` prints its full path. EOS keeps working; only Epic's pop-ups are gone, in every game that uses them, until it is renamed back.
+
+### The Rogue Prince of Persia
+
+- DirectX 11. **Set the display mode to borderless (windowed) fullscreen.** In exclusive fullscreen the game switches to windowed and recreates its swap chain; the presenter got stuck in its present at that moment, which first hung the game and then (v1.0.2 test build) crashed it. Borderless works.
+- Since v1.0.2, if the presenter gets stuck like this in any game, BFI switches off for the rest of the session and the game continues; the overlay says so. Restart the game to use BFI.
+
+### Alan Wake
+
+- 32-bit DirectX 9. Works with `BFIPresenter.addon32` (v1.0.2) and the 32-bit ReShade 6.8 or newer, which creates the game's device as Direct3D 9Ex for the add-on. The game runs windowed (borderless at full size) even when set to fullscreen.
+- Before v1.0.2 the game showed "DEVICE_CREATE_ERROR - Invalid call" (9Ex in exclusive fullscreen) and then "D3DXCreateTextureFromFileInMemoryEx failed" (D3DX refusing managed textures on 9Ex); both are handled now.
+- Don't use DXVK + the 32-bit Vulkan layer: BFI flickered (SDR) or the screen stayed black (HDR10), and the CRT shader's decay flickered the same way through DXVK. CRT-Standalone doesn't compile under ReShade's DirectX 9 path; use the presenter's BFI.
+
 ### BAJA: Edge of Control HD
 
-- 32-bit game: the 64-bit add-on can't load. Untested route: DXVK plus the 32-bit Vulkan layer.
+- 32-bit DirectX 11: works with `BFIPresenter.addon32` (v1.0.2) and the 32-bit ReShade.
+
+### Twelve Minutes
+
+- 32-bit Unity game on DirectX 11. Use `BFIPresenter.addon32` with the 32-bit ReShade installed for DirectX 10/11/12.
+- Through DXVK and the 32-bit Vulkan layer it first froze (fixed in v1.0.2: present fences, kernel vblank) and then flickered with BFI and even with the CRT shader's decay alone; frames did not reach the screen one per refresh. Don't use DXVK for this game.
+
+### Burnout Paradise Remastered
+
+- 32-bit DirectX 11. Works with `BFIPresenter.addon32`, also together with the Luma HDR add-on (an earlier v1.0.2 test build hung when Luma set the HDR colour space).
+
+### Dead Cells
+
+- 32-bit DirectX 11. With ReShade 6.5.1 the game crashed at start (a stack overflow inside the Steam overlay); it works with ReShade 6.8.
+
+### Lara Croft and the Guardian of Light
+
+- 32-bit DirectX 9. Works with `BFIPresenter.addon32` (v1.0.2) and the 32-bit ReShade 6.8 or newer; the game runs windowed (borderless at full size).
+
+### Wreckfest
+
+- DirectX 11. **Set `DX11GamePresent=1` in `BFIPresenter.ini`.** Without it the game's GPU frames got slower and slower while the presenter ran (14 ms to over 100 ms within a minute, down to 5 fps, with the GPU reported busy at only 70 W); the game ran fine without the add-on. With the setting the game's own swap chain presents each frame too (hidden under the presenter's window) and the game holds 120 fps.
+- An earlier test build presented through the overlay hooks and the game crashed when the Steam overlay set itself up; v1.0.2 presents past them.
 
 ## Known issues across games
 
@@ -185,5 +293,5 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 - **Game hitches show as single flashes:** when the whole GPU stalls for 100 ms or more, no refresh can be presented on time. With the GPU at its limit, shorter stalls of one to four refreshes flash too (God of War Ragnarök, Indiana Jones). GPU headroom helps everywhere; in DirectX, a realtime presenter queue (launcher run as administrator) removed them.
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR). Games already at the limit can collapse in performance.
 - **Overlays:** the RTSS OSD and the Steam overlay don't draw on the strobed frames (their hooks are bypassed for the presenter's own presents since v0.34). Any RTSS or driver frame limiter must stay off.
-- **APIs:** Direct3D 12 and 11 through the add-on (64-bit). Vulkan through the Vulkan layer (64- and 32-bit), which also covers DirectX 9–11 games run through DXVK. OpenGL is untested.
+- **APIs:** Direct3D 12, 11 and 9 through the add-on (64-bit, and 32-bit Direct3D 11 and 9 with `BFIPresenter.addon32`; Direct3D 9 needs ReShade 6.8+). Vulkan through the Vulkan layer (64- and 32-bit), which also covers DirectX 9–11 games run through DXVK. OpenGL is untested.
 - **Below the cap's frame rate, motion is uneven.** The overlay warns when strobe cycles step unevenly for more than a moment and says whether the game is below the cap. At \~100 fps on 120 Hz, Half refresh with just-in-time release gives even motion.

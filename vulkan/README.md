@@ -18,12 +18,12 @@ The same presenter-clocked black frame insertion as the [DX add-on](../dx/README
    - It registers the layer for your Windows user.
    - It lists the Vulkan layers in load order. **ReShade must be listed before BFI Presenter.**
 2. If you install or reinstall ReShade later, run `install_vulkan_layer.bat` again so BFI Presenter is listed after ReShade.
-3. To update, run the new package's `install_vulkan_layer.bat` (or `Update-BFIPresenter.ps1`, which also updates the installed layer).
+3. To update, run the new package's `install_vulkan_layer.bat`. Games pick up the new layer on their next start; your `BFIPresenter.ini` files stay as they are.
 4. To remove it, run `uninstall_vulkan_layer.bat`.
 
 ## Use in a game
 
-1. Copy `BFIPresenter.ini` (from `BFIPresenter.example.ini`) into the game folder, next to its `.exe`. The ini from a DX game works as-is. For emulators, put it next to the emulator's `.exe`.
+1. Copy `BFIPresenter.ini` from the package into the game folder, next to its `.exe` (the layer doesn't create it; it only switches on where the file exists). The ini from a DX game works as-is. For emulators, put it next to the emulator's `.exe`.
 2. Start the game. `BFIPresenterVK.log` appears next to the ini, and the ReShade overlay gets the **BFI Presenter (Vulkan)** tab.
 3. Use the same per-game setup as for DX games:
    - G-SYNC off in the game's NVIDIA profile if the display doesn't hold a fixed 120 Hz.
@@ -55,7 +55,7 @@ Don't put the DX add-on (`BFIPresenter.addon64`) in Vulkan game folders. It does
 Notes:
 
 - **Leave frame limiting off in DXVK** (no `dxgi.maxFrameRate` / `d3d9.maxFrameRate`) and in the game. Use the presenter's frame cap.
-- **SDR games are presented as HDR10** when Windows HDR is on (see `SdrToHdr` below).
+- **SDR games stay SDR under DXVK.** `SdrToHdr` is skipped there: an HDR10 swap chain makes the NVIDIA driver present through DXGI, which in a DXVK game is DXVK's own `dxgi.dll`, and the presenter hung. Use Gain 0.5 or Variable MPRT. (A game's own HDR through DXVK, `dxgi.enableHDR`, is untested.)
 - **Online games with anti-cheat may refuse DXVK.**
 - **OpenGL games aren't covered.** There is no DXVK-style path to Vulkan on Windows for them.
 
@@ -82,13 +82,13 @@ No log at all means the layer isn't active: check that `BFIPresenter.ini` is in 
 
 ## ini keys (Vulkan only)
 
-All other keys are shared with the DX add-on; see `BFIPresenter.example.ini` and the [DX reference](../dx/README.md).
+All other keys are shared with the DX add-on; see the comments in `BFIPresenter.ini` and the [DX reference](../dx/README.md).
 
 | Key | Default | Meaning |
 |---|---|---|
 | `VulkanLayer` | 1 | 0 = the layer stays off in this game even though the ini is there |
 | `VulkanOwnQueue` | 1 | 0 = the presenter shares the game's queue (locked) instead of its own |
-| `SdrToHdr` | 1 | SDR games are presented as HDR10 when the display offers it (Windows HDR on), so the lit refresh has headroom. 0 = plain SDR (use Gain 0.5 then) |
+| `SdrToHdr` | 1 | SDR games are presented as HDR10 when the display offers it (Windows HDR on), so the lit refresh has headroom. 0 = plain SDR (use Gain 0.5 then). In DXVK games 1 keeps them SDR (HDR10 hung the NVIDIA driver's present there); 2 forces HDR10 there too, together with NVIDIA "Vulkan/OpenGL present method: Prefer native" for the game |
 | `SdrWhiteNits` | 200 | Brightness of SDR white in that mode (Windows: 80 + 4 × the SDR content brightness slider) |
 | `SdrHighlightNits` | 800 | SDR highlights stretch toward this; 0 = no expansion |
 | `SdrHighlightKnee` | 0.65 | SDR signal level where the expansion starts |
@@ -100,6 +100,7 @@ Environment variable `DISABLE_BFI_PRESENTER_VK=1` turns the layer off for anythi
 
 - **Games run as administrator** don't load per-user Vulkan layers (a Vulkan loader rule), so the layer won't load there.
 - **Anti-cheat games** may refuse unknown Vulkan layers.
+- **32-bit games through DXVK can't strobe cleanly.** In Twelve Minutes (DX11) and Alan Wake (DX9) the presenter's BFI flickered as if the display showed some refreshes twice, even though its timing log was clean, and the CRT shader's own BFI (decay) flickered the same way without the layer. So the frames don't reach the screen one per refresh through DXVK there; it isn't the layer. HDR10 output also gave a black screen (Alan Wake) or froze the game (Twelve Minutes). For 32-bit Direct3D 11 games use the DX add-on's `BFIPresenter.addon32`; 32-bit Direct3D 9 games have no BFI route for now (CRT-Standalone doesn't run under ReShade's DirectX 9 path either).
 - **GPU-heavy games** can still flash when the GPU is saturated (Indiana Jones). Give the GPU headroom, raise the dark floor slightly, or try `QueueAhead=1`.
 - **Not yet in the Vulkan layer:** the VRR warning (Vulkan has no frame statistics to drive it), the crash and hang loggers, and realtime GPU priority for the presenter queue.
 

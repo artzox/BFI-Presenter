@@ -17,6 +17,6 @@ if command -v glslangValidator >/dev/null 2>&1; then
 fi
 F="-std=c++17 -O2 -shared -static -D_WIN32_WINNT=0x0A00 -I $TP/vulkan-headers -I $TP/reshade/include -I $TP/mingw-shim
    -Wall -Wno-unused-parameter -Wno-missing-field-initializers -Wno-attributes"
-x86_64-w64-mingw32-g++ $F bfi_presenter_vk.cpp -o BFIPresenterVK.dll -ldxgi -luser32 -lpsapi
-i686-w64-mingw32-g++ $F -Wl,--kill-at bfi_presenter_vk.cpp -o BFIPresenterVK32.dll -ldxgi -luser32 -lpsapi
+x86_64-w64-mingw32-g++ $F bfi_presenter_vk.cpp -o BFIPresenterVK.dll -luser32 -lpsapi
+i686-w64-mingw32-g++ $F -Wl,--kill-at bfi_presenter_vk.cpp -o BFIPresenterVK32.dll -luser32 -lpsapi
 echo "built vulkan/BFIPresenterVK.dll and BFIPresenterVK32.dll"

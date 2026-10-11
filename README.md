@@ -15,8 +15,8 @@ Each [release](../../releases) has two packages with the same version number:
 
 | Package | For | What's in it |
 |---|---|---|
-| `BFIPresenter-DX-v<version>.zip` | **Direct3D 12 and Direct3D 11** games (64-bit) | `BFIPresenter.addon64` (a ReShade add-on), example ini, update scripts |
-| `BFIPresenter-Vulkan-v<version>.zip` | **Vulkan** games, emulators (PCSX2, RPCS3, shadPS4…), and **DirectX 8–11** games run through [DXVK](https://github.com/doitsujin/dxvk) — 64- and 32-bit | `BFIPresenterVK.dll` / `BFIPresenterVK32.dll` (a Vulkan layer), installer, example ini |
+| `BFIPresenter-DX-v<version>.zip` | **Direct3D 12, 11 and 9** games, 64- and 32-bit (Direct3D 9 needs ReShade 6.8+) | `BFIPresenter.addon64` / `BFIPresenter.addon32` (ReShade add-ons), example ini, update scripts |
+| `BFIPresenter-Vulkan-v<version>.zip` | **Vulkan** games, emulators (PCSX2, RPCS3, shadPS4…), and **DirectX 8–11** games run through [DXVK](https://github.com/doitsujin/dxvk) — 64- and 32-bit | `BFIPresenterVK.dll` / `BFIPresenterVK32.dll` (a Vulkan layer), installer, a ready `BFIPresenter.ini` to copy into games |
 
 Both read the same `BFIPresenter.ini` with the same keys, so one ini works for either.
 
@@ -31,14 +31,14 @@ Both read the same `BFIPresenter.ini` with the same keys, so one ini works for e
 
 **DX games**
 
-1. Copy `BFIPresenter.addon64` into the game folder, next to ReShade's DLL.
-2. Copy `BFIPresenter.example.ini` there and rename it `BFIPresenter.ini`.
+1. Copy `BFIPresenter.addon64` into the game folder, next to ReShade's DLL (`BFIPresenter.addon32` for a 32-bit game, with the 32-bit ReShade).
+2. The add-on creates `BFIPresenter.ini` next to itself on first start. (`BFIPresenter.example.ini` explains every setting.)
 3. Start the game and open the ReShade overlay: the **BFI Presenter** tab shows the status and all settings. BFI starts at the game's first swap-chain resize; if it doesn't, change resolution or display mode once.
 
 **Vulkan games**
 
 1. Run `install_vulkan_layer.bat` once (no admin rights needed).
-2. Copy `BFIPresenter.example.ini` next to the game's `.exe` and rename it `BFIPresenter.ini`. The layer stays inactive in any game without this file.
+2. Copy `BFIPresenter.ini` from the package next to the game's `.exe`. The layer stays inactive in any game without this file, and it doesn't create one itself.
 3. Start the game: the ReShade overlay gets a **BFI Presenter (Vulkan)** tab, and `BFIPresenterVK.log` appears next to the ini.
 
 **Recommended settings:** Refresh cap + Lowest latency when the game holds 120 fps; Half refresh + Smooth (just-in-time release on, the default) when it holds 60 or more but not 120. More in the [DX reference](dx/README.md#recommended-setups).
@@ -55,7 +55,7 @@ If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that
 
 ## Updating many games
 
-`scripts/Find-BFIPresenter.ps1` finds every game folder with the add-on or an ini (Steam, Epic, GOG and Xbox folders, plus any `-Roots` you pass) and shows each one's version. `scripts/Update-BFIPresenter.ps1 -Source <extracted release>` copies a new build into all of them and updates the installed Vulkan layer; `-DryRun` previews. Your `BFIPresenter.ini` files are never changed.
+`scripts/Find-BFIPresenter.ps1` finds every game folder with the add-on or an ini (Steam, Epic, GOG and Xbox folders, plus any `-Roots` you pass) and shows each one's version. `scripts/Update-BFIPresenter.ps1 -Source <extracted release>` copies a new build into all of them and updates the installed Vulkan layer; `-DryRun` previews. Your `BFIPresenter.ini` files are never changed. Every replaced file is kept in `BFIPresenter_backups` next to the script and listed, with its old and new version, in `BFIPresenter_update_log.csv`; if a new version misbehaves, `-Revert` puts back what the last update replaced (run it again to go one more update back).
 
 **Easiest:** double-click `Find-BFIPresenter.bat`, then `Update-BFIPresenter.bat`, from the extracted release folder (the new build next to the scripts). The `.bat` files start PowerShell with the right options, so Windows' script policy and the "downloaded from the internet" block don't stop them.
 
@@ -65,6 +65,7 @@ From a command prompt, extra options pass through the `.bat` files:
 Find-BFIPresenter.bat -Roots "D:\Games"
 Update-BFIPresenter.bat -DryRun
 Update-BFIPresenter.bat -Source "D:\Downloads\BFIPresenter-1.0.0" -Backup
+Update-BFIPresenter.bat -Revert
 ```
 
 ## Building from source

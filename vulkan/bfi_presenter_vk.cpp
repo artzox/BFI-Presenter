@@ -27,7 +27,6 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <dxgi.h>
 #define VK_USE_PLATFORM_WIN32_KHR
 #define BFI_EXPORT extern "C" __declspec(dllexport)
 #else
@@ -57,7 +56,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.0"
+#define BFI_VERSION "1.0.2"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -330,7 +329,7 @@ static void LoadSettings(Settings &s)
     s.queueAhead = KvInt(kv, "QueueAhead", 0) ? 1 : 0;
     s.log      = KvInt(kv, "Log", 0);
     s.ownQueue = KvInt(kv, "VulkanOwnQueue", 1) ? 1 : 0;
-    s.sdrToHdr = KvInt(kv, "SdrToHdr", 1) ? 1 : 0;
+    s.sdrToHdr = Clamp(KvInt(kv, "SdrToHdr", 1), 0, 2);   // 2 = also in DXVK games
     s.sdrWhite = Clamp(KvFloat(kv, "SdrWhiteNits", 200.0f), 80.0f, 600.0f);
     s.sdrHiNits = KvFloat(kv, "SdrHighlightNits", 800.0f);
     if (s.sdrHiNits < 0.0f) s.sdrHiNits = 0.0f;
@@ -517,6 +516,7 @@ struct Constants
 // whole screen were lit, rolling or not.
 static double AblAvgAt(const float *cells, double C, bool rolling, int frames, bool mprt)
 {
+    if (frames < 2) frames = 2;          // BFI off: a measurement taken while it was on
     if (!rolling || frames < 2)
     {
         double a = 0.0;
@@ -710,55 +710,99 @@ static const char *OutName(int t)
     return (t >= 0 && t <= 5) ? k[t] : "?";
 }
 
+// DXVK's dxgi.dll / d3d11.dll in the game's folder (or loaded from outside
+// the system folder): the game runs through DXVK.
+static bool DxvkInProcess()
+{
+#ifdef _WIN32
+    wchar_t sys[MAX_PATH] = {}, exe[MAX_PATH] = {};
+    GetSystemDirectoryW(sys, MAX_PATH);
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (wchar_t *bs = wcsrchr(exe, L'\\')) bs[1] = 0;
+    for (const wchar_t *dll : { L"dxgi.dll", L"d3d11.dll" })
+    {
+        std::wstring f = std::wstring(exe) + dll;
+        if (GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+        HMODULE m = GetModuleHandleW(dll);
+        wchar_t path[MAX_PATH] = {};
+        if (m && GetModuleFileNameW(m, path, MAX_PATH) && _wcsnicmp(path, sys, wcslen(sys)) != 0) return true;
+    }
+#endif
+    return false;
+}
+
 // ---------------------------------------------------------------- vblank
 struct VBlank
 {
 #ifdef _WIN32
-    IDXGIFactory1 *factory = nullptr;
-    IDXGIOutput   *output = nullptr;
-    HMONITOR       monitor = nullptr;
-    double         modeHz = 0.0;     // the display mode's refresh rate
+    // The kernel's vblank event (D3DKMT, gdi32), not DXGI: in a game run
+    // through DXVK, "dxgi.dll" in the process is DXVK's. Its WaitForVBlank
+    // only estimates the vblank, and its factory brings up another Vulkan
+    // instance and device from inside the presenter thread (Twelve Minutes
+    // crashed or froze right after BFI started).
+    bool      warned = false;
+    struct OpenFromName { WCHAR DeviceName[32]; UINT hAdapter; LUID AdapterLuid; UINT VidPnSourceId; };
+    struct WaitVbl      { UINT hAdapter; UINT hDevice; UINT VidPnSourceId; };
+    struct CloseAd      { UINT hAdapter; };
+    typedef LONG (APIENTRY *PFN_Open)(OpenFromName *);
+    typedef LONG (APIENTRY *PFN_Wait)(const WaitVbl *);
+    typedef LONG (APIENTRY *PFN_Close)(const CloseAd *);
+    PFN_Open  pOpen = nullptr;
+    PFN_Wait  pWait = nullptr;
+    PFN_Close pClose = nullptr;
+    UINT      adapter = 0, source = 0;
+    HMONITOR  monitor = nullptr;
+    double    modeHz = 0.0;     // the display mode's refresh rate
+    void Close()
+    {
+        if (adapter && pClose) { CloseAd c = { adapter }; pClose(&c); }
+        adapter = 0;
+    }
     void Find(void *hwnd)
     {
         HMONITOR m = hwnd ? MonitorFromWindow((HWND)hwnd, MONITOR_DEFAULTTONEAREST)
                           : MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
-        if (m == monitor && output) return;
-        if (output) { output->Release(); output = nullptr; }
+        if (m == monitor && adapter) return;
+        Close();
         monitor = m;
-        if (!factory && FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory))) factory = nullptr;
-        if (!factory) return;
-        IDXGIAdapter1 *a = nullptr;
-        for (UINT i = 0; !output && factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++)
+        if (!pOpen)
         {
-            IDXGIOutput *o = nullptr;
-            for (UINT j = 0; !output && a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; j++)
+            HMODULE g = GetModuleHandleA("gdi32.dll");
+            if (!g) g = LoadLibraryA("gdi32.dll");
+            if (g)
             {
-                DXGI_OUTPUT_DESC od;
-                if (SUCCEEDED(o->GetDesc(&od)) && od.Monitor == m) output = o;
-                else o->Release();
+                pOpen  = (PFN_Open)(void *)GetProcAddress(g, "D3DKMTOpenAdapterFromGdiDisplayName");
+                pWait  = (PFN_Wait)(void *)GetProcAddress(g, "D3DKMTWaitForVerticalBlankEvent");
+                pClose = (PFN_Close)(void *)GetProcAddress(g, "D3DKMTCloseAdapter");
             }
-            a->Release();
+            if (!pOpen || !pWait) { pOpen = nullptr; if (!warned) { warned = true; LOGW("BFI Presenter: kernel vblank functions not found -- pacing by the present queue only"); } return; }
         }
-        if (output)
-        {
-            DXGI_OUTPUT_DESC od;
-            output->GetDesc(&od);
-            char name[64];
-            WideCharToMultiByte(CP_UTF8, 0, od.DeviceName, -1, name, sizeof(name), nullptr, nullptr);
-            DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
-            if (EnumDisplaySettingsW(od.DeviceName, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
-                modeHz = (double)dm.dmDisplayFrequency;
-            LOGI("BFI Presenter: vblank pacing on %s (%.0f Hz)", name, modeHz);
-        }
-        else LOGW("BFI Presenter: no DXGI output for the game's monitor -- pacing by the present queue only");
+        MONITORINFOEXW mi = {};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(m, &mi)) { if (!warned) { warned = true; LOGW("BFI Presenter: no monitor for the game's window -- pacing by the present queue only"); } return; }
+        OpenFromName o = {};
+        wcsncpy(o.DeviceName, mi.szDevice, 31);
+        const LONG st = pOpen(&o);
+        if (st != 0) { if (!warned) { warned = true; LOGW("BFI Presenter: vblank source for the game's monitor not opened (0x%08lX) -- pacing by the present queue only", (unsigned long)st); } return; }
+        adapter = o.hAdapter;
+        source = o.VidPnSourceId;
+        DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+            modeHz = (double)dm.dmDisplayFrequency;
+        char name[64];
+        WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, name, sizeof(name), nullptr, nullptr);
+        LOGI("BFI Presenter: vblank pacing on %s (%.0f Hz, kernel vblank event)", name, modeHz);
     }
-    bool Wait() { if (!output) return false; output->WaitForVBlank(); return true; }
-    void Release()
+    bool Wait()
     {
-        if (output) output->Release();
-        if (factory) factory->Release();
-        output = nullptr; factory = nullptr; monitor = nullptr;
+        if (!adapter) return false;
+        WaitVbl w = { adapter, 0, source };
+        if (pWait(&w) == 0) return true;
+        Close();                        // display changed: reopened at the next Find
+        monitor = nullptr;
+        return false;
     }
+    void Release() { Close(); monitor = nullptr; }
 #else
     // Test builds: a simulated 120 Hz vblank.
     double next = 0.0;
@@ -1239,6 +1283,11 @@ static void PresenterThread(Swapchain *sc)
             std::lock_guard<std::mutex> l(g_cfgLock);
             s = g_shared;
         }
+        // BFI off: a plain presenter, a new game frame every refresh. Kept at
+        // the strobe's cycle, every second frame of a 120 fps game was dropped
+        // and each shown twice (60 Hz motion), which also made a CRT shader's
+        // own BFI flicker (Twelve Minutes).
+        if (!s.enabled) s.frames = 1;
 
         // timing log: a new time-stamped file each time it is switched on
         if (s.log && !logf)
@@ -2571,10 +2620,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateSwapchainKHR(VkDevice device, co
     // boosted above SDR white (BFI needs the headroom; in SDR the boost is
     // clipped and Variable MPRT spills it all into the dark refresh).
     bool upgrade = false;
+    // Not in DXVK games: an HDR10 swap chain makes the NVIDIA driver present
+    // through DXGI / D3D11, which in that process are DXVK's own DLLs -- the
+    // presenter's first present never returned (Twelve Minutes).
+    static const bool dxvk = DxvkInProcess();
+    if (dxvk && s.sdrToHdr == 1 && ci->imageColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+    {
+        static bool logged = false;
+        if (!logged) { logged = true; LOGI("BFI Presenter: DXVK game -- SDR stays SDR (SdrToHdr=2 forces HDR10; needs NVIDIA 'Vulkan/OpenGL present method: Prefer native')"); }
+    }
     const VkFormat gf = ci->imageFormat;
     const bool sdrFmt = gf == VK_FORMAT_B8G8R8A8_UNORM || gf == VK_FORMAT_R8G8B8A8_UNORM || gf == VK_FORMAT_B8G8R8A8_SRGB ||
                         gf == VK_FORMAT_R8G8B8A8_SRGB || gf == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || gf == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-    if (s.sdrToHdr && ci->imageColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR && sdrFmt && g_colorspaceExt.load() &&
+    if ((!dxvk || s.sdrToHdr == 2) && s.sdrToHdr && ci->imageColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR && sdrFmt && g_colorspaceExt.load() &&
         inst->GetPhysicalDeviceSurfaceFormatsKHR)
     {
         uint32_t nf = 0;
@@ -2609,6 +2667,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateSwapchainKHR(VkDevice device, co
         FilterSwapchainChain(ci->pNext, c2, false);
         rci.pNext = c2.head;
         r = d->CreateSwapchainKHR(device, &rci, alloc, &real);
+    }
+    if (r == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR)
+    {
+        // An earlier swap chain of ours still holds the window (the game made
+        // a new one without passing the old as oldSwapchain): retire it.
+        Swapchain *prev = nullptr;
+        {
+            std::lock_guard<std::mutex> l(g_mapLock);
+            for (auto &kv : g_swapchains)
+                if (kv.second->surface == ci->surface && kv.second != old && kv.second->d == d) { prev = kv.second; break; }
+        }
+        if (prev)
+        {
+            prev->retired.store(true);
+            StopPresenter(prev);
+            rci.oldSwapchain = prev->real;
+            r = d->CreateSwapchainKHR(device, &rci, alloc, &real);
+            LOGI("BFI Presenter: the window was still held by the previous swap chain -- retired it (%d)", (int)r);
+        }
     }
     if (r != VK_SUCCESS)
     {
@@ -2836,11 +2913,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_QueuePresentKHR(VkQueue queue, const V
     CheckCaller(BFI_RETADDR());
 
     const uint64_t *ids = nullptr;
+    const VkFence *presentFences = nullptr;     // swapchain maintenance1 (DXVK 3)
     for (const VkBaseInStructure *p = (const VkBaseInStructure *)pi->pNext; p; p = p->pNext)
         if (p->sType == VK_STRUCTURE_TYPE_PRESENT_ID_KHR)
         {
             const VkPresentIdKHR *pid = (const VkPresentIdKHR *)p;
             if (pid->swapchainCount == pi->swapchainCount) ids = pid->pPresentIds;
+        }
+        else if ((int)p->sType == 1000275001)   // VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR / _EXT
+        {
+            const VkSwapchainPresentFenceInfoEXT *pf = (const VkSwapchainPresentFenceInfoEXT *)p;
+            if (pf->swapchainCount == pi->swapchainCount) presentFences = pf->pFences;
         }
 
     // Other swap chains in the same call wait on our copy instead of the
@@ -2865,6 +2948,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_QueuePresentKHR(VkQueue queue, const V
         if (pi->pResults) pi->pResults[i] = r;
         merge(r);
         first = false;
+        // Present fence: the game waits on it before it reuses the semaphores
+        // and image of this present (DXVK 3 does). Those were consumed by the
+        // copy just submitted, so an empty submit behind it signals the fence
+        // at the right time. Never signalled, DXVK waited for good (Twelve
+        // Minutes froze right after BFI started).
+        if (presentFences && presentFences[i])
+        {
+            std::unique_lock<std::recursive_mutex> ql(d->qlock, std::defer_lock);
+            if (IsOurQueue(d, queue)) ql.lock();
+            const VkResult fr = d->QueueSubmit(queue, 0, nullptr, presentFences[i]);
+            if (fr != VK_SUCCESS) LOGW("BFI Presenter: present fence submit failed (%d)", (int)fr);
+            static bool logged = false;
+            if (!logged) { logged = true; LOGI("BFI Presenter: the game uses present fences (swapchain maintenance1) -- signalled after each frame's copy"); }
+        }
     }
     if (!others.empty())
     {
@@ -2879,6 +2976,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_QueuePresentKHR(VkQueue queue, const V
         p2.pSwapchains = scs.data();
         p2.pImageIndices = idx.data();
         p2.pResults = res.data();
+        std::vector<VkFence> otherFences;
+        VkSwapchainPresentFenceInfoEXT pf2 = { (VkStructureType)1000275001 };
+        if (presentFences)
+        {
+            for (uint32_t i : others) otherFences.push_back(presentFences[i]);
+            pf2.swapchainCount = (uint32_t)otherFences.size();
+            pf2.pFences = otherFences.data();
+            p2.pNext = &pf2;
+        }
         {
             std::unique_lock<std::recursive_mutex> ql(d->qlock, std::defer_lock);
             if (IsOurQueue(d, queue)) ql.lock();

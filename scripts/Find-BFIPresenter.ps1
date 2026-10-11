@@ -3,7 +3,7 @@
 
   Looks in all Steam libraries (read from Steam's own library list), the usual Epic / GOG / Xbox
   folders, and any extra folders you pass with -Roots. For each folder it shows:
-    - the DX add-on (BFIPresenter.addon64) and its version
+    - the DX add-on (BFIPresenter.addon64, or BFIPresenter.addon32 for 32-bit games) and its version
     - BFIPresenter.ini (a Vulkan-layer game has the ini but no add-on)
   It also shows the version of the Vulkan layer installed for your Windows user.
 
@@ -67,18 +67,20 @@ Write-Host ''
 $found = @{}
 foreach ($root in $scan) {
     Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq 'BFIPresenter.addon64' -or $_.Name -eq 'BFIPresenter.ini' } |
+        Where-Object { $_.Name -eq 'BFIPresenter.addon64' -or $_.Name -eq 'BFIPresenter.addon32' -or $_.Name -eq 'BFIPresenter.ini' } |
         ForEach-Object {
             $dir = $_.DirectoryName
-            if (-not $found.ContainsKey($dir)) { $found[$dir] = @{ Addon = $null; Ini = $false } }
-            if ($_.Name -eq 'BFIPresenter.addon64') { $found[$dir].Addon = $_.FullName } else { $found[$dir].Ini = $true }
+            if (-not $found.ContainsKey($dir)) { $found[$dir] = @{ Addon = $null; Bits = ''; Ini = $false } }
+            if ($_.Name -eq 'BFIPresenter.addon64') { $found[$dir].Addon = $_.FullName; $found[$dir].Bits = '' }
+            elseif ($_.Name -eq 'BFIPresenter.addon32') { if (-not $found[$dir].Addon) { $found[$dir].Addon = $_.FullName; $found[$dir].Bits = ', 32-bit' } }
+            else { $found[$dir].Ini = $true }
         }
 }
 
 $rows = foreach ($dir in ($found.Keys | Sort-Object)) {
     $e = $found[$dir]
     if ($e.Addon) {
-        $kind = if ($e.Ini) { 'DX add-on' } else { 'DX add-on (no ini)' }
+        $kind = if ($e.Ini) { 'DX add-on' + $e.Bits } else { 'DX add-on (no ini' + $e.Bits + ')' }
         $ver  = Get-BfiVersion $e.Addon
         $date = (Get-Item -LiteralPath $e.Addon).LastWriteTime.ToString('yyyy-MM-dd HH:mm')
     } else {
