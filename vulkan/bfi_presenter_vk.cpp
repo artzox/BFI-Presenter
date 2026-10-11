@@ -329,7 +329,7 @@ static void LoadSettings(Settings &s)
     s.queueAhead = KvInt(kv, "QueueAhead", 0) ? 1 : 0;
     s.log      = KvInt(kv, "Log", 0);
     s.ownQueue = KvInt(kv, "VulkanOwnQueue", 1) ? 1 : 0;
-    s.sdrToHdr = KvInt(kv, "SdrToHdr", 1) ? 1 : 0;
+    s.sdrToHdr = Clamp(KvInt(kv, "SdrToHdr", 1), 0, 2);   // 2 = also in DXVK games
     s.sdrWhite = Clamp(KvFloat(kv, "SdrWhiteNits", 200.0f), 80.0f, 600.0f);
     s.sdrHiNits = KvFloat(kv, "SdrHighlightNits", 800.0f);
     if (s.sdrHiNits < 0.0f) s.sdrHiNits = 0.0f;
@@ -2624,15 +2624,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateSwapchainKHR(VkDevice device, co
     // through DXGI / D3D11, which in that process are DXVK's own DLLs -- the
     // presenter's first present never returned (Twelve Minutes).
     static const bool dxvk = DxvkInProcess();
-    if (dxvk && s.sdrToHdr && ci->imageColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+    if (dxvk && s.sdrToHdr == 1 && ci->imageColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
     {
         static bool logged = false;
-        if (!logged) { logged = true; LOGI("BFI Presenter: DXVK game -- SDR stays SDR (SdrToHdr is not used with DXVK); use Gain 0.5 or Variable MPRT"); }
+        if (!logged) { logged = true; LOGI("BFI Presenter: DXVK game -- SDR stays SDR (SdrToHdr=2 forces HDR10; needs NVIDIA 'Vulkan/OpenGL present method: Prefer native')"); }
     }
     const VkFormat gf = ci->imageFormat;
     const bool sdrFmt = gf == VK_FORMAT_B8G8R8A8_UNORM || gf == VK_FORMAT_R8G8B8A8_UNORM || gf == VK_FORMAT_B8G8R8A8_SRGB ||
                         gf == VK_FORMAT_R8G8B8A8_SRGB || gf == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || gf == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-    if (!dxvk && s.sdrToHdr && ci->imageColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR && sdrFmt && g_colorspaceExt.load() &&
+    if ((!dxvk || s.sdrToHdr == 2) && s.sdrToHdr && ci->imageColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR && sdrFmt && g_colorspaceExt.load() &&
         inst->GetPhysicalDeviceSurfaceFormatsKHR)
     {
         uint32_t nf = 0;

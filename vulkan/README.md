@@ -88,7 +88,7 @@ All other keys are shared with the DX add-on; see the comments in `BFIPresenter.
 |---|---|---|
 | `VulkanLayer` | 1 | 0 = the layer stays off in this game even though the ini is there |
 | `VulkanOwnQueue` | 1 | 0 = the presenter shares the game's queue (locked) instead of its own |
-| `SdrToHdr` | 1 | SDR games are presented as HDR10 when the display offers it (Windows HDR on), so the lit refresh has headroom. 0 = plain SDR (use Gain 0.5 then). Not used in DXVK games (it hangs the NVIDIA driver's present there); they stay SDR |
+| `SdrToHdr` | 1 | SDR games are presented as HDR10 when the display offers it (Windows HDR on), so the lit refresh has headroom. 0 = plain SDR (use Gain 0.5 then). In DXVK games 1 keeps them SDR (HDR10 hung the NVIDIA driver's present there); 2 forces HDR10 there too, together with NVIDIA "Vulkan/OpenGL present method: Prefer native" for the game |
 | `SdrWhiteNits` | 200 | Brightness of SDR white in that mode (Windows: 80 + 4 × the SDR content brightness slider) |
 | `SdrHighlightNits` | 800 | SDR highlights stretch toward this; 0 = no expansion |
 | `SdrHighlightKnee` | 0.65 | SDR signal level where the expansion starts |
