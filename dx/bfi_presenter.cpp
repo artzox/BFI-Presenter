@@ -576,8 +576,28 @@ static HANDLE                     g_gameFenceEvent = nullptr;
 static ID3D12Fence           *g_presFence = nullptr;
 static ID3D12CommandQueue    *g_presQueue = nullptr;      // presents run on this queue
 static bool                   g_ownPresentQueue = false;  // swap chain rebound to g_presQueue
-static thread_local bool      t_presenterThread = false;  // calls made on the presenter thread
-static thread_local int t_ownCall = 0;
+#ifdef _WIN64
+#define BFI_TLS(type, name) static thread_local type name = 0
+#else
+// 32-bit: plain Win32 TLS. MinGW's emulated thread_local crashed inside
+// __emutls_get_address on the first swap chain (Twelve Minutes, ReShade
+// loads and unloads add-ons several times while the game starts).
+template <class T> struct TlsVar
+{
+    DWORD idx = TlsAlloc();
+    T get() const { const DWORD e = GetLastError(); T v = (T)(intptr_t)TlsGetValue(idx); SetLastError(e); return v; }
+    void set(T v) { TlsSetValue(idx, (LPVOID)(intptr_t)v); }
+    operator T() const { return get(); }
+    TlsVar &operator=(T v) { set(v); return *this; }
+    TlsVar &operator++() { set((T)(get() + 1)); return *this; }
+    TlsVar &operator--() { set((T)(get() - 1)); return *this; }
+    T operator++(int) { T v = get(); set((T)(v + 1)); return v; }
+    T operator--(int) { T v = get(); set((T)(v - 1)); return v; }
+};
+#define BFI_TLS(type, name) static TlsVar<type> name
+#endif
+BFI_TLS(bool, t_presenterThread);   // calls made on the presenter thread
+BFI_TLS(int, t_ownCall);
 struct OwnCall { OwnCall() { t_ownCall++; } ~OwnCall() { t_ownCall--; } };
 static HRESULT OwnPresent();
 static std::atomic<bool>      g_needRebind{false};        // move presentation to g_presQueue on the first frame
@@ -4148,7 +4168,7 @@ static bool CreateStage11()
 // Exclusive fullscreen would put the game's own swap chain in charge of the
 // display: the presenter needs windowed (borderless) mode. The game is told
 // what it asked for.
-static thread_local int t_inFsCs = 0;      // re-entry from hooks below ours (Steam) goes straight to DXGI
+BFI_TLS(int, t_inFsCs);      // re-entry from hooks below ours (Steam) goes straight to DXGI
 struct FsCsDepth { FsCsDepth() { t_inFsCs++; } ~FsCsDepth() { t_inFsCs--; } };
 static HRESULT STDMETHODCALLTYPE hk_SetFS(IDXGISwapChain *sc, BOOL fs, IDXGIOutput *target)
 {
