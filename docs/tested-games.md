@@ -196,7 +196,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ### Alan Wake
 
-- 32-bit DirectX 9, so the only route is DXVK (`d3d9.dll`) plus the 32-bit Vulkan layer. The game runs, but BFI flickers as in Twelve Minutes, with or without DXVK's `dxgi.dll` in the folder, and HDR10 output (`SdrToHdr`) gives a black screen. Use the CRT shader's own BFI here for now.
+- 32-bit DirectX 9, so the only presenter route is DXVK (`d3d9.dll`) plus the 32-bit Vulkan layer. The game runs, but BFI flickers as in Twelve Minutes, with or without DXVK's `dxgi.dll` in the folder, and HDR10 output (`SdrToHdr`) gives a black screen. The CRT shader's decay flickers the same way through DXVK, so the cause is the DXVK route, not the layer. Play without DXVK, with ReShade for DirectX 9 and the CRT shader's decay.
 
 ### BAJA: Edge of Control HD
 
