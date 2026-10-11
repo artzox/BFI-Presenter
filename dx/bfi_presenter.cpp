@@ -4810,7 +4810,7 @@ static bool on_create_resource9(reshade::api::device *dev, reshade::api::resourc
     g_t9PendingDesc = desc;
     g_t9Pending.store(true);
     uint32_t n = ++g_t9Creates;
-    if (n <= 40 || (n % 500) == 0)
+    if (n <= 150 || (n % 500) == 0)
         LOGI("BFI Presenter: DX9 test: create #%u type %d, %ux%u, levels %u, format %d, heap %d, usage 0x%x, flags 0x%x",
              n, (int)desc.type, desc.texture.width, desc.texture.height, (unsigned)desc.texture.levels,
              (int)desc.texture.format, (int)desc.heap, (unsigned)desc.usage, (unsigned)desc.flags);
@@ -4821,10 +4821,12 @@ static void on_init_resource9(reshade::api::device *dev, const reshade::api::res
 {
     if (dev && dev->get_api() == reshade::api::device_api::d3d9) g_t9Pending.store(false);
 }
+static void Dx9DiagRemove();
 static void RegisterDx9Events(bool on)
 {
     if (!on)
     {
+        Dx9DiagRemove();
         LogT9Pending("at shutdown");
         if (g_dx9Upgrade.load())
             LOGI("BFI Presenter: DX9 test: %u resource creations seen, %u failed", g_t9Creates.load(), g_t9Fails.load());
@@ -4870,12 +4872,222 @@ static void Dx9TestRelease()
     SafeRelease(g_t9.query); SafeRelease(g_t9.surf); SafeRelease(g_t9.tex);
     g_t9.dev = nullptr; g_t9.rsc = nullptr;
 }
+// ---- DX9 test diagnostics: which call inside the game's texture loading fails.
+// Logs failing calls on the game's real (native) D3D9 device and texture
+// objects, and every D3DXCreateTextureFromFileInMemoryEx call that fails.
+static std::atomic<int> g_d9FailLogs{0};
+BFI_TLS(int, t_inD3dx);
+static const char *CallerModule(void *ret, char *buf, size_t n)
+{
+    HMODULE m = nullptr;
+    buf[0] = 0;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ret, &m) && m)
+    {
+        char p[MAX_PATH];
+        if (GetModuleFileNameA(m, p, MAX_PATH)) { const char *s = strrchr(p, '\\'); snprintf(buf, n, "%s", s ? s + 1 : p); }
+    }
+    return buf;
+}
+#define D9FAIL(hr, ...) do { if (FAILED(hr) && g_d9FailLogs.fetch_add(1) < 120) { char cm[64]; \
+    LOGW("BFI Presenter: DX9 diag: %s failed 0x%08lX%s (caller %s): " , __func__, (unsigned long)(hr), t_inD3dx ? " inside D3DX" : "", \
+         CallerModule(__builtin_return_address(0), cm, sizeof(cm))); LOGW(__VA_ARGS__); } } while (0)
+
+typedef HRESULT (STDMETHODCALLTYPE *PFN9_CreateTex)(IDirect3DDevice9 *, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9 **, HANDLE *);
+typedef HRESULT (STDMETHODCALLTYPE *PFN9_CreateVol)(IDirect3DDevice9 *, UINT, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DVolumeTexture9 **, HANDLE *);
+typedef HRESULT (STDMETHODCALLTYPE *PFN9_CreateCube)(IDirect3DDevice9 *, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DCubeTexture9 **, HANDLE *);
+typedef HRESULT (STDMETHODCALLTYPE *PFN9_CreateOff)(IDirect3DDevice9 *, UINT, UINT, D3DFORMAT, D3DPOOL, IDirect3DSurface9 **, HANDLE *);
+typedef HRESULT (STDMETHODCALLTYPE *PFN9_UpdSurf)(IDirect3DDevice9 *, IDirect3DSurface9 *, const RECT *, IDirect3DSurface9 *, const POINT *);
+typedef HRESULT (STDMETHODCALLTYPE *PFN9_UpdTex)(IDirect3DDevice9 *, IDirect3DBaseTexture9 *, IDirect3DBaseTexture9 *);
+typedef HRESULT (STDMETHODCALLTYPE *PFN9_Stretch)(IDirect3DDevice9 *, IDirect3DSurface9 *, const RECT *, IDirect3DSurface9 *, const RECT *, D3DTEXTUREFILTERTYPE);
+typedef HRESULT (STDMETHODCALLTYPE *PFN9_RTData)(IDirect3DDevice9 *, IDirect3DSurface9 *, IDirect3DSurface9 *);
+typedef HRESULT (STDMETHODCALLTYPE *PFN9_TexLock)(IDirect3DTexture9 *, UINT, D3DLOCKED_RECT *, const RECT *, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PFN9_SurfLock)(IDirect3DSurface9 *, D3DLOCKED_RECT *, const RECT *, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PFN9_CheckFmt)(IDirect3D9 *, UINT, D3DDEVTYPE, D3DFORMAT, DWORD, D3DRESOURCETYPE, D3DFORMAT);
+static PFN9_CreateTex o9_CreateTex; static PFN9_CreateVol o9_CreateVol; static PFN9_CreateCube o9_CreateCube;
+static PFN9_CreateOff o9_CreateOff; static PFN9_UpdSurf o9_UpdSurf; static PFN9_UpdTex o9_UpdTex;
+static PFN9_Stretch o9_Stretch; static PFN9_RTData o9_RTData; static PFN9_TexLock o9_TexLock; static PFN9_SurfLock o9_SurfLock;
+static PFN9_CheckFmt o9_CheckFmt;
+
+static void SurfDesc(IDirect3DSurface9 *s, char *b, size_t n)
+{
+    D3DSURFACE_DESC d = {};
+    if (s && SUCCEEDED(s->GetDesc(&d))) snprintf(b, n, "%ux%u fmt %d pool %d usage 0x%lx", d.Width, d.Height, (int)d.Format, (int)d.Pool, (unsigned long)d.Usage);
+    else snprintf(b, n, "null");
+}
+static HRESULT STDMETHODCALLTYPE h9_CreateTex(IDirect3DDevice9 *d, UINT w, UINT h, UINT l, DWORD u, D3DFORMAT f, D3DPOOL p, IDirect3DTexture9 **t, HANDLE *sh)
+{ HRESULT hr = o9_CreateTex(d, w, h, l, u, f, p, t, sh);
+  D9FAIL(hr, "BFI Presenter:   CreateTexture %ux%u levels %u usage 0x%lx format %d pool %d shared %d", w, h, l, (unsigned long)u, (int)f, (int)p, sh ? 1 : 0); return hr; }
+static HRESULT STDMETHODCALLTYPE h9_CreateVol(IDirect3DDevice9 *d, UINT w, UINT h, UINT z, UINT l, DWORD u, D3DFORMAT f, D3DPOOL p, IDirect3DVolumeTexture9 **t, HANDLE *sh)
+{ HRESULT hr = o9_CreateVol(d, w, h, z, l, u, f, p, t, sh);
+  D9FAIL(hr, "BFI Presenter:   CreateVolumeTexture %ux%ux%u levels %u usage 0x%lx format %d pool %d", w, h, z, l, (unsigned long)u, (int)f, (int)p); return hr; }
+static HRESULT STDMETHODCALLTYPE h9_CreateCube(IDirect3DDevice9 *d, UINT e, UINT l, DWORD u, D3DFORMAT f, D3DPOOL p, IDirect3DCubeTexture9 **t, HANDLE *sh)
+{ HRESULT hr = o9_CreateCube(d, e, l, u, f, p, t, sh);
+  D9FAIL(hr, "BFI Presenter:   CreateCubeTexture %u levels %u usage 0x%lx format %d pool %d", e, l, (unsigned long)u, (int)f, (int)p); return hr; }
+static HRESULT STDMETHODCALLTYPE h9_CreateOff(IDirect3DDevice9 *d, UINT w, UINT h, D3DFORMAT f, D3DPOOL p, IDirect3DSurface9 **s, HANDLE *sh)
+{ HRESULT hr = o9_CreateOff(d, w, h, f, p, s, sh);
+  D9FAIL(hr, "BFI Presenter:   CreateOffscreenPlainSurface %ux%u format %d pool %d", w, h, (int)f, (int)p); return hr; }
+static HRESULT STDMETHODCALLTYPE h9_UpdSurf(IDirect3DDevice9 *d, IDirect3DSurface9 *s, const RECT *r, IDirect3DSurface9 *t, const POINT *pt)
+{ HRESULT hr = o9_UpdSurf(d, s, r, t, pt);
+  if (FAILED(hr)) { char a[96], b[96]; SurfDesc(s, a, sizeof(a)); SurfDesc(t, b, sizeof(b)); D9FAIL(hr, "BFI Presenter:   UpdateSurface src %s -> dst %s", a, b); } return hr; }
+static HRESULT STDMETHODCALLTYPE h9_UpdTex(IDirect3DDevice9 *d, IDirect3DBaseTexture9 *s, IDirect3DBaseTexture9 *t)
+{ HRESULT hr = o9_UpdTex(d, s, t);
+  D9FAIL(hr, "BFI Presenter:   UpdateTexture src type %d -> dst type %d", s ? (int)s->GetType() : -1, t ? (int)t->GetType() : -1); return hr; }
+static HRESULT STDMETHODCALLTYPE h9_Stretch(IDirect3DDevice9 *d, IDirect3DSurface9 *s, const RECT *sr, IDirect3DSurface9 *t, const RECT *tr, D3DTEXTUREFILTERTYPE f)
+{ HRESULT hr = o9_Stretch(d, s, sr, t, tr, f);
+  if (FAILED(hr)) { char a[96], b[96]; SurfDesc(s, a, sizeof(a)); SurfDesc(t, b, sizeof(b)); D9FAIL(hr, "BFI Presenter:   StretchRect src %s -> dst %s filter %d", a, b, (int)f); } return hr; }
+static HRESULT STDMETHODCALLTYPE h9_RTData(IDirect3DDevice9 *d, IDirect3DSurface9 *s, IDirect3DSurface9 *t)
+{ HRESULT hr = o9_RTData(d, s, t);
+  if (FAILED(hr)) { char a[96], b[96]; SurfDesc(s, a, sizeof(a)); SurfDesc(t, b, sizeof(b)); D9FAIL(hr, "BFI Presenter:   GetRenderTargetData src %s -> dst %s", a, b); } return hr; }
+static HRESULT STDMETHODCALLTYPE h9_TexLock(IDirect3DTexture9 *t, UINT lv, D3DLOCKED_RECT *lr, const RECT *r, DWORD fl)
+{ HRESULT hr = o9_TexLock(t, lv, lr, r, fl);
+  if (FAILED(hr)) { D3DSURFACE_DESC d = {}; t->GetLevelDesc(lv, &d);
+    D9FAIL(hr, "BFI Presenter:   Texture LockRect level %u flags 0x%lx: %ux%u fmt %d pool %d usage 0x%lx", lv, (unsigned long)fl, d.Width, d.Height, (int)d.Format, (int)d.Pool, (unsigned long)d.Usage); } return hr; }
+static HRESULT STDMETHODCALLTYPE h9_SurfLock(IDirect3DSurface9 *s, D3DLOCKED_RECT *lr, const RECT *r, DWORD fl)
+{ HRESULT hr = o9_SurfLock(s, lr, r, fl);
+  if (FAILED(hr)) { char a[96]; SurfDesc(s, a, sizeof(a)); D9FAIL(hr, "BFI Presenter:   Surface LockRect flags 0x%lx: %s", (unsigned long)fl, a); } return hr; }
+static HRESULT STDMETHODCALLTYPE h9_CheckFmt(IDirect3D9 *d, UINT a, D3DDEVTYPE dt, D3DFORMAT af, DWORD u, D3DRESOURCETYPE rt, D3DFORMAT f)
+{ HRESULT hr = o9_CheckFmt(d, a, dt, af, u, rt, f);
+  if (t_inD3dx) D9FAIL(hr, "BFI Presenter:   CheckDeviceFormat adapter fmt %d usage 0x%lx rtype %d format %d", (int)af, (unsigned long)u, (int)rt, (int)f); return hr; }
+
+#ifndef _WIN64
+static BYTE *g_d3dxFn = nullptr; static BYTE g_d3dxOrig[16]; static size_t g_d3dxLen = 0;
+typedef HRESULT (WINAPI *PFN_D3DXTexMemEx)(IDirect3DDevice9 *, LPCVOID, UINT, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, DWORD, DWORD,
+                                           D3DCOLOR, void *, void *, IDirect3DTexture9 **);
+static PFN_D3DXTexMemEx o_D3DXTexMemEx;
+static HRESULT WINAPI h_D3DXTexMemEx(IDirect3DDevice9 *dev, LPCVOID src, UINT size, UINT w, UINT h, UINT mips, DWORD usage, D3DFORMAT fmt,
+                                     D3DPOOL pool, DWORD filter, DWORD mipf, D3DCOLOR ck, void *info, void *pal, IDirect3DTexture9 **out)
+{
+    t_inD3dx = t_inD3dx + 1;
+    HRESULT hr = o_D3DXTexMemEx(dev, src, size, w, h, mips, usage, fmt, pool, filter, mipf, ck, info, pal, out);
+    t_inD3dx = t_inD3dx - 1;
+    if (FAILED(hr))
+    {
+        char hdr[16] = {};
+        if (src && size >= 4) memcpy(hdr, src, 4);
+        for (int i = 0; i < 4; i++) if (hdr[i] < 32 || hdr[i] > 126) hdr[i] = '.';
+        LOGW("BFI Presenter: DX9 diag: D3DXCreateTextureFromFileInMemoryEx failed 0x%08lX: %u bytes (starts \"%s\"), %ux%u mips %u usage 0x%lx format %d pool %d filter 0x%lx mipfilter 0x%lx",
+             (unsigned long)hr, size, hdr, w, h, mips, (unsigned long)usage, (int)fmt, (int)pool, (unsigned long)filter, (unsigned long)mipf);
+    }
+    return hr;
+}
+// Minimal x86 inline detour: whole instructions covering 5 bytes go to a
+// trampoline, a jmp to the hook goes over them.
+static void *Detour32(void *target, void *hook)
+{
+    BYTE *code = (BYTE *)target;
+    if (!code || code[0] == 0xE9 || code[0] == 0xEB) return nullptr;      // already hooked or a stub
+    size_t len = 0;
+    while (len < 5)
+    {
+        int rd;
+        const int l = InsnLength(code + len, &rd);
+        if (l <= 0) return nullptr;
+        len += (size_t)l;
+    }
+    if (len > sizeof(g_d3dxOrig)) return nullptr;
+    BYTE *t = (BYTE *)VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!t) return nullptr;
+    memcpy(t, code, len);
+    memcpy(g_d3dxOrig, code, len); g_d3dxFn = code; g_d3dxLen = len;
+    t[len] = 0xE9;
+    int32_t rel = (int32_t)((intptr_t)(code + len) - (intptr_t)(t + len + 5));
+    memcpy(t + len + 1, &rel, 4);
+    FlushInstructionCache(GetCurrentProcess(), t, len + 5);
+    DWORD old;
+    VirtualProtect(code, len, PAGE_EXECUTE_READWRITE, &old);
+    code[0] = 0xE9;
+    rel = (int32_t)((intptr_t)hook - (intptr_t)(code + 5));
+    memcpy(code + 1, &rel, 4);
+    for (size_t i = 5; i < len; i++) code[i] = 0x90;
+    VirtualProtect(code, len, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, len);
+    return t;
+}
+#endif
+
+static void **g_d9vtDev = nullptr, **g_d9vtTex = nullptr, **g_d9vtSurf = nullptr, **g_d9vtD3d = nullptr;
+static bool g_d9diagDone = false;
+static void Dx9DiagRemove()
+{
+    if (!g_d9diagDone) return;
+    g_d9diagDone = false;
+    if (void **vt = g_d9vtDev)
+    {
+        UnpatchSlot(vt, 23, (void *)o9_CreateTex,  (void *)&h9_CreateTex);
+        UnpatchSlot(vt, 24, (void *)o9_CreateVol,  (void *)&h9_CreateVol);
+        UnpatchSlot(vt, 25, (void *)o9_CreateCube, (void *)&h9_CreateCube);
+        UnpatchSlot(vt, 30, (void *)o9_UpdSurf,    (void *)&h9_UpdSurf);
+        UnpatchSlot(vt, 31, (void *)o9_UpdTex,     (void *)&h9_UpdTex);
+        UnpatchSlot(vt, 32, (void *)o9_RTData,     (void *)&h9_RTData);
+        UnpatchSlot(vt, 34, (void *)o9_Stretch,    (void *)&h9_Stretch);
+        UnpatchSlot(vt, 36, (void *)o9_CreateOff,  (void *)&h9_CreateOff);
+    }
+    if (g_d9vtTex)  UnpatchSlot(g_d9vtTex, 19, (void *)o9_TexLock, (void *)&h9_TexLock);
+    if (g_d9vtSurf) UnpatchSlot(g_d9vtSurf, 13, (void *)o9_SurfLock, (void *)&h9_SurfLock);
+    if (g_d9vtD3d)  UnpatchSlot(g_d9vtD3d, 10, (void *)o9_CheckFmt, (void *)&h9_CheckFmt);
+    g_d9vtDev = g_d9vtTex = g_d9vtSurf = g_d9vtD3d = nullptr;
+#ifndef _WIN64
+    if (g_d3dxFn && g_d3dxLen)
+    {
+        DWORD old;
+        VirtualProtect(g_d3dxFn, g_d3dxLen, PAGE_EXECUTE_READWRITE, &old);
+        memcpy(g_d3dxFn, g_d3dxOrig, g_d3dxLen);
+        VirtualProtect(g_d3dxFn, g_d3dxLen, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), g_d3dxFn, g_d3dxLen);
+        // The trampoline stays allocated: a call may still be inside it.
+    }
+    g_d3dxFn = nullptr; g_d3dxLen = 0; o_D3DXTexMemEx = nullptr;
+#endif
+}
+static void Dx9DiagInstall(IDirect3DDevice9 *dev)
+{
+    if (g_d9diagDone || !dev) return;
+    g_d9diagDone = true;
+    void **vt = *(void ***)dev;
+    g_d9vtDev = vt;
+    PatchSlot(vt, 23, (void *)&h9_CreateTex,  (void **)&o9_CreateTex);
+    PatchSlot(vt, 24, (void *)&h9_CreateVol,  (void **)&o9_CreateVol);
+    PatchSlot(vt, 25, (void *)&h9_CreateCube, (void **)&o9_CreateCube);
+    PatchSlot(vt, 30, (void *)&h9_UpdSurf,    (void **)&o9_UpdSurf);
+    PatchSlot(vt, 31, (void *)&h9_UpdTex,     (void **)&o9_UpdTex);
+    PatchSlot(vt, 32, (void *)&h9_RTData,     (void **)&o9_RTData);
+    PatchSlot(vt, 34, (void *)&h9_Stretch,    (void **)&o9_Stretch);
+    PatchSlot(vt, 36, (void *)&h9_CreateOff,  (void **)&o9_CreateOff);
+    IDirect3DTexture9 *tx = nullptr;
+    if (SUCCEEDED(o9_CreateTex(dev, 4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &tx, nullptr)) && tx)
+    {
+        g_d9vtTex = *(void ***)tx;
+        PatchSlot(g_d9vtTex, 19, (void *)&h9_TexLock, (void **)&o9_TexLock);
+        IDirect3DSurface9 *s = nullptr;
+        if (SUCCEEDED(tx->GetSurfaceLevel(0, &s)) && s) { g_d9vtSurf = *(void ***)s; PatchSlot(g_d9vtSurf, 13, (void *)&h9_SurfLock, (void **)&o9_SurfLock); s->Release(); }
+        tx->Release();
+    }
+    IDirect3D9 *d3d = nullptr;
+    if (SUCCEEDED(dev->GetDirect3D(&d3d)) && d3d) { g_d9vtD3d = *(void ***)d3d; PatchSlot(g_d9vtD3d, 10, (void *)&h9_CheckFmt, (void **)&o9_CheckFmt); d3d->Release(); }
+    int dx = 0;
+#ifndef _WIN64
+    for (int v = 43; v >= 24 && !o_D3DXTexMemEx; v--)
+    {
+        char name[32];
+        snprintf(name, sizeof(name), "d3dx9_%d.dll", v);
+        HMODULE m = GetModuleHandleA(name);
+        if (!m) continue;
+        void *fn = (void *)GetProcAddress(m, "D3DXCreateTextureFromFileInMemoryEx");
+        o_D3DXTexMemEx = (PFN_D3DXTexMemEx)Detour32(fn, (void *)&h_D3DXTexMemEx);
+        LOGI("BFI Presenter: DX9 diag: %s found, D3DXCreateTextureFromFileInMemoryEx %s", name, o_D3DXTexMemEx ? "hooked" : "NOT hooked");
+        dx = v;
+    }
+#endif
+    LOGI("BFI Presenter: DX9 diag: watching the game's D3D9 calls for failures (d3dx9_%d)", dx);
+}
+
 static void Dx9TestInit(reshade::api::swapchain *swapchain)
 {
     Dx9TestRelease();
     IDirect3DDevice9 *dev = reinterpret_cast<IDirect3DDevice9 *>(swapchain->get_device()->get_native());
     IDirect3DSwapChain9 *sc9 = reinterpret_cast<IDirect3DSwapChain9 *>(swapchain->get_native());
     if (!dev || !sc9) return;
+    Dx9DiagInstall(dev);
     IDirect3DDevice9Ex *ex = nullptr;
     const bool isEx = SUCCEEDED(dev->QueryInterface(IID_IDirect3DDevice9Ex, (void **)&ex)) && ex;
     if (ex) ex->Release();
