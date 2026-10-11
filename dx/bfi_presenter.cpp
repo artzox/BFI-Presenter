@@ -39,6 +39,7 @@
 #include <d3dcompiler.h>
 #include <d3d12sdklayers.h>
 #include <d3d11_4.h>
+#include <d3d9.h>
 #include <algorithm>
 #include <atomic>
 #include <vector>
@@ -4746,6 +4747,177 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
     return hr;
 }
 
+// ---------------------------------------------------------------- DX9 (feasibility test)
+// Direct3D 9 can share a texture with newer APIs only from a 9Ex device.
+// ReShade can create the game's device as 9Ex (its create_device event, newer
+// ReShade only; it also converts the managed pool). This test build checks
+// that the game runs that way and that its frames can be copied into a
+// texture the add-on's own D3D11 device reads. No BFI yet: results go to
+// ReShade.log ("DX9 test: ...").
+static bool on_create_device9(reshade::api::device_api api, uint32_t &ver)
+{
+    if (api != reshade::api::device_api::d3d9 || ver >= 0x9100) return false;
+    if (GetPrivateProfileIntA("BFI", "DX9Support", 1, g_iniPath) == 0) return false;
+    ver = 0x9100;
+    LOGI("BFI Presenter: DX9 test: asking ReShade to create the game's device as Direct3D 9Ex");
+    return true;
+}
+static void on_present9(reshade::api::command_queue *, reshade::api::swapchain *, const reshade::api::rect *, const reshade::api::rect *,
+                        uint32_t, const reshade::api::rect *);
+static void RegisterDx9Events(bool on)
+{
+    // create_device is event 96 in newer ReShade (API 17+); older ReShade
+    // ignores event numbers it doesn't know.
+    HMODULE rs = reshade::internal::get_reshade_module_handle();
+    typedef void (*PFN_Ev)(reshade::addon_event, void *);
+    PFN_Ev f = rs ? (PFN_Ev)(void *)GetProcAddress(rs, on ? "ReShadeRegisterEvent" : "ReShadeUnregisterEvent") : nullptr;
+    if (f) f((reshade::addon_event)96, (void *)&on_create_device9);
+    if (on) reshade::register_event<reshade::addon_event::present>(on_present9);
+    else    reshade::unregister_event<reshade::addon_event::present>(on_present9);
+}
+
+struct Dx9Test
+{
+    reshade::api::swapchain *rsc = nullptr;
+    IDirect3DDevice9    *dev = nullptr;
+    IDirect3DTexture9   *tex = nullptr;
+    IDirect3DSurface9   *surf = nullptr;
+    IDirect3DQuery9     *query = nullptr;
+    ID3D11Device        *d11 = nullptr;
+    ID3D11DeviceContext *c11 = nullptr;
+    ID3D11Texture2D     *t11 = nullptr, *rb = nullptr;
+    UINT w = 0, h = 0;
+    double lastLog = 0.0, sumMs = 0.0, maxMs = 0.0;
+    uint64_t frames = 0, waits = 0;
+    bool ready = false;
+};
+static Dx9Test g_t9;
+static void Dx9TestRelease()
+{
+    g_t9.ready = false;
+    SafeRelease(g_t9.rb); SafeRelease(g_t9.t11); SafeRelease(g_t9.c11); SafeRelease(g_t9.d11);
+    SafeRelease(g_t9.query); SafeRelease(g_t9.surf); SafeRelease(g_t9.tex);
+    g_t9.dev = nullptr; g_t9.rsc = nullptr;
+}
+static void Dx9TestInit(reshade::api::swapchain *swapchain)
+{
+    Dx9TestRelease();
+    IDirect3DDevice9 *dev = reinterpret_cast<IDirect3DDevice9 *>(swapchain->get_device()->get_native());
+    IDirect3DSwapChain9 *sc9 = reinterpret_cast<IDirect3DSwapChain9 *>(swapchain->get_native());
+    if (!dev || !sc9) return;
+    IDirect3DDevice9Ex *ex = nullptr;
+    const bool isEx = SUCCEEDED(dev->QueryInterface(IID_IDirect3DDevice9Ex, (void **)&ex)) && ex;
+    if (ex) ex->Release();
+    D3DPRESENT_PARAMETERS pp = {};
+    sc9->GetPresentParameters(&pp);
+    LOGI("BFI Presenter: DX9 test: device %s, back buffer %ux%u format %u, %s, swap effect %u, interval %u",
+         isEx ? "is Direct3D 9Ex" : "is plain Direct3D 9 (NOT 9Ex)", pp.BackBufferWidth, pp.BackBufferHeight, (unsigned)pp.BackBufferFormat,
+         pp.Windowed ? "windowed" : "exclusive fullscreen", (unsigned)pp.SwapEffect, (unsigned)pp.PresentationInterval);
+    if (!isEx)
+    {
+        LOGW("BFI Presenter: DX9 test: frames can't be shared from a plain Direct3D 9 device. Update ReShade (6.8 or newer) "
+             "so it can create the device as 9Ex.");
+        SetReason(0, "DX9 test: the game's device is not Direct3D 9Ex (update ReShade).");
+        return;
+    }
+    // Shared render target on the game's device.
+    HANDLE share = nullptr;
+    HRESULT hr = dev->CreateTexture(pp.BackBufferWidth, pp.BackBufferHeight, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8,
+                                    D3DPOOL_DEFAULT, &g_t9.tex, &share);
+    if (FAILED(hr) || !share) { LOGW("BFI Presenter: DX9 test: shared texture not created (0x%08lX)", (unsigned long)hr); Dx9TestRelease(); return; }
+    g_t9.tex->GetSurfaceLevel(0, &g_t9.surf);
+    dev->CreateQuery(D3DQUERYTYPE_EVENT, &g_t9.query);
+    // Our own D3D11 device on the same adapter, past ReShade's hooks.
+    LUID luid = {};
+    {
+        IDirect3D9 *d3d = nullptr;
+        IDirect3D9Ex *d3dex = nullptr;
+        D3DDEVICE_CREATION_PARAMETERS cp = {};
+        dev->GetCreationParameters(&cp);
+        if (SUCCEEDED(dev->GetDirect3D(&d3d)) && d3d)
+        {
+            if (SUCCEEDED(d3d->QueryInterface(IID_IDirect3D9Ex, (void **)&d3dex)) && d3dex) { d3dex->GetAdapterLUID(cp.AdapterOrdinal, &luid); d3dex->Release(); }
+            d3d->Release();
+        }
+    }
+    typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void **);
+    typedef HRESULT (WINAPI *PFN_D3D11CD)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL *, UINT, UINT,
+                                          ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
+    HMODULE dx = LoadSystemDll("dxgi.dll"), d11m = LoadSystemDll("d3d11.dll");
+    PFN_CF1 cf1 = dx ? (PFN_CF1)RawEntry((void *)GetProcAddress(dx, "CreateDXGIFactory1"), "CreateDXGIFactory1") : nullptr;
+    PFN_D3D11CD cd = d11m ? (PFN_D3D11CD)RawEntry((void *)GetProcAddress(d11m, "D3D11CreateDevice"), "D3D11CreateDevice") : nullptr;
+    IDXGIFactory1 *fac = nullptr;
+    IDXGIAdapter1 *ad = nullptr;
+    if (cf1 && SUCCEEDED(cf1(__uuidof(IDXGIFactory1), (void **)&fac)) && fac)
+    {
+        IDXGIAdapter1 *a = nullptr;
+        for (UINT i = 0; !ad && fac->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++)
+        {
+            DXGI_ADAPTER_DESC1 d = {};
+            a->GetDesc1(&d);
+            if (d.AdapterLuid.LowPart == luid.LowPart && d.AdapterLuid.HighPart == luid.HighPart) ad = a; else a->Release();
+        }
+        fac->Release();
+    }
+    hr = cd ? cd(ad, ad ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                 &g_t9.d11, nullptr, &g_t9.c11) : E_FAIL;
+    if (ad) ad->Release();
+    if (FAILED(hr)) { LOGW("BFI Presenter: DX9 test: D3D11 device not created (0x%08lX)", (unsigned long)hr); Dx9TestRelease(); return; }
+    hr = g_t9.d11->OpenSharedResource(share, __uuidof(ID3D11Texture2D), (void **)&g_t9.t11);
+    if (FAILED(hr) || !g_t9.t11) { LOGW("BFI Presenter: DX9 test: D3D11 could not open the shared texture (0x%08lX)", (unsigned long)hr); Dx9TestRelease(); return; }
+    D3D11_TEXTURE2D_DESC td = {};
+    g_t9.t11->GetDesc(&td);
+    D3D11_TEXTURE2D_DESC rd = {};
+    rd.Width = rd.Height = 1; rd.MipLevels = rd.ArraySize = 1; rd.Format = td.Format; rd.SampleDesc.Count = 1;
+    rd.Usage = D3D11_USAGE_STAGING; rd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    g_t9.d11->CreateTexture2D(&rd, nullptr, &g_t9.rb);
+    g_t9.dev = dev;
+    g_t9.rsc = swapchain;
+    g_t9.w = pp.BackBufferWidth; g_t9.h = pp.BackBufferHeight;
+    g_t9.frames = g_t9.waits = 0; g_t9.sumMs = g_t9.maxMs = 0.0; g_t9.lastLog = Now();
+    g_t9.ready = true;
+    LOGI("BFI Presenter: DX9 test: shared texture opened in D3D11 (%ux%u, DXGI format %u) -- copying every frame; "
+         "a report follows every 2 seconds", td.Width, td.Height, (unsigned)td.Format);
+    SetReason(0, "DX9 test: frames are shared with D3D11 (see ReShade.log). No BFI in this test build.");
+}
+static void on_present9(reshade::api::command_queue *, reshade::api::swapchain *swapchain, const reshade::api::rect *,
+                        const reshade::api::rect *, uint32_t, const reshade::api::rect *)
+{
+    if (!g_t9.ready || swapchain != g_t9.rsc) return;
+    IDirect3DSwapChain9 *sc9 = reinterpret_cast<IDirect3DSwapChain9 *>(swapchain->get_native());
+    IDirect3DSurface9 *bb = nullptr;
+    if (FAILED(sc9->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+    const double t0 = Now();
+    const HRESULT hr = g_t9.dev->StretchRect(bb, nullptr, g_t9.surf, nullptr, D3DTEXF_NONE);
+    bb->Release();
+    if (g_t9.query)
+    {
+        g_t9.query->Issue(D3DISSUE_END);
+        while (g_t9.query->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_FALSE && Now() - t0 < 0.05) { g_t9.waits++; YieldProcessor(); }
+    }
+    const double ms = (Now() - t0) * 1000.0;
+    g_t9.frames++;
+    g_t9.sumMs += ms;
+    if (ms > g_t9.maxMs) g_t9.maxMs = ms;
+    const double now = Now();
+    if (now - g_t9.lastLog >= 2.0)
+    {
+        unsigned px = 0;
+        if (g_t9.rb)
+        {
+            D3D11_BOX box = { g_t9.w / 2, g_t9.h / 2, 0, g_t9.w / 2 + 1, g_t9.h / 2 + 1, 1 };
+            g_t9.c11->CopySubresourceRegion(g_t9.rb, 0, 0, 0, 0, g_t9.t11, 0, &box);
+            D3D11_MAPPED_SUBRESOURCE m = {};
+            if (SUCCEEDED(g_t9.c11->Map(g_t9.rb, 0, D3D11_MAP_READ, 0, &m))) { px = *(const unsigned *)m.pData; g_t9.c11->Unmap(g_t9.rb, 0); }
+        }
+        LOGI("BFI Presenter: DX9 test: %llu frames in %.1f s (%.0f fps), copy + wait %.2f ms average / %.2f ms max, StretchRect 0x%08lX, "
+             "centre pixel seen by D3D11: R%u G%u B%u",
+             (unsigned long long)g_t9.frames, now - g_t9.lastLog, g_t9.frames / (now - g_t9.lastLog), g_t9.sumMs / g_t9.frames, g_t9.maxMs,
+             (unsigned long)hr, (px >> 16) & 255, (px >> 8) & 255, px & 255);
+        g_t9.frames = 0; g_t9.sumMs = g_t9.maxMs = 0.0; g_t9.lastLog = now;
+    }
+}
+
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
     if (g_sc) return;                                            // resizes of ours are handled in the hook
@@ -4754,6 +4926,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     // the HDC as one in the probe check below).
     {
         const reshade::api::device_api a = swapchain->get_device()->get_api();
+        if (a == reshade::api::device_api::d3d9) { Dx9TestInit(swapchain); return; }
         if (a != reshade::api::device_api::d3d11 && a != reshade::api::device_api::d3d12)
         {
             SetReason(0, "Not managed: this game renders with %s; the add-on handles Direct3D 11 and 12 only.",
@@ -5278,6 +5451,7 @@ static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 
 static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+    if (g_t9.rsc && swapchain == g_t9.rsc) { Dx9TestRelease(); return; }
     if (!resize && g_dx11.load() && reinterpret_cast<void *>(swapchain->get_native()) == (void *)g_sc11)
     {
         LOGI("BFI Presenter: DX11 swap chain %p destroyed -- stopping the presenter", (void *)g_sc11);
@@ -5322,6 +5496,7 @@ static void UnregisterAll(HMODULE hModule)
     reshade::unregister_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
     reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::unregister_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
+    RegisterDx9Events(false);
     reshade::unregister_overlay("BFI Presenter", draw_overlay);
     RemoveHooks();
     reshade::unregister_addon(hModule);
@@ -5344,6 +5519,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
     reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
+    RegisterDx9Events(true);
     reshade::register_overlay("BFI Presenter", draw_overlay);
     if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
     return true;
@@ -5398,6 +5574,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
+        RegisterDx9Events(true);
         reshade::register_overlay("BFI Presenter", draw_overlay);
         // DRED must be switched on before the game creates its device; a
         // thread avoids calling into D3D12 under the loader lock.
