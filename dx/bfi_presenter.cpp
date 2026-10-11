@@ -1485,6 +1485,28 @@ static bool InImage(DWORD64 addr)
     return addr && VirtualQuery((const void *)(uintptr_t)addr, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.Type == MEM_IMAGE;
 }
 
+#ifndef _WIN64
+// 32-bit builds: follow the EBP frame chain (no unwind tables on x86). Frames
+// of code built without frame pointers are skipped; good enough for a log.
+static int WalkFramePointers(const CONTEXT &ctx, DWORD64 *frames, int max)
+{
+    int nf = 0;
+    if (ctx.Eip) frames[nf++] = ctx.Eip;
+    DWORD ebp = ctx.Ebp;
+    if (ctx.Eip < 0x10000 && !IsBadReadPtr((const void *)(uintptr_t)ctx.Esp, 4) && nf < max)
+        frames[nf++] = *(const DWORD *)(uintptr_t)ctx.Esp;        // call through a null pointer
+    while (nf < max && ebp && !IsBadReadPtr((const void *)(uintptr_t)ebp, 8))
+    {
+        const DWORD next = ((const DWORD *)(uintptr_t)ebp)[0], ret = ((const DWORD *)(uintptr_t)ebp)[1];
+        if (!ret) break;
+        frames[nf++] = ret;
+        if (next <= ebp) break;
+        ebp = next;
+    }
+    return nf;
+}
+#endif
+
 // Call stack of another thread, as "module+offset" frames. The thread is
 // suspended only while its context is captured and its stack unwound; module
 // names are resolved after it is resumed (that path takes the loader lock).
@@ -1500,6 +1522,9 @@ static void LogThreadStack(DWORD tid, const char *who)
         ctx.ContextFlags = CONTEXT_FULL;
         if (GetThreadContext(th, &ctx))
         {
+#ifndef _WIN64
+            nf = WalkFramePointers(ctx, frames, 32);
+#else
             for (; nf < 32 && ctx.Rip; nf++)
             {
                 frames[nf] = ctx.Rip;
@@ -1511,6 +1536,7 @@ static void LogThreadStack(DWORD tid, const char *who)
                 DWORD64 est = 0;
                 RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &hd, &est, nullptr);
             }
+#endif
         }
         ResumeThread(th);
     }
@@ -1564,6 +1590,9 @@ static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
     DWORD64 frames[24];
     int nf = 0;
     CONTEXT ctx = *ep->ContextRecord;
+#ifndef _WIN64
+    nf = WalkFramePointers(ctx, frames, 24);
+#else
     if (ctx.Rip < 0x10000 && !IsBadReadPtr((const void *)ctx.Rsp, 8))
     {
         // Call through a null (or tiny) pointer: the caller's return address
@@ -1587,6 +1616,7 @@ static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
         DWORD64 est = 0;
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &hd, &est, nullptr);
     }
+#endif
     char line[2048];
     SYSTEMTIME lt;
     GetLocalTime(&lt);
@@ -3402,7 +3432,11 @@ static int InsnLength(const BYTE *p, int *ripDisp)
     int i = 0;
     bool opsize = false, rexw = false;
     while (p[i] == 0x66 || p[i] == 0xF2 || p[i] == 0xF3) { if (p[i] == 0x66) opsize = true; i++; }
+#ifdef _WIN64
     if ((p[i] & 0xF0) == 0x40) { rexw = (p[i] & 8) != 0; i++; }
+#else
+    if ((p[i] & 0xF0) == 0x40) return i + 1;                       // x86: inc / dec reg
+#endif
     const BYTE op = p[i++];
     int imm = 0;
     bool modrm = false;
@@ -3439,7 +3473,11 @@ static int InsnLength(const BYTE *p, int *ripDisp)
         const BYTE sib = p[i++];
         if (mod == 0 && (sib & 7) == 5) i += 4;
     }
+#ifdef _WIN64
     if (mod == 0 && rm == 5) { *ripDisp = i; i += 4; }
+#else
+    if (mod == 0 && rm == 5) i += 4;                                 // x86: absolute address, copies as is
+#endif
     else if (mod == 1) i += 1;
     else if (mod == 2) i += 4;
     return i + imm;
@@ -3468,6 +3506,22 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
         ins[n] = (int)len; rip[n] = rd; n++;
         len += (size_t)l;
     }
+#ifndef _WIN64
+    // x86: no RIP-relative operands; copy the instructions and jmp rel32 back.
+    {
+        BYTE *t = (BYTE *)VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (!t) { snprintf(why, whyLen, "no memory"); return nullptr; }
+        memcpy(t, orig, len);
+        t[len] = 0xE9;
+        const int32_t rel = (int32_t)((intptr_t)(code + len) - (intptr_t)(t + len + 5));
+        memcpy(t + len + 1, &rel, 4);
+        DWORD o;
+        VirtualProtect(t, 4096, PAGE_EXECUTE_READ, &o);
+        FlushInstructionCache(GetCurrentProcess(), t, len + 5);
+        snprintf(why, whyLen, "%zu patched bytes skipped", patched);
+        return t;
+    }
+#endif
     // Near the function, so RIP-relative displacements still reach.
     BYTE *tramp = nullptr;
     const uintptr_t base = (uintptr_t)target & ~(uintptr_t)0xFFFF;

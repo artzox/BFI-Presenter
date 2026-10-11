@@ -1,5 +1,6 @@
 # Build outputs (attached to GitHub releases instead)
 *.addon64
+*.addon32
 *.dll
 *.so
 *.spv
