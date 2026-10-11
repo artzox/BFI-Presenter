@@ -4754,12 +4754,32 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
 // that the game runs that way and that its frames can be copied into a
 // texture the add-on's own D3D11 device reads. No BFI yet: results go to
 // ReShade.log ("DX9 test: ...").
+static std::atomic<bool> g_dx9Upgrade{false};
 static bool on_create_device9(reshade::api::device_api api, uint32_t &ver)
 {
     if (api != reshade::api::device_api::d3d9 || ver >= 0x9100) return false;
     if (GetPrivateProfileIntA("BFI", "DX9Support", 1, g_iniPath) == 0) return false;
     ver = 0x9100;
+    g_dx9Upgrade.store(true);
     LOGI("BFI Presenter: DX9 test: asking ReShade to create the game's device as Direct3D 9Ex");
+    return true;
+}
+// 9Ex can't create an exclusive-fullscreen device the way the game asks
+// (Alan Wake: DEVICE_CREATE_ERROR - Invalid call), and the presenter needs
+// a window anyway: keep the swap chain windowed (borderless at full size).
+// create_swapchain gained a device_api first argument in newer ReShade; this
+// callback reads either form: an API value is small, a pointer is not.
+static bool on_create_swapchain9(uintptr_t a, uintptr_t b, uintptr_t)
+{
+    if (!g_dx9Upgrade.load()) return false;
+    reshade::api::swapchain_desc *desc = nullptr;
+    if (a == (uintptr_t)reshade::api::device_api::d3d9) desc = (reshade::api::swapchain_desc *)b;   // newer ReShade
+    else if (a < 0x100000) return false;                                                           // another API
+    else desc = (reshade::api::swapchain_desc *)a;                                                  // older ReShade
+    if (!desc || !desc->fullscreen_state) return false;
+    desc->fullscreen_state = false;
+    desc->fullscreen_refresh_rate = 0;
+    LOGI("BFI Presenter: DX9 test: the game asked for exclusive fullscreen -- kept windowed (9Ex needs it, BFI needs borderless)");
     return true;
 }
 static void on_present9(reshade::api::command_queue *, reshade::api::swapchain *, const reshade::api::rect *, const reshade::api::rect *,
@@ -4772,6 +4792,7 @@ static void RegisterDx9Events(bool on)
     typedef void (*PFN_Ev)(reshade::addon_event, void *);
     PFN_Ev f = rs ? (PFN_Ev)(void *)GetProcAddress(rs, on ? "ReShadeRegisterEvent" : "ReShadeUnregisterEvent") : nullptr;
     if (f) f((reshade::addon_event)96, (void *)&on_create_device9);
+    if (f) f(reshade::addon_event::create_swapchain, (void *)&on_create_swapchain9);
     if (on) reshade::register_event<reshade::addon_event::present>(on_present9);
     else    reshade::unregister_event<reshade::addon_event::present>(on_present9);
 }
