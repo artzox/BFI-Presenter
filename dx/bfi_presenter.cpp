@@ -4822,11 +4822,13 @@ static void on_init_resource9(reshade::api::device *dev, const reshade::api::res
     if (dev && dev->get_api() == reshade::api::device_api::d3d9) g_t9Pending.store(false);
 }
 static void Dx9DiagRemove();
+static void Dx9UnhideEx();
 static void RegisterDx9Events(bool on)
 {
     if (!on)
     {
         Dx9DiagRemove();
+        Dx9UnhideEx();
         LogT9Pending("at shutdown");
         if (g_dx9Upgrade.load())
             LOGI("BFI Presenter: DX9 test: %u resource creations seen, %u failed", g_t9Creates.load(), g_t9Fails.load());
@@ -5081,6 +5083,84 @@ static void Dx9DiagInstall(IDirect3DDevice9 *dev)
     LOGI("BFI Presenter: DX9 diag: watching the game's D3D9 calls for failures (d3dx9_%d)", dx);
 }
 
+// D3DX (d3dx9_NN.dll) refuses D3DPOOL_MANAGED once it sees an
+// IDirect3DDevice9Ex (Alan Wake: D3DXCreateTextureFromFileInMemoryEx ->
+// D3DERR_INVALIDCALL, pool 1). ReShade already turns MANAGED into
+// MANAGED_EX for the runtime, so D3DX only needs to not see Ex: deny the Ex
+// interfaces to callers inside a d3dx9 DLL.
+typedef HRESULT (STDMETHODCALLTYPE *PFN_QI)(IUnknown *, REFIID, void **);
+static PFN_QI o_ProxyDevQI = nullptr, o_NativeD3dQI = nullptr;
+static void **g_proxyDevVt = nullptr, **g_nativeD3dVt = nullptr;
+static std::atomic<int> g_hideExLogs{0};
+static bool CallerIsD3dx(void *ret)
+{
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ret, &m) || !m) return false;
+    char p[MAX_PATH];
+    if (!GetModuleFileNameA(m, p, MAX_PATH)) return false;
+    const char *s = strrchr(p, '\\');
+    s = s ? s + 1 : p;
+    return _strnicmp(s, "d3dx9_", 6) == 0;
+}
+static HRESULT STDMETHODCALLTYPE h_ProxyDevQI(IUnknown *self, REFIID riid, void **pp)
+{
+    if (IsEqualIID(riid, IID_IDirect3DDevice9Ex) && CallerIsD3dx(__builtin_return_address(0)))
+    {
+        if (g_hideExLogs.fetch_add(1) == 0) LOGI("BFI Presenter: DX9: hid Direct3D 9Ex from D3DX so its D3DPOOL_MANAGED loads keep working");
+        if (pp) *pp = nullptr;
+        return E_NOINTERFACE;
+    }
+    return o_ProxyDevQI(self, riid, pp);
+}
+static HRESULT STDMETHODCALLTYPE h_NativeD3dQI(IUnknown *self, REFIID riid, void **pp)
+{
+    if (IsEqualIID(riid, IID_IDirect3D9Ex) && CallerIsD3dx(__builtin_return_address(0)))
+    {
+        if (g_hideExLogs.fetch_add(1) == 0) LOGI("BFI Presenter: DX9: hid Direct3D 9Ex from D3DX so its D3DPOOL_MANAGED loads keep working");
+        if (pp) *pp = nullptr;
+        return E_NOINTERFACE;
+    }
+    return o_NativeD3dQI(self, riid, pp);
+}
+static void Dx9HideExFromD3dx(reshade::api::device *apiDev, IDirect3DDevice9 *native)
+{
+    HMODULE rs = reshade::internal::get_reshade_module_handle();
+    // ReShade's proxy is "class Direct3DDevice9 : public IDirect3DDevice9Ex,
+    // public reshade::d3d9::device_impl": the api::device sits one vtable
+    // pointer after the COM interface the game holds. Check before using it.
+    IUnknown *proxy = reinterpret_cast<IUnknown *>(reinterpret_cast<char *>(apiDev) - sizeof(void *));
+    bool ok = false;
+    if (rs && apiDev)
+    {
+        HMODULE vm = nullptr;
+        void **vt = *reinterpret_cast<void ***>(proxy);
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)vt[0], &vm) && vm == rs)
+        {
+            IUnknown *same = nullptr;
+            if (SUCCEEDED(proxy->QueryInterface(IID_IDirect3DDevice9, (void **)&same)) && same)
+            {
+                ok = (same == proxy);
+                same->Release();
+            }
+            if (ok) { g_proxyDevVt = vt; PatchSlot(vt, 0, (void *)&h_ProxyDevQI, (void **)&o_ProxyDevQI); }
+        }
+    }
+    IDirect3D9 *d3d = nullptr;
+    if (native && SUCCEEDED(native->GetDirect3D(&d3d)) && d3d)
+    {
+        g_nativeD3dVt = *reinterpret_cast<void ***>(d3d);
+        PatchSlot(g_nativeD3dVt, 0, (void *)&h_NativeD3dQI, (void **)&o_NativeD3dQI);
+        d3d->Release();
+    }
+    LOGI("BFI Presenter: DX9: D3DX will see a plain Direct3D 9 device (%s)", ok ? "ReShade device proxy found" : "proxy NOT found -- D3DX may still fail");
+}
+static void Dx9UnhideEx()
+{
+    if (g_proxyDevVt)  UnpatchSlot(g_proxyDevVt, 0, (void *)o_ProxyDevQI, (void *)&h_ProxyDevQI);
+    if (g_nativeD3dVt) UnpatchSlot(g_nativeD3dVt, 0, (void *)o_NativeD3dQI, (void *)&h_NativeD3dQI);
+    g_proxyDevVt = g_nativeD3dVt = nullptr;
+}
+
 static void Dx9TestInit(reshade::api::swapchain *swapchain)
 {
     Dx9TestRelease();
@@ -5103,6 +5183,7 @@ static void Dx9TestInit(reshade::api::swapchain *swapchain)
         SetReason(0, "DX9 test: the game's device is not Direct3D 9Ex (update ReShade).");
         return;
     }
+    if (!g_proxyDevVt) Dx9HideExFromD3dx(swapchain->get_device(), dev);
     // Shared render target on the game's device.
     HANDLE share = nullptr;
     HRESULT hr = dev->CreateTexture(pp.BackBufferWidth, pp.BackBufferHeight, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8,
