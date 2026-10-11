@@ -4792,7 +4792,10 @@ static void RegisterDx9Events(bool on)
     typedef void (*PFN_Ev)(reshade::addon_event, void *);
     PFN_Ev f = rs ? (PFN_Ev)(void *)GetProcAddress(rs, on ? "ReShadeRegisterEvent" : "ReShadeUnregisterEvent") : nullptr;
     if (f) f((reshade::addon_event)96, (void *)&on_create_device9);
+    // create_swapchain moved from 7 to 97 (with the device_api argument) in
+    // newer ReShade; 7 is now unused there, 97 is ignored by older ReShade.
     if (f) f(reshade::addon_event::create_swapchain, (void *)&on_create_swapchain9);
+    if (f) f((reshade::addon_event)97, (void *)&on_create_swapchain9);
     if (on) reshade::register_event<reshade::addon_event::present>(on_present9);
     else    reshade::unregister_event<reshade::addon_event::present>(on_present9);
 }
