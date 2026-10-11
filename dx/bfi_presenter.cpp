@@ -4639,6 +4639,9 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
     if (!g_running.load())
     {
         // Presenter unavailable: show the game's own frames under a hidden child window.
+        static bool logged = false;
+        if (!logged) { logged = true; LOGW("BFI Presenter: presenter not running (failed %d, buffers %u, stuck %d) -- the game's own frames are shown",
+                                         (int)g_presenterFailed.load(), g_bufCount, (int)g_presenterStuck.load()); }
         HWND h = g_childHwnd.load();
         if (h && IsWindowVisible(h)) ShowWindowAsync(h, SW_HIDE);
         ReleaseGameSlot();               // shown by DXGI directly: the presenter won't release this slot
@@ -4848,8 +4851,12 @@ static void on_init_resource9(reshade::api::device *dev, const reshade::api::res
 static void Dx9DiagRemove();
 static void Dx9UnhideEx();
 static void Dx9UnhookPresent();
+static void on_present9(reshade::api::command_queue *, reshade::api::swapchain *, const reshade::api::rect *,
+                        const reshade::api::rect *, uint32_t, const reshade::api::rect *);
 static void RegisterDx9Events(bool on)
 {
+    if (on) reshade::register_event<reshade::addon_event::present>(on_present9);
+    else    reshade::unregister_event<reshade::addon_event::present>(on_present9);
     if (!on)
     {
         Dx9UnhookPresent();
@@ -5245,21 +5252,34 @@ static HRESULT SubmitGameFrame9(ShowOwn showOwn)
         },
         showOwn);
 }
+static std::atomic<uint32_t> g_9hits{0}, g_9owned{0}, g_9rsPresents{0};
+static void Dx9LogHit(const char *which, void *obj, void *expect)
+{
+    if (g_9hits.fetch_add(1) == 0)
+        LOGI("BFI Presenter: DX9: first %s reached the add-on (object %s, dx9 %d, active %d, ready %d, nested %d)", which,
+             obj == expect ? "matches" : "does NOT match", (int)g_dx9.load(), (int)g_active.load(), (int)g_t9.ready, (int)t_in9Present);
+}
 static bool Dx9OwnsDevice(void *dev) { return !t_in9Present && g_dx9.load() && g_active.load() && g_t9.ready && dev == (void *)g_t9.dev; }
 static bool Dx9OwnsSc(void *sc)      { return !t_in9Present && g_dx9.load() && g_active.load() && g_t9.ready && sc == (void *)g_t9.sc9; }
 static HRESULT STDMETHODCALLTYPE h9_Present(IDirect3DDevice9 *d, const RECT *sr, const RECT *dr, HWND w, const RGNDATA *rg)
 {
+    Dx9LogHit("device Present", d, g_t9.dev);
     if (!Dx9OwnsDevice(d)) return o9_Present(d, sr, dr, w, rg);
+    g_9owned++;
     return SubmitGameFrame9([&]() -> HRESULT { t_in9Present++; HRESULT hr = o9_Present(d, sr, dr, w, rg); t_in9Present--; return hr; });
 }
 static HRESULT STDMETHODCALLTYPE h9_PresentEx(IDirect3DDevice9Ex *d, const RECT *sr, const RECT *dr, HWND w, const RGNDATA *rg, DWORD fl)
 {
+    Dx9LogHit("device PresentEx", d, g_t9.dev);
     if (!Dx9OwnsDevice(d)) return o9_PresentEx(d, sr, dr, w, rg, fl);
+    g_9owned++;
     return SubmitGameFrame9([&]() -> HRESULT { t_in9Present++; HRESULT hr = o9_PresentEx(d, sr, dr, w, rg, fl); t_in9Present--; return hr; });
 }
 static HRESULT STDMETHODCALLTYPE h9_ScPresent(IDirect3DSwapChain9 *sc, const RECT *sr, const RECT *dr, HWND w, const RGNDATA *rg, DWORD fl)
 {
+    Dx9LogHit("swap chain Present", sc, g_t9.sc9);
     if (!Dx9OwnsSc(sc)) return o9_ScPresent(sc, sr, dr, w, rg, fl);
+    g_9owned++;
     return SubmitGameFrame9([&]() -> HRESULT { t_in9Present++; HRESULT hr = o9_ScPresent(sc, sr, dr, w, rg, fl); t_in9Present--; return hr; });
 }
 static void Dx9HookPresent(IDirect3DDevice9 *dev, IDirect3DSwapChain9 *sc9)
@@ -5286,6 +5306,29 @@ static void Dx9UnhookPresent()
     g_9vtDev = g_9vtSc = nullptr;
 }
 
+// ReShade's present event: a check that the game's Present reaches the
+// add-on's hooks (logged every 5 seconds while they don't).
+static void on_present9(reshade::api::command_queue *, reshade::api::swapchain *swapchain, const reshade::api::rect *,
+                        const reshade::api::rect *, uint32_t, const reshade::api::rect *)
+{
+    if (!g_dx9.load() || swapchain != g_t9.rsc) return;
+    static double last = 0.0;
+    static uint32_t lastOwned = 0;
+    g_9rsPresents++;
+    const double now = Now();
+    if (last == 0.0) { last = now; return; }
+    if (now - last < 5.0) return;
+    last = now;
+    const uint32_t owned = g_9owned.load();
+    if (owned != lastOwned) { lastOwned = owned; return; }
+    char m17[64] = "", m3[64] = "";
+    void **vt = *(void ***)g_t9.dev, **vs = *(void ***)g_t9.sc9;
+    ModuleOf(vt[17], m17, sizeof(m17));
+    ModuleOf(vs[3], m3, sizeof(m3));
+    LOGW("BFI Presenter: DX9: %u Presents seen by ReShade, %u reached the add-on, %u taken over; device Present slot %s (%s), "
+         "swap chain Present slot %s (%s)", g_9rsPresents.load(), g_9hits.load(), owned,
+         vt[17] == (void *)&h9_Present ? "is ours" : "is NOT ours", m17, vs[3] == (void *)&h9_ScPresent ? "is ours" : "is NOT ours", m3);
+}
 static void InitDx9(reshade::api::swapchain *swapchain)
 {
     ReleaseDx9();
