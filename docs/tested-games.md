@@ -21,7 +21,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-31 of 35 tested games run with BFI (four of them only without frame generation or a conflicting mod), five of them 32-bit. Two are partial, Jusant runs but isn't recommended, and Sifu hasn't been retested since DirectX 11 support arrived.
+32 of 36 tested games run with BFI (four of them only without frame generation or a conflicting mod), six of them 32-bit. Two are partial, Jusant runs but isn't recommended, and Sifu hasn't been retested since DirectX 11 support arrived.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -56,6 +56,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Silt | Working (DX11) | Not tested | v1.0.2 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
 | The Rogue Prince of Persia | Working (DX11) | Not tested | v1.0.2 | Borderless (windowed) fullscreen, not exclusive fullscreen: leaving exclusive fullscreen hung or crashed the presenter |
 | Alan Wake | Working (DX9, 32-bit) | — | v1.1.0 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+ (not DXVK: flickered); runs windowed |
+| Lara Croft and the Guardian of Light | Working (DX9, 32-bit) | — | v1.1.0 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+; runs windowed |
 | BAJA: Edge of Control HD | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade |
 | Twelve Minutes | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade for DirectX 11 -- not through DXVK (flickered) |
 | Burnout Paradise Remastered | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; works with the Luma HDR add-on |

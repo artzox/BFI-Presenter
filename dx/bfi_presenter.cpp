@@ -4737,8 +4737,17 @@ static HRESULT SubmitGameFrame11(IDXGISwapChain *sc, UINT sync, UINT flags)
             [&]() -> HRESULT { OwnCall own; return o_Present(sc, sync, flags); });
         if (g_running.load())
         {
+            // DXGI's own Present, past the overlay hooks (Steam, RTSS): the
+            // frame is never seen, and Steam's overlay crashed Wreckfest when
+            // it saw both the game's DX11 presents and the presenter's D3D12
+            // device.
             OwnCall own;
-            const HRESULT ph = o_Present(sc, 0, DXGI_PRESENT_DO_NOT_WAIT);
+            static PFN_Present direct = nullptr;
+            static void **forVt = nullptr;
+            void **vt = *(void ***)sc;
+            if (forVt != vt) { forVt = vt; direct = (PFN_Present)DirectSlot(vt, VT_Present); }
+            const HRESULT ph = (direct && direct != (PFN_Present)&hk_Present) ? direct(sc, 0, DXGI_PRESENT_DO_NOT_WAIT)
+                                                                                : o_Present(sc, 0, DXGI_PRESENT_DO_NOT_WAIT);
             static bool logged = false;
             if (!logged) { logged = true; LOGI("BFI Presenter: DX11: the game's own swap chain presents too (DX11GamePresent=1): 0x%08lX", (unsigned long)ph); }
         }
