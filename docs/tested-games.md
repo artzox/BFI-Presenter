@@ -21,7 +21,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-30 of 35 tested games run with BFI (four of them only without frame generation or a conflicting mod), four of them 32-bit. Two are partial, Jusant runs but isn't recommended, Sifu hasn't been retested since DirectX 11 support arrived, and Alan Wake (32-bit DirectX 9) has no working route yet.
+31 of 35 tested games run with BFI (four of them only without frame generation or a conflicting mod), five of them 32-bit. Two are partial, Jusant runs but isn't recommended, and Sifu hasn't been retested since DirectX 11 support arrived.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -55,7 +55,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Moons of Madness | Working (DX11) | Not tested | v1.0.2 | Holds a locked 120 fps, so the CRT shader's own BFI (decay) is the better fit; with the presenter use Half refresh + Lowest latency (Refresh + Smooth stutters) |
 | Silt | Working (DX11) | Not tested | v1.0.2 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
 | The Rogue Prince of Persia | Working (DX11) | Not tested | v1.0.2 | Borderless (windowed) fullscreen, not exclusive fullscreen: leaving exclusive fullscreen hung or crashed the presenter |
-| Alan Wake | Not working (DX9, 32-bit) | — | — | Through DXVK + the 32-bit Vulkan layer: BFI flickers (SDR), black screen (HDR10). No BFI route for 32-bit DX9 yet |
+| Alan Wake | Working (DX9, 32-bit) | — | v1.1.0 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+ (not DXVK: flickered); runs windowed |
 | BAJA: Edge of Control HD | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade |
 | Twelve Minutes | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade for DirectX 11 -- not through DXVK (flickered) |
 | Burnout Paradise Remastered | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; works with the Luma HDR add-on |
@@ -196,7 +196,9 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ### Alan Wake
 
-- 32-bit DirectX 9, so the only presenter route is DXVK (`d3d9.dll`) plus the 32-bit Vulkan layer. The game runs, but BFI flickers as in Twelve Minutes, with or without DXVK's `dxgi.dll` in the folder, and HDR10 output (`SdrToHdr`) gives a black screen. The CRT shader's decay flickers the same way through DXVK, so the cause is the DXVK route, not the layer. Without DXVK there's no BFI route either: CRT-Standalone doesn't run under ReShade's DirectX 9 path. No BFI for this game for now.
+- 32-bit DirectX 9. Works with `BFIPresenter.addon32` (v1.1.0) and the 32-bit ReShade 6.8 or newer, which creates the game's device as Direct3D 9Ex for the add-on. The game runs windowed (borderless at full size) even when set to fullscreen.
+- Before v1.1.0 the game showed "DEVICE_CREATE_ERROR - Invalid call" (9Ex in exclusive fullscreen) and then "D3DXCreateTextureFromFileInMemoryEx failed" (D3DX refusing managed textures on 9Ex); both are handled now.
+- Don't use DXVK + the 32-bit Vulkan layer: BFI flickered (SDR) or the screen stayed black (HDR10), and the CRT shader's decay flickered the same way through DXVK. CRT-Standalone doesn't compile under ReShade's DirectX 9 path; use the presenter's BFI.
 
 ### BAJA: Edge of Control HD
 
@@ -222,5 +224,5 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 - **Game hitches show as single flashes:** when the whole GPU stalls for 100 ms or more, no refresh can be presented on time. With the GPU at its limit, shorter stalls of one to four refreshes flash too (God of War Ragnarök, Indiana Jones). GPU headroom helps everywhere; in DirectX, a realtime presenter queue (launcher run as administrator) removed them.
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR). Games already at the limit can collapse in performance.
 - **Overlays:** the RTSS OSD and the Steam overlay don't draw on the strobed frames (their hooks are bypassed for the presenter's own presents since v0.34). Any RTSS or driver frame limiter must stay off.
-- **APIs:** Direct3D 12 and 11 through the add-on (64-bit; 32-bit Direct3D 11 with `BFIPresenter.addon32`). Vulkan through the Vulkan layer (64- and 32-bit), which also covers DirectX 9–11 games run through DXVK. OpenGL is untested.
+- **APIs:** Direct3D 12, 11 and 9 through the add-on (64-bit, and 32-bit Direct3D 11 and 9 with `BFIPresenter.addon32`; Direct3D 9 needs ReShade 6.8+). Vulkan through the Vulkan layer (64- and 32-bit), which also covers DirectX 9–11 games run through DXVK. OpenGL is untested.
 - **Below the cap's frame rate, motion is uneven.** The overlay warns when strobe cycles step unevenly for more than a moment and says whether the game is below the cap. At \~100 fps on 120 Hz, Half refresh with just-in-time release gives even motion.

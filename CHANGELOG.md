@@ -7,6 +7,15 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.1.0] — unreleased
+
+- **[DX] Direct3D 9 games.** The add-on now manages Direct3D 9 games (32- and 64-bit) through the same presenter as DX11 games. It asks ReShade (6.8 or newer) to create the game's device as Direct3D 9Ex, the only kind that can share its frames. Each finished frame (ReShade's effects applied) is copied into a texture shared with the add-on's own D3D11 device, then into the presenter's staging ring, and shown with the strobe through a window laid over the game's. The game's own Present is skipped. Tested: Alan Wake (32-bit).
+  - The game stays windowed (borderless at full size). Direct3D 9Ex can't take an exclusive-fullscreen device the way older games ask for one, and the presenter needs a window anyway.
+  - D3DX (`d3dx9_NN.dll`, used by most DX9 games to load textures) refuses managed-pool textures once it sees a 9Ex device. The add-on hides 9Ex from D3DX only; ReShade already handles managed textures on 9Ex.
+  - Direct3D 9 has no shared fences, so the game's thread waits on the CPU for each frame's copy (about 0.5–1.5 ms at 4K in Alan Wake).
+  - The Direct3D 9 runtime puts its own Present back into the device's vtable after the add-on hooks it; the hook is checked and restored before every Present.
+  - `DX9Support=0` leaves DX9 games alone. `DX9Ex=0` keeps a plain Direct3D 9 device (windowed, no BFI), and `DX9Diag=1` logs failing D3D9/D3DX calls for troubleshooting.
+
 ## [1.0.2] — 2026-10
 
 - **[DX] 32-bit games: `BFIPresenter.addon32`.** A 32-bit build of the DX add-on, for 32-bit Direct3D 11 games with the 32-bit ReShade (tested: Twelve Minutes, BAJA: Edge of Control HD, Burnout Paradise Remastered with the Luma HDR add-on, Dead Cells). The crash logger and watchdog walk 32-bit stacks; calls past other hooks relocate 32-bit code and read 32-bit DLLs' original vtables; per-thread flags use Windows' own TLS. For 32-bit DX11 games this is the route to use: DXVK + the 32-bit Vulkan layer flickered in Twelve Minutes and Alan Wake (known limit, see the Vulkan README).

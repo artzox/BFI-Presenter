@@ -1,4 +1,4 @@
-# BFI Presenter — DX add-on (Direct3D 12 and 11)
+# BFI Presenter — DX add-on (Direct3D 12, 11 and 9)
 
 Presenter-clocked black frame insertion (BFI) for PC games. The lit/dark strobe runs on the display's own refresh clock, not the game's. A late game frame becomes a repeated image (CRT-like stutter) instead of a lit or dark refresh held too long (a flash). It includes a just-in-time frame cap that keeps latency low and motion even, an ABL guard for OLED panels, and a rolling-scan mode.
 
@@ -8,13 +8,14 @@ The [Vulkan layer](../vulkan/README.md) covers Vulkan games and DirectX 9–11 g
 
 - **Direct3D 12:** the game and ReShade (including CRT-Standalone) render into stand-in back buffers. Each finished frame is copied into a ring of six staging images. A high-priority presenter thread waits for every vblank, picks a game frame, draws the strobe refresh from it, and presents.
 - **Direct3D 11:** the game keeps its own DX11 device (so DLSS and ReShade work as usual). Its frames are copied to shared textures, and the add-on's own D3D12 presenter shows them through a window laid over the game's. Use a borderless or windowed mode.
+- **Direct3D 9:** ReShade (6.8 or newer) creates the game's device as Direct3D 9Ex, which can share textures, and the game is kept windowed. Each frame is copied into a shared texture, picked up by the add-on's own D3D11 device and shown by the same presenter as DX11 games.
 - **The strobe:** each refresh is one sub-frame of the cycle (2 at 120 Hz: one lit, one dark). The shader applies gain in display light (SDR, scRGB or HDR10), BFI with highlight roll-off or the Variable MPRT brightness budget, dark floor, sine BFI, inverted cycle and rolling scan.
 - **Frame cap and release:** the presenter lets the game start each frame (through its frame-latency waitable and Present) on its own refresh clock. The game therefore runs exactly in step with the strobe. Just-in-time release times that so frames finish right before the refresh that shows them.
 
 ## Requirements
 
 - ReShade **6.4 or newer, the build with full add-on support** (tested on 6.8).
-- A **Direct3D 12 or Direct3D 11** game. 64-bit games use `BFIPresenter.addon64`; 32-bit Direct3D 11 games use `BFIPresenter.addon32` (with the 32-bit ReShade).
+- A **Direct3D 12, 11 or 9** game. 64-bit games use `BFIPresenter.addon64`; 32-bit games use `BFIPresenter.addon32` (with the 32-bit ReShade). Direct3D 9 needs ReShade 6.8 or newer.
 - **Fixed refresh (120 Hz), VRR off for the game** (G-SYNC off in its NVIDIA profile, or VRR off on the TV), unless the presenter holds 120 Hz on its own (the overlay warns when it doesn't).
 - **No frame limiter acting on the presenter:** RTSS limit 0 for BFI games, NVIDIA Max Frame Rate off (also in NVIDIA Profile Inspector).
 - **NVIDIA Vertical Sync:** "Use the 3D application setting" or Force on, never Force off or Fast Sync.
@@ -127,6 +128,9 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 | Key (default) | What it does |
 |---|---|
 | `DX11Support` (1) | Manage Direct3D 11 games through the add-on's own D3D12 presenter |
+| `DX9Support` (1) | Manage Direct3D 9 games: the device is created as 9Ex (ReShade 6.8+), kept windowed, and shown by the same presenter |
+| `DX9Ex` (1) | 0 = keep a plain Direct3D 9 device (windowed, no BFI); for checking whether 9Ex is what breaks a game |
+| `DX9Diag` (0) | 1 = log failing D3D9 and D3DX calls and resource creations to `ReShade.log` |
 | `PresenterQueuePriority` (2) | 0 normal, 1 high, 2 global realtime when Windows allows it (launcher run as administrator), otherwise high. Try 1 or 0 if a game hangs the GPU. Read at game start |
 | `ReuseDrawnBuffers` (1) | A refresh that would redraw the same frame with the same settings re-presents the buffer that already holds it: no GPU work, so a busy GPU can't hold up the strobe |
 | `StartBFIAfterGameResize` (1) | Every swap chain shows the game's own frames until its first resize, then BFI starts on the presenter's queue (0 deadlocked Pragmata) |
@@ -169,7 +173,9 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 - **A presenter that won't stop** (stuck in its present for 5 s while the game resizes or recreates its swap chain): BFI switches off for the rest of the session and the game continues on its own frames. Restart the game to use BFI again.
 - **NVIDIA Smooth Motion** (driver frame generation): turn it off for BFI games. The DX11 path stays off while it is active.
 - **Epic Online Services overlay** (`EOSOVH-Win64-Shipping.dll`, loaded by games that use EOS, also on Steam): it hooks Direct3D 12 and crashed the DX11 presenter in Silt, so the DX11 path stays off while it is loaded. `ReShade.log` names its path; rename the file to use BFI (`AllowEosOverlay=1` manages the game anyway).
-- **32-bit games:** `BFIPresenter.addon32` covers 32-bit Direct3D 11 games. Older 32-bit games (Direct3D 9) need DXVK + the 32-bit Vulkan layer; prefer the add-on wherever the game is Direct3D 11 (through DXVK, Twelve Minutes flickered).
+- **32-bit games:** `BFIPresenter.addon32` covers 32-bit Direct3D 11 and 9 games. Prefer it over DXVK + the 32-bit Vulkan layer (through DXVK, Twelve Minutes and Alan Wake flickered).
+- **Direct3D 9 games run windowed** (borderless at full size): 9Ex can't create the exclusive-fullscreen device older games ask for. A game that breaks on a 9Ex device can be checked with `DX9Ex=0`, and `DX9Diag=1` logs the failing calls. The game's thread waits on the CPU for each frame's copy (no shared fences in Direct3D 9): about 0.5–1.5 ms at 4K.
+- **CRT-Standalone doesn't compile under ReShade's Direct3D 9 path** (shader model 3 limits); the presenter's own BFI works there.
 
 ## Building
 
