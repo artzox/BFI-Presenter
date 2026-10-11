@@ -5207,10 +5207,22 @@ static void Dx9UnhideEx()
 typedef HRESULT (STDMETHODCALLTYPE *PFN9_Present)(IDirect3DDevice9 *, const RECT *, const RECT *, HWND, const RGNDATA *);
 typedef HRESULT (STDMETHODCALLTYPE *PFN9_PresentEx)(IDirect3DDevice9Ex *, const RECT *, const RECT *, HWND, const RGNDATA *, DWORD);
 typedef HRESULT (STDMETHODCALLTYPE *PFN9_ScPresent)(IDirect3DSwapChain9 *, const RECT *, const RECT *, HWND, const RGNDATA *, DWORD);
-static PFN9_Present   o9_Present = nullptr;
-static PFN9_PresentEx o9_PresentEx = nullptr;
 static PFN9_ScPresent o9_ScPresent = nullptr;
-static void **g_9vtDev = nullptr, **g_9vtSc = nullptr;
+static void **g_9vtSc = nullptr;
+// The runtime switches the device object between several vtables after it is
+// created (Alan Wake: the slot hooked at init was no longer the one in use a
+// few frames later). Every vtable seen gets hooked, each with its own
+// originals; ReShade's present event re-checks before each Present.
+struct Dx9DevVt { void **vt; PFN9_Present present; PFN9_PresentEx presentEx; };
+static Dx9DevVt g_9devVts[8];
+static int g_9devVtN = 0;
+static CRITICAL_SECTION g_9vtLock;
+static bool g_9vtLockInit = false;
+static const Dx9DevVt *Dx9FindVt(void **vt)
+{
+    for (int i = 0; i < g_9devVtN; i++) if (g_9devVts[i].vt == vt) return &g_9devVts[i];
+    return g_9devVtN ? &g_9devVts[0] : nullptr;
+}
 BFI_TLS(int, t_in9Present);                 // the runtime's Present may go through another of the hooked ones
 static std::atomic<bool> g_9firstLogged{false};
 
@@ -5263,6 +5275,7 @@ static bool Dx9OwnsDevice(void *dev) { return !t_in9Present && g_dx9.load() && g
 static bool Dx9OwnsSc(void *sc)      { return !t_in9Present && g_dx9.load() && g_active.load() && g_t9.ready && sc == (void *)g_t9.sc9; }
 static HRESULT STDMETHODCALLTYPE h9_Present(IDirect3DDevice9 *d, const RECT *sr, const RECT *dr, HWND w, const RGNDATA *rg)
 {
+    const PFN9_Present o9_Present = Dx9FindVt(*(void ***)d)->present;
     Dx9LogHit("device Present", d, g_t9.dev);
     if (!Dx9OwnsDevice(d)) return o9_Present(d, sr, dr, w, rg);
     g_9owned++;
@@ -5270,6 +5283,7 @@ static HRESULT STDMETHODCALLTYPE h9_Present(IDirect3DDevice9 *d, const RECT *sr,
 }
 static HRESULT STDMETHODCALLTYPE h9_PresentEx(IDirect3DDevice9Ex *d, const RECT *sr, const RECT *dr, HWND w, const RGNDATA *rg, DWORD fl)
 {
+    const PFN9_PresentEx o9_PresentEx = Dx9FindVt(*(void ***)d)->presentEx;
     Dx9LogHit("device PresentEx", d, g_t9.dev);
     if (!Dx9OwnsDevice(d)) return o9_PresentEx(d, sr, dr, w, rg, fl);
     g_9owned++;
@@ -5282,16 +5296,46 @@ static HRESULT STDMETHODCALLTYPE h9_ScPresent(IDirect3DSwapChain9 *sc, const REC
     g_9owned++;
     return SubmitGameFrame9([&]() -> HRESULT { t_in9Present++; HRESULT hr = o9_ScPresent(sc, sr, dr, w, rg, fl); t_in9Present--; return hr; });
 }
-static void Dx9HookPresent(IDirect3DDevice9 *dev, IDirect3DSwapChain9 *sc9)
+static void Dx9HookDeviceVt(IDirect3DDevice9 *dev)
 {
     void **vt = *(void ***)dev;
-    if (g_9vtDev != vt)
+    if (vt[17] == (void *)&h9_Present && vt[121] == (void *)&h9_PresentEx) return;
+    if (!g_9vtLockInit) { InitializeCriticalSection(&g_9vtLock); g_9vtLockInit = true; }
+    EnterCriticalSection(&g_9vtLock);
+    Dx9DevVt *e = nullptr;
+    for (int i = 0; i < g_9devVtN; i++) if (g_9devVts[i].vt == vt) e = &g_9devVts[i];
+    if (!e && g_9devVtN < 8)
     {
-        if (g_9vtDev) LOGW("BFI Presenter: DX9: the device uses a different vtable than the first one hooked");
-        g_9vtDev = vt;
-        PatchSlot(vt, 17,  (void *)&h9_Present,   (void **)&o9_Present);
-        PatchSlot(vt, 121, (void *)&h9_PresentEx, (void **)&o9_PresentEx);     // IDirect3DDevice9Ex::PresentEx
+        e = &g_9devVts[g_9devVtN];
+        e->vt = vt; e->present = nullptr; e->presentEx = nullptr;
+        char m[64];
+        ModuleOf(vt[17], m, sizeof(m));
+        LOGI("BFI Presenter: DX9: hooking device vtable %u (Present in %s)", (unsigned)g_9devVtN + 1, m);
     }
+    if (e)
+    {
+        DWORD old;
+        if (vt[17] != (void *)&h9_Present)
+        {
+            VirtualProtect(&vt[17], sizeof(void *), PAGE_EXECUTE_READWRITE, &old);
+            e->present = (PFN9_Present)vt[17];
+            vt[17] = (void *)&h9_Present;
+            VirtualProtect(&vt[17], sizeof(void *), old, &old);
+        }
+        if (vt[121] != (void *)&h9_PresentEx)
+        {
+            VirtualProtect(&vt[121], sizeof(void *), PAGE_EXECUTE_READWRITE, &old);
+            e->presentEx = (PFN9_PresentEx)vt[121];
+            vt[121] = (void *)&h9_PresentEx;
+            VirtualProtect(&vt[121], sizeof(void *), old, &old);
+        }
+        if (e == &g_9devVts[g_9devVtN]) g_9devVtN++;
+    }
+    LeaveCriticalSection(&g_9vtLock);
+}
+static void Dx9HookPresent(IDirect3DDevice9 *dev, IDirect3DSwapChain9 *sc9)
+{
+    Dx9HookDeviceVt(dev);
     void **vs = *(void ***)sc9;
     if (g_9vtSc != vs)
     {
@@ -5301,9 +5345,15 @@ static void Dx9HookPresent(IDirect3DDevice9 *dev, IDirect3DSwapChain9 *sc9)
 }
 static void Dx9UnhookPresent()
 {
-    if (g_9vtDev) { UnpatchSlot(g_9vtDev, 17, (void *)o9_Present, (void *)&h9_Present); UnpatchSlot(g_9vtDev, 121, (void *)o9_PresentEx, (void *)&h9_PresentEx); }
+    for (int i = 0; i < g_9devVtN; i++)
+    {
+        Dx9DevVt &e = g_9devVts[i];
+        if (e.present)   UnpatchSlot(e.vt, 17,  (void *)e.present,   (void *)&h9_Present);
+        if (e.presentEx) UnpatchSlot(e.vt, 121, (void *)e.presentEx, (void *)&h9_PresentEx);
+    }
+    g_9devVtN = 0;
     if (g_9vtSc) UnpatchSlot(g_9vtSc, 3, (void *)o9_ScPresent, (void *)&h9_ScPresent);
-    g_9vtDev = g_9vtSc = nullptr;
+    g_9vtSc = nullptr;
 }
 
 // ReShade's present event: a check that the game's Present reaches the
@@ -5312,6 +5362,7 @@ static void on_present9(reshade::api::command_queue *, reshade::api::swapchain *
                         const reshade::api::rect *, uint32_t, const reshade::api::rect *)
 {
     if (!g_dx9.load() || swapchain != g_t9.rsc) return;
+    Dx9HookDeviceVt(g_t9.dev);                  // the runtime may have switched the device's vtable
     static double last = 0.0;
     static uint32_t lastOwned = 0;
     g_9rsPresents++;
