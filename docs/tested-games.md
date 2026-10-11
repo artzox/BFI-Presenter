@@ -21,7 +21,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-30 of 34 tested games run with BFI (four of them only without frame generation or a conflicting mod), four of them 32-bit. Two are partial, Jusant runs but isn't recommended, and Sifu hasn't been retested since DirectX 11 support arrived.
+30 of 35 tested games run with BFI (four of them only without frame generation or a conflicting mod), four of them 32-bit. Two are partial, Jusant runs but isn't recommended, Sifu hasn't been retested since DirectX 11 support arrived, and Alan Wake (32-bit DirectX 9) has no working route yet.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -55,6 +55,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Moons of Madness | Working (DX11) | Not tested | v1.0.2 | Holds a locked 120 fps, so the CRT shader's own BFI (decay) is the better fit; with the presenter use Half refresh + Lowest latency (Refresh + Smooth stutters) |
 | Silt | Working (DX11) | Not tested | v1.0.2 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
 | The Rogue Prince of Persia | Working (DX11) | Not tested | v1.0.2 | Borderless (windowed) fullscreen, not exclusive fullscreen: leaving exclusive fullscreen hung or crashed the presenter |
+| Alan Wake | Not working (DX9, 32-bit) | — | — | Through DXVK + the 32-bit Vulkan layer: BFI flickers (SDR), black screen (HDR10). No presenter route for 32-bit DX9 yet |
 | BAJA: Edge of Control HD | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade |
 | Twelve Minutes | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade for DirectX 11 -- not through DXVK (flickered) |
 | Burnout Paradise Remastered | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; works with the Luma HDR add-on |
@@ -192,6 +193,10 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 - DirectX 11. **Set the display mode to borderless (windowed) fullscreen.** In exclusive fullscreen the game switches to windowed and recreates its swap chain; the presenter got stuck in its present at that moment, which first hung the game and then (v1.0.2 test build) crashed it. Borderless works.
 - Since v1.0.2, if the presenter gets stuck like this in any game, BFI switches off for the rest of the session and the game continues; the overlay says so. Restart the game to use BFI.
+
+### Alan Wake
+
+- 32-bit DirectX 9, so the only route is DXVK (`d3d9.dll`) plus the 32-bit Vulkan layer. The game runs, but BFI flickers as in Twelve Minutes, with or without DXVK's `dxgi.dll` in the folder, and HDR10 output (`SdrToHdr`) gives a black screen. Use the CRT shader's own BFI here for now.
 
 ### BAJA: Edge of Control HD
 

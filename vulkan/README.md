@@ -100,6 +100,7 @@ Environment variable `DISABLE_BFI_PRESENTER_VK=1` turns the layer off for anythi
 
 - **Games run as administrator** don't load per-user Vulkan layers (a Vulkan loader rule), so the layer won't load there.
 - **Anti-cheat games** may refuse unknown Vulkan layers.
+- **32-bit games through DXVK don't work properly yet.** In Twelve Minutes (DX11) and Alan Wake (DX9) the strobe flickered as if the display showed some refreshes twice, even though the presenter's timing log was clean; HDR10 output gave a black screen (Alan Wake) or froze the game (Twelve Minutes). For 32-bit Direct3D 11 games use the DX add-on's `BFIPresenter.addon32` instead; 32-bit Direct3D 9 games have no presenter route for now (the CRT shader's own BFI is the fallback).
 - **GPU-heavy games** can still flash when the GPU is saturated (Indiana Jones). Give the GPU headroom, raise the dark floor slightly, or try `QueueAhead=1`.
 - **Not yet in the Vulkan layer:** the VRR warning (Vulkan has no frame statistics to drive it), the crash and hang loggers, and realtime GPU priority for the presenter queue.
 
