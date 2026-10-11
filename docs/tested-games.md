@@ -21,7 +21,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-21 of 25 tested games run with BFI (four of them only without frame generation or a conflicting mod). Two are partial, Sifu hasn't been retested since DirectX 11 support arrived, and one 32-bit game doesn't load the presenter.
+30 of 34 tested games run with BFI (four of them only without frame generation or a conflicting mod), four of them 32-bit. Two are partial, Jusant runs but isn't recommended, and Sifu hasn't been retested since DirectX 11 support arrived.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -55,7 +55,10 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Moons of Madness | Working (DX11) | Not tested | v1.0.2 | Holds a locked 120 fps, so the CRT shader's own BFI (decay) is the better fit; with the presenter use Half refresh + Lowest latency (Refresh + Smooth stutters) |
 | Silt | Working (DX11) | Not tested | v1.0.2 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
 | The Rogue Prince of Persia | Working (DX11) | Not tested | v1.0.2 | Borderless (windowed) fullscreen, not exclusive fullscreen: leaving exclusive fullscreen hung or crashed the presenter |
-| BAJA: Edge of Control HD | Not supported | — | — | 32-bit game: the add-on doesn't load (try DXVK + the 32-bit Vulkan layer) |
+| BAJA: Edge of Control HD | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade |
+| Twelve Minutes | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade for DirectX 11 -- not through DXVK (flickered) |
+| Burnout Paradise Remastered | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; works with the Luma HDR add-on |
+| Dead Cells | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with ReShade 6.8 (6.5.1 with the Steam overlay crashed at start) |
 
 ## Per-game notes
 
@@ -192,7 +195,20 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ### BAJA: Edge of Control HD
 
-- 32-bit game: the 64-bit add-on can't load. Untested route: DXVK plus the 32-bit Vulkan layer.
+- 32-bit DirectX 11: works with `BFIPresenter.addon32` (v1.0.2) and the 32-bit ReShade.
+
+### Twelve Minutes
+
+- 32-bit Unity game on DirectX 11. Use `BFIPresenter.addon32` with the 32-bit ReShade installed for DirectX 10/11/12.
+- Through DXVK and the 32-bit Vulkan layer it first froze (fixed in v1.0.2: present fences, kernel vblank) and then flickered with BFI and even with the CRT shader's decay alone; frames did not reach the screen one per refresh. Don't use DXVK for this game.
+
+### Burnout Paradise Remastered
+
+- 32-bit DirectX 11. Works with `BFIPresenter.addon32`, also together with the Luma HDR add-on (an earlier v1.0.2 test build hung when Luma set the HDR colour space).
+
+### Dead Cells
+
+- 32-bit DirectX 11. With ReShade 6.5.1 the game crashed at start (a stack overflow inside the Steam overlay); it works with ReShade 6.8.
 
 ## Known issues across games
 
@@ -201,5 +217,5 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 - **Game hitches show as single flashes:** when the whole GPU stalls for 100 ms or more, no refresh can be presented on time. With the GPU at its limit, shorter stalls of one to four refreshes flash too (God of War Ragnarök, Indiana Jones). GPU headroom helps everywhere; in DirectX, a realtime presenter queue (launcher run as administrator) removed them.
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR). Games already at the limit can collapse in performance.
 - **Overlays:** the RTSS OSD and the Steam overlay don't draw on the strobed frames (their hooks are bypassed for the presenter's own presents since v0.34). Any RTSS or driver frame limiter must stay off.
-- **APIs:** Direct3D 12 and 11 through the add-on (64-bit). Vulkan through the Vulkan layer (64- and 32-bit), which also covers DirectX 9–11 games run through DXVK. OpenGL is untested.
+- **APIs:** Direct3D 12 and 11 through the add-on (64-bit; 32-bit Direct3D 11 with `BFIPresenter.addon32`). Vulkan through the Vulkan layer (64- and 32-bit), which also covers DirectX 9–11 games run through DXVK. OpenGL is untested.
 - **Below the cap's frame rate, motion is uneven.** The overlay warns when strobe cycles step unevenly for more than a moment and says whether the game is below the cap. At \~100 fps on 120 Hz, Half refresh with just-in-time release gives even motion.

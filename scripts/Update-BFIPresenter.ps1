@@ -1,7 +1,7 @@
 <#
   Update-BFIPresenter.ps1  --  copies a new BFI Presenter build into every game folder that has it.
 
-  Reads BFIPresenter_locations.txt (made by Find-BFIPresenter.ps1) and replaces BFIPresenter.addon64
+  Reads BFIPresenter_locations.txt (made by Find-BFIPresenter.ps1) and replaces BFIPresenter.addon64 / .addon32
   in each listed folder. If the source also has the Vulkan layer, the installed layer is updated too.
   BFIPresenter.ini files are never touched (your per-game settings stay as they are).
 
@@ -9,7 +9,7 @@
            (the files directly in it, or in its BFIPresenter / BFIPresenterVK subfolders).
            Default: the folder this script is in.
   -DryRun  only show what would change.
-  -Backup  keep the old add-on as BFIPresenter.addon64.bak in each folder.
+  -Backup  keep the old add-on as BFIPresenter.addon64.bak (or .addon32.bak) in each folder.
 
   Run:  powershell -ExecutionPolicy Bypass -File .\Update-BFIPresenter.ps1 -DryRun
         powershell -ExecutionPolicy Bypass -File .\Update-BFIPresenter.ps1 -Source "D:\BFIPresenter_dev\latest"
@@ -43,43 +43,52 @@ function Find-InSource([string]$name, [string]$sub) {
 }
 function Get-Hash([string]$file) { (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash }
 
-$newAddon = Find-InSource 'BFIPresenter.addon64' 'BFIPresenter'
-$newVk64  = Find-InSource 'BFIPresenterVK.dll' 'BFIPresenterVK'
-if (-not $newAddon -and -not $newVk64) {
-    Write-Host "No BFIPresenter.addon64 or BFIPresenterVK.dll found in $Source (or its BFIPresenter / BFIPresenterVK subfolders)." -ForegroundColor Red
+$newAddon   = Find-InSource 'BFIPresenter.addon64' 'BFIPresenter'
+$newAddon32 = Find-InSource 'BFIPresenter.addon32' 'BFIPresenter'
+$newVk64    = Find-InSource 'BFIPresenterVK.dll' 'BFIPresenterVK'
+if (-not $newAddon -and -not $newAddon32 -and -not $newVk64) {
+    Write-Host "No BFIPresenter.addon64 / .addon32 or BFIPresenterVK.dll found in $Source (or its BFIPresenter / BFIPresenterVK subfolders)." -ForegroundColor Red
     exit 1
 }
 if ($DryRun) { Write-Host 'Dry run: nothing will be changed.' -ForegroundColor Yellow }
 
 $updated = 0; $current = 0; $failed = 0; $missing = 0
 
-# ---- DX add-on in every listed game folder
-if ($newAddon) {
+# ---- DX add-on (64- and 32-bit) in every listed game folder
+if ($newAddon -or $newAddon32) {
     if (-not (Test-Path -LiteralPath $ListFile)) {
         Write-Host "$ListFile not found -- run Find-BFIPresenter.ps1 first." -ForegroundColor Red
         exit 1
     }
-    $newVer  = Get-BfiVersion $newAddon
-    $newHash = Get-Hash $newAddon
-    Write-Host ("DX add-on: v{0} from {1}" -f $newVer, $newAddon) -ForegroundColor Cyan
+    $kinds = @()
+    if ($newAddon)   { $kinds += ,@('BFIPresenter.addon64', $newAddon) }
+    if ($newAddon32) { $kinds += ,@('BFIPresenter.addon32', $newAddon32) }
+    foreach ($k in $kinds) { Write-Host ("DX add-on: v{0} from {1}" -f (Get-BfiVersion $k[1]), $k[1]) -ForegroundColor Cyan }
     $folders = Get-Content -LiteralPath $ListFile | Where-Object { $_.Trim() -ne '' }
     foreach ($dir in $folders) {
-        $dst = [System.IO.Path]::Combine($dir, 'BFIPresenter.addon64')
-        if (-not (Test-Path -LiteralPath $dst)) {
-            Write-Host "  missing   $dir  (no add-on there any more -- re-run Find-BFIPresenter.ps1)" -ForegroundColor DarkYellow
-            $missing++; continue
+        $any = $false
+        foreach ($k in $kinds) {
+            $dst = [System.IO.Path]::Combine($dir, $k[0])
+            if (-not (Test-Path -LiteralPath $dst)) { continue }
+            $any = $true
+            $newHash = Get-Hash $k[1]
+            if ((Get-Hash $dst) -eq $newHash) { Write-Host "  current   $dir  ($($k[0]))"; $current++; continue }
+            $oldVer = Get-BfiVersion $dst
+            $newVer = Get-BfiVersion $k[1]
+            if ($DryRun) { Write-Host ("  would update {0} -> {1}  {2}  ({3})" -f (Format-Ver $oldVer), (Format-Ver $newVer), $dir, $k[0]) -ForegroundColor Green; $updated++; continue }
+            try {
+                if ($Backup) { Copy-Item -LiteralPath $dst -Destination ($dst + '.bak') -Force -ErrorAction Stop }
+                Copy-Item -LiteralPath $k[1] -Destination $dst -Force -ErrorAction Stop
+                Write-Host ("  updated   {0} -> {1}  {2}  ({3})" -f (Format-Ver $oldVer), (Format-Ver $newVer), $dir, $k[0]) -ForegroundColor Green
+                $updated++
+            } catch {
+                Write-Host "  FAILED    $dir  ($($_.Exception.Message) -- is the game running?)" -ForegroundColor Red
+                $failed++
+            }
         }
-        if ((Get-Hash $dst) -eq $newHash) { Write-Host "  current   $dir"; $current++; continue }
-        $oldVer = Get-BfiVersion $dst
-        if ($DryRun) { Write-Host ("  would update {0} -> {1}  {2}" -f (Format-Ver $oldVer), (Format-Ver $newVer), $dir) -ForegroundColor Green; $updated++; continue }
-        try {
-            if ($Backup) { Copy-Item -LiteralPath $dst -Destination ($dst + '.bak') -Force -ErrorAction Stop }
-            Copy-Item -LiteralPath $newAddon -Destination $dst -Force -ErrorAction Stop
-            Write-Host ("  updated   {0} -> {1}  {2}" -f (Format-Ver $oldVer), (Format-Ver $newVer), $dir) -ForegroundColor Green
-            $updated++
-        } catch {
-            Write-Host "  FAILED    $dir  ($($_.Exception.Message) -- is the game running?)" -ForegroundColor Red
-            $failed++
+        if (-not $any) {
+            Write-Host "  missing   $dir  (no add-on there any more -- re-run Find-BFIPresenter.ps1)" -ForegroundColor DarkYellow
+            $missing++
         }
     }
 }

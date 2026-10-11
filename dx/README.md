@@ -14,7 +14,7 @@ The [Vulkan layer](../vulkan/README.md) covers Vulkan games and DirectX 9–11 g
 ## Requirements
 
 - ReShade **6.4 or newer, the build with full add-on support** (tested on 6.8).
-- A 64-bit **Direct3D 12 or Direct3D 11** game. 32-bit games need the Vulkan layer through DXVK.
+- A **Direct3D 12 or Direct3D 11** game. 64-bit games use `BFIPresenter.addon64`; 32-bit Direct3D 11 games use `BFIPresenter.addon32` (with the 32-bit ReShade).
 - **Fixed refresh (120 Hz), VRR off for the game** (G-SYNC off in its NVIDIA profile, or VRR off on the TV), unless the presenter holds 120 Hz on its own (the overlay warns when it doesn't).
 - **No frame limiter acting on the presenter:** RTSS limit 0 for BFI games, NVIDIA Max Frame Rate off (also in NVIDIA Profile Inspector).
 - **NVIDIA Vertical Sync:** "Use the 3D application setting" or Force on, never Force off or Fast Sync.
@@ -22,14 +22,14 @@ The [Vulkan layer](../vulkan/README.md) covers Vulkan games and DirectX 9–11 g
 
 ## Install, update, uninstall
 
-1. Copy `BFIPresenter.addon64` into the game folder, next to ReShade's DLL. It creates `BFIPresenter.ini` there on first start (`BFIPresenter.example.ini` explains every setting).
+1. Copy `BFIPresenter.addon64` (64-bit game) or `BFIPresenter.addon32` (32-bit game) into the game folder, next to ReShade's DLL. It creates `BFIPresenter.ini` there on first start (`BFIPresenter.example.ini` explains every setting).
 2. In CRT-Standalone set **`ENABLE_DECAY=0`**. The add-on does the BFI; leaving both on doubles it.
 3. Start the game and open the ReShade overlay. The **BFI Presenter** tab shows the version, whether the swap chain is managed (and why not, if it isn't), and live timing.
 4. BFI starts at the game's first swap-chain resize (nearly all games resize at start-up). If it doesn't start, change resolution or display mode once.
 
 **Updating many games:** `Find-BFIPresenter.ps1` lists every game folder with the add-on (and its version) into `BFIPresenter_locations.txt`. `Update-BFIPresenter.ps1 -Source <folder with the new build>` copies the new add-on into all of them; `-DryRun` previews, `-Backup` keeps `.bak` copies. Neither script touches your `BFIPresenter.ini` files.
 
-**Uninstall:** delete `BFIPresenter.addon64` (and the ini) from the game folder.
+**Uninstall:** delete `BFIPresenter.addon64` / `.addon32` (and the ini) from the game folder.
 
 ## Recommended setups
 
@@ -169,11 +169,11 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 - **A presenter that won't stop** (stuck in its present for 5 s while the game resizes or recreates its swap chain): BFI switches off for the rest of the session and the game continues on its own frames. Restart the game to use BFI again.
 - **NVIDIA Smooth Motion** (driver frame generation): turn it off for BFI games. The DX11 path stays off while it is active.
 - **Epic Online Services overlay** (`EOSOVH-Win64-Shipping.dll`, loaded by games that use EOS, also on Steam): it hooks Direct3D 12 and crashed the DX11 presenter in Silt, so the DX11 path stays off while it is loaded. `ReShade.log` names its path; rename the file to use BFI (`AllowEosOverlay=1` manages the game anyway).
-- 32-bit games: not supported by the add-on (use DXVK + the 32-bit Vulkan layer).
+- **32-bit games:** `BFIPresenter.addon32` covers 32-bit Direct3D 11 games. Older 32-bit games (Direct3D 9) need DXVK + the 32-bit Vulkan layer; prefer the add-on wherever the game is Direct3D 11 (through DXVK, Twelve Minutes flickered).
 
 ## Building
 
 - **MinGW-w64** (Linux, WSL or MSYS2): run `./build_mingw.sh` in this folder.
 - **Visual Studio:** open "x64 Native Tools Command Prompt for VS" in this folder and run `build_msvc.bat`.
 
-Both write `BFIPresenter.addon64` here. Headers come from `../third_party/reshade/include` (ReShade add-on and Dear ImGui headers); see [third_party](../third_party/README.md).
+Both write `BFIPresenter.addon64` here; `build_mingw.sh` also builds `BFIPresenter.addon32`. Headers come from `../third_party/reshade/include` (ReShade add-on and Dear ImGui headers); see [third_party](../third_party/README.md).

@@ -15,7 +15,7 @@ Each [release](../../releases) has two packages with the same version number:
 
 | Package | For | What's in it |
 |---|---|---|
-| `BFIPresenter-DX-v<version>.zip` | **Direct3D 12 and Direct3D 11** games (64-bit) | `BFIPresenter.addon64` (a ReShade add-on), example ini, update scripts |
+| `BFIPresenter-DX-v<version>.zip` | **Direct3D 12 and Direct3D 11** games: 64-bit, and 32-bit Direct3D 11 | `BFIPresenter.addon64` / `BFIPresenter.addon32` (ReShade add-ons), example ini, update scripts |
 | `BFIPresenter-Vulkan-v<version>.zip` | **Vulkan** games, emulators (PCSX2, RPCS3, shadPS4…), and **DirectX 8–11** games run through [DXVK](https://github.com/doitsujin/dxvk) — 64- and 32-bit | `BFIPresenterVK.dll` / `BFIPresenterVK32.dll` (a Vulkan layer), installer, a ready `BFIPresenter.ini` to copy into games |
 
 Both read the same `BFIPresenter.ini` with the same keys, so one ini works for either.
@@ -31,7 +31,7 @@ Both read the same `BFIPresenter.ini` with the same keys, so one ini works for e
 
 **DX games**
 
-1. Copy `BFIPresenter.addon64` into the game folder, next to ReShade's DLL.
+1. Copy `BFIPresenter.addon64` into the game folder, next to ReShade's DLL (`BFIPresenter.addon32` for a 32-bit game, with the 32-bit ReShade).
 2. The add-on creates `BFIPresenter.ini` next to itself on first start. (`BFIPresenter.example.ini` explains every setting.)
 3. Start the game and open the ReShade overlay: the **BFI Presenter** tab shows the status and all settings. BFI starts at the game's first swap-chain resize; if it doesn't, change resolution or display mode once.
 
