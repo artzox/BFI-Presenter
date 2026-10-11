@@ -1373,6 +1373,7 @@ struct Constants
 // whole screen were lit, rolling or not.
 static double AblAvgAt(const float *cells, double C, bool rolling, int frames, bool mprt)
 {
+    if (frames < 2) frames = 2;          // BFI off: a measurement taken while it was on
     if (!rolling || frames < 2)
     {
         double a = 0.0;
@@ -2027,6 +2028,11 @@ static DWORD WINAPI PresenterThread(void *)
 
         EnterCriticalSection(&g_cfgLock);
         s = g_shared;
+        // BFI off: a plain presenter, a new game frame every refresh. Kept at
+        // the strobe's cycle, every second frame of a 120 fps game was dropped
+        // and each shown twice (60 Hz motion), which also made a CRT shader's
+        // own BFI flicker (Twelve Minutes, Vulkan layer).
+        if (!s.enabled) s.frames = 1;
         // Release the game's frame-latency slot when the frame is handed
         // over (not when the strobe takes it) in Lowest latency, and also
         // whenever a Half/Quarter cap already paces the game to the strobe:

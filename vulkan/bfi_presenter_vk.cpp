@@ -516,6 +516,7 @@ struct Constants
 // whole screen were lit, rolling or not.
 static double AblAvgAt(const float *cells, double C, bool rolling, int frames, bool mprt)
 {
+    if (frames < 2) frames = 2;          // BFI off: a measurement taken while it was on
     if (!rolling || frames < 2)
     {
         double a = 0.0;
@@ -1282,6 +1283,11 @@ static void PresenterThread(Swapchain *sc)
             std::lock_guard<std::mutex> l(g_cfgLock);
             s = g_shared;
         }
+        // BFI off: a plain presenter, a new game frame every refresh. Kept at
+        // the strobe's cycle, every second frame of a 120 fps game was dropped
+        // and each shown twice (60 Hz motion), which also made a CRT shader's
+        // own BFI flicker (Twelve Minutes).
+        if (!s.enabled) s.frames = 1;
 
         // timing log: a new time-stamped file each time it is switched on
         if (s.log && !logf)
@@ -2661,6 +2667,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateSwapchainKHR(VkDevice device, co
         FilterSwapchainChain(ci->pNext, c2, false);
         rci.pNext = c2.head;
         r = d->CreateSwapchainKHR(device, &rci, alloc, &real);
+    }
+    if (r == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR)
+    {
+        // An earlier swap chain of ours still holds the window (the game made
+        // a new one without passing the old as oldSwapchain): retire it.
+        Swapchain *prev = nullptr;
+        {
+            std::lock_guard<std::mutex> l(g_mapLock);
+            for (auto &kv : g_swapchains)
+                if (kv.second->surface == ci->surface && kv.second != old && kv.second->d == d) { prev = kv.second; break; }
+        }
+        if (prev)
+        {
+            prev->retired.store(true);
+            StopPresenter(prev);
+            rci.oldSwapchain = prev->real;
+            r = d->CreateSwapchainKHR(device, &rci, alloc, &real);
+            LOGI("BFI Presenter: the window was still held by the previous swap chain -- retired it (%d)", (int)r);
+        }
     }
     if (r != VK_SUCCESS)
     {
