@@ -709,6 +709,27 @@ static const char *OutName(int t)
     return (t >= 0 && t <= 5) ? k[t] : "?";
 }
 
+// DXVK's dxgi.dll / d3d11.dll in the game's folder (or loaded from outside
+// the system folder): the game runs through DXVK.
+static bool DxvkInProcess()
+{
+#ifdef _WIN32
+    wchar_t sys[MAX_PATH] = {}, exe[MAX_PATH] = {};
+    GetSystemDirectoryW(sys, MAX_PATH);
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (wchar_t *bs = wcsrchr(exe, L'\\')) bs[1] = 0;
+    for (const wchar_t *dll : { L"dxgi.dll", L"d3d11.dll" })
+    {
+        std::wstring f = std::wstring(exe) + dll;
+        if (GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+        HMODULE m = GetModuleHandleW(dll);
+        wchar_t path[MAX_PATH] = {};
+        if (m && GetModuleFileNameW(m, path, MAX_PATH) && _wcsnicmp(path, sys, wcslen(sys)) != 0) return true;
+    }
+#endif
+    return false;
+}
+
 // ---------------------------------------------------------------- vblank
 struct VBlank
 {
@@ -2593,10 +2614,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateSwapchainKHR(VkDevice device, co
     // boosted above SDR white (BFI needs the headroom; in SDR the boost is
     // clipped and Variable MPRT spills it all into the dark refresh).
     bool upgrade = false;
+    // Not in DXVK games: an HDR10 swap chain makes the NVIDIA driver present
+    // through DXGI / D3D11, which in that process are DXVK's own DLLs -- the
+    // presenter's first present never returned (Twelve Minutes).
+    static const bool dxvk = DxvkInProcess();
+    if (dxvk && s.sdrToHdr && ci->imageColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+    {
+        static bool logged = false;
+        if (!logged) { logged = true; LOGI("BFI Presenter: DXVK game -- SDR stays SDR (SdrToHdr is not used with DXVK); use Gain 0.5 or Variable MPRT"); }
+    }
     const VkFormat gf = ci->imageFormat;
     const bool sdrFmt = gf == VK_FORMAT_B8G8R8A8_UNORM || gf == VK_FORMAT_R8G8B8A8_UNORM || gf == VK_FORMAT_B8G8R8A8_SRGB ||
                         gf == VK_FORMAT_R8G8B8A8_SRGB || gf == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || gf == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-    if (s.sdrToHdr && ci->imageColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR && sdrFmt && g_colorspaceExt.load() &&
+    if (!dxvk && s.sdrToHdr && ci->imageColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR && sdrFmt && g_colorspaceExt.load() &&
         inst->GetPhysicalDeviceSurfaceFormatsKHR)
     {
         uint32_t nf = 0;

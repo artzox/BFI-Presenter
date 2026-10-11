@@ -55,7 +55,7 @@ Don't put the DX add-on (`BFIPresenter.addon64`) in Vulkan game folders. It does
 Notes:
 
 - **Leave frame limiting off in DXVK** (no `dxgi.maxFrameRate` / `d3d9.maxFrameRate`) and in the game. Use the presenter's frame cap.
-- **SDR games are presented as HDR10** when Windows HDR is on (see `SdrToHdr` below).
+- **SDR games stay SDR under DXVK.** `SdrToHdr` is skipped there: an HDR10 swap chain makes the NVIDIA driver present through DXGI, which in a DXVK game is DXVK's own `dxgi.dll`, and the presenter hung. Use Gain 0.5 or Variable MPRT. (A game's own HDR through DXVK, `dxgi.enableHDR`, is untested.)
 - **Online games with anti-cheat may refuse DXVK.**
 - **OpenGL games aren't covered.** There is no DXVK-style path to Vulkan on Windows for them.
 
@@ -88,7 +88,7 @@ All other keys are shared with the DX add-on; see the comments in `BFIPresenter.
 |---|---|---|
 | `VulkanLayer` | 1 | 0 = the layer stays off in this game even though the ini is there |
 | `VulkanOwnQueue` | 1 | 0 = the presenter shares the game's queue (locked) instead of its own |
-| `SdrToHdr` | 1 | SDR games are presented as HDR10 when the display offers it (Windows HDR on), so the lit refresh has headroom. 0 = plain SDR (use Gain 0.5 then) |
+| `SdrToHdr` | 1 | SDR games are presented as HDR10 when the display offers it (Windows HDR on), so the lit refresh has headroom. 0 = plain SDR (use Gain 0.5 then). Not used in DXVK games (it hangs the NVIDIA driver's present there); they stay SDR |
 | `SdrWhiteNits` | 200 | Brightness of SDR white in that mode (Windows: 80 + 4 × the SDR content brightness slider) |
 | `SdrHighlightNits` | 800 | SDR highlights stretch toward this; 0 = no expansion |
 | `SdrHighlightKnee` | 0.65 | SDR signal level where the expansion starts |
