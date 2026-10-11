@@ -3401,6 +3401,49 @@ static bool OriginalCodeBytes(const void *fn, BYTE *out, size_t n)
                 pos.QuadPart = (LONGLONG)(sec->PointerToRawData + (rva - sec->VirtualAddress));
                 if (SetFilePointerEx(fh, pos, nullptr, FILE_BEGIN) && ReadFile(fh, out, (DWORD)n, &rd, nullptr) && rd == n)
                     ok = true;
+#ifndef _WIN64
+                // x86 code holds absolute addresses: apply the module's base
+                // relocations, or a DLL loaded away from its preferred base
+                // (BFI Presenter itself under 32-bit ReShade) looks "hooked"
+                // everywhere and the copied code reads the wrong addresses.
+                if (ok)
+                {
+                    const IMAGE_NT_HEADERS32 *nt32 = (const IMAGE_NT_HEADERS32 *)(hdr + dos->e_lfanew);
+                    const DWORD delta = (DWORD)(uintptr_t)m - nt32->OptionalHeader.ImageBase;
+                    const IMAGE_NT_HEADERS32 *mem = (const IMAGE_NT_HEADERS32 *)((const BYTE *)m + ((const IMAGE_DOS_HEADER *)m)->e_lfanew);
+                    const IMAGE_DATA_DIRECTORY &rd5 = mem->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+                    if (delta && rd5.VirtualAddress && rd5.Size)
+                    {
+                        const BYTE *p = (const BYTE *)m + rd5.VirtualAddress, *end = p + rd5.Size;
+                        while (p + 8 <= end)
+                        {
+                            const IMAGE_BASE_RELOCATION *b = (const IMAGE_BASE_RELOCATION *)p;
+                            if (b->SizeOfBlock < 8) break;
+                            if (b->VirtualAddress + 0x1000 + 4 > rva && b->VirtualAddress < rva + n)
+                            {
+                                const WORD *e = (const WORD *)(p + 8);
+                                for (DWORD k = 0; k < (b->SizeOfBlock - 8) / 2; k++)
+                                {
+                                    if ((e[k] >> 12) != IMAGE_REL_BASED_HIGHLOW) continue;
+                                    const DWORD at = b->VirtualAddress + (e[k] & 0xFFF);
+                                    if (at + 4 <= rva || at >= rva + n) continue;
+                                    if (at >= rva && at + 4 <= rva + n)
+                                    {
+                                        DWORD val;
+                                        memcpy(&val, out + (at - rva), 4);
+                                        val += delta;
+                                        memcpy(out + (at - rva), &val, 4);
+                                    }
+                                    else                                 // straddles the window edge: take those bytes as loaded
+                                        for (DWORD r = at; r < at + 4; r++)
+                                            if (r >= rva && r < rva + n) out[r - rva] = ((const BYTE *)m)[r];
+                                }
+                            }
+                            p += b->SizeOfBlock;
+                        }
+                    }
+                }
+#endif
                 break;
             }
         }
@@ -3509,6 +3552,14 @@ static int InsnLength(const BYTE *p, int *ripDisp)
 // nullptr if the original start can't be relocated safely.
 static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
 {
+    {
+        // One of our own hooks (the vtable's pristine entry was not found):
+        // nothing to bypass.
+        HMODULE self = nullptr, tm = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&MakeUnhookedEntry, &self);
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)target, &tm);
+        if (target && self && tm == self) { snprintf(why, whyLen, "own hook"); return target; }
+    }
     BYTE orig[64];
     if (!target || !OriginalCodeBytes(target, orig, sizeof(orig))) { snprintf(why, whyLen, "original bytes unavailable"); return nullptr; }
     const BYTE *code = (const BYTE *)target;
