@@ -15,13 +15,13 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 - **[DX] Epic Online Services overlay is detected.** `EOSOVH-Win64-Shipping.dll`, which games using EOS load from a shared Epic folder (also on Steam, without the Epic launcher), hooks Direct3D 12 and crashed the DX11 presenter in Silt. `ReShade.log` now lists it among the other Present hooks and names its full path. The DX11 path stays off while it is loaded, so the game runs without BFI instead of crashing; rename the file to use BFI (`AllowEosOverlay=1` manages the game anyway).
 - **[DX] No more hang or crash when a DX11 game leaves exclusive fullscreen and recreates its swap chain** (The Rogue Prince of Persia). Stopping the presenter waited on the game's window thread while the presenter's Present could need that same thread. It now serves the window's messages while it waits. If the presenter still doesn't stop within 5 s, BFI switches off for the rest of the session and the game continues on its own frames; nothing the stuck presenter uses is freed (freeing it crashed the game). Use borderless fullscreen in this game.
 - **[DX] Watchdog: "the game's window is not responding".** When Windows would call the game hung (no window messages for 5 s), `ReShade.log` gets the call stacks of the game's window thread, the presenter's window thread (DX11) and the game's present thread, to show where it is stuck.
-- **[Vulkan]** No changes.
+- **[Vulkan] Games run through DXVK no longer freeze or crash when BFI starts** (Twelve Minutes, 32-bit). The presenter waited for vblank through DXGI, and in a DXVK game the process's `dxgi.dll` is DXVK's: its vblank wait is only an estimate, and creating its factory started another Vulkan instance and device from inside the presenter thread. The layer now waits on the kernel's vblank event directly and doesn't use DXGI at all.
 
 ## [1.0.1] — 2026-10
 
 - **[DX] Unity (Mono) games no longer hang or quit while loading** (Blasphemous). The crash logger ran before every other exception handler and walked the stack of each first-seen access violation. Mono raises those on purpose, and asking Windows to unwind its JIT-compiled code can deadlock inside Mono. The logger now runs after the game's own handlers (exceptions the game handles never reach it) and stops a stack walk at JIT code. The watchdog's stack dumps stop there too.
 - **[DX] `CrashLog=0`** in `BFIPresenter.ini` turns the crash logger off completely.
-- **[Vulkan]** No changes.
+- **[Vulkan] Games run through DXVK no longer freeze or crash when BFI starts** (Twelve Minutes, 32-bit). The presenter waited for vblank through DXGI, and in a DXVK game the process's `dxgi.dll` is DXVK's: its vblank wait is only an estimate, and creating its factory started another Vulkan instance and device from inside the presenter thread. The layer now waits on the kernel's vblank event directly and doesn't use DXGI at all.
 
 ## [1.0.0] — 2026-10
 

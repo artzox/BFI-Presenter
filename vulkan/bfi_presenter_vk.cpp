@@ -27,7 +27,6 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <dxgi.h>
 #define VK_USE_PLATFORM_WIN32_KHR
 #define BFI_EXPORT extern "C" __declspec(dllexport)
 #else
@@ -714,51 +713,74 @@ static const char *OutName(int t)
 struct VBlank
 {
 #ifdef _WIN32
-    IDXGIFactory1 *factory = nullptr;
-    IDXGIOutput   *output = nullptr;
-    HMONITOR       monitor = nullptr;
-    double         modeHz = 0.0;     // the display mode's refresh rate
+    // The kernel's vblank event (D3DKMT, gdi32), not DXGI: in a game run
+    // through DXVK, "dxgi.dll" in the process is DXVK's. Its WaitForVBlank
+    // only estimates the vblank, and its factory brings up another Vulkan
+    // instance and device from inside the presenter thread (Twelve Minutes
+    // crashed or froze right after BFI started).
+    bool      warned = false;
+    struct OpenFromName { WCHAR DeviceName[32]; UINT hAdapter; LUID AdapterLuid; UINT VidPnSourceId; };
+    struct WaitVbl      { UINT hAdapter; UINT hDevice; UINT VidPnSourceId; };
+    struct CloseAd      { UINT hAdapter; };
+    typedef LONG (APIENTRY *PFN_Open)(OpenFromName *);
+    typedef LONG (APIENTRY *PFN_Wait)(const WaitVbl *);
+    typedef LONG (APIENTRY *PFN_Close)(const CloseAd *);
+    PFN_Open  pOpen = nullptr;
+    PFN_Wait  pWait = nullptr;
+    PFN_Close pClose = nullptr;
+    UINT      adapter = 0, source = 0;
+    HMONITOR  monitor = nullptr;
+    double    modeHz = 0.0;     // the display mode's refresh rate
+    void Close()
+    {
+        if (adapter && pClose) { CloseAd c = { adapter }; pClose(&c); }
+        adapter = 0;
+    }
     void Find(void *hwnd)
     {
         HMONITOR m = hwnd ? MonitorFromWindow((HWND)hwnd, MONITOR_DEFAULTTONEAREST)
                           : MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
-        if (m == monitor && output) return;
-        if (output) { output->Release(); output = nullptr; }
+        if (m == monitor && adapter) return;
+        Close();
         monitor = m;
-        if (!factory && FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory))) factory = nullptr;
-        if (!factory) return;
-        IDXGIAdapter1 *a = nullptr;
-        for (UINT i = 0; !output && factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++)
+        if (!pOpen)
         {
-            IDXGIOutput *o = nullptr;
-            for (UINT j = 0; !output && a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; j++)
+            HMODULE g = GetModuleHandleA("gdi32.dll");
+            if (!g) g = LoadLibraryA("gdi32.dll");
+            if (g)
             {
-                DXGI_OUTPUT_DESC od;
-                if (SUCCEEDED(o->GetDesc(&od)) && od.Monitor == m) output = o;
-                else o->Release();
+                pOpen  = (PFN_Open)(void *)GetProcAddress(g, "D3DKMTOpenAdapterFromGdiDisplayName");
+                pWait  = (PFN_Wait)(void *)GetProcAddress(g, "D3DKMTWaitForVerticalBlankEvent");
+                pClose = (PFN_Close)(void *)GetProcAddress(g, "D3DKMTCloseAdapter");
             }
-            a->Release();
+            if (!pOpen || !pWait) { pOpen = nullptr; if (!warned) { warned = true; LOGW("BFI Presenter: kernel vblank functions not found -- pacing by the present queue only"); } return; }
         }
-        if (output)
-        {
-            DXGI_OUTPUT_DESC od;
-            output->GetDesc(&od);
-            char name[64];
-            WideCharToMultiByte(CP_UTF8, 0, od.DeviceName, -1, name, sizeof(name), nullptr, nullptr);
-            DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
-            if (EnumDisplaySettingsW(od.DeviceName, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
-                modeHz = (double)dm.dmDisplayFrequency;
-            LOGI("BFI Presenter: vblank pacing on %s (%.0f Hz)", name, modeHz);
-        }
-        else LOGW("BFI Presenter: no DXGI output for the game's monitor -- pacing by the present queue only");
+        MONITORINFOEXW mi = {};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(m, &mi)) { if (!warned) { warned = true; LOGW("BFI Presenter: no monitor for the game's window -- pacing by the present queue only"); } return; }
+        OpenFromName o = {};
+        wcsncpy(o.DeviceName, mi.szDevice, 31);
+        const LONG st = pOpen(&o);
+        if (st != 0) { if (!warned) { warned = true; LOGW("BFI Presenter: vblank source for the game's monitor not opened (0x%08lX) -- pacing by the present queue only", (unsigned long)st); } return; }
+        adapter = o.hAdapter;
+        source = o.VidPnSourceId;
+        DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+            modeHz = (double)dm.dmDisplayFrequency;
+        char name[64];
+        WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, name, sizeof(name), nullptr, nullptr);
+        LOGI("BFI Presenter: vblank pacing on %s (%.0f Hz, kernel vblank event)", name, modeHz);
     }
-    bool Wait() { if (!output) return false; output->WaitForVBlank(); return true; }
-    void Release()
+    bool Wait()
     {
-        if (output) output->Release();
-        if (factory) factory->Release();
-        output = nullptr; factory = nullptr; monitor = nullptr;
+        if (!adapter) return false;
+        WaitVbl w = { adapter, 0, source };
+        if (pWait(&w) == 0) return true;
+        Close();                        // display changed: reopened at the next Find
+        monitor = nullptr;
+        return false;
     }
+    void Release() { Close(); monitor = nullptr; }
 #else
     // Test builds: a simulated 120 Hz vblank.
     double next = 0.0;
