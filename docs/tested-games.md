@@ -65,7 +65,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Red Dead Redemption 2 | Working (Vulkan) | Not tested | — | Vulkan renderer; Vulkan layer, `BFIPresenter.ini` next to `RDR2.exe` |
 | Kena: Bridge of Spirits | Working, engine stutter | Not tested | v1.0.2 | Standard setup; the stutter is the engine's own |
 | Need for Speed: Porsche Unleashed | Working (OpenGL, 32-bit), engine stutter | — | v1.0.2 | `BFIPresenter.addon32`; NVIDIA profile: Vulkan/OpenGL present method = Prefer layered on DXGI swapchain |
-| Legacy of Kain: Soul Reaver 1 & 2 Remastered | Working (OpenGL) | — | v1.0.2 | Works with DLSS 5; Half refresh + Smooth below 60 fps |
+| Legacy of Kain: Soul Reaver 1 & 2 Remastered | Working (OpenGL) | — | v1.0.2 | With DLSS 5: Half refresh + Lowest latency. Without: Refresh + Lowest latency + Later release (Smooth stutters more) |
 | Heretic II | Working (OpenGL, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` |
 | Clive Barker's Undying | Working (DX11 via dgVoodoo, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; G-SYNC off for the game (Fixed refresh + VSync Force on), or Queue one refresh ahead |
 | PCSX2 | Working (Vulkan) | — | — | Vulkan layer; Vulkan renderer, `BFIPresenter.ini` next to the emulator's .exe |
@@ -308,7 +308,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 - The add-on takes each finished OpenGL frame after ReShade's effects and shares it with its own Direct3D 11 device through NVIDIA's `WGL_NV_DX_interop2`, so OpenGL needs an NVIDIA GPU. The game's swap interval is set to 0 so its own SwapBuffers doesn't wait for vblank (`OpenGLSwapInterval0=0` turns that off).
 - **Need for Speed: Porsche Unleashed** (32-bit): old exchange-swap OpenGL games blocked the presenter (presents of 20–46 ms) until the game's NVIDIA profile had *Vulkan/OpenGL present method* set to *Prefer layered on DXGI swapchain*. Runs after that; the remaining stutter is the engine's own.
-- **Legacy of Kain: Soul Reaver 1 & 2 Remastered:** works together with the DLSS 5 add-ons, which lower the frame rate well below 120; Half refresh + Smooth keeps motion even. Motion looked smooth even at about 35 fps.
+- **Legacy of Kain: Soul Reaver 1 & 2 Remastered:** works together with the DLSS 5 add-ons, which lower the frame rate well below 120. With DLSS 5 use Half refresh + Lowest latency; without it the game holds 120, so use Refresh + Lowest latency + Later release. Frame pacing Smooth stutters more in this game.
 - **Heretic II** (32-bit): works with `BFIPresenter.addon32`.
 
 ### Clive Barker's Undying
