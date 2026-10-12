@@ -2136,7 +2136,7 @@ static DWORD WINAPI PresenterThread(void *)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,present_count,sync_refresh_count,"
                               "bfi,method,frames,gain,floor,rolloff,pacing,cap,ahead,vblank,queue_ahead,queued,"
                               "wait_vblank_ms,wait_gpu_ms,submit_ms,present_ms,hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,"
-                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms\n");
+                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup\n");
                 LOGI("BFI Presenter: timing log started: %s", path);
             }
         }
@@ -2677,14 +2677,14 @@ static DWORD WINAPI PresenterThread(void *)
             EnterCriticalSection(&g_cfgLock);
             lrLog.lrState = g_status.lrState; lrLog.lrEst = g_status.lrEst; lrLog.lrMargin = g_status.lrMargin;
             LeaveCriticalSection(&g_cfgLock);
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f\n", t * 1000.0,
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d\n", t * 1000.0,
                     (unsigned long long)presents, c.slot,
                     (unsigned long long)pickId, (t - pickTime) * 1000.0, (t - lastT) * 1000.0,
                     sok ? (int)st.PresentCount : -1, sok ? (int)st.SyncRefreshCount : -1,
                     s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     g_maxAhead.load(), s.pacing, s.queueAhead, queuedNow,
                     (tVb - tLoop0) * 1000.0, (tFence - tVb) * 1000.0, (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f, hotArea, rawAvg,
-                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin);
+                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp);
         }
         lastT = t;
         if (pickId != lastShownId) lastNewFrameT = Now();
