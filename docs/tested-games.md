@@ -13,7 +13,8 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 - **ABL guard budget (HDR, v0.52+): set it to the display's full-white brightness.** `AblGuardBudgetNits=250` for the A95L (spec 250–260 nits at a 100 % window). South of Midnight's sky still flashed at 300 and was clean at 250; God of War Ragnarök's brightest scene passed at 300. One value covers all games.
 - **Recommended presenter settings (v0.82):** PresenterBuffers 3, Wait for vblank on, Queue one refresh ahead off, Automatic frames ahead on.
   - Game holds 120 fps: Game frame cap Refresh rate + Frame pacing Lowest latency. Light games: add Later release (Cuphead: \~5 ms less latency).
-  - Game can't hold 120: Game frame cap Half refresh + Frame pacing Smooth, with Just-in-time release on (the default).
+  - Game can't hold 120: Game frame cap Half refresh + Frame pacing Smooth, with Just-in-time release on (the default). Some games are smoother with Lowest latency instead (Soul Reaver).
+  - **With frame generation: Game frame cap Refresh rate, not Half refresh.** FG doubles (or triples) the game's output, so let the presenter take every generated frame; Half refresh throws half of them away.
 - **DirectX 11 games: borderless or windowed, not exclusive fullscreen.** The DX11 path presents through its own window over the game (Mirror's Edge Catalyst crashed on exit in exclusive fullscreen).
 - **Realtime GPU priority (DirectX):** start Steam (or the game's launcher) as administrator for the session. The presenter queue then runs at global realtime priority, which removed the \~30 ms stalls behind God of War Ragnarök's flashes. The overlay's Status section shows the queue priority.
 - **Vulkan games:** install the Vulkan layer once with `install_vulkan_layer.bat` and put `BFIPresenter.ini` next to the game's .exe. The layer loads only when the game runs without administrator rights.
@@ -21,22 +22,22 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-91 of 94 tested games and emulators run with BFI: the 42 working in the table below (some only with a setting, without frame generation or without a conflicting mod; nine of them 32-bit; four with the engine's own stutter) and 49 more listed after it. Two are partial, and Sifu hasn't been retested since DirectX 11 support arrived.
+92 of 94 tested games and emulators run with BFI: the 43 working in the table below (some only with a setting, without frame generation or without a conflicting mod; nine of them 32-bit; four with the engine's own stutter) and 49 more listed after it. Two are partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
 | Shadow of the Tomb Raider | Working | Works (OptiScaler FSR 3.1 FG) | v0.2 | Standard setup |
-| Alan Wake 2 | Working | Not tested | v0.19 | Standard setup |
+| Alan Wake 2 | Working | Works (2×, 3×); Refresh cap | v0.19 | Standard setup |
 | God of War Ragnarök | Working | Runs, but judders below 60 output fps | v0.24 | Standard setup; RTSS limiter off |
 | Riven (2023) | Working | Not tested | v0.13 | A steady 60 fps for smooth motion |
-| Onimusha | Working | Not tested | v0.27 | Standard setup |
+| Onimusha | Working | Works (2×, 3×); Refresh cap | v0.27 | Standard setup |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
 | Returnal | Working without FG | Menu freezes, flickering UI | v0.27 | FG off |
 | Pragmata | Working without FG | DLSS FG throttled to \~30 fps (Reflex) | v0.35 | FG off |
 | Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps |
-| Control | Working | Not engaged in testing | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54 |
+| Control | Working | Works (2×, 3×, 4× with the [Control-FG](https://github.com/Frooglemcdoo/Control-FG) mod, also with DLSS 5); Refresh cap | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54 |
 | Marvel's Spider-Man 2 | Partial | Unstable even without the presenter | v0.35 | VRAM-limited at 4K; resolution toggle to start BFI |
-| Sifu | Not retested | — | — | DirectX 11 (supported since the DX11 path); borderless window |
+| Sifu | Working (DX11) | Not tested | — | Borderless window |
 | God of War (2018) | Working (DX11) | Not tested | v0.60 | Borderless window |
 | No Rest for the Wicked | Working | Not tested | v0.61 | Standard setup (froze on a resize after loading before v0.61) |
 | Mirror's Edge Catalyst | Working (DX11) | Not tested | v0.65 | Borderless window, not exclusive fullscreen |
@@ -73,13 +74,13 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ### More games tested
 
-Also tested and working with the standard setup above. Their notes weren't recorded in detail, so the API, frame generation and first working version aren't listed.
+Also tested and working with the standard setup above. Their notes weren't recorded in detail, so the API and first working version aren't listed; DLSS 5 and frame generation are noted where tested.
 
 | Game | Notes |
 | --- | --- |
 | Ashen | Standard setup |
 | Assassin's Creed Unity | Standard setup |
-| Blade of Darkness | Standard setup |
+| Blade of Darkness (2021 remaster) | Standard setup |
 | Blair Witch | Standard setup |
 | Castlevania: Belmont's Curse (demo) | Standard setup |
 | Cocoon | Standard setup |
@@ -97,34 +98,34 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Jotun | Standard setup |
 | Journey | Standard setup |
 | Layers of Fear 2 | Standard setup |
-| Legacy of Kain: Defiance Remastered | Standard setup |
+| Legacy of Kain: Defiance Remastered | Works with DLSS 5 |
 | Little Nightmares (Enhanced Edition) | Standard setup |
 | Little Nightmares II (Enhanced Edition) | Standard setup |
 | Mafia: Definitive Edition | Standard setup |
-| Mortal Shell | Standard setup |
+| Mortal Shell | Works with DLSS 5 |
 | Need for Speed (2015) | Standard setup |
 | Planet of Lana II | Standard setup |
 | Prodeus | Standard setup |
-| REANIMAL | Standard setup |
+| REANIMAL | Works with DLSS 5 |
 | Return to Monkey Island | Standard setup |
 | RiME | Standard setup |
 | Shadow Man Remastered | Standard setup |
-| Silent Hill 2 (2024) | Standard setup |
+| Silent Hill 2 (2024) | Works with DLSS 5 and FG 2× (Refresh cap) |
 | South of Midnight | HDR: `AblGuardBudgetNits=250` (the sky flashed at 300) |
 | Split Fiction | Standard setup |
 | Spyro Reignited Trilogy | Standard setup |
 | Stray | Standard setup |
 | The Callisto Protocol | Standard setup |
-| The Dark Pictures Anthology: Directive 8020 | Standard setup |
-| The Elder Scrolls IV: Oblivion Remastered | Standard setup |
-| The Last of Us Part I | Needs `TypedBackBufferDesc=1` (the default; it crashed without it) |
+| The Dark Pictures Anthology: Directive 8020 | Works with DLSS 5 and FG 2× (Refresh cap) |
+| The Elder Scrolls IV: Oblivion Remastered | Works with DLSS 5 |
+| The Last of Us Part I | Works with DLSS 5. Needs `TypedBackBufferDesc=1` (the default; it crashed without it) |
 | The Vanishing of Ethan Carter Redux | Standard setup |
-| The Witcher 3: Wild Hunt (DirectX 12) | Standard setup |
+| The Witcher 3: Wild Hunt (patch 4.04, DirectX 12) | Works with DLSS 5 |
 | Thief (2014) | Standard setup |
 | Tony Hawk's Pro Skater 1 + 2 | Standard setup |
 | Trine 5 | Standard setup |
 | Unto The End | Standard setup |
-| Until Dawn (2024) | Standard setup |
+| Until Dawn (2024) | Works with DLSS 5 and FG (Refresh cap) |
 | Untitled Goose Game | Standard setup |
 
 ## Per-game notes
@@ -195,7 +196,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### Sifu
 
-- DirectX 11 is now supported through the add-on's own D3D12 presenter (use a borderless window); Sifu hasn't been retested.
+- DirectX 11 game, runs through the add-on's own presenter. Use a borderless window.
 
 ### God of War (2018)
 
@@ -321,7 +322,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ## Known issues across games
 
 - **Below 60 fps, motion judders.** The strobe shows 60 lit images per second; a game at 45 fps repeats frames. Clarity is unaffected.
-- **NVIDIA DLSS Frame Generation** relies on Reflex pacing, which misreads the presenter's own presents and throttles the game (Pragmata, likely Returnal). OptiScaler FSR FG worked in Shadow of the Tomb Raider.
+- **Frame generation:** use the Refresh rate cap, not Half refresh. DLSS FG (2×–4×) works in Alan Wake 2, Onimusha, Control (Control-FG mod), Silent Hill 2, Directive 8020 and Until Dawn; OptiScaler FSR FG in Shadow of the Tomb Raider. In a few games Reflex pacing misreads the presenter's own presents and throttles the game (Pragmata, likely Returnal).
 - **Game hitches show as single flashes:** when the whole GPU stalls for 100 ms or more, no refresh can be presented on time. With the GPU at its limit, shorter stalls of one to four refreshes flash too (God of War Ragnarök, Indiana Jones). GPU headroom helps everywhere; in DirectX, a realtime presenter queue (launcher run as administrator) removed them.
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR). Games already at the limit can collapse in performance.
 - **Overlays:** the RTSS OSD and the Steam overlay don't draw on the strobed frames (their hooks are bypassed for the presenter's own presents since v0.34). Any RTSS or driver frame limiter must stay off.
