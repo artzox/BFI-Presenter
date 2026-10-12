@@ -111,7 +111,7 @@ struct Settings
     int   ownQueue = 1;       // present on the add-on's own queue (read when a swap chain is set up)
     int   pacingMode = 0;     // 0 = smooth (every game frame shown once, in order), 1 = lowest latency (newest)
     int   maxAhead = 1;       // game may run this many frames ahead of the GPU (0 = no limit)
-    int   smoothCatchUp = 1;  // Smooth: skip a frame when two have waited for 3 cycles (standing latency)
+    int   smoothCatchUp = 0;  // Smooth: 1 = skip a frame when two have waited for 3 cycles (standing latency)
     int   autoAhead = 1;      // automatic: 1 frame ahead, 2 while the game keeps missing strobe cycles
     int   presBuffers = 3;    // real swap chain buffers for the presenter (read when presentation moves)
     int   queueAhead = 0;     // with vblank pacing: keep this many extra presents queued (0 or 1)
@@ -212,7 +212,7 @@ static void LoadSettings(Settings &s)
     s.pacingMode = IniInt("FramePacing", 0) ? 1 : 0;
     s.maxAhead = IniInt("MaxFramesAhead", 1);
     s.autoAhead = IniInt("AutoFramesAhead", 1) ? 1 : 0;
-    s.smoothCatchUp = IniInt("SmoothCatchUp", 1) ? 1 : 0;
+    s.smoothCatchUp = IniInt("SmoothCatchUp", 0) ? 1 : 0;
     s.presBuffers = IniInt("PresenterBuffers", 3);
     s.queueAhead = IniInt("QueueAhead", 0) ? 1 : 0;
     s.laterRelease = IniInt("LaterRelease", 0) ? 1 : 0;
@@ -6383,10 +6383,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
         {
             bool cu = s.smoothCatchUp != 0;
             if (ImGui::Checkbox("Smooth: catch up after a hitch", &cu)) s.smoothCatchUp = cu ? 1 : 0;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("On: when two finished frames keep waiting (after a game hitch), one is skipped to get back\n"
-                                                          "to the lowest latency -- a second stutter shortly after the first.\n"
-                                                          "Off: the presenter stays one frame behind instead (about one cycle more latency) and\n"
-                                                          "never skips a frame to catch up. For games whose frames finish close to the lit refresh.");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off (default): after a game hitch the presenter stays one frame behind (about one cycle\n"
+                                                          "more latency) and shows every frame once, in order.\n"
+                                                          "On: when two finished frames keep waiting, one is skipped to get back to the lowest\n"
+                                                          "latency -- a second stutter shortly after the first.");
         }
         bool cj = s.capJit != 0;
         if (ImGui::Checkbox("Just-in-time release at Half / Quarter cap", &cj)) s.capJit = cj ? 1 : 0;

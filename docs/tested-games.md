@@ -122,7 +122,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | The Last of Us Part I | Works with DLSS 5. Needs `TypedBackBufferDesc=1` (the default; it crashed without it) |
 | The Vanishing of Ethan Carter Redux | Standard setup |
 | The Witcher 3: Wild Hunt (patch 4.04, DirectX 12) | Works with DLSS 5 |
-| Thief (2014) | Standard setup |
+| Thief (2014) | Half refresh + Smooth; with catch-up on (before v1.0.2) Smooth repeated and then skipped a frame about once a second |
 | Tony Hawk's Pro Skater 1 + 2 | Standard setup |
 | Trine 5 | Standard setup |
 | Unto The End | Standard setup |
@@ -226,6 +226,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### The Midnight Walk
 
+- Smooth with the v1.0.2 default (`SmoothCatchUp=0`) shows every frame once at 60: no repeats or skips, against about one of each a second with catch-up on.
 - Camera-rotation judder that remains in every mode is the game's own. Half refresh + Lowest latency is the best combination; v0.69 releases the game in time for the lit refresh (frames \~5 ms old when shown).
 
 ### Cuphead
