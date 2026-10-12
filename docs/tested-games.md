@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-92 of 94 tested games and emulators run with BFI: the 43 working in the table below (some only with a setting, without frame generation or without a conflicting mod; nine of them 32-bit; four with the engine's own stutter) and 49 more listed after it. Two are partial.
+94 of 96 tested games and emulators run with BFI: the 44 working in the table below (some only with a setting, without frame generation or without a conflicting mod; ten of them 32-bit; four with the engine's own stutter) and 50 more listed after it. Two are partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -63,6 +63,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Twelve Minutes | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade for DirectX 11 -- not through DXVK (flickered) |
 | Burnout Paradise Remastered | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; works with the Luma HDR add-on |
 | Dead Cells | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with ReShade 6.8 (6.5.1 with the Steam overlay crashed at start) |
+| FlatOut: Ultimate Carnage | Working (DX9, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; Refresh + Lowest latency (Half refresh doesn't hold it at 60, and an NVIDIA Profile Inspector cap stutters) |
 | Red Dead Redemption 2 | Working (Vulkan) | Not tested | — | Vulkan renderer; Vulkan layer, `BFIPresenter.ini` next to `RDR2.exe` |
 | Kena: Bridge of Spirits | Working, engine stutter | Not tested | v1.0.2 | Standard setup; the stutter is the engine's own |
 | Need for Speed: Porsche Unleashed | Working (OpenGL, 32-bit), engine stutter | — | v1.0.2 | `BFIPresenter.addon32`; NVIDIA profile: Vulkan/OpenGL present method = Prefer layered on DXGI swapchain |
@@ -127,6 +128,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Unto The End | Standard setup |
 | Until Dawn (2024) | Works with DLSS 5 and FG (Refresh cap) |
 | Untitled Goose Game | Standard setup |
+| Wreckfest 2 | Standard setup |
 
 ## Per-game notes
 
@@ -318,6 +320,10 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - With G-SYNC on, VRR engaged on the borderless window and the game dropped to about 101 fps. Set G-SYNC off for the game (Fixed refresh) with Vertical Sync Force on, or use Queue one refresh ahead.
 - If the mouse stops working, change the input setting in `Undying.ini`.
 - When dgVoodoo changes display mode (or on quit) the presenter can get stuck; BFI then switches off for the session and the game continues.
+
+### FlatOut: Ultimate Carnage
+
+- 32-bit DirectX 9, works with `BFIPresenter.addon32` and the 32-bit ReShade 6.8+. With Half refresh the game kept running at about 100 fps instead of 60, and capping it at 60 in NVIDIA Profile Inspector made it stutter. Play it at Refresh + Lowest latency.
 
 ## Known issues across games
 
