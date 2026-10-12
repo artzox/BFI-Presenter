@@ -9,6 +9,8 @@
 *.exp
 *.lib
 *.pdb
+*.exe
+manager/tested_games.inc
 dist/
 
 # Logs and per-user files a test run can leave behind

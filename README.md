@@ -37,6 +37,8 @@ Each [release](../../releases) has two packages with the same version number:
 
 Both read the same `BFIPresenter.ini` with the same keys, so one ini works for either.
 
+**Or let the app do it:** `BFIPresenterManager.exe` (on the same release page) finds your Steam, Epic, GOG, Xbox and other games, works out whether each needs the 64-bit or 32-bit add-on or the Vulkan layer, checks that ReShade is there (also as `ReShade64.dll` behind OptiScaler), and installs, updates or removes BFI Presenter with a backup of every replaced file. See the [manager README](manager/README.md).
+
 ## Quick start
 
 **Requirements:**
@@ -79,6 +81,8 @@ If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that
 
 ## Updating many games
 
+The [manager app](manager/README.md) does all of this with a window; the scripts below do the same from PowerShell.
+
 `scripts/Find-BFIPresenter.ps1` finds every game folder with the add-on or an ini (Steam, Epic, GOG and Xbox folders, plus any `-Roots` you pass) and shows each one's version. `scripts/Update-BFIPresenter.ps1 -Source <extracted release>` copies a new build into all of them and updates the installed Vulkan layer; `-DryRun` previews. Your `BFIPresenter.ini` files are never changed. Every replaced file is kept in `BFIPresenter_backups` next to the script and listed, with its old and new version, in `BFIPresenter_update_log.csv`; if a new version misbehaves, `-Revert` puts back what the last update replaced (run it again to go one more update back).
 
 **Easiest:** double-click `Find-BFIPresenter.bat`, then `Update-BFIPresenter.bat`, from the extracted release folder (the new build next to the scripts). The `.bat` files start PowerShell with the right options, so Windows' script policy and the "downloaded from the internet" block don't stop them.
@@ -97,6 +101,7 @@ Update-BFIPresenter.bat -Revert
 | Part | MinGW-w64 (Linux, WSL, MSYS2) | Visual Studio |
 |---|---|---|
 | DX add-on | `dx/build_mingw.sh` | `dx/build_msvc.bat` from an x64 Native Tools prompt |
+| Manager app | `manager/build_mingw.sh` | — |
 | Vulkan layer | `vulkan/build_mingw.sh` (64- and 32-bit; recompiles the shaders if `glslangValidator` is installed) | — |
 
 All headers needed are in [`third_party`](third_party/README.md).
@@ -106,6 +111,7 @@ All headers needed are in [`third_party`](third_party/README.md).
 ```
 dx/          DX add-on source, build scripts, reference
 vulkan/      Vulkan layer source, GLSL shaders, manifests, installer, reference
+manager/     BFIPresenterManager.exe source (finds games, installs and updates)
 scripts/     Find-/Update-BFIPresenter.ps1
 docs/        tested games, latency estimates
 third_party/ ReShade, Dear ImGui and Vulkan headers
