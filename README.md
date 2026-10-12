@@ -1,5 +1,7 @@
 # BFI Presenter
 
+[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/artzox)
+
 Presenter-clocked black frame insertion (BFI) for PC games on fixed-refresh displays, built for 120 Hz OLEDs.
 
 Software BFI usually strobes on the game's frame clock, so any late frame leaves a lit or dark refresh on screen too long: a flash. BFI Presenter takes over presentation and runs the strobe on the **display's own vblank clock**. A late game frame becomes a repeated image (a CRT-like stutter) instead of a flash, and the game is paced to the strobe so frames land on the refresh that shows them.
