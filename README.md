@@ -2,13 +2,28 @@
 
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/artzox)
 
-Presenter-clocked black frame insertion (BFI) for PC games on fixed-refresh displays, built for 120 Hz OLEDs.
+**Variable MPRT strobing for PC games on 120 Hz OLEDs: the motion clarity of black frame insertion without giving up brightness.**
 
-Software BFI usually strobes on the game's frame clock, so any late frame leaves a lit or dark refresh on screen too long: a flash. BFI Presenter takes over presentation and runs the strobe on the **display's own vblank clock**. A late game frame becomes a repeated image (a CRT-like stutter) instead of a flash, and the game is paced to the strobe so frames land on the refresh that shows them.
+Classic black frame insertion (BFI) shows each frame for one refresh and then blacks out the next. Motion gets sharper because each image is on screen for less time (a lower MPRT, motion picture response time), but the screen is dark half the time, so the picture loses half its brightness.
 
-- **Strobe:** classic BFI with highlight roll-off, or the Variable MPRT brightness budget (highlights spill into the dark refresh instead of clipping); dark floor, sine BFI, inverted cycle, rolling scan with phosphor decay.
-- **HDR:** SDR, scRGB and HDR10 output with a display-peak ceiling and an **ABL guard** that keeps bright scenes within an OLED's full-screen power budget.
+BFI Presenter implements the **Variable MPRT** method described by [Blur Busters](https://blurbusters.com) instead. Each pixel's light for the whole strobe cycle is front-loaded into the lit refresh, up to the panel's ceiling, and only what doesn't fit spills into the following refresh:
+
+- **Dark and mid-tone pixels**, nearly all of a typical image, fit in the lit refresh and get the full motion-clarity gain of BFI.
+- **Bright highlights** that would clip spill over, so they stay on screen a little longer (a variable MPRT per pixel) instead of being dimmed or clipped.
+- **Brightness is kept.** At `Gain 1.0` the average light matches the game without strobing. In HDR the panel's headroom (`DisplayPeakNits`) leaves room for most content to fit entirely in the lit refresh, and an **ABL guard** keeps the boosted refresh within an OLED's full-screen power budget so the panel doesn't dim it.
+
+On top of that comes the Blur Busters CRT-simulator approach: **rolling scan with phosphor fade**. The strobe can be split into horizontal bands lit in turn from the top down, each row fading out like CRT phosphor after the simulated beam passes, so the screen never goes fully dark and flicker is softer. At 120 Hz this alternates two halves with the fade hiding the seam; at 240 Hz and above it becomes a real rolling band.
+
+### Why a presenter
+
+Software strobing usually runs on the game's frame clock, so any late frame leaves a lit or dark refresh on screen too long: a flash. BFI Presenter takes over presentation and runs the strobe on the **display's own vblank clock**. A late game frame becomes a repeated image (a CRT-like stutter) instead of a flash, and the game is paced to the strobe so each frame lands on the refresh that shows it.
+
+### Features
+
+- **Strobe:** Variable MPRT (the default) or classic BFI with hue-preserving highlight roll-off (Ctrl+Shift+M switches); frames per cycle, gain, dark-frame floor, sine and inverted cycles; rolling scan with phosphor fade or a soft seam.
+- **HDR:** SDR, scRGB and HDR10 output with a display-peak ceiling and the ABL guard.
 - **Pacing:** game frame cap at Refresh / Half / Quarter, Smooth or Lowest-latency pacing, just-in-time release so each frame finishes right before its lit refresh, automatic frames ahead, hitch guard.
+- **APIs:** Direct3D 12, 11 and 9 and OpenGL through a ReShade add-on; Vulkan (and DXVK) through a Vulkan layer. Works with frame generation (DLSS FG, FSR FG, Lossless Scaling) at the Refresh cap.
 - **Settings** live in the ReShade overlay and in one `BFIPresenter.ini` per game.
 
 ## Which download do I need?
@@ -43,9 +58,16 @@ Both read the same `BFIPresenter.ini` with the same keys, so one ini works for e
 2. Copy `BFIPresenter.ini` from the package next to the game's `.exe`. The layer stays inactive in any game without this file, and it doesn't create one itself.
 3. Start the game: the ReShade overlay gets a **BFI Presenter (Vulkan)** tab, and `BFIPresenterVK.log` appears next to the ini.
 
-**Recommended settings:** Refresh cap + Lowest latency when the game holds 120 fps; Half refresh + Smooth (just-in-time release on, the default) when it holds 60 or more but not 120. More in the [DX reference](dx/README.md#recommended-setups).
+**Recommended settings:**
 
-If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that BFI off (`ENABLE_DECAY=0`) so the two don't stack.
+- **Method Variable MPRT, Gain 1.0** for full brightness (Gain 0.5, the default, keeps the lit refresh as the game drew it, at half the average brightness). In HDR, set `AblGuardBudgetNits` to the panel's full-white brightness (250 for the Sony A95L).
+- Game holds 120 fps: Refresh cap + Lowest latency.
+- Game holds 60 or more but not 120: Half refresh + Smooth (just-in-time release on, the default).
+- **With frame generation** (DLSS FG, FSR FG, Lossless Scaling): always the **Refresh** cap, never Half refresh, which throws away half the generated frames. Lossless Scaling worked with its VSync set to 1/2.
+
+More in the [DX reference](dx/README.md#recommended-setups).
+
+If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that off (`ENABLE_DECAY=0`) so the two don't stack.
 
 ## Documentation
 
@@ -96,4 +118,4 @@ BFI Presenter is free software under the [GNU General Public License v3.0](LICEN
 
 ## Safety
 
-BFI flickers at 60 Hz by design. If you are sensitive to flicker or flashing images, take care, and use the hotkey (Ctrl+Shift+B by default) to turn BFI off.
+Strobing flickers at 60 Hz by design (rolling scan with phosphor fade softens it). If you are sensitive to flicker or flashing images, take care, and use the hotkey (Ctrl+Shift+B by default) to turn the strobe off.

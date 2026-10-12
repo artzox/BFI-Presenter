@@ -171,7 +171,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 
 - **Below the cap's frame rate, motion is uneven.** The strobe shows 60 lit images a second at 120 Hz; use the cap that the game can hold.
 - **Game hitches and GPU stalls show as flashes.** A stall longer than a refresh holds the current refresh on screen. Realtime queue priority and GPU headroom help.
-- **Frame generation:** set Game frame cap to Refresh rate, not Half refresh (Half throws away half the generated frames). DLSS FG 2×–4× works in most tested games; in a few, Reflex pacing misreads the presenter and throttles the game (Pragmata). OptiScaler FSR FG worked in Shadow of the Tomb Raider.
+- **Frame generation:** set Game frame cap to Refresh rate, not Half refresh (Half throws away half the generated frames). DLSS FG 2×–4× works in most tested games, and Lossless Scaling mostly worked with its VSync at 1/2; in a few, Reflex pacing misreads the presenter and throttles the game (Pragmata). OptiScaler FSR FG worked in Shadow of the Tomb Raider.
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR).
 - **Exclusive fullscreen in DX11 games** is not supported; use borderless (windowed) fullscreen. The Rogue Prince of Persia hung its presenter when it left exclusive fullscreen.
 - **A presenter that won't stop** (stuck in its present for 5 s while the game resizes or recreates its swap chain): BFI switches off for the rest of the session and the game continues on its own frames. Restart the game to use BFI again.
