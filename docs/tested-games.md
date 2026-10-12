@@ -21,7 +21,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-84 of 88 tested games and emulators run with BFI: the 35 in the table below (five of them only with a setting, without frame generation or without a conflicting mod; six of them 32-bit) and 49 more listed after it. Two are partial, Jusant runs but isn't recommended, and Sifu hasn't been retested since DirectX 11 support arrived.
+91 of 94 tested games and emulators run with BFI: the 42 working in the table below (some only with a setting, without frame generation or without a conflicting mod; nine of them 32-bit; four with the engine's own stutter) and 49 more listed after it. Two are partial, and Sifu hasn't been retested since DirectX 11 support arrived.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -51,7 +51,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | shadPS4 | Working (Vulkan) | — | VK 0.7 | Vulkan layer; BFIPresenter.ini next to the emulator's .exe |
 | Blasphemous | Working (DX11) | NVIDIA Smooth Motion must be off | v1.0.2 | Smooth Motion off in the NVIDIA app (with it on, the game closed and relaunched itself) |
 | Guacamelee! 2 | Working (DX11) | Not tested | v1.0.2 | Standard setup; works with Special K (crashed at start before v1.0.2) |
-| Jusant | Not recommended | Not tested | v1.0.2 | Runs, but Unreal's frame pipeline delivers finished frames with a varying delay (10–33 ms), so a fixed 120 Hz strobe judders at any setting; play with VRR instead. Queue one refresh ahead removes the flashes |
+| Jusant | Working, engine stutter | Not tested | v1.0.2 | Runs; Unreal's frame pipeline delivers finished frames with a varying delay (10–33 ms), so some judder remains at any setting. Queue one refresh ahead removes the flashes |
 | Moons of Madness | Working (DX11) | Not tested | v1.0.2 | Holds a locked 120 fps, so the CRT shader's own BFI (decay) is the better fit; with the presenter use Half refresh + Lowest latency (Refresh + Smooth stutters) |
 | Wreckfest | Working (DX11) | Not tested | v1.0.2 | `DX11GamePresent=1` in `BFIPresenter.ini`: without it the game slowed to 5 fps within a minute |
 | Silt | Working (DX11) | Not tested | v1.0.2 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
@@ -62,6 +62,12 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Twelve Minutes | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with the 32-bit ReShade for DirectX 11 -- not through DXVK (flickered) |
 | Burnout Paradise Remastered | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; works with the Luma HDR add-on |
 | Dead Cells | Working (DX11, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` with ReShade 6.8 (6.5.1 with the Steam overlay crashed at start) |
+| Red Dead Redemption 2 | Working (Vulkan) | Not tested | — | Vulkan renderer; Vulkan layer, `BFIPresenter.ini` next to `RDR2.exe` |
+| Kena: Bridge of Spirits | Working, engine stutter | Not tested | v1.0.2 | Standard setup; the stutter is the engine's own |
+| Need for Speed: Porsche Unleashed | Working (OpenGL, 32-bit), engine stutter | — | v1.0.2 | `BFIPresenter.addon32`; NVIDIA profile: Vulkan/OpenGL present method = Prefer layered on DXGI swapchain |
+| Legacy of Kain: Soul Reaver 1 & 2 Remastered | Working (OpenGL) | — | v1.0.2 | Works with DLSS 5; Half refresh + Smooth below 60 fps |
+| Heretic II | Working (OpenGL, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32` |
+| Clive Barker's Undying | Working (DX11 via dgVoodoo, 32-bit) | — | v1.0.2 | `BFIPresenter.addon32`; G-SYNC off for the game (Fixed refresh + VSync Force on), or Queue one refresh ahead |
 | PCSX2 | Working (Vulkan) | — | — | Vulkan layer; Vulkan renderer, `BFIPresenter.ini` next to the emulator's .exe |
 | RPCS3 | Working (Vulkan) | — | — | Vulkan layer; `BFIPresenter.ini` next to the emulator's .exe |
 
@@ -286,6 +292,32 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - DirectX 11. **Set `DX11GamePresent=1` in `BFIPresenter.ini`.** Without it the game's GPU frames got slower and slower while the presenter ran (14 ms to over 100 ms within a minute, down to 5 fps, with the GPU reported busy at only 70 W); the game ran fine without the add-on. With the setting the game's own swap chain presents each frame too (hidden under the presenter's window) and the game holds 120 fps.
 - An earlier test build presented through the overlay hooks and the game crashed when the Steam overlay set itself up; v1.0.2 presents past them.
 
+### Jusant
+
+- Unreal Engine game. Unreal's frame pipeline hands finished frames over with a varying delay (10–33 ms), so a fixed 120 Hz strobe shows some judder at any setting; this is the engine, not the presenter. Queue one refresh ahead removes the flashes.
+
+### Kena: Bridge of Spirits
+
+- Works with the standard setup; the remaining stutter is the engine's own and shows without the presenter too.
+
+### Red Dead Redemption 2
+
+- Use the game's Vulkan renderer with the Vulkan layer installed, and put `BFIPresenter.ini` next to `RDR2.exe`.
+
+### OpenGL games (v1.0.2)
+
+- The add-on takes each finished OpenGL frame after ReShade's effects and shares it with its own Direct3D 11 device through NVIDIA's `WGL_NV_DX_interop2`, so OpenGL needs an NVIDIA GPU. The game's swap interval is set to 0 so its own SwapBuffers doesn't wait for vblank (`OpenGLSwapInterval0=0` turns that off).
+- **Need for Speed: Porsche Unleashed** (32-bit): old exchange-swap OpenGL games blocked the presenter (presents of 20–46 ms) until the game's NVIDIA profile had *Vulkan/OpenGL present method* set to *Prefer layered on DXGI swapchain*. Runs after that; the remaining stutter is the engine's own.
+- **Legacy of Kain: Soul Reaver 1 & 2 Remastered:** works together with the DLSS 5 add-ons, which lower the frame rate well below 120; Half refresh + Smooth keeps motion even. Motion looked smooth even at about 35 fps.
+- **Heretic II** (32-bit): works with `BFIPresenter.addon32`.
+
+### Clive Barker's Undying
+
+- 32-bit, run through dgVoodoo (Direct3D 11 output) with `BFIPresenter.addon32`. The game's fullscreen setting used to end up windowed with the add-on; since v1.0.2 the window is made borderless over the monitor automatically (`BorderlessFullscreen=1`).
+- With G-SYNC on, VRR engaged on the borderless window and the game dropped to about 101 fps. Set G-SYNC off for the game (Fixed refresh) with Vertical Sync Force on, or use Queue one refresh ahead.
+- If the mouse stops working, change the input setting in `Undying.ini`.
+- When dgVoodoo changes display mode (or on quit) the presenter can get stuck; BFI then switches off for the session and the game continues.
+
 ## Known issues across games
 
 - **Below 60 fps, motion judders.** The strobe shows 60 lit images per second; a game at 45 fps repeats frames. Clarity is unaffected.
@@ -293,5 +325,5 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - **Game hitches show as single flashes:** when the whole GPU stalls for 100 ms or more, no refresh can be presented on time. With the GPU at its limit, shorter stalls of one to four refreshes flash too (God of War Ragnarök, Indiana Jones). GPU headroom helps everywhere; in DirectX, a realtime presenter queue (launcher run as administrator) removed them.
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR). Games already at the limit can collapse in performance.
 - **Overlays:** the RTSS OSD and the Steam overlay don't draw on the strobed frames (their hooks are bypassed for the presenter's own presents since v0.34). Any RTSS or driver frame limiter must stay off.
-- **APIs:** Direct3D 12, 11 and 9 through the add-on (64-bit, and 32-bit Direct3D 11 and 9 with `BFIPresenter.addon32`; Direct3D 9 needs ReShade 6.8+). Vulkan through the Vulkan layer (64- and 32-bit), which also covers DirectX 9–11 games run through DXVK. OpenGL is untested.
+- **APIs:** Direct3D 12, 11 and 9 through the add-on (64-bit, and 32-bit Direct3D 11 and 9 with `BFIPresenter.addon32`; Direct3D 9 needs ReShade 6.8+). OpenGL through the add-on on NVIDIA GPUs (`WGL_NV_DX_interop2`, 64- and 32-bit). Vulkan through the Vulkan layer (64- and 32-bit), which also covers DirectX 9–11 games run through DXVK.
 - **Below the cap's frame rate, motion is uneven.** The overlay warns when strobe cycles step unevenly for more than a moment and says whether the game is below the cap. At \~100 fps on 120 Hz, Half refresh with just-in-time release gives even motion.
