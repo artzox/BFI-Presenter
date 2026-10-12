@@ -4228,6 +4228,45 @@ static bool CreateStage11()
     return true;
 }
 
+// Exclusive fullscreen is held off (the presenter needs a window), so the
+// game's window is made to cover its monitor without a border instead -- what
+// exclusive fullscreen would have looked like. Off with BorderlessFullscreen=0.
+static struct { HWND hwnd; LONG_PTR style, exStyle; RECT rect; bool saved; } g_bl = {};
+static void MakeBorderless(HWND h, HMONITOR mon)
+{
+    if (!h || !IsWindow(h) || GetPrivateProfileIntA("BFI", "BorderlessFullscreen", 1, g_iniPath) == 0) return;
+    if (!mon) mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoA(mon, &mi)) return;
+    const RECT &m = mi.rcMonitor;
+    RECT wr = {};
+    GetWindowRect(h, &wr);
+    const LONG_PTR style = GetWindowLongPtrA(h, GWL_STYLE), ex = GetWindowLongPtrA(h, GWL_EXSTYLE);
+    const bool covers = wr.left == m.left && wr.top == m.top && wr.right == m.right && wr.bottom == m.bottom;
+    if (covers && !(style & (WS_CAPTION | WS_THICKFRAME))) return;          // already borderless on the monitor
+    if (!g_bl.saved || g_bl.hwnd != h) { g_bl.hwnd = h; g_bl.style = style; g_bl.exStyle = ex; g_bl.rect = wr; g_bl.saved = true; }
+    SetWindowLongPtrA(h, GWL_STYLE, (style & ~(LONG_PTR)(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP);
+    SetWindowLongPtrA(h, GWL_EXSTYLE, ex & ~(LONG_PTR)(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE));
+    SetWindowPos(h, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    LOGI("BFI Presenter: the game's window made borderless over its monitor (%ldx%ld) in place of exclusive fullscreen",
+         m.right - m.left, m.bottom - m.top);
+}
+static void RestoreWindowed(HWND h)
+{
+    if (!g_bl.saved || g_bl.hwnd != h || !IsWindow(h)) return;
+    g_bl.saved = false;
+    SetWindowLongPtrA(h, GWL_STYLE, g_bl.style);
+    SetWindowLongPtrA(h, GWL_EXSTYLE, g_bl.exStyle);
+    SetWindowPos(h, nullptr, g_bl.rect.left, g_bl.rect.top, g_bl.rect.right - g_bl.rect.left, g_bl.rect.bottom - g_bl.rect.top,
+                 SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
+    LOGI("BFI Presenter: the game left fullscreen -- its window style and size restored");
+}
+static HMONITOR OutputMonitor(IDXGIOutput *o)
+{
+    DXGI_OUTPUT_DESC od = {};
+    return (o && SUCCEEDED(o->GetDesc(&od))) ? od.Monitor : nullptr;
+}
+
 // Exclusive fullscreen would put the game's own swap chain in charge of the
 // display: the presenter needs windowed (borderless) mode. The game is told
 // what it asked for.
@@ -4243,6 +4282,8 @@ static HRESULT STDMETHODCALLTYPE hk_SetFS(IDXGISwapChain *sc, BOOL fs, IDXGIOutp
     FsCsDepth depth;
     if (t_ownCall || !IsGame11(sc)) return o_SetFS(sc, fs, target);
     g_fsWanted = fs;
+    if (fs) MakeBorderless(g_gameHwnd, OutputMonitor(target));
+    else    RestoreWindowed(g_gameHwnd);
     if (fs)
     {
         if (!g_fsLogged)
@@ -4582,6 +4623,7 @@ static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 
             OwnCall own;
             const HRESULT hr = ((PFN_SetFS)DirectSlot(*(void ***)sc3, VT_SetFullscreenState))(sc3, FALSE, nullptr);
             g_fsWanted = TRUE;
+            MakeBorderless(hwnd, nullptr);
             LOGW("BFI Presenter: DX11: the game was in exclusive fullscreen -- switched to windowed (0x%08lX); "
                  "choose borderless/windowed fullscreen in the game for the best result", (unsigned long)hr);
         }
@@ -4807,6 +4849,7 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
 // texture the add-on's own D3D11 device reads. No BFI yet: results go to
 // ReShade.log ("DX9 test: ...").
 static std::atomic<bool> g_dx9Upgrade{false};
+static bool g_dx9WantedFs = false;                  // the game asked for exclusive fullscreen (kept windowed)
 static bool g_dx9Diag = false;
 static bool on_create_device9(reshade::api::device_api api, uint32_t &ver)
 {
@@ -4842,6 +4885,7 @@ static bool on_create_swapchain9(uintptr_t a, uintptr_t b, uintptr_t)
     if (!desc || !desc->fullscreen_state) return false;
     desc->fullscreen_state = false;
     desc->fullscreen_refresh_rate = 0;
+    g_dx9WantedFs = true;
     LOGI("BFI Presenter: DX9: the game asked for exclusive fullscreen -- kept windowed (9Ex needs it, BFI needs borderless)");
     return true;
 }
@@ -4882,8 +4926,12 @@ static void Dx9UnhideEx();
 static void Dx9UnhookPresent();
 static void on_present9(reshade::api::command_queue *, reshade::api::swapchain *, const reshade::api::rect *,
                         const reshade::api::rect *, uint32_t, const reshade::api::rect *);
+static void on_reshade_present_gl(reshade::api::effect_runtime *runtime);
 static void RegisterDx9Events(bool on)
 {
+    // (also the OpenGL front end's frame event)
+    if (on) reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present_gl);
+    else    reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present_gl);
     if (on) reshade::register_event<reshade::addon_event::present>(on_present9);
     else    reshade::unregister_event<reshade::addon_event::present>(on_present9);
     if (!on)
@@ -5549,9 +5597,354 @@ static void InitDx9(reshade::api::swapchain *swapchain)
         ReleaseDx9();
         return;
     }
+    if (g_dx9WantedFs) MakeBorderless(hwnd, nullptr);
     g_dx9.store(true);
     g_t9.ready = true;
     Dx9HookPresent(dev, sc9);
+}
+
+// ---------------------------------------------------------------- OpenGL front end
+// The game's frames (ReShade's effects and overlay applied) are blitted, at
+// ReShade's reshade_present event, into a Direct3D 11 texture the game's GL
+// context sees through WGL_NV_DX_interop2; from there they take the DX11
+// path to the presenter. The game's own SwapBuffers still runs (under the
+// presenter's window, swap interval 0), so nothing below ReShade is hooked.
+#define BFI_GL_READ_FRAMEBUFFER          0x8CA8
+#define BFI_GL_DRAW_FRAMEBUFFER          0x8CA9
+#define BFI_GL_READ_FRAMEBUFFER_BINDING  0x8CAA
+#define BFI_GL_DRAW_FRAMEBUFFER_BINDING  0x8CA6
+#define BFI_GL_COLOR_ATTACHMENT0         0x8CE0
+#define BFI_GL_FRAMEBUFFER_COMPLETE      0x8CD5
+#define BFI_GL_FRAMEBUFFER_SRGB          0x8DB9
+#define BFI_GL_SCISSOR_TEST              0x0C11
+#define BFI_GL_RASTERIZER_DISCARD        0x8C89
+#define BFI_GL_COLOR_BUFFER_BIT          0x00004000
+#define BFI_GL_NEAREST                   0x2600
+#define BFI_GL_BACK                      0x0405
+#define BFI_GL_READ_BUFFER               0x0C02
+#define BFI_GL_TEXTURE_2D                0x0DE1
+#define BFI_WGL_ACCESS_WRITE_DISCARD_NV  0x0002
+typedef unsigned int GLuintB; typedef int GLintB; typedef unsigned int GLenumB; typedef unsigned char GLbooleanB;
+struct GlFns
+{
+    PROC   (WINAPI *GetProcAddress)(LPCSTR) = nullptr;
+    HGLRC  (WINAPI *GetCurrentContext)() = nullptr;
+    void   (WINAPI *GetIntegerv)(GLenumB, GLintB *) = nullptr;
+    GLbooleanB (WINAPI *IsEnabled)(GLenumB) = nullptr;
+    void   (WINAPI *Enable)(GLenumB) = nullptr;
+    void   (WINAPI *Disable)(GLenumB) = nullptr;
+    void   (WINAPI *GenTextures)(int, GLuintB *) = nullptr;
+    void   (WINAPI *DeleteTextures)(int, const GLuintB *) = nullptr;
+    void   (WINAPI *ReadBuffer)(GLenumB) = nullptr;
+    GLenumB (WINAPI *GetError)() = nullptr;
+    void   (APIENTRY *GenFramebuffers)(int, GLuintB *) = nullptr;
+    void   (APIENTRY *DeleteFramebuffers)(int, const GLuintB *) = nullptr;
+    void   (APIENTRY *BindFramebuffer)(GLenumB, GLuintB) = nullptr;
+    void   (APIENTRY *FramebufferTexture2D)(GLenumB, GLenumB, GLenumB, GLuintB, GLintB) = nullptr;
+    GLenumB (APIENTRY *CheckFramebufferStatus)(GLenumB) = nullptr;
+    void   (APIENTRY *BlitFramebuffer)(GLintB, GLintB, GLintB, GLintB, GLintB, GLintB, GLintB, GLintB, unsigned, GLenumB) = nullptr;
+    HANDLE (WINAPI *DXOpenDeviceNV)(void *) = nullptr;
+    BOOL   (WINAPI *DXCloseDeviceNV)(HANDLE) = nullptr;
+    HANDLE (WINAPI *DXRegisterObjectNV)(HANDLE, void *, GLuintB, GLenumB, GLenumB) = nullptr;
+    BOOL   (WINAPI *DXUnregisterObjectNV)(HANDLE, HANDLE) = nullptr;
+    BOOL   (WINAPI *DXLockObjectsNV)(HANDLE, GLintB, HANDLE *) = nullptr;
+    BOOL   (WINAPI *DXUnlockObjectsNV)(HANDLE, GLintB, HANDLE *) = nullptr;
+    BOOL   (WINAPI *SwapIntervalEXT)(int) = nullptr;
+    int    (WINAPI *GetSwapIntervalEXT)() = nullptr;
+};
+struct GlState
+{
+    reshade::api::effect_runtime *rt = nullptr;   // ReShade's runtime for the game's window
+    HWND   hwnd = nullptr;
+    HGLRC  ctx = nullptr;                          // the game's context (GL objects below belong to it)
+    ID3D11Device        *d11 = nullptr;
+    ID3D11DeviceContext *c11 = nullptr;
+    ID3D11Texture2D     *tex = nullptr;            // interop texture, the frame for the presenter
+    HANDLE glDev = nullptr, glObj = nullptr;
+    GLuintB glTex = 0, fbo = 0;
+    UINT   w = 0, h = 0;
+    bool   presenter = false;                      // InitPresenter11 succeeded
+    bool   glReady = false, glFailed = false;
+    bool   swapLogged = false;
+};
+static GlState g_gl;
+static GlFns   g_glf;
+static std::atomic<bool> g_glActive{false};
+
+static bool LoadGlFns()
+{
+    if (g_glf.GetProcAddress) return true;
+    HMODULE m = GetModuleHandleA("opengl32.dll");
+    if (!m) return false;
+    auto core = [&](const char *n) { return (void *)GetProcAddress(m, n); };
+    g_glf.GetProcAddress    = (decltype(g_glf.GetProcAddress))core("wglGetProcAddress");
+    g_glf.GetCurrentContext = (decltype(g_glf.GetCurrentContext))core("wglGetCurrentContext");
+    g_glf.GetIntegerv       = (decltype(g_glf.GetIntegerv))core("glGetIntegerv");
+    g_glf.IsEnabled         = (decltype(g_glf.IsEnabled))core("glIsEnabled");
+    g_glf.Enable            = (decltype(g_glf.Enable))core("glEnable");
+    g_glf.Disable           = (decltype(g_glf.Disable))core("glDisable");
+    g_glf.GenTextures       = (decltype(g_glf.GenTextures))core("glGenTextures");
+    g_glf.DeleteTextures    = (decltype(g_glf.DeleteTextures))core("glDeleteTextures");
+    g_glf.ReadBuffer        = (decltype(g_glf.ReadBuffer))core("glReadBuffer");
+    g_glf.GetError          = (decltype(g_glf.GetError))core("glGetError");
+    return g_glf.GetProcAddress && g_glf.GetCurrentContext && g_glf.GetIntegerv && g_glf.IsEnabled && g_glf.Enable &&
+           g_glf.Disable && g_glf.GenTextures && g_glf.DeleteTextures && g_glf.ReadBuffer && g_glf.GetError;
+}
+// Extension functions: per context in theory; loaded with the game's context current.
+static bool LoadGlExtFns()
+{
+    auto ext = [&](const char *n) { return (void *)g_glf.GetProcAddress(n); };
+    g_glf.GenFramebuffers        = (decltype(g_glf.GenFramebuffers))ext("glGenFramebuffers");
+    g_glf.DeleteFramebuffers     = (decltype(g_glf.DeleteFramebuffers))ext("glDeleteFramebuffers");
+    g_glf.BindFramebuffer        = (decltype(g_glf.BindFramebuffer))ext("glBindFramebuffer");
+    g_glf.FramebufferTexture2D   = (decltype(g_glf.FramebufferTexture2D))ext("glFramebufferTexture2D");
+    g_glf.CheckFramebufferStatus = (decltype(g_glf.CheckFramebufferStatus))ext("glCheckFramebufferStatus");
+    g_glf.BlitFramebuffer        = (decltype(g_glf.BlitFramebuffer))ext("glBlitFramebuffer");
+    g_glf.DXOpenDeviceNV         = (decltype(g_glf.DXOpenDeviceNV))ext("wglDXOpenDeviceNV");
+    g_glf.DXCloseDeviceNV        = (decltype(g_glf.DXCloseDeviceNV))ext("wglDXCloseDeviceNV");
+    g_glf.DXRegisterObjectNV     = (decltype(g_glf.DXRegisterObjectNV))ext("wglDXRegisterObjectNV");
+    g_glf.DXUnregisterObjectNV   = (decltype(g_glf.DXUnregisterObjectNV))ext("wglDXUnregisterObjectNV");
+    g_glf.DXLockObjectsNV        = (decltype(g_glf.DXLockObjectsNV))ext("wglDXLockObjectsNV");
+    g_glf.DXUnlockObjectsNV      = (decltype(g_glf.DXUnlockObjectsNV))ext("wglDXUnlockObjectsNV");
+    g_glf.SwapIntervalEXT        = (decltype(g_glf.SwapIntervalEXT))ext("wglSwapIntervalEXT");
+    g_glf.GetSwapIntervalEXT     = (decltype(g_glf.GetSwapIntervalEXT))ext("wglGetSwapIntervalEXT");
+    const bool fbo = g_glf.GenFramebuffers && g_glf.DeleteFramebuffers && g_glf.BindFramebuffer && g_glf.FramebufferTexture2D &&
+                     g_glf.CheckFramebufferStatus && g_glf.BlitFramebuffer;
+    const bool nv  = g_glf.DXOpenDeviceNV && g_glf.DXCloseDeviceNV && g_glf.DXRegisterObjectNV && g_glf.DXUnregisterObjectNV &&
+                     g_glf.DXLockObjectsNV && g_glf.DXUnlockObjectsNV;
+    if (!fbo) LOGW("BFI Presenter: OpenGL: framebuffer-object functions missing (OpenGL 3.0 or newer needed)");
+    if (!nv)  LOGW("BFI Presenter: OpenGL: WGL_NV_DX_interop2 not available (NVIDIA drivers have it; some AMD drivers don't)");
+    return fbo && nv;
+}
+
+// GL objects: only with the game's context current on this thread.
+static void GlReleaseObjects()
+{
+    if (!g_gl.ctx || !LoadGlFns() || g_glf.GetCurrentContext() != g_gl.ctx)
+    {
+        if (g_gl.glDev || g_gl.fbo) LOGI("BFI Presenter: OpenGL: the game's context isn't current here -- its interop objects are left to it");
+        g_gl.glObj = g_gl.glDev = nullptr; g_gl.glTex = g_gl.fbo = 0; g_gl.glReady = false;
+        return;
+    }
+    if (g_gl.glObj && g_glf.DXUnregisterObjectNV) g_glf.DXUnregisterObjectNV(g_gl.glDev, g_gl.glObj);
+    if (g_gl.glDev && g_glf.DXCloseDeviceNV)      g_glf.DXCloseDeviceNV(g_gl.glDev);
+    if (g_gl.fbo && g_glf.DeleteFramebuffers)     g_glf.DeleteFramebuffers(1, &g_gl.fbo);
+    if (g_gl.glTex)                               g_glf.DeleteTextures(1, &g_gl.glTex);
+    g_gl.glObj = g_gl.glDev = nullptr; g_gl.glTex = g_gl.fbo = 0; g_gl.glReady = false;
+}
+static void ReleaseGl()
+{
+    const bool wasActive = g_glActive.exchange(false);
+    GlReleaseObjects();
+    if (wasActive || g_gl.presenter)
+    {
+        ReleaseDx11();
+        if (g_presenterStuck.load()) { g_gl = GlState(); return; }       // leave the rest alive (see StopPresenter)
+    }
+    SafeRelease(g_gl.tex); SafeRelease(g_gl.c11); SafeRelease(g_gl.d11);
+    g_gl = GlState();
+}
+
+// The add-on's own D3D11 device, past ReShade's hooks: the first hardware
+// adapter (OpenGL gives no adapter LUID; this is the GPU the desktop runs on).
+static HRESULT CreateAddonD3D11(ID3D11Device **dev, ID3D11DeviceContext **ctx, LUID *luid)
+{
+    typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void **);
+    typedef HRESULT (WINAPI *PFN_D3D11CDSC)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL *, UINT, UINT,
+                                            const DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **, ID3D11Device **, D3D_FEATURE_LEVEL *,
+                                            ID3D11DeviceContext **);
+    static PFN_CF1 cf1 = nullptr;
+    static PFN_D3D11CDSC cd = nullptr;
+    if (!cf1) { HMODULE m = LoadSystemDll("dxgi.dll"); if (m) cf1 = (PFN_CF1)RawEntry((void *)GetProcAddress(m, "CreateDXGIFactory1"), "CreateDXGIFactory1"); }
+    if (!cd)  { HMODULE m = LoadSystemDll("d3d11.dll"); if (m) cd = (PFN_D3D11CDSC)RawEntry((void *)GetProcAddress(m, "D3D11CreateDeviceAndSwapChain"), "D3D11CreateDeviceAndSwapChain"); }
+    if (!cf1 || !cd) return E_FAIL;
+    IDXGIFactory1 *fac = nullptr;
+    IDXGIAdapter1 *ad = nullptr;
+    if (SUCCEEDED(cf1(__uuidof(IDXGIFactory1), (void **)&fac)) && fac)
+    {
+        IDXGIAdapter1 *a = nullptr;
+        for (UINT i = 0; !ad && fac->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++)
+        {
+            DXGI_ADAPTER_DESC1 d = {};
+            a->GetDesc1(&d);
+            if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) { ad = a; *luid = d.AdapterLuid; } else a->Release();
+        }
+        fac->Release();
+    }
+    HRESULT hr;
+    {
+        OwnCall own;
+        hr = cd(ad, ad ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                nullptr, nullptr, dev, nullptr, ctx);
+    }
+    if (ad) ad->Release();
+    return hr;
+}
+
+// Device side, from init_swapchain: the add-on's D3D11 device, the frame
+// texture and the presenter. The GL side follows on the first present.
+static void InitGl(reshade::api::swapchain *swapchain)
+{
+    ReleaseGl();
+    if (GetPrivateProfileIntA("BFI", "OpenGLSupport", 1, g_iniPath) == 0)
+    {
+        SetReason(0, "Not managed: OpenGL support is off (OpenGLSupport=0).");
+        return;
+    }
+    HWND hwnd = (HWND)swapchain->get_hwnd();
+    RECT rc = {};
+    if (!hwnd || !GetClientRect(hwnd, &rc) || rc.right - rc.left < 64 || rc.bottom - rc.top < 64)
+    {
+        LOGI("BFI Presenter: OpenGL: ignoring a window of %ldx%ld", rc.right - rc.left, rc.bottom - rc.top);
+        return;
+    }
+    const UINT w = (UINT)(rc.right - rc.left), h = (UINT)(rc.bottom - rc.top);
+    LUID luid = {};
+    HRESULT hr = CreateAddonD3D11(&g_gl.d11, &g_gl.c11, &luid);
+    if (FAILED(hr))
+    {
+        LOGW("BFI Presenter: OpenGL: the add-on's D3D11 device was not created (0x%08lX)", (unsigned long)hr);
+        SetReason(0, "Not managed (OpenGL): the add-on's D3D11 device could not be created.");
+        ReleaseGl();
+        return;
+    }
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w; td.Height = h; td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    hr = g_gl.d11->CreateTexture2D(&td, nullptr, &g_gl.tex);
+    if (FAILED(hr))
+    {
+        LOGW("BFI Presenter: OpenGL: frame texture not created (0x%08lX)", (unsigned long)hr);
+        ReleaseGl();
+        return;
+    }
+    ID3D11Device3 *dev3 = nullptr;
+    ID3D11DeviceContext3 *ctx3 = nullptr;
+    bool ok = SUCCEEDED(g_gl.d11->QueryInterface(IID_PPV_ARGS(&g_dev11)));
+    if (ok && SUCCEEDED(g_gl.d11->QueryInterface(IID_PPV_ARGS(&dev3))))
+    {
+        dev3->GetImmediateContext3(&ctx3);
+        if (ctx3) ctx3->QueryInterface(IID_PPV_ARGS(&g_ctx11));
+    }
+    SafeRelease(ctx3);
+    SafeRelease(dev3);
+    if (!ok || !g_ctx11)
+    {
+        SafeRelease(g_ctx11); SafeRelease(g_dev11);
+        SetReason(0, "Not managed (OpenGL): no shared-fence support (needs Windows 10 1703 or later).");
+        ReleaseGl();
+        return;
+    }
+    LOGI("BFI Presenter: OpenGL init 1/5 -- window %ux%u; frames go through the add-on's D3D11 device", w, h);
+    DXGI_SWAP_CHAIN_DESC1 d = {};
+    d.Width = w; d.Height = h; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.SampleDesc.Count = 1; d.BufferCount = 2;
+    if (!InitPresenter11(swapchain, nullptr, d, hwnd, DXGI_FORMAT_R8G8B8A8_UNORM, luid, "OpenGL"))
+    {
+        SafeRelease(g_ctx11); SafeRelease(g_dev11);
+        g_dx11.store(false);
+        ReleaseGl();
+        return;
+    }
+    g_gl.presenter = true;
+    g_gl.hwnd = hwnd;
+    g_gl.w = w; g_gl.h = h;
+    g_glActive.store(true);
+}
+
+// GL side, on the game's render thread with its context current.
+static bool GlSetup(HGLRC ctx)
+{
+    if (!LoadGlFns() || !LoadGlExtFns()) return false;
+    g_gl.ctx = ctx;
+    g_gl.glDev = g_glf.DXOpenDeviceNV(g_gl.d11);
+    if (!g_gl.glDev) { LOGW("BFI Presenter: OpenGL: wglDXOpenDeviceNV failed (%lu)", GetLastError()); return false; }
+    g_glf.GenTextures(1, &g_gl.glTex);
+    g_gl.glObj = g_glf.DXRegisterObjectNV(g_gl.glDev, g_gl.tex, g_gl.glTex, BFI_GL_TEXTURE_2D, BFI_WGL_ACCESS_WRITE_DISCARD_NV);
+    if (!g_gl.glObj) { LOGW("BFI Presenter: OpenGL: wglDXRegisterObjectNV failed (%lu)", GetLastError()); return false; }
+    GLintB oldRead = 0, oldDraw = 0;
+    g_glf.GetIntegerv(BFI_GL_READ_FRAMEBUFFER_BINDING, &oldRead);
+    g_glf.GetIntegerv(BFI_GL_DRAW_FRAMEBUFFER_BINDING, &oldDraw);
+    g_glf.GenFramebuffers(1, &g_gl.fbo);
+    g_glf.DXLockObjectsNV(g_gl.glDev, 1, &g_gl.glObj);
+    g_glf.BindFramebuffer(BFI_GL_DRAW_FRAMEBUFFER, g_gl.fbo);
+    g_glf.FramebufferTexture2D(BFI_GL_DRAW_FRAMEBUFFER, BFI_GL_COLOR_ATTACHMENT0, BFI_GL_TEXTURE_2D, g_gl.glTex, 0);
+    const GLenumB st = g_glf.CheckFramebufferStatus(BFI_GL_DRAW_FRAMEBUFFER);
+    g_glf.DXUnlockObjectsNV(g_gl.glDev, 1, &g_gl.glObj);
+    g_glf.BindFramebuffer(BFI_GL_READ_FRAMEBUFFER, (GLuintB)oldRead);
+    g_glf.BindFramebuffer(BFI_GL_DRAW_FRAMEBUFFER, (GLuintB)oldDraw);
+    if (st != BFI_GL_FRAMEBUFFER_COMPLETE) { LOGW("BFI Presenter: OpenGL: the frame texture's framebuffer is incomplete (0x%X)", st); return false; }
+    LOGI("BFI Presenter: OpenGL init 2/5 -- the game's context shares the frame texture through WGL_NV_DX_interop2");
+    return true;
+}
+
+// One OpenGL game frame: blit the default framebuffer (bottom-up) into the
+// interop texture (top-down), then hand it to the DX11 core.
+static void on_reshade_present_gl(reshade::api::effect_runtime *runtime)
+{
+    if (!g_glActive.load() || !g_gl.presenter || g_gl.glFailed) return;
+    if (runtime->get_device()->get_api() != reshade::api::device_api::opengl) return;
+    if ((HWND)runtime->get_hwnd() != g_gl.hwnd) return;
+    if (!LoadGlFns()) return;
+    HGLRC ctx = g_glf.GetCurrentContext();
+    if (!ctx) return;
+    if (!g_gl.glReady)
+    {
+        if (!GlSetup(ctx))
+        {
+            g_gl.glFailed = true;
+            SetReason(0, "Not managed (OpenGL): the game's frames could not be shared with the presenter (see ReShade.log).");
+            GlReleaseObjects();
+            if (HWND h = g_childHwnd.load()) ShowWindowAsync(h, SW_HIDE);
+            return;
+        }
+        g_gl.glReady = true;
+    }
+    if (ctx != g_gl.ctx) return;                                    // another context of the game
+    RECT rc = {};
+    GetClientRect(g_gl.hwnd, &rc);
+    if ((UINT)(rc.right - rc.left) != g_gl.w || (UINT)(rc.bottom - rc.top) != g_gl.h) return;   // resized: init_swapchain follows
+    // The game's swap must not wait for vblank: the presenter paces the game.
+    if (g_glf.SwapIntervalEXT && g_glf.GetSwapIntervalEXT && GetPrivateProfileIntA("BFI", "OpenGLSwapInterval0", 1, g_iniPath))
+    {
+        const int si = g_glf.GetSwapIntervalEXT();
+        if (si != 0)
+        {
+            g_glf.SwapIntervalEXT(0);
+            if (!g_gl.swapLogged) { g_gl.swapLogged = true; LOGI("BFI Presenter: OpenGL: the game's swap interval %d set to 0 (the presenter paces the game)", si); }
+        }
+    }
+    SubmitFrame11Core(
+        [&]() -> ID3D11Texture2D * {
+            GLintB oldRead = 0, oldDraw = 0, oldReadBuf = 0;
+            g_glf.GetIntegerv(BFI_GL_READ_FRAMEBUFFER_BINDING, &oldRead);
+            g_glf.GetIntegerv(BFI_GL_DRAW_FRAMEBUFFER_BINDING, &oldDraw);
+            const bool scissor = g_glf.IsEnabled(BFI_GL_SCISSOR_TEST) != 0;
+            const bool srgb    = g_glf.IsEnabled(BFI_GL_FRAMEBUFFER_SRGB) != 0;
+            const bool discard = g_glf.IsEnabled(BFI_GL_RASTERIZER_DISCARD) != 0;
+            if (!g_glf.DXLockObjectsNV(g_gl.glDev, 1, &g_gl.glObj)) return nullptr;
+            g_glf.BindFramebuffer(BFI_GL_READ_FRAMEBUFFER, 0);
+            g_glf.GetIntegerv(BFI_GL_READ_BUFFER, &oldReadBuf);
+            g_glf.ReadBuffer(BFI_GL_BACK);
+            g_glf.BindFramebuffer(BFI_GL_DRAW_FRAMEBUFFER, g_gl.fbo);
+            if (scissor) g_glf.Disable(BFI_GL_SCISSOR_TEST);
+            if (srgb)    g_glf.Disable(BFI_GL_FRAMEBUFFER_SRGB);
+            if (discard) g_glf.Disable(BFI_GL_RASTERIZER_DISCARD);
+            g_glf.BlitFramebuffer(0, 0, (GLintB)g_gl.w, (GLintB)g_gl.h, 0, (GLintB)g_gl.h, (GLintB)g_gl.w, 0,
+                                  BFI_GL_COLOR_BUFFER_BIT, BFI_GL_NEAREST);
+            if (scissor) g_glf.Enable(BFI_GL_SCISSOR_TEST);
+            if (srgb)    g_glf.Enable(BFI_GL_FRAMEBUFFER_SRGB);
+            if (discard) g_glf.Enable(BFI_GL_RASTERIZER_DISCARD);
+            g_glf.ReadBuffer((GLenumB)oldReadBuf);
+            g_glf.BindFramebuffer(BFI_GL_READ_FRAMEBUFFER, (GLuintB)oldRead);
+            g_glf.BindFramebuffer(BFI_GL_DRAW_FRAMEBUFFER, (GLuintB)oldDraw);
+            g_glf.DXUnlockObjectsNV(g_gl.glDev, 1, &g_gl.glObj);
+            static bool first = true;
+            if (first) { first = false; LOGI("BFI Presenter: OpenGL: first game frame copied (GL error 0x%X)", g_glf.GetError()); }
+            g_gl.tex->AddRef();
+            return g_gl.tex;
+        },
+        []() -> HRESULT { return S_OK; });                         // the game's own SwapBuffers follows anyway
 }
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
@@ -5563,6 +5956,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     {
         const reshade::api::device_api a = swapchain->get_device()->get_api();
         if (a == reshade::api::device_api::d3d9) { if (!g_dx9.load()) InitDx9(swapchain); return; }
+        if (a == reshade::api::device_api::opengl) { if (!g_glActive.load()) InitGl(swapchain); return; }
         if (a != reshade::api::device_api::d3d11 && a != reshade::api::device_api::d3d12)
         {
             SetReason(0, "Not managed: this game renders with %s; the add-on handles Direct3D 12, 11 and 9.",
@@ -6087,6 +6481,13 @@ static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 
 static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+    if (g_glActive.load() && swapchain->get_device()->get_api() == reshade::api::device_api::opengl &&
+        (HWND)swapchain->get_hwnd() == g_gl.hwnd)
+    {
+        LOGI("BFI Presenter: OpenGL swap chain %s -- stopping the presenter", resize ? "resized" : "destroyed");
+        ReleaseGl();
+        return;
+    }
     if (g_t9.rsc && swapchain == g_t9.rsc)
     {
         LOGI("BFI Presenter: DX9 swap chain %s -- stopping the presenter", resize ? "reset" : "destroyed");
