@@ -29,9 +29,9 @@ Both read the same `BFIPresenter.ini` with the same keys, so one ini works for e
 - The display at a **fixed 120 Hz** for the game. The presenter's steady presents usually hold it there; where they don't, set G-SYNC off (and Vertical Sync Force on) in the game's NVIDIA profile. The overlay warns when VRR takes over.
 - NVIDIA Vertical Sync never "Force off" or "Fast Sync", and no frame limiter acting on the game (RTSS limit 0, NVIDIA Max Frame Rate off).
 
-**DX games**
+**Direct3D 12 / 11 / 9 and OpenGL games** (the same add-on covers all of them)
 
-1. Copy `BFIPresenter.addon64` into the game folder, next to ReShade's DLL (`BFIPresenter.addon32` for a 32-bit game, with the 32-bit ReShade).
+1. Install ReShade for the game's API (for OpenGL, ReShade's DLL is `opengl32.dll`), then copy `BFIPresenter.addon64` into the game folder, next to ReShade's DLL (`BFIPresenter.addon32` for a 32-bit game, with the 32-bit ReShade). OpenGL needs an NVIDIA GPU.
 2. The add-on creates `BFIPresenter.ini` next to itself on first start. (`BFIPresenter.example.ini` explains every setting.)
 3. Start the game and open the ReShade overlay: the **BFI Presenter** tab shows the status and all settings. BFI starts at the game's first swap-chain resize; if it doesn't, change resolution or display mode once.
 
