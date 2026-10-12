@@ -4228,6 +4228,45 @@ static bool CreateStage11()
     return true;
 }
 
+// Exclusive fullscreen is held off (the presenter needs a window), so the
+// game's window is made to cover its monitor without a border instead -- what
+// exclusive fullscreen would have looked like. Off with BorderlessFullscreen=0.
+static struct { HWND hwnd; LONG_PTR style, exStyle; RECT rect; bool saved; } g_bl = {};
+static void MakeBorderless(HWND h, HMONITOR mon)
+{
+    if (!h || !IsWindow(h) || GetPrivateProfileIntA("BFI", "BorderlessFullscreen", 1, g_iniPath) == 0) return;
+    if (!mon) mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoA(mon, &mi)) return;
+    const RECT &m = mi.rcMonitor;
+    RECT wr = {};
+    GetWindowRect(h, &wr);
+    const LONG_PTR style = GetWindowLongPtrA(h, GWL_STYLE), ex = GetWindowLongPtrA(h, GWL_EXSTYLE);
+    const bool covers = wr.left == m.left && wr.top == m.top && wr.right == m.right && wr.bottom == m.bottom;
+    if (covers && !(style & (WS_CAPTION | WS_THICKFRAME))) return;          // already borderless on the monitor
+    if (!g_bl.saved || g_bl.hwnd != h) { g_bl.hwnd = h; g_bl.style = style; g_bl.exStyle = ex; g_bl.rect = wr; g_bl.saved = true; }
+    SetWindowLongPtrA(h, GWL_STYLE, (style & ~(LONG_PTR)(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP);
+    SetWindowLongPtrA(h, GWL_EXSTYLE, ex & ~(LONG_PTR)(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE));
+    SetWindowPos(h, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    LOGI("BFI Presenter: the game's window made borderless over its monitor (%ldx%ld) in place of exclusive fullscreen",
+         m.right - m.left, m.bottom - m.top);
+}
+static void RestoreWindowed(HWND h)
+{
+    if (!g_bl.saved || g_bl.hwnd != h || !IsWindow(h)) return;
+    g_bl.saved = false;
+    SetWindowLongPtrA(h, GWL_STYLE, g_bl.style);
+    SetWindowLongPtrA(h, GWL_EXSTYLE, g_bl.exStyle);
+    SetWindowPos(h, nullptr, g_bl.rect.left, g_bl.rect.top, g_bl.rect.right - g_bl.rect.left, g_bl.rect.bottom - g_bl.rect.top,
+                 SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
+    LOGI("BFI Presenter: the game left fullscreen -- its window style and size restored");
+}
+static HMONITOR OutputMonitor(IDXGIOutput *o)
+{
+    DXGI_OUTPUT_DESC od = {};
+    return (o && SUCCEEDED(o->GetDesc(&od))) ? od.Monitor : nullptr;
+}
+
 // Exclusive fullscreen would put the game's own swap chain in charge of the
 // display: the presenter needs windowed (borderless) mode. The game is told
 // what it asked for.
@@ -4243,6 +4282,8 @@ static HRESULT STDMETHODCALLTYPE hk_SetFS(IDXGISwapChain *sc, BOOL fs, IDXGIOutp
     FsCsDepth depth;
     if (t_ownCall || !IsGame11(sc)) return o_SetFS(sc, fs, target);
     g_fsWanted = fs;
+    if (fs) MakeBorderless(g_gameHwnd, OutputMonitor(target));
+    else    RestoreWindowed(g_gameHwnd);
     if (fs)
     {
         if (!g_fsLogged)
@@ -4582,6 +4623,7 @@ static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 
             OwnCall own;
             const HRESULT hr = ((PFN_SetFS)DirectSlot(*(void ***)sc3, VT_SetFullscreenState))(sc3, FALSE, nullptr);
             g_fsWanted = TRUE;
+            MakeBorderless(hwnd, nullptr);
             LOGW("BFI Presenter: DX11: the game was in exclusive fullscreen -- switched to windowed (0x%08lX); "
                  "choose borderless/windowed fullscreen in the game for the best result", (unsigned long)hr);
         }
@@ -4807,6 +4849,7 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
 // texture the add-on's own D3D11 device reads. No BFI yet: results go to
 // ReShade.log ("DX9 test: ...").
 static std::atomic<bool> g_dx9Upgrade{false};
+static bool g_dx9WantedFs = false;                  // the game asked for exclusive fullscreen (kept windowed)
 static bool g_dx9Diag = false;
 static bool on_create_device9(reshade::api::device_api api, uint32_t &ver)
 {
@@ -4842,6 +4885,7 @@ static bool on_create_swapchain9(uintptr_t a, uintptr_t b, uintptr_t)
     if (!desc || !desc->fullscreen_state) return false;
     desc->fullscreen_state = false;
     desc->fullscreen_refresh_rate = 0;
+    g_dx9WantedFs = true;
     LOGI("BFI Presenter: DX9: the game asked for exclusive fullscreen -- kept windowed (9Ex needs it, BFI needs borderless)");
     return true;
 }
@@ -5553,6 +5597,7 @@ static void InitDx9(reshade::api::swapchain *swapchain)
         ReleaseDx9();
         return;
     }
+    if (g_dx9WantedFs) MakeBorderless(hwnd, nullptr);
     g_dx9.store(true);
     g_t9.ready = true;
     Dx9HookPresent(dev, sc9);
