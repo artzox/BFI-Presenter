@@ -627,11 +627,12 @@ static unsigned ApisFromStrings(std::string_view f)
 {
     static const struct { const char *n; unsigned a; } k[] = {
         { "d3d12.dll", ApiD3D12 }, { "d3d11.dll", ApiD3D11 }, { "d3d9.dll", ApiD3D9 },
-        { "opengl32.dll", ApiGL }, { "vulkan-1.dll", ApiVulkan }, { "d3d10.dll", ApiD3D10 } };
+        { "opengl32.dll", ApiGL }, { "vulkan-1.dll", ApiVulkan }, { "d3d10.dll", ApiD3D10 },
+        { "\0opengl32\0", ApiGL }, { "\"opengl32\"", ApiGL } };     // LoadLibrary("opengl32") (Quake II's ref_gl.dll)
     unsigned a = 0;
     for (auto &e : k)
     {
-        std::string n = e.n, wn;
+        std::string n = (e.n[0] == '\0') ? std::string(e.n, strlen(e.n + 1) + 2) : std::string(e.n), wn;
         for (char c : n) { wn += c; wn += '\0'; }
         if (FindNoCase(f, n) || FindNoCase(f, wn)) a |= e.a;
     }
@@ -674,7 +675,7 @@ static void SaveCache()
 static ExeFacts AnalyzeExe(const std::wstring &exe)
 {
     std::wstring key = Lower(exe);
-    std::wstring stamp = L"4_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
+    std::wstring stamp = L"5_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
     {
         std::lock_guard<std::mutex> l(g_cacheLock);
         LoadCache();
@@ -698,6 +699,10 @@ static ExeFacts AnalyzeExe(const std::wstring &exe)
         // (PCGamingWiki, when it knows the game, says otherwise).
         r.apis = ApiD3D11;
     }
+    else if (pi.dotnet && Exists(Join(dir, L"FNA.dll")))
+        r.apis = ApiD3D11;                 // FNA: FNA3D picks Direct3D 11, Vulkan or OpenGL at run time
+    else if (pi.dotnet && FindNoCase(f.view(), "Microsoft.Xna.Framework"))
+        r.apis = ApiD3D9;                  // XNA 4.0: Direct3D 9 through Microsoft's shared XNA runtime
     else if (!(r.apis & strong))
     {
         // Engines that keep the renderer in a DLL (Northlight: Control, Alan Wake 2)
@@ -705,22 +710,38 @@ static ExeFacts AnalyzeExe(const std::wstring &exe)
             L"version", L"winmm", L"dbghelp", L"reshade", L"optiscaler", L"d3dcompiler", L"dxcompiler", L"dxil", L"nvngx",
             L"sl.", L"amd_", L"ffx", L"libxess", L"xess", L"nvapi", L"gfsdk", L"steam_api", L"eossdk", L"galaxy", L"discord",
             L"bink", L"fmod", L"wwise", L"physx", L"openal", L"dstorage", L"nvidia", L"igxess", L"renderdoc" };
-        WIN32_FIND_DATAW fd;
-        HANDLE h = FindFirstFileW(Join(dir, L"*.dll").c_str(), &fd);
-        int n = 0;
-        if (h != INVALID_HANDLE_VALUE)
-        {
-            do
+        // DLLs next to the exe and in the usual sub-folders (FNA's x86/x64, lib, bin), and HashLink's .hdll
+        // modules (Dead Cells). Imports first; if none of them names a graphics API, the renderer loads it at run
+        // time, so look for the API's DLL name in their strings too.
+        std::vector<std::wstring> mods;
+        for (const wchar_t *sub : { L"", L"x86", L"x64", L"lib", L"lib64", L"bin", L"bin32", L"bin64" })
+            for (const wchar_t *pat : { L"*.dll", L"*.hdll" })
             {
-                std::wstring l = Lower(fd.cFileName);
-                bool bad = false;
-                for (auto k : skip) if (l.rfind(k, 0) == 0) bad = true;
-                if (bad) continue;
-                Mapped m(Join(dir, fd.cFileName));
-                r.apis |= ApisFromImports(ReadPe(m.view()).imports);
-            } while (++n < 300 && FindNextFileW(h, &fd));
-            FindClose(h);
+                std::wstring d = *sub ? Join(dir, sub) : dir;
+                WIN32_FIND_DATAW fd;
+                HANDLE h = FindFirstFileW(Join(d, pat).c_str(), &fd);
+                if (h == INVALID_HANDLE_VALUE) continue;
+                do
+                {
+                    std::wstring l = Lower(fd.cFileName);
+                    bool bad = false;
+                    for (auto k : skip) if (l.rfind(k, 0) == 0) bad = true;
+                    if (!bad && mods.size() < 300) mods.push_back(Join(d, fd.cFileName));
+                } while (FindNextFileW(h, &fd));
+                FindClose(h);
+            }
+        for (auto &m : mods)
+        {
+            Mapped mm(m);
+            r.apis |= ApisFromImports(ReadPe(mm.view()).imports);
         }
+        if (!(r.apis & strong))
+            for (auto &m : mods)
+            {
+                if (FileSize(m) > (64ull << 20)) continue;
+                Mapped mm(m);
+                r.apis |= ApisFromStrings(mm.view());
+            }
         if (!(r.apis & strong))
         {
             unsigned str = ApisFromStrings(f.view());
@@ -1302,6 +1323,16 @@ void Detect(Game &g)
     else if (g.apis & ApiD3D10) g.route = Route::Unsupported;
     else g.route = g.bits == 32 ? Route::Addon32 : g.bits == 64 ? Route::Addon64 : Route::Unknown;
 
+    if (Exists(Join(dir, L"FNA.dll")))
+        g.notes.push_back("FNA game: add --graphics D3D11 to its launch options so ReShade (as dxgi.dll) and BFI Presenter run "
+                          "on Direct3D 11 (the game's log.txt shows the driver in use).");
+    else if (!g.exe.empty() && FileSize(g.exe) < (100ll << 20))
+    {
+        Mapped m(g.exe);
+        if (ReadPe(m.view()).dotnet && FindNoCase(m.view(), "Microsoft.Xna.Framework"))
+            g.notes.push_back("XNA game: Direct3D 9 runs through Microsoft's shared XNA runtime, which doesn't load ReShade from "
+                              "the game folder. Use an FNA build if the game has one (Celeste: Steam beta \"opengl\").");
+    }
     if (g.bits == 0) g.notes.push_back("Couldn't read the executable's header; pick the game's .exe below.");
     if (!g.apis) g.notes.push_back("The graphics API wasn't recognised from the executable; the route below is a guess.");
     if (g.pcgwKnown && g.pcgwApis && g.exeApis && !(g.pcgwApis & g.exeApis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL | ApiVulkan)))

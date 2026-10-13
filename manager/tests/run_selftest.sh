@@ -30,6 +30,10 @@ mkdir -p "$G/DOOM Eternal"; cp "$B/gvk_64.exe" "$G/DOOM Eternal/DOOMEternalx64vk
 mkdir -p "$G/Hades II/Ship" "$G/Hades II/Tools" "$G/Hades II/Content"; cp "$B/g11_64.exe" "$G/Hades II/Ship/Hades2.exe"; pad g11_64.exe "$G/Hades II/Tools/F10.exe" 30
 mkdir -p "$G/Burnout Paradise Remastered"; cp "$B/g11_64.exe" "$G/Burnout Paradise Remastered/BurnoutPR.exe"; pad g11_64.exe "$G/Burnout Paradise Remastered/BurnoutPR_trial.exe" 5
 mk PerfGame gperf_64.exe PerfGame.exe
+printf 'int main(){return 0;}\n' > "$B/plain.c"; i686-w64-mingw32-gcc "$B/plain.c" -o "$B/plain_32.exe"; x86_64-w64-mingw32-gcc "$B/plain.c" -o "$B/plain_64.exe"
+printf '#include <windows.h>\nBOOL WINAPI DllMain(HINSTANCE a, DWORD b, LPVOID c){ if (b == 99) LoadLibraryA("opengl32"); return TRUE; }\n' > "$B/refgl.c"; i686-w64-mingw32-gcc -shared "$B/refgl.c" -o "$B/ref_gl.dll"
+mk QuakeRef plain_32.exe QuakeRef.exe; cp "$B/ref_gl.dll" "$G/QuakeRef/ref_gl.dll"
+mk HlGame plain_64.exe HlGame.exe; cp "$B/g11_64.exe" "$G/HlGame/directx.hdll"
 mk OldUnity ggl_32.exe OldUnity.exe; mkdir -p "$G/OldUnity/OldUnity_Data/Managed"
 mk ShaderGame g11_64.exe ShaderGame.exe; cp "$B/rs_64.dll" "$G/ShaderGame/dxgi.dll"
 printf '[GENERAL]\r\nEffectSearchPaths=.\\fx\\Shaders\\**,.\\other\r\nPresetPath=.\\MyPreset.ini\r\n' > "$G/ShaderGame/ReShade.ini"

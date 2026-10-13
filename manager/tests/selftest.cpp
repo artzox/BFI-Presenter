@@ -163,6 +163,9 @@ int wmain(int argc, wchar_t **argv)
     {
         Game *ou = Find(all, "OldUnity");
         CHECK(ou && (ou->apis & ApiD3D11) && !(ou->apis & ApiGL), "OldUnity: engine in the exe with _Data\\Managed -> D3D11 (%s)", ou ? ApiText(ou->apis).c_str() : "-");
+        Game *qr = Find(all, "QuakeRef"), *hl = Find(all, "HlGame");
+        CHECK(qr && (qr->apis & ApiGL), "QuakeRef: LoadLibrary(\"opengl32\") in ref_gl.dll -> OpenGL (%s)", qr ? ApiText(qr->apis).c_str() : "-");
+        CHECK(hl && (hl->apis & ApiD3D11), "HlGame: directx.hdll imports d3d11 -> D3D11 (%s)", hl ? ApiText(hl->apis).c_str() : "-");
         Source none = SourceFromFolder(games);
         CHECK(!none.shaderFile.empty() && none.shaderVersion == src.shaderVersion, "a release without the shader gets the built-in one (v%s)", none.shaderVersion.c_str());
     }
