@@ -28,7 +28,7 @@ The [Vulkan layer](../vulkan/README.md) covers Vulkan games and DirectX 9–11 g
 3. Start the game and open the ReShade overlay. The **BFI Presenter** tab shows the version, whether the swap chain is managed (and why not, if it isn't), and live timing.
 4. BFI starts at the game's first swap-chain resize (nearly all games resize at start-up). If it doesn't start, change resolution or display mode once.
 
-**Updating many games:** `Find-BFIPresenter.ps1` lists every game folder with the add-on (and its version) into `BFIPresenter_locations.txt`. `Update-BFIPresenter.ps1 -Source <folder with the new build>` copies the new add-on into all of them; `-DryRun` previews, `-Backup` keeps `.bak` copies. Neither script touches your `BFIPresenter.ini` files.
+**Updating many games:** use the BFI Presenter Manager (`BFIPresenterManager.exe` on the release page): it finds every game with the add-on and updates them all, with backups.
 
 **Uninstall:** delete `BFIPresenter.addon64` / `.addon32` (and the ini) from the game folder.
 
@@ -96,10 +96,11 @@ Settings apply immediately. **Save to BFIPresenter.ini** keeps them; **Reload in
 | Control | ini key (default) | What it does |
 |---|---|---|
 | Game frame cap | `CapGameToRefresh` (1) | 0 off, 1 Refresh rate, 2 Half refresh (60 fps at 120 Hz, every frame lit once), 3 Quarter refresh (30 fps, every frame lit twice). Counted against the presenter's refreshes, so it stays in step with the strobe |
-| Frame pacing | `FramePacing` (0) | 0 Smooth: every game frame shown once, in order, one held in reserve (catches up after 3 cycles). 1 Lowest latency: the newest finished frame (waits up to 3 ms for an expected frame that is about to finish) |
+| Frame pacing | `FramePacing` (0) | 0 Smooth: every game frame shown once, in order, one held in reserve. 1 Lowest latency: the newest finished frame (waits up to 3 ms for an expected frame that is about to finish) |
 | Just-in-time release at Half / Quarter cap | `CapJustInTime` (1) | Each frame targets a lit refresh and the game is released at that refresh's vblank minus its measured frame time and the margin. No repeat-then-skip at Half, no 1-then-3-cycle frames at Quarter. At its limit it releases as early as the cap allows |
 | Later release at Refresh cap | `LaterRelease` (0) | Refresh cap + Lowest latency: releases the game just in time for the pick instead of a full refresh earlier, so its input is read later. Helps light games; does nothing while frames take nearly a whole refresh. Not for frame generation |
 | Just-in-time safety margin | `LaterReleaseMarginMs` (1.5) | Added to the measured frame time (95th percentile of the last 128 frames). Widens 1 ms after a second with 2+ misses (up to 3 ms over the base), narrows after 5 clean seconds. The status line shows state, frame time and margin |
+| Smooth: catch up after a hitch | `SmoothCatchUp` (0) | Smooth only. Off: after a game hitch the presenter stays one frame behind (about one cycle more latency) and never skips a frame. On: once two finished frames have waited for 3 cycles, one is skipped to get back to the lowest latency, which shows as a second stutter (Thief, The Midnight Walk: about one repeat and one skip a second with it on, none with it off) |
 | Automatic frames ahead | `AutoFramesAhead` (1) | 1 frame queued normally, 2 while the game keeps missing strobe cycles; back to 1 once it has headroom, and stays at 2 if it needs 2 again within a minute |
 | Max frames ahead | `MaxFramesAhead` (1) | With the automatic mode off: how many frames the game may queue on the GPU (0 = no limit). 1 = lowest input lag |
 

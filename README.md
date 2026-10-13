@@ -32,10 +32,12 @@ Each [release](../../releases) has two packages with the same version number:
 
 | Package | For | What's in it |
 |---|---|---|
-| `BFIPresenter-DX-v<version>.zip` | **Direct3D 12, 11 and 9 and OpenGL** games, 64- and 32-bit (Direct3D 9 needs ReShade 6.8+; OpenGL needs an NVIDIA GPU) | `BFIPresenter.addon64` / `BFIPresenter.addon32` (ReShade add-ons), example ini, update scripts |
+| `BFIPresenter-DX-v<version>.zip` | **Direct3D 12, 11 and 9 and OpenGL** games, 64- and 32-bit (Direct3D 9 needs ReShade 6.8+; OpenGL needs an NVIDIA GPU) | `BFIPresenter.addon64` / `BFIPresenter.addon32` (ReShade add-ons), example ini |
 | `BFIPresenter-Vulkan-v<version>.zip` | **Vulkan** games, emulators (PCSX2, RPCS3, shadPS4…), and **DirectX 8–11** games run through [DXVK](https://github.com/doitsujin/dxvk) — 64- and 32-bit | `BFIPresenterVK.dll` / `BFIPresenterVK32.dll` (a Vulkan layer), installer, a ready `BFIPresenter.ini` to copy into games |
 
 Both read the same `BFIPresenter.ini` with the same keys, so one ini works for either.
+
+**Or let the app do it:** `BFIPresenterManager.exe` (on the same release page) finds your Steam, Epic, GOG, Xbox and other games, works out whether each needs the 64-bit or 32-bit add-on or the Vulkan layer, checks that ReShade is there (also as `ReShade64.dll` behind OptiScaler), and installs, updates or removes BFI Presenter with a backup of every replaced file. See the [manager README](manager/README.md).
 
 ## Quick start
 
@@ -79,24 +81,16 @@ If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that
 
 ## Updating many games
 
-`scripts/Find-BFIPresenter.ps1` finds every game folder with the add-on or an ini (Steam, Epic, GOG and Xbox folders, plus any `-Roots` you pass) and shows each one's version. `scripts/Update-BFIPresenter.ps1 -Source <extracted release>` copies a new build into all of them and updates the installed Vulkan layer; `-DryRun` previews. Your `BFIPresenter.ini` files are never changed. Every replaced file is kept in `BFIPresenter_backups` next to the script and listed, with its old and new version, in `BFIPresenter_update_log.csv`; if a new version misbehaves, `-Revert` puts back what the last update replaced (run it again to go one more update back).
+Use the [manager app](manager/README.md): point it at the new release (**Check GitHub**, or **Use folder...** with both zips extracted into one folder) and press **Update outdated**. Every replaced file is backed up, and **Undo last change** puts it back per game.
 
-**Easiest:** double-click `Find-BFIPresenter.bat`, then `Update-BFIPresenter.bat`, from the extracted release folder (the new build next to the scripts). The `.bat` files start PowerShell with the right options, so Windows' script policy and the "downloaded from the internet" block don't stop them.
-
-From a command prompt, extra options pass through the `.bat` files:
-
-```bat
-Find-BFIPresenter.bat -Roots "D:\Games"
-Update-BFIPresenter.bat -DryRun
-Update-BFIPresenter.bat -Source "D:\Downloads\BFIPresenter-1.0.0" -Backup
-Update-BFIPresenter.bat -Revert
-```
+The older PowerShell scripts (`scripts/Find-BFIPresenter.ps1`, `scripts/Update-BFIPresenter.ps1`) stay in the repository for anyone who prefers them, but are no longer part of the release zips.
 
 ## Building from source
 
 | Part | MinGW-w64 (Linux, WSL, MSYS2) | Visual Studio |
 |---|---|---|
 | DX add-on | `dx/build_mingw.sh` | `dx/build_msvc.bat` from an x64 Native Tools prompt |
+| Manager app | `manager/build_mingw.sh` | — |
 | Vulkan layer | `vulkan/build_mingw.sh` (64- and 32-bit; recompiles the shaders if `glslangValidator` is installed) | — |
 
 All headers needed are in [`third_party`](third_party/README.md).
@@ -106,7 +100,8 @@ All headers needed are in [`third_party`](third_party/README.md).
 ```
 dx/          DX add-on source, build scripts, reference
 vulkan/      Vulkan layer source, GLSL shaders, manifests, installer, reference
-scripts/     Find-/Update-BFIPresenter.ps1
+manager/     BFIPresenterManager.exe source (finds games, installs and updates)
+scripts/     Find-/Update-BFIPresenter.ps1 (older command-line updater)
 docs/        tested games, latency estimates
 third_party/ ReShade, Dear ImGui and Vulkan headers
 BFIPresenter.example.ini   shared settings reference

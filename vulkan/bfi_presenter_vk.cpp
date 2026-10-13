@@ -56,7 +56,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.2"
+#define BFI_VERSION "1.0.3"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -261,6 +261,7 @@ struct Settings
     int   laterRelease = 0;   // Refresh cap + Lowest latency: release just in time for the pick
     float laterReleaseMs = 1.5f; // just-in-time safety margin (widened automatically)
     int   maxAhead = 1;       // game may run this many frames ahead of the GPU (0 = no limit)
+    int   smoothCatchUp = 0;  // Smooth: 1 = skip a frame when two have waited for 3 cycles (standing latency)
     int   autoAhead = 1;      // automatic: 1 frame ahead, 2 while the game keeps missing strobe cycles
     int   presBuffers = 3;    // real swap chain images (read when the swap chain is created)
     int   ablGuard = 1;       // HDR: keep the lit refresh within the panel's full-screen budget
@@ -320,6 +321,7 @@ static void LoadSettings(Settings &s)
     s.laterReleaseMs = Clamp(KvFloat(kv, "LaterReleaseMarginMs", 1.5f), 0.5f, 5.0f);
     s.maxAhead = Clamp(KvInt(kv, "MaxFramesAhead", 1), 0, 3);
     s.autoAhead = KvInt(kv, "AutoFramesAhead", 1) ? 1 : 0;
+    s.smoothCatchUp = KvInt(kv, "SmoothCatchUp", 0) ? 1 : 0;
     s.presBuffers = Clamp(KvInt(kv, "PresenterBuffers", 3), 2, 4);
     s.ablGuard = KvInt(kv, "AblGuard", 1) ? 1 : 0;
     s.ablBudget = Clamp(KvInt(kv, "AblGuardBudgetNits", 250), 100, 1500);
@@ -353,7 +355,7 @@ static void LoadSettings(Settings &s)
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
-    I("AutoFramesAhead", s.autoAhead); I("PresenterBuffers", s.presBuffers); I("AblGuard", s.ablGuard);
+    I("AutoFramesAhead", s.autoAhead); I("SmoothCatchUp", s.smoothCatchUp); I("PresenterBuffers", s.presBuffers); I("AblGuard", s.ablGuard);
     I("AblGuardBudgetNits", s.ablBudget); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs);
     I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
@@ -1308,7 +1310,7 @@ static void PresenterThread(Swapchain *sc)
             {
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,bfi,method,frames,gain,floor,rolloff,"
                               "pacing,cap,ahead,vblank,wait_vblank_ms,acquire_ms,wait_gpu_ms,submit_ms,present_ms,reused,"
-                              "hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,queue_ahead\n");
+                              "hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,queue_ahead,smooth_catchup\n");
                 LOGI("BFI Presenter: timing log started: %s", path.c_str());
             }
         }
@@ -1420,7 +1422,7 @@ static void PresenterThread(Swapchain *sc)
             {
                 pick = oldestNew;
                 if (cycleStart) extraCycles = (unseen >= 2) ? extraCycles + 1 : 0;
-                if (unseen <= 2 && extraCycles >= 3 && newest >= 0)
+                if (s.smoothCatchUp && unseen <= 2 && extraCycles >= 3 && newest >= 0)
                 {
                     // Two frames waiting for 3 cycles in a row is standing
                     // latency: show the newer one (DX12 add-on v0.70; picking
@@ -1866,12 +1868,12 @@ static void PresenterThread(Swapchain *sc)
                 std::lock_guard<std::mutex> l(g_cfgLock);
                 lrSt = g_status.lrState; lrE = g_status.lrEst; lrM = g_status.lrMargin;
             }
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d\n",
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d\n",
                     t * 1000.0, (unsigned long long)presents, c.slot, (unsigned long long)pickId, (t - pickTime) * 1000.0,
                     (t - lastT) * 1000.0, s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     sc->maxAhead.load(), vblank ? 1 : 0, (tVb - tLoop0) * 1000.0, (tAcq - tVb) * 1000.0, (tFence - tAcq) * 1000.0,
                     (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, reuse ? 1 : 0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f,
-                    litAvg, rawAvg, lrSt, sc->lrLead.load() * 1000.0, lrE, lrM, qa ? (primeIter ? 2 : qaPrimed ? 1 : 0) : -1);
+                    litAvg, rawAvg, lrSt, sc->lrLead.load() * 1000.0, lrE, lrM, qa ? (primeIter ? 2 : qaPrimed ? 1 : 0) : -1, s.smoothCatchUp);
             if ((presents % 120) == 0) fflush(logf);
         }
         lastT = t;
@@ -3537,9 +3539,18 @@ static void draw_overlay(reshade::api::effect_runtime *)
     if (ImGui::CollapsingHeader("Frame pacing and latency", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::Combo("Game frame cap", &s.gameCap, "Off\0Refresh rate\0Half refresh (one game frame per lit + dark pair)\0Quarter refresh (30 fps at 120 Hz)\0");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it.\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI, and the best choice when the game can't hold 120. Leave frame generation off.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it.\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI, and the best choice when the game can't hold 120. With frame generation use Refresh rate:\nHalf throws away half the generated frames.");
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest latency shows the newest frame -- best at the Refresh cap.\nSmooth holds up to one finished frame in reserve (about one refresh more latency) so every\nframe is lit once and in order -- it only helps at the Half or Quarter cap.");
+        if (s.pacingMode == 0)
+        {
+            bool cu = s.smoothCatchUp != 0;
+            if (ImGui::Checkbox("Smooth: catch up after a hitch", &cu)) s.smoothCatchUp = cu ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off (default): after a game hitch the presenter stays one frame behind (about one cycle\n"
+                                                          "more latency) and shows every frame once, in order.\n"
+                                                          "On: when two finished frames keep waiting, one is skipped to get back to the lowest\n"
+                                                          "latency -- a second stutter shortly after the first.");
+        }
         bool cj = s.capJit != 0;
         if (ImGui::Checkbox("Just-in-time release at Half / Quarter cap", &cj)) s.capJit = cj ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Releases the game for each frame at the lit refresh minus its measured frame time and a\n"

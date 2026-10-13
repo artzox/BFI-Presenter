@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.2"
+#define BFI_ADDON_VERSION "1.0.3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -111,6 +111,7 @@ struct Settings
     int   ownQueue = 1;       // present on the add-on's own queue (read when a swap chain is set up)
     int   pacingMode = 0;     // 0 = smooth (every game frame shown once, in order), 1 = lowest latency (newest)
     int   maxAhead = 1;       // game may run this many frames ahead of the GPU (0 = no limit)
+    int   smoothCatchUp = 0;  // Smooth: 1 = skip a frame when two have waited for 3 cycles (standing latency)
     int   autoAhead = 1;      // automatic: 1 frame ahead, 2 while the game keeps missing strobe cycles
     int   presBuffers = 3;    // real swap chain buffers for the presenter (read when presentation moves)
     int   queueAhead = 0;     // with vblank pacing: keep this many extra presents queued (0 or 1)
@@ -211,6 +212,7 @@ static void LoadSettings(Settings &s)
     s.pacingMode = IniInt("FramePacing", 0) ? 1 : 0;
     s.maxAhead = IniInt("MaxFramesAhead", 1);
     s.autoAhead = IniInt("AutoFramesAhead", 1) ? 1 : 0;
+    s.smoothCatchUp = IniInt("SmoothCatchUp", 0) ? 1 : 0;
     s.presBuffers = IniInt("PresenterBuffers", 3);
     s.queueAhead = IniInt("QueueAhead", 0) ? 1 : 0;
     s.laterRelease = IniInt("LaterRelease", 0) ? 1 : 0;
@@ -342,6 +344,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FramePacing", s.pacingMode);
     IniWriteInt("MaxFramesAhead", s.maxAhead);
     IniWriteInt("AutoFramesAhead", s.autoAhead);
+    IniWriteInt("SmoothCatchUp", s.smoothCatchUp);
     IniWriteInt("PresenterBuffers", s.presBuffers);
     IniWriteInt("QueueAhead", s.queueAhead);
     IniWriteInt("LaterRelease", s.laterRelease);
@@ -2133,7 +2136,7 @@ static DWORD WINAPI PresenterThread(void *)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,present_count,sync_refresh_count,"
                               "bfi,method,frames,gain,floor,rolloff,pacing,cap,ahead,vblank,queue_ahead,queued,"
                               "wait_vblank_ms,wait_gpu_ms,submit_ms,present_ms,hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,"
-                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms\n");
+                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup\n");
                 LOGI("BFI Presenter: timing log started: %s", path);
             }
         }
@@ -2238,7 +2241,7 @@ static DWORD WINAPI PresenterThread(void *)
             // A second waiting frame that persists for 3 cycles is standing
             // latency, not jitter: skip one to catch up.
             if (cycleStart) extraCycles = (unseen >= 2) ? extraCycles + 1 : 0;
-            if (unseen <= 2 && extraCycles >= 3 && newest >= 0)
+            if (s.smoothCatchUp && unseen <= 2 && extraCycles >= 3 && newest >= 0)
             {
                 // Two frames waiting for 3 cycles in a row is standing latency:
                 // show the newer one. (This used to pick "the newest but one",
@@ -2674,14 +2677,14 @@ static DWORD WINAPI PresenterThread(void *)
             EnterCriticalSection(&g_cfgLock);
             lrLog.lrState = g_status.lrState; lrLog.lrEst = g_status.lrEst; lrLog.lrMargin = g_status.lrMargin;
             LeaveCriticalSection(&g_cfgLock);
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f\n", t * 1000.0,
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d\n", t * 1000.0,
                     (unsigned long long)presents, c.slot,
                     (unsigned long long)pickId, (t - pickTime) * 1000.0, (t - lastT) * 1000.0,
                     sok ? (int)st.PresentCount : -1, sok ? (int)st.SyncRefreshCount : -1,
                     s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     g_maxAhead.load(), s.pacing, s.queueAhead, queuedNow,
                     (tVb - tLoop0) * 1000.0, (tFence - tVb) * 1000.0, (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f, hotArea, rawAvg,
-                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin);
+                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp);
         }
         lastT = t;
         if (pickId != lastShownId) lastNewFrameT = Now();
@@ -6373,9 +6376,18 @@ static void draw_overlay(reshade::api::effect_runtime *)
     if (ImGui::CollapsingHeader("Frame pacing and latency", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::Combo("Game frame cap", &s.gameCap, "Off\0Refresh rate\0Half refresh (one game frame per lit + dark pair)\0Quarter refresh (30 fps at 120 Hz)\0");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it.\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI, and the best choice when the game can't hold 120. Leave frame generation off.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it.\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI, and the best choice when the game can't hold 120. With frame generation use Refresh rate:\nHalf throws away half the generated frames.");
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest latency shows the newest frame -- best at the Refresh cap.\nSmooth holds up to one finished frame in reserve (about one refresh more latency) so every\nframe is lit once and in order -- it only helps at the Half or Quarter cap.");
+        if (s.pacingMode == 0)
+        {
+            bool cu = s.smoothCatchUp != 0;
+            if (ImGui::Checkbox("Smooth: catch up after a hitch", &cu)) s.smoothCatchUp = cu ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off (default): after a game hitch the presenter stays one frame behind (about one cycle\n"
+                                                          "more latency) and shows every frame once, in order.\n"
+                                                          "On: when two finished frames keep waiting, one is skipped to get back to the lowest\n"
+                                                          "latency -- a second stutter shortly after the first.");
+        }
         bool cj = s.capJit != 0;
         if (ImGui::Checkbox("Just-in-time release at Half / Quarter cap", &cj)) s.capJit = cj ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Releases the game for each frame at the lit refresh minus its measured frame time and a\n"
