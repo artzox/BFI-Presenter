@@ -9,7 +9,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 
 ## [1.0.4] — unreleased
 
-- **[DX] Direct3D 9 and OpenGL games now read `BFIPresenter.ini` at start, and create it on the first start.** Before, those two paths never loaded the ini: the file wasn't written until you pressed Save in the overlay, and an existing ini was only read after Reload ini or Ctrl+Shift+R (DOOM 3 BFG).
+- **[DX] `BFIPresenter.ini` is read, and on the first start created, as soon as the add-on loads, in every game.** Direct3D 9 and OpenGL games never loaded it before: the file wasn't written until you pressed Save in the overlay, and an existing ini was only read after Reload ini or Ctrl+Shift+R (DOOM 3 BFG).
 - **[DX] OpenGL: warning when the presenter's own presents block.** When an OpenGL game's presenter runs well below the refresh rate because its presents block (DOOM 3 BFG ran at about 30 fps, Need for Speed: Porsche Unleashed at 20–46 ms per present), the overlay and the log say to set *Vulkan/OpenGL present method* to *Prefer layered on DXGI swapchain* in the game's NVIDIA profile.
 - **[Manager] 1.0.1:** sets that NVIDIA setting for OpenGL games when installing (a tick in the install question, on by default) and shows it in the game's NVIDIA section (*OpenGL present*). The ini checkbox next to Remove is now labelled "Remove deletes the ini too": it was never an install option.
 

@@ -313,12 +313,13 @@ static void LoadShared()
 {
     Settings s;
     LoadSettings(s);
-    static bool upgraded = false;
-    if (!upgraded) { upgraded = true; UpgradeIni(s); }
+    static std::atomic<bool> upgraded{false};
+    if (!upgraded.exchange(true)) UpgradeIni(s);
     EnterCriticalSection(&g_cfgLock);
     g_shared = s;
     LeaveCriticalSection(&g_cfgLock);
 }
+static DWORD WINAPI LoadIniThread(LPVOID) { LoadShared(); return 0; }
 
 static void IniWriteInt(const char *key, int v) { char b[32]; snprintf(b, sizeof(b), "%d", v); IniWrite(key, b); }
 static void IniWriteFloat(const char *key, float v) { char b[32]; snprintf(b, sizeof(b), "%.3f", v); IniWrite(key, b); }
@@ -6669,6 +6670,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         if (g_diagnostics)
         {
             HANDLE t = CreateThread(nullptr, 0, EnableDredThread, nullptr, 0, nullptr);
+            if (t) CloseHandle(t);
+        }
+        // Read (and on the first start create) BFIPresenter.ini as soon as the
+        // add-on loads, whatever the API -- not under the loader lock.
+        {
+            HANDLE t = CreateThread(nullptr, 0, LoadIniThread, nullptr, 0, nullptr);
             if (t) CloseHandle(t);
         }
         break;
