@@ -30,12 +30,16 @@ mkdir -p "$G/DOOM Eternal"; cp "$B/gvk_64.exe" "$G/DOOM Eternal/DOOMEternalx64vk
 mkdir -p "$G/Hades II/Ship" "$G/Hades II/Tools" "$G/Hades II/Content"; cp "$B/g11_64.exe" "$G/Hades II/Ship/Hades2.exe"; pad g11_64.exe "$G/Hades II/Tools/F10.exe" 30
 mkdir -p "$G/Burnout Paradise Remastered"; cp "$B/g11_64.exe" "$G/Burnout Paradise Remastered/BurnoutPR.exe"; pad g11_64.exe "$G/Burnout Paradise Remastered/BurnoutPR_trial.exe" 5
 mk PerfGame gperf_64.exe PerfGame.exe
+mk ShaderGame g11_64.exe ShaderGame.exe; cp "$B/rs_64.dll" "$G/ShaderGame/dxgi.dll"
+printf '[GENERAL]\r\nEffectSearchPaths=.\\fx\\Shaders\\**,.\\other\r\nPresetPath=.\\MyPreset.ini\r\n' > "$G/ShaderGame/ReShade.ini"
+printf 'Techniques=CRT@CRT-Standalone.fx\r\nTechniqueSorting=CRT@CRT-Standalone.fx\r\n\r\n[CRT-Standalone.fx]\r\nfoo=1\r\n' > "$G/ShaderGame/MyPreset.ini"
 python3 -c "
 import zipfile,sys
 z=zipfile.ZipFile(sys.argv[1]+'/rs.zip','w',zipfile.ZIP_DEFLATED)
 z.write(sys.argv[1]+'/rs_64.dll','ReShade64.dll'); z.write(sys.argv[1]+'/rs_32.dll','ReShade32.dll'); z.close()" "$B"
 cat "$B/g11_64.exe" "$B/rs.zip" > "$B/rssetup.exe"
 cp -r "$REL" "$W/release"
+cp ../../shader/BFIPresenter_Shader.fx "$W/release/"
 x86_64-w64-mingw32-g++ -O1 -std=c++17 -municode -static -I .. selftest.cpp ../core.cpp ../unzip.cpp -o "$B/selftest.exe" \
     -lwinhttp -lversion -lshell32 -lole32 -ladvapi32
 WINEDEBUG=-all wine "$B/selftest.exe" "$(winepath -w "$G")" "$(winepath -w "$W/release")"

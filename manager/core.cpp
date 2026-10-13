@@ -82,6 +82,7 @@ const char *RouteText(Route r)
     case Route::Addon64:     return "DX add-on (64-bit)";
     case Route::Addon32:     return "DX add-on (32-bit)";
     case Route::Vulkan:      return "Vulkan layer";
+    case Route::Shader:      return "BFI shader (ReShade effect)";
     case Route::Unsupported: return "Not supported";
     default:                 return "Unknown";
     }
@@ -445,6 +446,22 @@ int CompareVersions(const std::string &a, const std::string &b)
 }
 
 // The DX add-on carries "BFI Presenter v1.0.2"; the Vulkan layer "BFI Presenter (Vulkan layer) v1.0.2".
+const wchar_t *const kShaderFile = L"BFIPresenter_Shader.fx";
+
+std::string ShaderVersionOf(const std::wstring &file)
+{
+    auto v = ReadBytes(file, 1u << 20);
+    if (v.empty()) return {};
+    const char *key = "BFI Presenter shader v";
+    size_t kl = strlen(key);
+    auto it = std::search(v.begin(), v.end(), key, key + kl);
+    if (it == v.end()) return "older";
+    std::string out;
+    for (auto p = it + kl; p != v.end() && ((*p >= '0' && *p <= '9') || *p == '.'); ++p) out += *p;
+    while (!out.empty() && out.back() == '.') out.pop_back();
+    return out;
+}
+
 std::string BfiVersionOf(const std::wstring &file, bool vulkan)
 {
     auto v = ReadBytes(file, 64u << 20);
@@ -1035,6 +1052,114 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
 
 // ------------------------------------------------------------------ detection
 
+// ------------------------------------------------------------------ ReShade effects and presets (BFI shader)
+
+// A path from ReShade.ini: relative ones are relative to the folder ReShade.ini is in.
+static std::wstring ReShadeIniPath(const std::wstring &base, std::wstring v)
+{
+    v = W(Trim(U8(v)));
+    if (v.size() >= 2 && v.front() == L'"' && v.back() == L'"') v = v.substr(1, v.size() - 2);
+    while (!v.empty() && (v.back() == L'*' || v.back() == L'\\' || v.back() == L'/')) v.pop_back();   // "...\Shaders\**"
+    if (v.empty()) return base;
+    if (v.size() > 1 && v[1] == L':') return v;
+    if (v[0] == L'\\' || v[0] == L'/') return v;
+    if (v[0] == L'.' && (v.size() == 1 || v[1] == L'\\' || v[1] == L'/')) v = v.size() > 2 ? v.substr(2) : L"";
+    return v.empty() ? base : Join(base, v);
+}
+
+// Where ReShade loads effects from (the first EffectSearchPaths entry) and its active preset.
+static void ReShadeEffectPaths(const std::wstring &reshadeDir, std::wstring &shaderDir, std::wstring &preset)
+{
+    std::wstring ini = Join(reshadeDir, L"ReShade.ini");
+    wchar_t buf[4096]{};
+    GetPrivateProfileStringW(L"GENERAL", L"EffectSearchPaths", L"", buf, 4096, ini.c_str());
+    std::wstring first = buf;
+    size_t c = first.find(L',');
+    if (c != std::wstring::npos) first = first.substr(0, c);
+    shaderDir = Trim(U8(first)).empty() ? Join(reshadeDir, L"reshade-shaders\\Shaders") : ReShadeIniPath(reshadeDir, first);
+    buf[0] = 0;
+    GetPrivateProfileStringW(L"GENERAL", L"PresetPath", L"", buf, 4096, ini.c_str());
+    preset = Trim(U8(buf)).empty() ? Join(reshadeDir, L"ReShadePreset.ini") : ReShadeIniPath(reshadeDir, buf);
+}
+
+static const char *kShaderTech = "BFIPresenter_Shader@BFIPresenter_Shader.fx";
+
+// The preset's "Techniques=" / "TechniqueSorting=" lines (before the first [section]).
+static std::vector<std::string> ReadLines(const std::wstring &path)
+{
+    std::vector<std::string> out;
+    std::ifstream in{fs::path(path), std::ios::binary};
+    std::string l;
+    while (std::getline(in, l)) { if (!l.empty() && l.back() == '\r') l.pop_back(); out.push_back(l); }
+    return out;
+}
+
+static bool PresetHasShader(const std::wstring &preset)
+{
+    for (auto &l : ReadLines(preset))
+    {
+        if (!l.empty() && l[0] == '[') break;
+        if (l.rfind("Techniques=", 0) == 0)
+        {
+            std::string v = "," + l.substr(11) + ",";
+            return v.find(std::string(",") + kShaderTech + ",") != std::string::npos;
+        }
+    }
+    return false;
+}
+
+// Turns the shader on (listed last, so it runs after every other effect) or off in the preset.
+static bool PresetSetShader(const std::wstring &preset, bool on)
+{
+    std::vector<std::string> lines = ReadLines(preset);
+    auto edit = [&](const char *key) {
+        size_t kl = strlen(key);
+        size_t at = std::string::npos, firstSection = lines.size();
+        for (size_t i = 0; i < lines.size(); i++)
+        {
+            if (!lines[i].empty() && lines[i][0] == '[') { firstSection = i; break; }
+            if (lines[i].rfind(key, 0) == 0) { at = i; break; }
+        }
+        std::vector<std::string> items;
+        if (at != std::string::npos)
+        {
+            std::string v = lines[at].substr(kl);
+            size_t p = 0;
+            while (p <= v.size())
+            {
+                size_t c = v.find(',', p);
+                std::string it = v.substr(p, c == std::string::npos ? std::string::npos : c - p);
+                if (!it.empty() && it != kShaderTech) items.push_back(it);
+                if (c == std::string::npos) break;
+                p = c + 1;
+            }
+        }
+        if (on) items.push_back(kShaderTech);
+        std::string line = key;
+        for (size_t i = 0; i < items.size(); i++) line += (i ? "," : "") + items[i];
+        if (at != std::string::npos) lines[at] = line;
+        else if (on) lines.insert(lines.begin() + firstSection, line);
+    };
+    edit("Techniques=");
+    edit("TechniqueSorting=");
+    std::ofstream o{fs::path(preset), std::ios::binary | std::ios::trunc};
+    if (!o) return false;
+    for (auto &l : lines) o << l << "\r\n";
+    return (bool)o;
+}
+
+static void DetectShader(Game &g)
+{
+    g.shaderPath.clear(); g.shaderVersion.clear(); g.shaderOn = false; g.shaderDir.clear(); g.presetPath.clear();
+    if (!g.reshade) return;
+    ReShadeEffectPaths(DirOf(g.reshadeDll.path), g.shaderDir, g.presetPath);
+    std::wstring f = Join(g.shaderDir, kShaderFile);
+    if (!Exists(f)) return;
+    g.shaderPath = f;
+    g.shaderVersion = ShaderVersionOf(f);
+    g.shaderOn = PresetHasShader(g.presetPath);
+}
+
 void Detect(Game &g)
 {
     g.notes.clear();
@@ -1115,8 +1240,14 @@ void Detect(Game &g)
     // Route
     std::wstring ro = LoadSetting(RouteKey(g.root).c_str(), L"");
     unsigned dxApis = g.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL);
+    DetectShader(g);
+    g.shaderRecommended = g.tested.find("BFI shader recommended") != std::string::npos;
     if (ro == L"vulkan") g.route = Route::Vulkan;
     else if (ro == L"dx") g.route = g.bits == 32 ? Route::Addon32 : Route::Addon64;
+    else if (ro == L"shader") g.route = Route::Shader;
+    else if (!g.shaderPath.empty() && g.addonPath.empty()) g.route = Route::Shader;       // installed that way
+    else if (g.shaderRecommended && g.addonPath.empty() && (g.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL)))
+        g.route = Route::Shader;                                                          // the tested list suggests it
     else if (g.dxvk) g.route = Route::Vulkan;
     else if ((g.apis & ApiVulkan) && g.tested.find("(Vulkan") != std::string::npos) g.route = Route::Vulkan;
     else if (dxApis) g.route = g.bits == 32 ? Route::Addon32 : Route::Addon64;
@@ -1544,6 +1675,8 @@ Source SourceFromFolder(const std::wstring &dir)
         if (missing.empty()) s.vkVersion = BfiVersionOf(Join(s.vkDir, L"BFIPresenterVK.dll"), true);
         else { s.vkMissing = missing; s.vkDir.clear(); }
     }
+    std::wstring shDir = FindFileUnder(dir, kShaderFile, 2);
+    if (!shDir.empty()) { s.shaderFile = Join(shDir, kShaderFile); s.shaderVersion = ShaderVersionOf(s.shaderFile); }
     s.label = U8(dir);
     return s;
 }
@@ -1650,10 +1783,51 @@ static std::string DeleteKept(Txn &t, const std::wstring &dest)
     return {};
 }
 
+// Takes the shader out of the game (file and preset entry), as part of transaction t.
+static std::string RemoveShader(Txn &t, Game &g)
+{
+    std::string err;
+    if (!g.presetPath.empty() && Exists(g.presetPath) && PresetHasShader(g.presetPath))
+    {
+        if (!t.Keep(g.presetPath)) return LastError("Couldn't back up", g.presetPath);
+        if (!PresetSetShader(g.presetPath, false)) return LastError("Couldn't write", g.presetPath);
+    }
+    if (!g.shaderPath.empty()) err = DeleteKept(t, g.shaderPath);
+    return err;
+}
+
+static void MakeDirs(const std::wstring &d)
+{
+    std::error_code ec;
+    fs::create_directories(fs::path(d), ec);
+}
+
 std::string InstallOrUpdate(Game &g, const Source &src)
 {
     std::string err;
-    if (g.route == Route::Addon64 || g.route == Route::Addon32)
+    if (g.route == Route::Shader)
+    {
+        if (src.shaderFile.empty()) return "The selected release has no BFI shader (it comes with releases from 1.0.5 on).";
+        if (!g.reshade) return "Install ReShade for this game first.";
+        if (g.shaderDir.empty()) DetectShader(g);
+        std::string oldV = g.shaderVersion;
+        Txn t(g);
+        MakeDirs(g.shaderDir);
+        std::wstring dest = Join(g.shaderDir, kShaderFile);
+        err = CopyIn(t, src.shaderFile, dest);
+        if (err.empty() && !PresetHasShader(g.presetPath))
+        {
+            if (!t.Keep(g.presetPath)) err = LastError("Couldn't back up", g.presetPath);
+            else if (!PresetSetShader(g.presetPath, true)) err = LastError("Couldn't write", g.presetPath);
+        }
+        // never both: the add-on would strobe the shader's strobe
+        if (!g.addonPath.empty())
+            for (auto n : { L"BFIPresenter.addon64", L"BFIPresenter.addon32", L"BFIPresenter.addon" })
+                if (err.empty()) err = DeleteKept(t, Join(DirOf(g.addonPath), n));
+        t.Finish();
+        if (err.empty()) Log(oldV.empty() ? "install shader" : "update shader", g.name, dest, oldV, src.shaderVersion);
+    }
+    else if (g.route == Route::Addon64 || g.route == Route::Addon32)
     {
         if (src.dxDir.empty()) return "The selected release has no DX add-on.";
         if (!g.reshade) return "Install ReShade (with full add-on support) for this game first.";
@@ -1666,6 +1840,7 @@ std::string InstallOrUpdate(Game &g, const Source &src)
         err = CopyIn(t, Join(src.dxDir, name), Join(dir, name));
         if (err.empty()) err = DeleteKept(t, other);
         if (err.empty()) err = DeleteKept(t, Join(dir, L"BFIPresenter.addon"));
+        if (err.empty()) err = RemoveShader(t, g);
         t.Finish();
         if (err.empty()) Log(oldV.empty() ? "install" : "update", g.name, Join(dir, name), oldV, src.dxVersion);
     }
@@ -1704,8 +1879,10 @@ std::string Remove(Game &g, bool alsoIni)
             if (err.empty()) err = DeleteKept(t, Join(dir, n));
     }
     if (err.empty() && g.ini && (alsoIni || g.route == Route::Vulkan)) err = DeleteKept(t, g.iniPath);
+    std::wstring shader = g.shaderPath;
+    if (err.empty()) err = RemoveShader(t, g);
     t.Finish();
-    if (err.empty()) Log("remove", g.name, g.addonPath.empty() ? g.iniPath : g.addonPath, oldV, "");
+    if (err.empty()) Log("remove", g.name, !g.addonPath.empty() ? g.addonPath : !shader.empty() ? shader : g.iniPath, oldV, "");
     Detect(g);
     return err;
 }

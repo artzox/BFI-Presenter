@@ -32,10 +32,12 @@ Each [release](../../releases) has two packages with the same version number:
 
 | Package | For | What's in it |
 |---|---|---|
-| `BFIPresenter-DX-v<version>.zip` | **Direct3D 12, 11 and 9 and OpenGL** games, 64- and 32-bit (Direct3D 9 needs ReShade 6.8+; OpenGL needs an NVIDIA GPU) | `BFIPresenter.addon64` / `BFIPresenter.addon32` (ReShade add-ons), example ini |
+| `BFIPresenter-DX-v<version>.zip` | **Direct3D 12, 11 and 9 and OpenGL** games, 64- and 32-bit (Direct3D 9 needs ReShade 6.8+; OpenGL needs an NVIDIA GPU) | `BFIPresenter.addon64` / `BFIPresenter.addon32` (ReShade add-ons), example ini, `BFIPresenter_Shader.fx` (the BFI shader, see below) |
 | `BFIPresenter-Vulkan-v<version>.zip` | **Vulkan** games, emulators (PCSX2, RPCS3, shadPS4…), and **DirectX 8–11** games run through [DXVK](https://github.com/doitsujin/dxvk) — 64- and 32-bit | `BFIPresenterVK.dll` / `BFIPresenterVK32.dll` (a Vulkan layer), installer, a ready `BFIPresenter.ini` to copy into games |
 
 Both read the same `BFIPresenter.ini` with the same keys, so one ini works for either.
+
+**The BFI shader** (`BFIPresenter_Shader.fx`, in the DX zip) is the same strobe as a ReShade effect, clocked by the game's own frames instead of the display's. It is a fallback for the few games that hold a rock-steady 120 fps but whose engine stutters with the presenter (Moons of Madness). Unless both are true, use the add-on: with the shader every late frame flashes. See [shader/README.md](shader/README.md) and the [tested-games list](docs/tested-games.md#bfi-shader-game-clocked-bfi-as-a-reshade-effect-v105).
 
 **Or let the app do it:** `BFIPresenterManager.exe` (on the same release page) finds your Steam, Epic, GOG, Xbox and other games, works out whether each needs the 64-bit or 32-bit add-on or the Vulkan layer, checks that ReShade is there (also as `ReShade64.dll` behind OptiScaler), and installs, updates or removes BFI Presenter with a backup of every replaced file. See the [manager README](manager/README.md).
 
@@ -101,6 +103,7 @@ All headers needed are in [`third_party`](third_party/README.md).
 dx/          DX add-on source, build scripts, reference
 vulkan/      Vulkan layer source, GLSL shaders, manifests, installer, reference
 manager/     BFIPresenterManager.exe source (finds games, installs and updates)
+shader/      BFIPresenter_Shader.fx (the BFI shader: game-clocked BFI as a ReShade effect)
 scripts/     Find-/Update-BFIPresenter.ps1 (older command-line updater)
 docs/        tested games, latency estimates
 third_party/ ReShade, Dear ImGui and Vulkan headers

@@ -1,4 +1,4 @@
-// BFI Presenter -- shader version (ReShade effect). PROTOTYPE.
+// BFI Presenter shader v1.0.5 -- the BFI Presenter strobe as a ReShade effect.
 // Copyright (C) 2026 artzox. SPDX-License-Identifier: GPL-3.0-or-later
 //
 // The same strobe as the BFI Presenter add-on (BFI with highlight roll-off,
@@ -20,7 +20,9 @@
 //   * Put this effect LAST in the ReShade effect list (after CRT-Standalone;
 //     set ENABLE_DECAY=0 there).
 
-#include "ReShade.fxh"
+// Self-contained (no ReShade.fxh), so it also runs where no other shaders are installed.
+texture BFI_BackBufferTex : COLOR;
+sampler BFI_BackBuffer { Texture = BFI_BackBufferTex; };
 
 #ifndef BUFFER_COLOR_SPACE
     #define BUFFER_COLOR_SPACE 1
@@ -334,7 +336,9 @@ float DecayShare(int s, float phi, float T, float n)
 
 void PostProcessVS_BFI(in uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD)
 {
-    PostProcessVS(id, pos, uv);
+    uv.x = (id == 2) ? 2.0 : 0.0;
+    uv.y = (id == 1) ? 2.0 : 0.0;
+    pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
 }
 
 #if BFI_ABL
@@ -350,7 +354,7 @@ float CellsPS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     [unroll] for (int x = 0; x < 4; x++)
     {
         float2 p = (floor(pos.xy) + (float2(x, y) + 0.5) / 4.0) * cell;
-        float3 lin = max(Decode(tex2Dlod(ReShade::BackBuffer, float4(p / float2(BUFFER_WIDTH, BUFFER_HEIGHT), 0, 0)).rgb, t), 0.0);
+        float3 lin = max(Decode(tex2Dlod(BFI_BackBuffer, float4(p / float2(BUFFER_WIDTH, BUFFER_HEIGHT), 0, 0)).rgb, t), 0.0);
         float m = max(max(lin.r, lin.g), lin.b);
         float S = (m > 1e-6) ? max(ceilLin / m, 1.0) : 1e6;
         sum += dot(lin, float3(0.2126, 0.7152, 0.0722)) * min(litGain, S);
@@ -428,7 +432,7 @@ float4 CopyStatePS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 
 float4 StrobePS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
-    float4 c = tex2D(ReShade::BackBuffer, uv);
+    float4 c = tex2D(BFI_BackBuffer, uv);
     if (!bfi_enabled) return c;
     float4 st = tex2Dfetch(bfi_state, int2(0, 0));
     int t = OutType();

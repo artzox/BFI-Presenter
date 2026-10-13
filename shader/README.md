@@ -1,13 +1,15 @@
-# BFI Presenter — shader version (prototype)
+# BFI Presenter — BFI shader
 
 `BFIPresenter_Shader.fx` is a ReShade effect with the same strobe as the add-on: BFI with highlight roll-off, the Variable MPRT brightness budget, sine and inverted cycles, rolling scan with phosphor decay, and the ABL guard. The difference is the clock. The add-on presents on the display's vblank; the shader strobes with the game's own frames, one game frame per sub-frame of the cycle.
 
-It is meant for the few games that hold a locked frame rate equal to the refresh rate but whose engine doesn't get along with the presenter (Moons of Madness: Refresh + Smooth stuttered). Everywhere else the add-on is better: here a late game frame shows a lit or a dark refresh twice. The hitch guard can soften that, but not prevent it.
+**Use it only when the game holds a rock-steady frame rate equal to the refresh rate and its engine stutters with the presenter** (Moons of Madness: Refresh + Smooth stuttered; the shader doesn't). Everywhere else the add-on is better: here a late game frame shows a lit or a dark refresh twice. The hitch guard can soften that, but not prevent it. Games where CRT-Standalone's decay flashed (Stray, Sifu) are not candidates, and it can't fix a game's own stutter (Ori). The [tested-games list](../docs/tested-games.md#bfi-shader-game-clocked-bfi-as-a-reshade-effect-v105) has the details.
+
+The BFI Presenter Manager installs it with **Install as → BFI shader**: it removes the add-on, copies the shader into ReShade's shader folder (the first `EffectSearchPaths` entry in `ReShade.ini`) and turns it on as the last effect in the active preset. It suggests the shader for games the tested list recommends it for.
 
 ## Use
 
 1. Remove the add-on from the game (`BFIPresenter.addon64` / `.addon32`), or set `Enabled=0` in its `BFIPresenter.ini`. Never run both.
-2. Copy `BFIPresenter_Shader.fx` into the game's ReShade shader folder (`reshade-shaders\Shaders`).
+2. Copy `BFIPresenter_Shader.fx` into the game's ReShade shader folder (`reshade-shaders\Shaders`). It needs no other shader files.
 3. In the ReShade overlay turn on **BFI Presenter (shader)** and drag it to the **bottom** of the list, after CRT-Standalone (set `ENABLE_DECAY=0` there).
 4. Display at a fixed refresh rate (G-SYNC off for the game), VSync on, and a game that holds exactly that frame rate. Set **Display refresh rate** to it (120 by default).
 

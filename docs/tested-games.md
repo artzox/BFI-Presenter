@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-96 of 98 tested games and emulators run with BFI: the 46 working in the table below (some only with a setting, without frame generation or without a conflicting mod; eleven of them 32-bit; four with the engine's own stutter) and 50 more listed after it. Two are partial.
+97 of 99 tested games and emulators run with BFI: the 47 working in the table below (some only with a setting, without frame generation or without a conflicting mod; eleven of them 32-bit; five with the engine's own stutter) and 50 more listed after it. Two are partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -53,7 +53,8 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Blasphemous | Working (DX11) | NVIDIA Smooth Motion must be off | v1.0.3 | Smooth Motion off in the NVIDIA app (with it on, the game closed and relaunched itself) |
 | Guacamelee! 2 | Working (DX11) | Not tested | v1.0.3 | Standard setup; works with Special K (crashed at start before v1.0.3) |
 | Jusant | Working, engine stutter | Not tested | v1.0.3 | Runs; Unreal's frame pipeline delivers finished frames with a varying delay (10–33 ms), so some judder remains at any setting. Queue one refresh ahead removes the flashes |
-| Moons of Madness | Working (DX11) | Not tested | v1.0.3 | Holds a locked 120 fps, so the CRT shader's own BFI (decay) is the better fit; with the presenter use Half refresh + Lowest latency (Refresh + Smooth stutters) |
+| Moons of Madness | Working (DX11) | Not tested | v1.0.3 | BFI shader recommended: with the presenter the engine stutters (Refresh + Smooth); the shader at the game's locked 120 fps doesn't. If you use the presenter: Half refresh + Lowest latency |
+| Ori | Working (DX11), engine stutter | Not tested | v1.0.3 | Half refresh + Lowest latency (a fast game: Smooth adds latency). At Refresh the game's own 60 Hz simulation stutters, with the presenter or the BFI shader |
 | Wreckfest | Working (DX11) | Not tested | v1.0.3 | `DX11GamePresent=1` in `BFIPresenter.ini`: without it the game slowed to 5 fps within a minute |
 | Silt | Working (DX11) | Not tested | v1.0.3 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
 | The Rogue Prince of Persia | Working (DX11) | Not tested | v1.0.3 | Borderless (windowed) fullscreen, not exclusive fullscreen: leaving exclusive fullscreen hung or crashed the presenter |
@@ -333,6 +334,16 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### FlatOut: Ultimate Carnage
 
 - 32-bit DirectX 9, works with `BFIPresenter.addon32` and the 32-bit ReShade 6.8+. With Half refresh the game kept running at about 100 fps instead of 60, and capping it at 60 in NVIDIA Profile Inspector made it stutter. Play it at Refresh + Lowest latency.
+
+### BFI shader (game-clocked BFI as a ReShade effect, v1.0.5)
+
+The shader runs the presenter's strobe inside ReShade, one game frame per sub-frame, so the game's own VSync does the pacing. **Use it only when the game holds a rock-steady 120 fps and its engine stutters with the presenter.** Otherwise the presenter is better: with the shader every late game frame shows a lit or a dark frame twice (a flash), which the shader's hitch guard can only soften.
+
+- **Recommended:** Moons of Madness. The presenter's pacing makes the engine stutter; the shader doesn't. It flickers a little, no more than CRT-Standalone's decay did.
+- **Likely fine, not yet tested with the shader** (CRT-Standalone's decay ran cleanly in them, and they hold 120 fps): Hades, Hades II, FAR: Lone Sails, Layers of Fear 2, Cocoon, Cuphead, Guacamelee! 2, Hollow Knight, Prodeus, Tony Hawk's Pro Skater 1 + 2, Jotun. The presenter works in all of them too.
+- **Not recommended:** Stray and Sifu: CRT-Standalone's decay flashed a lot there; use the presenter.
+- **Doesn't help:** Ori: the stutter at 120 comes from the game's own 60 Hz simulation. Use the presenter at Half refresh + Lowest latency.
+- The BFI Presenter Manager installs it with **Install as → BFI shader** (it removes the add-on, copies the shader into ReShade's shader folder and turns it on as the last effect in the active preset) and suggests it for the games recommended above. By hand: see [shader/README.md](../shader/README.md).
 
 ## Known issues across games
 

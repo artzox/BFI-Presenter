@@ -124,6 +124,42 @@ int wmain(int argc, wchar_t **argv)
         CHECK(CanRevert(*op) && Revert(*op).empty() && op->reshadeDll.version == "6.4.1", "OptiGame: ReShade change undone (%s)", op->reshadeDll.version.c_str());
     }
 
+    // BFI shader: add-on first, then the shader (removes the add-on, enables it last in the preset), back to the add-on
+    {
+        Game *sg = Find(all, "ShaderGame");
+        CHECK(sg && sg->reshade, "ShaderGame found with ReShade");
+        if (sg)
+        {
+            CHECK(!src.shaderFile.empty() && !src.shaderVersion.empty(), "release has the shader (v%s)", src.shaderVersion.c_str());
+            std::wstring dir = sg->exe.substr(0, sg->exe.find_last_of(L'\\'));
+            CHECK(sg->shaderDir == dir + L"\\fx\\Shaders" && sg->presetPath == dir + L"\\MyPreset.ini", "ReShade.ini paths read: %s",
+                  U8(sg->shaderDir).c_str());
+            e = InstallOrUpdate(*sg, src);
+            CHECK(e.empty() && !sg->addonPath.empty(), "ShaderGame: add-on installed first (%s)", e.c_str());
+            SaveSetting(RouteKey(sg->root).c_str(), L"shader");
+            Detect(*sg);
+            CHECK(sg->route == Route::Shader, "ShaderGame: route set to shader");
+            e = InstallOrUpdate(*sg, src);
+            std::string preset;
+            { FILE *f = _wfopen(sg->presetPath.c_str(), L"rb"); char b[4096] = {}; if (f) { fread(b, 1, 4095, f); fclose(f); } preset = b; }
+            CHECK(e.empty() && !sg->shaderPath.empty() && sg->shaderOn && sg->addonPath.empty(), "ShaderGame: shader installed and on, add-on removed (%s)", e.c_str());
+            CHECK(preset.find("Techniques=CRT@CRT-Standalone.fx,BFIPresenter_Shader@BFIPresenter_Shader.fx\r\n") != std::string::npos &&
+                  preset.find("TechniqueSorting=CRT@CRT-Standalone.fx,BFIPresenter_Shader@BFIPresenter_Shader.fx\r\n") != std::string::npos &&
+                  preset.find("[CRT-Standalone.fx]") != std::string::npos, "ShaderGame: preset lists the shader last, rest kept");
+            SaveSetting(RouteKey(sg->root).c_str(), L"dx");
+            Detect(*sg);
+            e = InstallOrUpdate(*sg, src);
+            CHECK(e.empty() && sg->shaderPath.empty() && !sg->shaderOn && !sg->addonPath.empty(), "ShaderGame: back to the add-on, shader removed (%s)", e.c_str());
+            e = Revert(*sg);
+            CHECK(e.empty() && !sg->shaderPath.empty() && sg->shaderOn && sg->addonPath.empty(), "ShaderGame: undo puts the shader back (%s)", e.c_str());
+            // a game without a preset: one is made
+            SaveSetting(RouteKey(wf->root).c_str(), L"shader");
+            Detect(*wf);
+            e = InstallOrUpdate(*wf, src);
+            CHECK(e.empty() && wf->shaderOn && wf->addonPath.empty(), "Wreckfest: shader with a new ReShadePreset.ini (%s)", e.c_str());
+        }
+    }
+
     printf(g_fail ? "\n%d FAILED\n" : "\nall passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
