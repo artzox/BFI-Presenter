@@ -423,7 +423,9 @@ int CompareVersions(const std::string &a, const std::string &b)
     auto parts = [](const std::string &s) {
         std::vector<int> v;
         int cur = -1;
-        for (char c : s)
+        size_t i0 = 0;
+        while (i0 < s.size() && !(s[i0] >= '0' && s[i0] <= '9')) i0++;   // "v1.0.4", "v.1.0.4"
+        for (char c : s.substr(i0))
         {
             if (c >= '0' && c <= '9') cur = (cur < 0 ? 0 : cur * 10) + (c - '0');
             else if (c == '.') { v.push_back(cur < 0 ? 0 : cur); cur = -1; }

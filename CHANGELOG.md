@@ -7,6 +7,10 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## Manager 1.0.2 — 2026-10-13
+
+- **[Manager] Check GitHub ignored release tags written `v.1.0.4`:** it read them as 0.1.0.4, older than the release already downloaded, and kept using that. Tags with any prefix (`v1.0.4`, `v.1.0.4`) are now read correctly.
+
 ## [1.0.4] — 2026-10-13
 
 - **[DX] `BFIPresenter.ini` is read, and on the first start created, as soon as the add-on loads, in every game.** Direct3D 9 and OpenGL games never loaded it before: the file wasn't written until you pressed Save in the overlay, and an existing ini was only read after Reload ini or Ctrl+Shift+R (DOOM 3 BFG).
