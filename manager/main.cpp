@@ -715,20 +715,24 @@ static void DrawTop(HWND hwnd)
 
 static void DrawTable(float height)
 {
-    ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY |
-                         ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable;
+    // Columns keep their own width (drag the header borders; remembered in manager_ui.ini) and the table scrolls
+    // sideways when the pane is narrower than all of them, instead of squeezing the headers to "St..." / "G-...".
+    ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+                         ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
+                         ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Sortable;
+    const float em = ImGui::GetFontSize();
     if (!ImGui::BeginTable("games", 10, tf, ImVec2(0, height))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("##pick", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize | ImGuiTableColumnFlags_NoSort, ImGui::GetFrameHeight());
-    ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_DefaultSort, 2.6f);
-    ImGui::TableSetupColumn("Store", ImGuiTableColumnFlags_WidthStretch, 0.6f);
-    ImGui::TableSetupColumn("Bits", ImGuiTableColumnFlags_WidthStretch, 0.35f);
-    ImGui::TableSetupColumn("API", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-    ImGui::TableSetupColumn("ReShade", ImGuiTableColumnFlags_WidthStretch, 0.7f);
-    ImGui::TableSetupColumn("BFI Presenter", ImGuiTableColumnFlags_WidthStretch, 0.9f);
-    ImGui::TableSetupColumn("G-SYNC", ImGuiTableColumnFlags_WidthStretch, 0.6f);
-    ImGui::TableSetupColumn("VSync", ImGuiTableColumnFlags_WidthStretch, 0.75f);
-    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch, 1.3f);
+    ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_NoHide, em * 15.0f);
+    ImGui::TableSetupColumn("Store", ImGuiTableColumnFlags_WidthFixed, em * 4.0f);
+    ImGui::TableSetupColumn("Bits", ImGuiTableColumnFlags_WidthFixed, em * 3.2f);
+    ImGui::TableSetupColumn("API", ImGuiTableColumnFlags_WidthFixed, em * 8.0f);
+    ImGui::TableSetupColumn("ReShade", ImGuiTableColumnFlags_WidthFixed, em * 5.5f);
+    ImGui::TableSetupColumn("BFI Presenter", ImGuiTableColumnFlags_WidthFixed, em * 8.5f);
+    ImGui::TableSetupColumn("G-SYNC", ImGuiTableColumnFlags_WidthFixed, em * 4.5f);
+    ImGui::TableSetupColumn("VSync", ImGuiTableColumnFlags_WidthFixed, em * 6.0f);
+    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoHide, em * 8.0f);
     std::vector<int> vis;
     for (int i = 0; i < (int)g_app.games.size(); i++)
         if (Matches(g_app.games[i], g_app.search) && (!g_app.onlyRelevant || Relevant(g_app.games[i]))) vis.push_back(i);
@@ -1480,15 +1484,30 @@ static void DrawFrame(HWND hwnd)
     ImGuiViewport *vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
-    ImGui::Begin("main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-                                   ImGuiWindowFlags_NoBringToFrontOnFocus);
+    // (no NoSavedSettings: the game table's column widths, order and sort are kept in manager_ui.ini)
+    ImGui::Begin("main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
     DrawTop(hwnd);
+    // Table | splitter | detail pane. Drag the splitter to give either side more room; the share is remembered.
+    static float split = -1.0f;
+    if (split < 0.0f) { split = (float)_wtof(LoadSetting(L"Split", L"0.6").c_str()); if (split < 0.2f || split > 0.9f) split = 0.6f; }
     float avail = ImGui::GetContentRegionAvail().x;
-    float tableW = std::max(avail * 0.56f, avail - ImGui::GetFontSize() * 34);
+    const float sw = std::max(6.0f, ImGui::GetFontSize() * 0.4f);
+    float tableW = std::clamp(avail * split, ImGui::GetFontSize() * 12, avail - sw - ImGui::GetFontSize() * 16);
     ImGui::BeginChild("left", ImVec2(tableW, 0));
     DrawTable(ImGui::GetContentRegionAvail().y);
     ImGui::EndChild();
-    ImGui::SameLine();
+    ImGui::SameLine(0, 0);
+    ImGui::InvisibleButton("##split", ImVec2(sw, ImGui::GetContentRegionAvail().y));
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    if (ImGui::IsItemActive())
+    {
+        split = std::clamp((tableW + ImGui::GetIO().MouseDelta.x) / std::max(avail, 1.0f), 0.2f, 0.9f);
+        ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        ImGui::GetWindowDrawList()->AddRectFilled(ImVec2((a.x + b.x) * 0.5f - 1, a.y), ImVec2((a.x + b.x) * 0.5f + 1, b.y),
+                                                  ImGui::GetColorU32(ImGuiCol_SeparatorActive));
+    }
+    if (ImGui::IsItemDeactivated()) SaveSetting(L"Split", std::to_wstring(split));
+    ImGui::SameLine(0, 0);
     ImGui::BeginChild("detail", ImVec2(0, 0), ImGuiChildFlags_Borders);
     DrawDetail(hwnd);
     ImGui::EndChild();
@@ -1592,7 +1611,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
-    io.IniFilename = nullptr;
+    // ImGui's own settings file: only the game table's columns (widths, order, hidden, sort) are worth keeping
+    static std::string uiIni = U8(DataDir() + L"\\manager_ui.ini");
+    io.IniFilename = uiIni.c_str();
     io.ConfigDebugHighlightIdConflicts = false;     // never show ImGui's programmer popup to users
     SetupStyle(g_dpiScale);
     LoadFonts(g_dpiScale);
