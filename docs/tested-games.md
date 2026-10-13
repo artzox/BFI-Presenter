@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-94 of 96 tested games and emulators run with BFI: the 44 working in the table below (some only with a setting, without frame generation or without a conflicting mod; ten of them 32-bit; four with the engine's own stutter) and 50 more listed after it. Two are partial.
+95 of 97 tested games and emulators run with BFI: the 45 working in the table below (some only with a setting, without frame generation or without a conflicting mod; ten of them 32-bit; four with the engine's own stutter) and 50 more listed after it. Two are partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -65,6 +65,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Dead Cells | Working (DX11, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32` with ReShade 6.8 (6.5.1 with the Steam overlay crashed at start) |
 | FlatOut: Ultimate Carnage | Working (DX9, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32`; Refresh + Lowest latency (Half refresh doesn't hold it at 60, and an NVIDIA Profile Inspector cap stutters) |
 | Red Dead Redemption 2 | Working (Vulkan) | Not tested | — | Vulkan renderer; Vulkan layer, `BFIPresenter.ini` next to `RDR2.exe` |
+| DOOM Eternal | Working (Vulkan) | Not tested | v1.0.3 | Vulkan layer without ReShade (the game didn't start with ReShade); `BFIPresenter.ini` next to `DOOMEternalx64vk.exe`; settings in the ini + hotkeys |
 | Kena: Bridge of Spirits | Working, engine stutter | Not tested | v1.0.3 | Standard setup; the stutter is the engine's own |
 | Need for Speed: Porsche Unleashed | Working (OpenGL, 32-bit), engine stutter | — | v1.0.3 | `BFIPresenter.addon32`; NVIDIA profile: Vulkan/OpenGL present method = Prefer layered on DXGI swapchain |
 | Legacy of Kain: Soul Reaver 1 & 2 Remastered | Working (OpenGL) | — | v1.0.3 | With DLSS 5: Half refresh + Lowest latency. Without: Refresh + Lowest latency + Later release (Smooth stutters more) |
@@ -307,6 +308,11 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### Red Dead Redemption 2
 
 - Use the game's Vulkan renderer with the Vulkan layer installed, and put `BFIPresenter.ini` next to `RDR2.exe`.
+
+### DOOM Eternal
+
+- The game didn't start with ReShade, but the Vulkan layer doesn't need it: install the layer and put `BFIPresenter.ini` next to `DOOMEternalx64vk.exe` (not `idTechLauncher.exe`).
+- Without ReShade there's no settings window. Edit `BFIPresenter.ini` and press **Ctrl+Shift+R** in the game to reload it; **Ctrl+Shift+B** turns BFI on and off, **Ctrl+Shift+M** switches BFI / Variable MPRT, **Ctrl+Shift+S** toggles rolling scan. `BFIPresenterVK.log` next to the ini shows the status.
 
 ### OpenGL games (v1.0.3)
 
