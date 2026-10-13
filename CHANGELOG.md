@@ -7,10 +7,11 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [1.0.4] — unreleased
+## [1.0.4] — 2026-10-13
 
 - **[DX] `BFIPresenter.ini` is read, and on the first start created, as soon as the add-on loads, in every game.** Direct3D 9 and OpenGL games never loaded it before: the file wasn't written until you pressed Save in the overlay, and an existing ini was only read after Reload ini or Ctrl+Shift+R (DOOM 3 BFG).
 - **[DX] OpenGL: warning when the presenter's own presents block.** When an OpenGL game's presenter runs well below the refresh rate because its presents block (DOOM 3 BFG ran at about 30 fps, Need for Speed: Porsche Unleashed at 20–46 ms per present), the overlay and the log say to set *Vulkan/OpenGL present method* to *Prefer layered on DXGI swapchain* in the game's NVIDIA profile.
+- **[Vulkan] No changes apart from the version number.** The layer runs without ReShade: settings in `BFIPresenter.ini`, Ctrl+Shift+R reloads it, Ctrl+Shift+B / M / S toggle BFI, the method and rolling scan (DOOM Eternal, which doesn't start with ReShade, runs this way).
 - **[Manager] 1.0.1:** sets that NVIDIA setting for OpenGL games when installing (a tick in the install question, on by default) and shows it in the game's NVIDIA section (*OpenGL present*). The ini checkbox next to Remove is now labelled "Remove deletes the ini too": it was never an install option.
 
 ## [1.0.3] — 2026-10
