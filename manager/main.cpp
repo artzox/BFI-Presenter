@@ -19,7 +19,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.0.1"
+#define MANAGER_VERSION "1.0.2"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -289,7 +289,8 @@ static void StartFetch()
         if (rr.ok)
         {
             std::string tagV = rr.tag;
-            if (!tagV.empty() && (tagV[0] == 'v' || tagV[0] == 'V')) tagV = tagV.substr(1);
+            // "v1.0.4", "v.1.0.4", "1.0.4": skip everything before the first digit
+            while (!tagV.empty() && !isdigit((unsigned char)tagV[0])) tagV.erase(0, 1);
             Source cached = CachedRelease();
             if (cached.ok() && CompareVersions(cached.dxVersion.empty() ? cached.vkVersion : cached.dxVersion, tagV) >= 0)
                 s = cached;
