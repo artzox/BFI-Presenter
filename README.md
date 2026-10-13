@@ -2,7 +2,7 @@
 
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/artzox)
 
-**Variable MPRT strobing for PC games on 120 Hz OLEDs: the motion clarity of black frame insertion without giving up brightness.**
+**Variable MPRT strobing for PC games on fixed-refresh displays: the motion clarity of black frame insertion without giving up brightness.** Developed and tested on a 120 Hz OLED (Sony A95L); higher refresh rates work the same way, with more refreshes per strobe cycle and a real rolling band for rolling scan at 240 Hz and above.
 
 Classic black frame insertion (BFI) shows each frame for one refresh and then blacks out the next. Motion gets sharper because each image is on screen for less time (a lower MPRT, motion picture response time), but the screen is dark half the time, so the picture loses half its brightness.
 
@@ -45,7 +45,7 @@ Both read the same `BFIPresenter.ini` with the same keys, so one ini works for e
 
 - Windows 10/11.
 - [ReShade](https://reshade.me) 6.4 or newer, the build with full add-on support. The DX add-on needs it; the Vulkan layer also runs without ReShade (settings then come from the ini alone).
-- The display at a **fixed 120 Hz** for the game. The presenter's steady presents usually hold it there; where they don't, set G-SYNC off (and Vertical Sync Force on) in the game's NVIDIA profile. The overlay warns when VRR takes over.
+- The display at a **fixed refresh rate** for the game (tested at 120 Hz). The presenter's steady presents usually hold it there; where they don't, set G-SYNC off (and Vertical Sync Force on) in the game's NVIDIA profile. The overlay warns when VRR takes over.
 - NVIDIA Vertical Sync never "Force off" or "Fast Sync", and no frame limiter acting on the game (RTSS limit 0, NVIDIA Max Frame Rate off).
 
 **Direct3D 12 / 11 / 9 and OpenGL games** (the same add-on covers all of them)
