@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-97 of 99 tested games and emulators run with BFI: the 47 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; five with the engine's own stutter) and 50 more listed after it. Two are partial.
+98 of 100 tested games and emulators run with BFI: the 48 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; five with the engine's own stutter) and 50 more listed after it. Two are partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -55,6 +55,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Jusant | Working, engine stutter | Not tested | v1.0.3 | Runs; Unreal's frame pipeline delivers finished frames with a varying delay (10–33 ms), so some judder remains at any setting. Queue one refresh ahead removes the flashes |
 | Moons of Madness | Working (DX11) | Not tested | v1.0.3 | BFI shader recommended: with the presenter the engine stutters (Refresh + Smooth); the shader at the game's locked 120 fps doesn't. If you use the presenter: Half refresh + Lowest latency |
 | Ori and the Blind Forest: Definitive Edition | Working (DX11, 32-bit), engine stutter | Not tested | v1.0.3 | `BFIPresenter.addon32`; Half refresh + Lowest latency (a fast game: Smooth adds latency). At Refresh the game's own 60 Hz simulation stutters, with the presenter or the BFI shader |
+| Celeste | Working (DX11 through FNA) | — | v1.0.5 | Steam beta "opengl" (the FNA build) + launch option `--graphics D3D11`, ReShade as `dxgi.dll`; game locked at 60 fps: Half refresh |
 | Wreckfest | Working (DX11) | Not tested | v1.0.3 | `DX11GamePresent=1` in `BFIPresenter.ini`: without it the game slowed to 5 fps within a minute |
 | Silt | Working (DX11) | Not tested | v1.0.3 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
 | The Rogue Prince of Persia | Working (DX11) | Not tested | v1.0.3 | Borderless (windowed) fullscreen, not exclusive fullscreen: leaving exclusive fullscreen hung or crashed the presenter |
@@ -334,6 +335,12 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### FlatOut: Ultimate Carnage
 
 - 32-bit DirectX 9, works with `BFIPresenter.addon32` and the 32-bit ReShade 6.8+. With Half refresh the game kept running at about 100 fps instead of 60, and capping it at 60 in NVIDIA Profile Inspector made it stutter. Play it at Refresh + Lowest latency.
+
+### Celeste
+
+- The default Windows build runs on XNA (Direct3D 9, 32-bit), and ReShade never loads in it, whatever its name or bitness (`ReShade.log` keeps the setup's placeholder text).
+- Use the FNA build instead: Steam → Properties → Betas → **opengl**. Add `--graphics D3D11` to the launch options (the game's `log.txt` then says `FNA3D Driver: D3D11`) and install ReShade as `dxgi.dll` (Direct3D 10/11/12) with the bitness the manager shows. BFI Presenter then works as in any DX11 game.
+- The game is locked at 60 fps: use the Half refresh cap.
 
 ### BFI shader (game-clocked BFI as a ReShade effect, v1.0.5)
 
