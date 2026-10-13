@@ -11,6 +11,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 
 - **[Manager] Batch actions no longer freeze the window.** Update outdated, Install / update and Remove for ticked games, and installing ReShade in many games now run a few games per frame with a progress dialog (game n of N, the current game, a Stop button) instead of blocking until the last game is done.
 - **[Manager] Readable, adjustable game list.** Columns keep their own width (drag a header border), can be reordered and hidden (right-click a header), and the list scrolls sideways instead of squeezing the headers; widths, order and sort are remembered (`manager_ui.ini`). A splitter between the list and the game details can be dragged to give either side more room, and is remembered too.
+- **[Manager] No phantom OpenGL in the API column.** Engines link OpenGL next to Direct3D without shipping it on Windows (Unreal: Jusant, ABZÛ, Ashen, Blair Witch). When the executable also uses Direct3D, OpenGL is no longer listed for it; it still is when it is the only renderer (Doom 3 BFG, Heretic II) or when PCGamingWiki lists it.
 - **[Manager] AnyCPU .NET games run 64-bit:** a PE32 .NET assembly without the 32-bit flags (FNA games) is shown and installed as 64-bit.
 
 ## [1.0.5] — 2026-10-13
