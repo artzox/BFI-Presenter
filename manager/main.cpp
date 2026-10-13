@@ -9,14 +9,16 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <set>
 #include "imgui.h"
+#include "imgui_internal.h"   // ImGuiItemFlags_MixedValue (tri-state checkbox)
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include "core.h"
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.0.0 (test 4)"
+#define MANAGER_VERSION "1.0.0 (test 5)"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -117,7 +119,8 @@ static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 struct App {
     std::vector<Game> games;
-    int sel = -1;
+    int sel = -1;                      // the game shown in the detail pane (and the Shift-range anchor)
+    std::set<std::wstring> picked;     // ticked games, by install folder
     Source src;
     VulkanLayerState vk;
     ScanOptions opt;
@@ -487,8 +490,9 @@ static void DrawTable(float height)
 {
     ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY |
                          ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
-    if (!ImGui::BeginTable("games", 7, tf, ImVec2(0, height))) return;
+    if (!ImGui::BeginTable("games", 8, tf, ImVec2(0, height))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("##pick", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize, ImGui::GetFrameHeight());
     ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch, 2.6f);
     ImGui::TableSetupColumn("Store", ImGuiTableColumnFlags_WidthStretch, 0.6f);
     ImGui::TableSetupColumn("Bits", ImGuiTableColumnFlags_WidthStretch, 0.35f);
@@ -496,12 +500,36 @@ static void DrawTable(float height)
     ImGui::TableSetupColumn("ReShade", ImGuiTableColumnFlags_WidthStretch, 0.7f);
     ImGui::TableSetupColumn("BFI Presenter", ImGuiTableColumnFlags_WidthStretch, 0.9f);
     ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch, 1.3f);
-    ImGui::TableHeadersRow();
-
-    // Keyboard: Up/Down/PageUp/PageDown/Home/End move the selection itself (not just a highlight).
     std::vector<int> vis;
     for (int i = 0; i < (int)g_app.games.size(); i++)
         if (Matches(g_app.games[i], g_app.search) && (!g_app.onlyRelevant || Relevant(g_app.games[i]))) vis.push_back(i);
+    auto picked = [](int i) { return g_app.picked.count(g_app.games[i].root) != 0; };
+    auto setPicked = [](int i, bool on) { if (on) g_app.picked.insert(g_app.games[i].root); else g_app.picked.erase(g_app.games[i].root); };
+    auto pickRange = [&](int fromIdx, int toIdx, bool add) {
+        int a = -1, b = -1;
+        for (int k = 0; k < (int)vis.size(); k++) { if (vis[k] == fromIdx) a = k; if (vis[k] == toIdx) b = k; }
+        if (b < 0) return;
+        if (a < 0) a = b;
+        if (!add) g_app.picked.clear();
+        for (int k = std::min(a, b); k <= std::max(a, b); k++) setPicked(vis[k], true);
+    };
+
+    // header: a checkbox that ticks or clears every game shown
+    ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+    ImGui::TableSetColumnIndex(0);
+    {
+        int n = 0;
+        for (int i : vis) if (picked(i)) n++;
+        bool all = !vis.empty() && n == (int)vis.size();
+        if (n > 0 && !all) ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
+        if (ImGui::Checkbox("##all", &all)) for (int i : vis) setPicked(i, all);
+        if (n > 0 && !all) ImGui::PopItemFlag();
+        Tooltip("Tick or clear all games shown (Ctrl+A ticks all, Esc clears)");
+    }
+    for (int c = 1; c < 8; c++) { ImGui::TableSetColumnIndex(c); ImGui::TableHeader(ImGui::TableGetColumnName(c)); }
+
+    // Keyboard: Up/Down/PageUp/PageDown/Home/End move the selection itself (Shift extends the ticks),
+    // Ctrl+A ticks every game shown, Esc clears the ticks.
     bool scrollToSel = false;
     if (!vis.empty() && !ImGui::GetIO().WantTextInput && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId))
     {
@@ -517,9 +545,13 @@ static void DrawTable(float height)
         if (np != pos)
         {
             np = std::max(0, std::min(np, (int)vis.size() - 1));
+            int anchor = g_app.sel;
             g_app.sel = vis[np];
             scrollToSel = true;
+            if (ImGui::GetIO().KeyShift) pickRange(anchor < 0 ? vis[np] : anchor, vis[np], true);
         }
+        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A)) for (int i : vis) setPicked(i, true);
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) g_app.picked.clear();
     }
 
     for (int i = 0; i < (int)g_app.games.size(); i++)
@@ -527,9 +559,19 @@ static void DrawTable(float height)
         Game &g = g_app.games[i];
         if (!Matches(g, g_app.search) || (g_app.onlyRelevant && !Relevant(g))) continue;
         ImGui::TableNextRow();
-        ImGui::TableNextColumn();
         ImGui::PushID(i);
-        if (ImGui::Selectable(g.name.c_str(), g_app.sel == i, ImGuiSelectableFlags_SpanAllColumns)) g_app.sel = i;
+        ImGui::TableNextColumn();
+        bool pk = picked(i);
+        if (ImGui::Checkbox("##p", &pk)) setPicked(i, pk);
+        ImGui::TableNextColumn();
+        if (ImGui::Selectable(g.name.c_str(), g_app.sel == i || pk, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
+        {
+            ImGuiIO &io = ImGui::GetIO();
+            if (io.KeyShift && g_app.sel >= 0) pickRange(g_app.sel, i, io.KeyCtrl);
+            else if (io.KeyCtrl) setPicked(i, !pk);
+            else if (!g_app.picked.empty()) g_app.picked.clear();     // a plain click shows one game
+            g_app.sel = i;
+        }
         if (scrollToSel && g_app.sel == i) ImGui::SetScrollHereY(0.5f);
         ImGui::PopID();
         ImGui::TableNextColumn(); ImGui::TextColored(kGrey, "%s", g.store.c_str());
@@ -577,8 +619,106 @@ static void DrawActions(Game &g)
     ImGui::EndDisabled();
 }
 
+static bool CanInstall(const Game &g)
+{
+    return g_app.src.ok() && !g.exe.empty() &&
+           ((g.route == Route::Vulkan && !g_app.src.vkDir.empty()) ||
+            ((g.route == Route::Addon64 || g.route == Route::Addon32) && g.reshade && !g_app.src.dxDir.empty()));
+}
+
+// What "Install / update" would do for a ticked game ("" = it will be installed or updated).
+static std::string BatchSkip(const Game &g)
+{
+    St s = StatusOf(g);
+    if (s == St::Installed) return "up to date";
+    if (s == St::NoExe) return "no executable";
+    if (s == St::Unsupported) return "not supported";
+    if (s == St::NeedsReShade) return "needs ReShade";
+    if (!CanInstall(g)) return g_app.src.ok() ? "not in this release" : "pick a release first";
+    return {};
+}
+
+static void DrawBatch()
+{
+    std::vector<Game *> sel;
+    for (auto &g : g_app.games) if (g_app.picked.count(g.root)) sel.push_back(&g);
+    int nInst = 0, nRem = 0;
+    for (auto *g : sel) { if (BatchSkip(*g).empty()) nInst++; if (!g->addonPath.empty() || g->ini) nRem++; }
+
+    ImGui::Text("%d games ticked", (int)sel.size());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Clear")) { g_app.picked.clear(); return; }
+    ImGui::Spacing();
+    char lbl[64];
+    snprintf(lbl, 64, "Install / update (%d)", nInst);
+    ImGui::BeginDisabled(nInst == 0 || g_app.busy);
+    if (ImGui::Button(lbl))
+    {
+        int ok = 0, fail = 0;
+        std::string firstErr;
+        for (auto *g : sel)
+        {
+            if (!BatchSkip(*g).empty()) continue;
+            std::string e = InstallOrUpdate(*g, g_app.src);
+            if (e.empty()) ok++; else { fail++; if (firstErr.empty()) firstErr = g->name + ": " + e; }
+        }
+        g_app.vk = DetectVulkanLayer();
+        g_app.SetMsg("Installed or updated " + std::to_string(ok) + (fail ? ", failed " + std::to_string(fail) + ". " + firstErr : "."), fail != 0);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    snprintf(lbl, 64, "Remove (%d)", nRem);
+    ImGui::BeginDisabled(nRem == 0 || g_app.busy);
+    if (ImGui::Button(lbl)) ImGui::OpenPopup("Remove ticked");
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::Checkbox("also BFIPresenter.ini", &g_app.removeIni);
+    if (ImGui::BeginPopupModal("Remove ticked", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
+    {
+        ImGui::Text("Remove BFI Presenter from %d games%s?", nRem, g_app.removeIni ? ", with their BFIPresenter.ini" : "");
+        ImGui::TextColored(kGrey, "Every removed file is backed up; Undo last change in each game puts it back.");
+        if (ImGui::Button("Remove"))
+        {
+            int ok = 0, fail = 0;
+            std::string firstErr;
+            for (auto *g : sel)
+            {
+                if (g->addonPath.empty() && !g->ini) continue;
+                std::string e = Remove(*g, g_app.removeIni);
+                if (e.empty()) ok++; else { fail++; if (firstErr.empty()) firstErr = g->name + ": " + e; }
+            }
+            g_app.SetMsg("Removed from " + std::to_string(ok) + (fail ? ", failed " + std::to_string(fail) + ". " + firstErr : "."), fail != 0);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    ImGui::Separator();
+    if (ImGui::BeginTable("batch", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 0)))
+    {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("Install as", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn("Install / update", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableHeadersRow();
+        for (auto *g : sel)
+        {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(g->name.c_str());
+            ImGui::TableNextColumn(); ImGui::TextColored(kGrey, "%s", RouteText(g->route));
+            ImGui::TableNextColumn();
+            std::string skip = BatchSkip(*g);
+            if (skip.empty()) ImGui::TextColored(kGreen, StatusOf(*g) == St::NotInstalled ? "install" : "update");
+            else ImGui::TextColored(skip == "up to date" ? kGrey : kOrange, "skip: %s", skip.c_str());
+        }
+        ImGui::EndTable();
+    }
+}
+
 static void DrawDetail(HWND)
 {
+    if (g_app.picked.size() > 1) { DrawBatch(); return; }
     if (g_app.sel < 0 || g_app.sel >= (int)g_app.games.size())
     {
         ImGui::TextColored(kGrey, "Select a game to see what it needs and to install, update or remove BFI Presenter.");

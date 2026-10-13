@@ -11,6 +11,7 @@ A small Windows app that finds your games, works out what each one needs, and in
 - **Shows what else is there:** OptiScaler, DXVK, dgVoodoo, Special K, the ReShade version (Direct3D 9 needs 6.8+), and the game's entry from the [tested-games list](../docs/tested-games.md) with its key requirement.
 - **Installs, updates, removes.** Every file it replaces or deletes is kept in `%LOCALAPPDATA%\BFIPresenter\backups`; **Undo last change** puts it back (click again to go one more step back). Each change is listed in `manager_log.csv` (created with the first change).
 - **Update all** brings every game with an older add-on (or one for the wrong bitness) to the selected release, and the Vulkan layer too.
+- **Several games at once:** tick them in the first column (the header box ticks or clears every game shown), Ctrl+click or Shift+click a row, Shift+arrow keys, or Ctrl+A; Esc clears. The right pane then lists what **Install / update** and **Remove** will do for each ticked game and which ones are skipped (up to date, needs ReShade).
 - **Vulkan layer:** installs it for your Windows user (no admin rights), the same way `install_vulkan_layer.bat` does, and copies `BFIPresenter.ini` next to Vulkan games' executables (that file turns the layer on in a game).
 
 ## Where the files come from
