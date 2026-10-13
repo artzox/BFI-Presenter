@@ -94,6 +94,18 @@ static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SYSCOMMAND:
         if ((wp & 0xfff0) == SC_KEYMENU) return 0;
         break;
+    case WM_CLOSE:
+    {
+        WINDOWPLACEMENT wp{ sizeof(wp) };
+        if (GetWindowPlacement(hwnd, &wp))
+        {
+            const RECT &r = wp.rcNormalPosition;   // workspace coordinates: same as screen when the taskbar is at the bottom
+            wchar_t b[96];
+            swprintf(b, 96, L"%ld,%ld,%ld,%ld,%d", r.left, r.top, r.right, r.bottom, wp.showCmd == SW_SHOWMAXIMIZED ? 1 : 0);
+            SaveSetting(L"Window", b);
+        }
+        break;
+    }
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -108,7 +120,8 @@ struct App {
     int sel = -1;
     Source src;
     VulkanLayerState vk;
-    std::vector<std::wstring> folders;
+    ScanOptions opt;
+    LibraryInfo libs;
 
     // background work
     std::mutex lock;
@@ -117,6 +130,8 @@ struct App {
     std::string busyText;              // guarded by lock
     bool scanDone = false;             // guarded by lock
     std::vector<Game> scanned;         // guarded by lock
+    std::string scanErr;               // guarded by lock
+    bool lastFresh = false;
     bool releaseDone = false;          // guarded by lock
     Source fetched;                    // guarded by lock
     std::string remoteTag, remoteErr;  // guarded by lock
@@ -127,7 +142,7 @@ struct App {
     std::string msg;
     bool msgErr = false;
     bool removeIni = false;
-    bool showFolders = false;
+    bool showLibraries = false;        // open the Libraries dialog this frame
     std::string latestTag;             // newest tag seen on GitHub this session
     bool scannedOnce = false, checkedOnce = false;   // GitHub is checked once, after the first scan
 
@@ -141,19 +156,38 @@ static void JoinWorker()
     if (g_app.worker.joinable()) g_app.worker.join();
 }
 
-static void StartScan()
+static void SetBusy(const std::string &t)
+{
+    std::lock_guard<std::mutex> l(g_app.lock);
+    g_app.busyText = t;
+}
+
+// fresh: search the libraries again; otherwise re-check the saved list (exe facts are cached).
+static void StartScan(bool fresh)
 {
     if (g_app.busy) return;
     JoinWorker();
     g_app.busy = true;
-    { std::lock_guard<std::mutex> l(g_app.lock); g_app.busyText = "Scanning game libraries..."; }
-    auto folders = g_app.folders;
-    g_app.worker = std::thread([folders] {
-        auto games = FindGames(folders);
+    g_app.lastFresh = fresh;
+    SetBusy(fresh ? "Scanning game libraries..." : "Checking games...");
+    ScanOptions opt = g_app.opt;
+    std::vector<Game> current = g_app.games;
+    g_app.worker = std::thread([opt, fresh, current]() mutable {
+        std::vector<Game> games;
+        if (fresh) games = FindGames(opt, SetBusy);
+        else { games = std::move(current); DetectAll(games, SetBusy); }
+        std::string err;
+        if (LoadSetting(L"PCGamingWiki", L"1") == L"1")
+        {
+            err = FetchPcgw(games, SetBusy);
+            DetectAll(games, SetBusy);
+        }
+        SaveGameList(games);
         auto vk = DetectVulkanLayer();
         std::lock_guard<std::mutex> l(g_app.lock);
         g_app.scanned = std::move(games);
         g_app.vk = vk;
+        g_app.scanErr = err;
         g_app.scanDone = true;
         g_app.busy = false;
     });
@@ -203,7 +237,8 @@ static void PollWorker()
         g_app.sel = -1;
         for (int i = 0; i < (int)g_app.games.size(); i++)
             if (g_app.games[i].root == selRoot) g_app.sel = i;
-        g_app.SetMsg("Found " + std::to_string(g_app.games.size()) + " games.", false);
+        g_app.SetMsg((g_app.lastFresh ? "Found " : "Checked ") + std::to_string(g_app.games.size()) + " games." +
+                     (g_app.scanErr.empty() ? "" : " (" + g_app.scanErr + ")"), false);
         g_app.scannedOnce = true;
     }
     if (g_app.releaseDone)
@@ -396,10 +431,11 @@ static void DrawTop(HWND hwnd)
 
     // Toolbar
     ImGui::BeginDisabled(g_app.busy);
-    if (ImGui::Button("Rescan")) StartScan();
+    if (ImGui::Button("Rescan")) StartScan(true);
+    Tooltip("Searches the selected libraries again (new or removed games). Games already known are checked again quickly.");
     ImGui::SameLine();
-    if (ImGui::Button("Game folders...")) g_app.showFolders = true;
-    Tooltip("Steam, Epic, GOG and Xbox games are found automatically. Add folders for games installed elsewhere.");
+    if (ImGui::Button("Libraries...")) g_app.showLibraries = true;
+    Tooltip("Choose which stores to search and add folders with other games.");
     ImGui::SameLine();
     int nUpd = 0;
     for (auto &g : g_app.games) { St s = StatusOf(g); if ((s == St::Update || s == St::WrongBits) && g.route != Route::Vulkan) nUpd++; }
@@ -572,11 +608,27 @@ static void DrawDetail(HWND)
         ImGui::TextColored(kAccent, "%s", RouteText(g.route));
     }
 
+    // API sources
+    ImGui::TextColored(kGrey, "Graphics API"); ImGui::SameLine(lab);
+    {
+        std::string t;
+        if (g.pcgwKnown && !g.pcgwText.empty()) t = "PCGamingWiki: " + g.pcgwText;
+        if (g.exeApis) t += (t.empty() ? "" : "   |   ") + std::string("executable: ") + ApiText(g.exeApis);
+        if (t.empty()) t = "unknown";
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextUnformatted(t.c_str());
+        ImGui::PopTextWrapPos();
+    }
+
     // ReShade / other
     ImGui::TextColored(kGrey, "ReShade"); ImGui::SameLine(lab);
     if (g.reshade) ImGui::Text("%s  (%s)", g.reshadeDll.version.c_str(), U8(g.reshadeDll.path.substr(g.reshadeDll.path.find_last_of(L'\\') + 1)).c_str());
     else if (g.route == Route::Vulkan)
-        ImGui::TextColored(kGrey, g_app.vk.reshadeLayer ? "through ReShade's Vulkan layer" : "optional for Vulkan games (ReShade's Vulkan layer isn't installed)");
+    {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextColored(kGrey, "%s", g_app.vk.reshadeLayer ? "through ReShade's Vulkan layer" : "optional for Vulkan games (ReShade's Vulkan layer isn't installed)");
+        ImGui::PopTextWrapPos();
+    }
     else ImGui::TextColored(kOrange, "not found next to the executable");
     std::string extra;
     if (g.optiscaler) extra += "OptiScaler  ";
@@ -605,35 +657,79 @@ static void DrawDetail(HWND)
 
 }
 
-static void DrawFolders(HWND hwnd)
+static void DrawLibraries(HWND hwnd)
 {
-    if (g_app.showFolders) { ImGui::OpenPopup("Game folders"); g_app.showFolders = false; }
-    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 40, 0), ImGuiCond_Appearing);
-    if (!ImGui::BeginPopupModal("Game folders", nullptr, ImGuiWindowFlags_NoSavedSettings)) return;
-    ImGui::TextWrapped("Folders searched in addition to Steam, Epic, GOG and Xbox. Each sub-folder is taken as one game "
-                       "(or the folder itself, if it has the game's .exe).");
+    static bool open = false;
+    if (g_app.showLibraries)
+    {
+        g_app.showLibraries = false;
+        g_app.libs = FindLibraries();
+        ImGui::OpenPopup("Libraries");
+        open = true;
+    }
+    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 42, 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Libraries", &open, ImGuiWindowFlags_NoSavedSettings)) return;
+    ScanOptions &o = g_app.opt;
+    LibraryInfo &li = g_app.libs;
+    ImGui::TextWrapped("Choose where to look for games, then Scan. The list is kept, so this is needed only once and when "
+                       "you install games somewhere new.");
+    ImGui::Spacing();
+    auto lib = [](const char *name, bool *on, bool found, const std::string &text) {
+        ImGui::BeginDisabled(!found);
+        if (!found) *on = false;
+        ImGui::Checkbox(name, on);
+        ImGui::EndDisabled();
+        ImGui::SameLine(ImGui::GetFontSize() * 9);
+        ImGui::TextColored(found ? kGrey : ImVec4(0.45f, 0.45f, 0.48f, 1), "%s", text.c_str());
+    };
+    lib("Steam", &o.steam, li.steam, li.steamText);
+    lib("Epic Games", &o.epic, li.epic, li.epicText);
+    lib("GOG", &o.gog, li.gog, li.gogText);
+    lib("Xbox", &o.xbox, li.xbox, li.xboxText);
+    {
+        bool pw = LoadSetting(L"PCGamingWiki", L"1") == L"1";
+        if (ImGui::Checkbox("Look up each game's graphics APIs on PCGamingWiki", &pw)) SaveSetting(L"PCGamingWiki", pw ? L"1" : L"0");
+        Tooltip("Asks pcgamingwiki.com which APIs a game supports (Steam games by app id, others by name). More reliable than "
+                "reading the executable, for example for games that load Vulkan or Direct3D 12 at run time. Results are cached.");
+    }
+    ImGui::Spacing();
     ImGui::Separator();
+    ImGui::TextUnformatted("Other folders");
+    ImGui::PushStyleColor(ImGuiCol_Text, kGrey);
+    ImGui::TextWrapped("Each sub-folder is taken as one game (or the folder itself, if it has the game's .exe).");
+    ImGui::PopStyleColor();
     int del = -1;
-    for (int i = 0; i < (int)g_app.folders.size(); i++)
+    for (int i = 0; i < (int)o.folders.size(); i++)
     {
         ImGui::PushID(i);
         if (ImGui::SmallButton("Remove")) del = i;
         ImGui::SameLine();
-        ImGui::TextUnformatted(U8(g_app.folders[i]).c_str());
+        ImGui::TextUnformatted(U8(o.folders[i]).c_str());
         ImGui::PopID();
     }
-    if (g_app.folders.empty()) ImGui::TextColored(kGrey, "(none)");
-    if (del >= 0) { g_app.folders.erase(g_app.folders.begin() + del); SaveFolders(g_app.folders); }
-    ImGui::Separator();
+    if (o.folders.empty()) ImGui::TextColored(kGrey, "(none)");
+    if (del >= 0) o.folders.erase(o.folders.begin() + del);
     if (ImGui::Button("Add folder..."))
     {
         std::wstring d = PickFolder(hwnd, L"Folder with games");
-        if (!d.empty()) { g_app.folders.push_back(d); SaveFolders(g_app.folders); }
+        if (!d.empty()) o.folders.push_back(d);
     }
+    ImGui::Spacing();
+    ImGui::Separator();
+    bool any = o.steam || o.epic || o.gog || o.xbox || !o.folders.empty();
+    ImGui::BeginDisabled(!any || g_app.busy);
+    if (ImGui::Button("Scan"))
+    {
+        SaveScanOptions(o);
+        ImGui::CloseCurrentPopup();
+        StartScan(true);
+    }
+    ImGui::EndDisabled();
     ImGui::SameLine();
-    if (ImGui::Button("Close and rescan")) { ImGui::CloseCurrentPopup(); StartScan(); }
-    ImGui::SameLine();
-    if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+    if (ImGui::Button("Cancel")) { g_app.opt = LoadScanOptions(); ImGui::CloseCurrentPopup(); }
+    if (!open) g_app.opt = LoadScanOptions();     // closed with the X
     ImGui::EndPopup();
 }
 
@@ -654,7 +750,7 @@ static void DrawFrame(HWND hwnd)
     ImGui::BeginChild("detail", ImVec2(0, 0), ImGuiChildFlags_Borders);
     DrawDetail(hwnd);
     ImGui::EndChild();
-    DrawFolders(hwnd);
+    DrawLibraries(hwnd);
     ImGui::End();
 }
 
@@ -679,6 +775,10 @@ static void SetupStyle(float scale)
     st.ScaleAllSizes(scale);
 }
 
+// Latin with accents, Greek, Cyrillic, punctuation and symbols such as ™ and ® that game names use
+static const ImWchar kRanges[] = { 0x0020, 0x024F, 0x0370, 0x03FF, 0x0400, 0x052F, 0x2000, 0x206F, 0x20A0, 0x20CF,
+                                   0x2100, 0x214F, 0x2190, 0x21FF, 0x2460, 0x24FF, 0 };
+
 static void LoadFonts(float scale)
 {
     ImGuiIO &io = ImGui::GetIO();
@@ -689,7 +789,7 @@ static void LoadFonts(float scale)
     ImFontConfig cfg;
     cfg.OversampleH = 2;
     if (GetFileAttributesA(font.c_str()) == INVALID_FILE_ATTRIBUTES ||
-        !io.Fonts->AddFontFromFileTTF(font.c_str(), 17.0f * scale, &cfg, io.Fonts->GetGlyphRangesDefault()))
+        !io.Fonts->AddFontFromFileTTF(font.c_str(), 17.0f * scale, &cfg, kRanges))
     {
         ImFontConfig d;
         d.SizePixels = 13.0f * scale;
@@ -704,14 +804,37 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, inst, LoadIconW(inst, MAKEINTRESOURCEW(1)), LoadCursor(nullptr, IDC_ARROW),
                        nullptr, nullptr, L"BFIPresenterManager", nullptr };
     RegisterClassExW(&wc);
-    POINT pt{ 0, 0 };
-    HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+    // Where the window was last time, if that is still on a monitor; else centred on the monitor with the mouse.
+    RECT saved{};
+    bool maximized = false, haveSaved = false;
+    {
+        std::wstring ws = LoadSetting(L"Window", L"");
+        int a, b, c, d, m;
+        if (swscanf(ws.c_str(), L"%d,%d,%d,%d,%d", &a, &b, &c, &d, &m) == 5 && c - a > 200 && d - b > 150)
+        {
+            saved = { a, b, c, d };
+            maximized = m != 0;
+            haveSaved = MonitorFromRect(&saved, MONITOR_DEFAULTTONULL) != nullptr;
+        }
+    }
+    POINT pt{};
+    GetCursorPos(&pt);
+    HMONITOR mon = haveSaved ? MonitorFromRect(&saved, MONITOR_DEFAULTTONEAREST) : MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{ sizeof(mi) };
     GetMonitorInfoW(mon, &mi);
     g_dpiScale = ImGui_ImplWin32_GetDpiScaleForMonitor(mon);
     if (g_dpiScale < 1.0f) g_dpiScale = 1.0f;
-    int w = (int)(1280 * g_dpiScale), h = (int)(820 * g_dpiScale);
-    int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - w) / 2, y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - h) / 2;
+    const RECT &wa = mi.rcWork;
+    int waW = wa.right - wa.left, waH = wa.bottom - wa.top;
+    int w, h, x, y;
+    if (haveSaved) { w = saved.right - saved.left; h = saved.bottom - saved.top; x = saved.left; y = saved.top; }
+    else { w = (int)(1280 * g_dpiScale); h = (int)(820 * g_dpiScale); x = 0; y = 0; }
+    // never larger than the work area, and never with the title bar off screen
+    w = std::min(w, waW * 95 / 100);
+    h = std::min(h, waH * 92 / 100);
+    if (!haveSaved) { x = wa.left + (waW - w) / 2; y = wa.top + (waH - h) / 2; }
+    x = std::max((int)wa.left, std::min(x, (int)wa.right - w));
+    y = std::max((int)wa.top, std::min(y, (int)wa.bottom - h));
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"BFI Presenter Manager " MANAGER_VERSION, WS_OVERLAPPEDWINDOW, x, y, w, h,
                               nullptr, nullptr, inst, nullptr);
     if (!CreateDevice(hwnd))
@@ -720,7 +843,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         MessageBoxW(nullptr, L"Couldn't create a Direct3D 11 device.", L"BFI Presenter Manager", MB_ICONERROR);
         return 1;
     }
-    ShowWindow(hwnd, SW_SHOWDEFAULT);
+    ShowWindow(hwnd, maximized ? SW_SHOWMAXIMIZED : SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
 
     ImGui::CreateContext();
@@ -733,12 +856,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     ImGui_ImplDX11_Init(g_dev, g_ctx);
 
     // initial state
-    g_app.folders = LoadFolders();
+    g_app.opt = LoadScanOptions();
     std::wstring srcDir = LoadSetting(L"Source", L"");
     if (!srcDir.empty()) g_app.src = SourceFromFolder(srcDir);
     if (!g_app.src.ok()) g_app.src = CachedRelease();
     g_app.vk = DetectVulkanLayer();
-    StartScan();
+    if (LoadGameList(g_app.games)) StartScan(false);      // the saved list, re-checked in the background
+    else g_app.showLibraries = true;                      // first start: choose libraries, then scan
 
     bool done = false;
     while (!done)

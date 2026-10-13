@@ -35,12 +35,17 @@ struct Source {
 
 struct Game {
     std::string  name, store;    // store: Steam, Epic, GOG, Xbox, Folder
+    std::string  appid;          // Steam app id, if any
     std::wstring root;           // install folder
     std::vector<std::wstring> exes;   // candidates, best first
     std::wstring exe;            // chosen (best or the user's override)
     bool         exeOverride = false;
     int          bits = 0;       // 32, 64, 0 unknown
-    unsigned     apis = 0;
+    unsigned     apis = 0;       // what the route is decided on: PCGamingWiki if known, else the executable
+    unsigned     exeApis = 0;    // read from the executable and the DLLs next to it
+    bool         pcgwKnown = false;
+    unsigned     pcgwApis = 0;   // from PCGamingWiki
+    std::string  pcgwText;       // e.g. "Direct3D 12, 11; Vulkan"
     // Detected next to the exe
     bool         reshade = false;
     DllInfo      reshadeDll;     // the ReShade DLL (any name: dxgi.dll, ReShade64.dll, ...)
@@ -75,7 +80,19 @@ std::wstring LoadExeOverride(const std::wstring &root);
 void SaveExeOverride(const std::wstring &root, const std::wstring &exe);
 
 // ----- Discovery and detection
-std::vector<Game> FindGames(const std::vector<std::wstring> &extraFolders);
+struct ScanOptions { bool steam = true, epic = true, gog = true, xbox = true; std::vector<std::wstring> folders; };
+ScanOptions LoadScanOptions();
+void SaveScanOptions(const ScanOptions &o);
+struct LibraryInfo { bool steam = false, epic = false, gog = false, xbox = false; std::string steamText, epicText, gogText, xboxText; };
+LibraryInfo FindLibraries();                    // which stores are installed (quick)
+std::vector<Game> FindGames(const ScanOptions &opt,
+                            const std::function<void(const std::string &)> &progress = nullptr);
+// The game list is kept between runs: saved after each scan, loaded (and re-detected) at start.
+void SaveGameList(const std::vector<Game> &games);
+bool LoadGameList(std::vector<Game> &games);    // false if there is no saved list
+void DetectAll(std::vector<Game> &games, const std::function<void(const std::string &)> &progress = nullptr);
+// PCGamingWiki: graphics APIs per game (Steam by app id, others by page name). Blocking; caches results.
+std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const std::string &)> &progress = nullptr);
 void Detect(Game &g);                          // (re)detects everything for g.exe
 VulkanLayerState DetectVulkanLayer();
 DllInfo ReadDllInfo(const std::wstring &path);

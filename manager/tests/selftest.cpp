@@ -31,7 +31,10 @@ int wmain(int argc, wchar_t **argv)
 {
     if (argc < 3) { printf("usage: selftest <games dir> <release dir>\n"); return 2; }
     std::wstring games = argv[1], rel = argv[2];
-    auto all = FindGames({ games });
+    ScanOptions o;
+    o.steam = o.epic = o.gog = o.xbox = false;
+    o.folders = { games };
+    auto all = FindGames(o);
     printf("found %zu games\n", all.size());
     for (auto &g : all) Dump(g);
 
@@ -48,6 +51,11 @@ int wmain(int argc, wchar_t **argv)
     CHECK(h2->bits == 32 && (h2->apis & ApiGL) && h2->route == Route::Addon32 && h2->reshade, "Heretic II: 32-bit OpenGL, addon32");
     CHECK(!nr->reshade, "NoReShade: no ReShade");
     CHECK(ue->exe.find(L"Shipping") != std::wstring::npos && ue->reshade, "UEGame: picks the Shipping exe with ReShade");
+    Game *de = Find(all, "DOOM Eternal"), *hd = Find(all, "Hades II"), *bp = Find(all, "Burnout Paradise Remastered"), *pf = Find(all, "PerfGame");
+    CHECK(de && de->exe.find(L"DOOMEternalx64vk.exe") != std::wstring::npos, "DOOM Eternal: DOOMEternalx64vk.exe, not idTechLauncher");
+    CHECK(hd && hd->exe.find(L"Ship\\Hades2.exe") != std::wstring::npos, "Hades II: Ship\\Hades2.exe, not F10.exe");
+    CHECK(bp && bp->exe.find(L"BurnoutPR.exe") != std::wstring::npos, "Burnout: BurnoutPR.exe, not the trial");
+    CHECK(pf && !(pf->apis & ApiD3D9) && (pf->apis & ApiVulkan) && (pf->apis & ApiD3D12), "D3DPERF-only d3d9 import ignored: %s", pf ? ApiText(pf->apis).c_str() : "-");
 
     Source src = SourceFromFolder(rel);
     printf("source dx=%s vk=%s\n", src.dxVersion.c_str(), src.vkVersion.c_str());
