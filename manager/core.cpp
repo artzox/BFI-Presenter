@@ -26,6 +26,8 @@ namespace fs = std::filesystem;
 
 namespace bfi {
 
+bool ZipExtract(const std::string &data, const std::string &name, std::string &out);   // unzip.cpp
+
 // ------------------------------------------------------------------ strings
 
 std::string U8(const std::wstring &w)
@@ -162,7 +164,7 @@ static bool SameContent(const std::wstring &a, const std::wstring &b)
 
 static std::string ReadText(const std::wstring &p)
 {
-    auto v = ReadBytes(p, 64u << 20);
+    auto v = ReadBytes(p, 256u << 20);
     return std::string(v.begin(), v.end());
 }
 
@@ -860,7 +862,7 @@ static std::string TestedFor(const std::string &game)
 // ------------------------------------------------------------------ PCGamingWiki
 
 static bool HttpGet(const std::wstring &url, std::string &body, std::string &err,
-                    const std::function<void(size_t, size_t)> &prog = nullptr);
+                    const std::function<void(size_t, size_t)> &prog = nullptr, const std::wstring &extraHeaders = L"");
 static std::string JsonString(const std::string &json, const std::string &key);
 
 struct PcgwEntry { long long when = 0; bool found = false; unsigned apis = 0; std::string text; };
@@ -1798,7 +1800,7 @@ std::string UninstallVulkanLayer()
 // ------------------------------------------------------------------ GitHub
 
 static bool HttpGet(const std::wstring &url, std::string &body, std::string &err,
-                    const std::function<void(size_t, size_t)> &prog)
+                    const std::function<void(size_t, size_t)> &prog, const std::wstring &extraHeaders)
 {
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
@@ -1814,7 +1816,8 @@ static bool HttpGet(const std::wstring &url, std::string &body, std::string &err
     bool ok = false;
     if (r)
     {
-        const wchar_t *hdr = L"Accept: application/vnd.github+json, application/octet-stream\r\n";
+        std::wstring hdrs = L"Accept: application/vnd.github+json, application/octet-stream\r\n" + extraHeaders;
+        const wchar_t *hdr = hdrs.c_str();
         if (WinHttpSendRequest(r, hdr, (DWORD)-1, nullptr, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr))
         {
             DWORD status = 0, sz = sizeof(status);
@@ -1945,6 +1948,130 @@ Source CachedRelease()
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     return best;
+}
+
+// ------------------------------------------------------------------ ReShade
+
+std::string FetchReShadeVersions(std::vector<std::string> &out)
+{
+    out.clear();
+    std::string body, err;
+    if (!HttpGet(L"https://api.github.com/repos/crosire/reshade/tags?per_page=100", body, err))
+        return "Couldn't get the list of ReShade versions: " + err;
+    for (size_t p = 0; (p = body.find("\"name\"", p)) != std::string::npos; p += 6)
+    {
+        std::string n = JsonString(body.substr(p, 80), "name");
+        if (n.size() > 1 && (n[0] == 'v' || n[0] == 'V')) n = n.substr(1);
+        bool ok = !n.empty() && isdigit((unsigned char)n[0]) && n.find_first_not_of("0123456789.") == std::string::npos;
+        if (ok && CompareVersions(n, "5.0") >= 0 && std::find(out.begin(), out.end(), n) == out.end()) out.push_back(n);
+    }
+    std::sort(out.begin(), out.end(), [](const std::string &a, const std::string &b) { return CompareVersions(a, b) > 0; });
+    if (out.empty()) return "No ReShade versions found.";
+    return {};
+}
+
+std::wstring ReShadeCacheDir(const std::string &version)
+{
+    std::wstring d = Join(DataDir(), L"reshade");
+    CreateDirectoryW(d.c_str(), nullptr);
+    d = Join(d, W(version));
+    CreateDirectoryW(d.c_str(), nullptr);
+    return d;
+}
+
+std::vector<std::string> CachedReShadeVersions()
+{
+    std::vector<std::string> out;
+    std::wstring root = Join(DataDir(), L"reshade");
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(Join(root, L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do
+    {
+        std::wstring n = fd.cFileName;
+        if (n != L"." && n != L".." && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            Exists(Join(Join(root, n), L"ReShade64.dll")))
+            out.push_back(U8(n));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(out.begin(), out.end(), [](const std::string &a, const std::string &b) { return CompareVersions(a, b) > 0; });
+    return out;
+}
+
+// The add-on build of ReShade's setup carries ReShade32.dll and ReShade64.dll in a zip appended to the exe.
+std::string EnsureReShade(const std::string &version, const std::function<void(const std::string &)> &progress)
+{
+    std::wstring dir = ReShadeCacheDir(version);
+    if (Exists(Join(dir, L"ReShade64.dll")) && Exists(Join(dir, L"ReShade32.dll"))) return {};
+    std::wstring setup = Join(dir, W("ReShade_Setup_" + version + "_Addon.exe"));
+    if (!Exists(setup))
+    {
+        std::string body, err;
+        std::wstring url = W("https://reshade.me/downloads/ReShade_Setup_" + version + "_Addon.exe");
+        if (progress) progress("Downloading ReShade " + version + " (with add-on support)");
+        if (!HttpGet(url, body, err, [&](size_t got, size_t total) {
+                if (progress && total) progress("Downloading ReShade " + version + " (" + std::to_string(got * 100 / total) + " %)");
+            }, L"Referer: https://reshade.me/\r\n"))
+            return "Download of ReShade " + version + " failed: " + err;
+        if (body.size() < 100000 || body[0] != 'M' || body[1] != 'Z') return "reshade.me didn't send the ReShade " + version + " setup.";
+        std::ofstream(fs::path(setup), std::ios::binary).write(body.data(), (std::streamsize)body.size());
+    }
+    if (progress) progress("Unpacking ReShade " + version);
+    {
+        std::string all = ReadText(setup), dll;
+        for (auto n : { "ReShade64.dll", "ReShade32.dll" })
+            if (ZipExtract(all, n, dll)) std::ofstream(fs::path(Join(dir, W(n))), std::ios::binary).write(dll.data(), (std::streamsize)dll.size());
+    }
+    if (!Exists(Join(dir, L"ReShade64.dll"))) Extract(setup, dir);
+    if (!Exists(Join(dir, L"ReShade64.dll")))
+    {
+        // tar didn't take the exe: let .NET's zip reader try a copy named .zip
+        std::wstring zip = Join(dir, L"setup.zip");
+        CopyFileW(setup.c_str(), zip.c_str(), FALSE);
+        Extract(zip, dir);
+        DeleteFileW(zip.c_str());
+    }
+    if (!Exists(Join(dir, L"ReShade64.dll")) || !InfoHas(ReadDllInfo(Join(dir, L"ReShade64.dll")), "ReShade"))
+        return "Couldn't unpack ReShade from its setup. Install it with the setup from reshade.me instead.";
+    return {};
+}
+
+std::string InstallReShade(Game &g, const std::string &version, std::string *note)
+{
+    if (g.exe.empty()) return "No game executable.";
+    if (g.route == Route::Vulkan)
+        return "Vulkan games: ReShade installs as a system-wide Vulkan layer; use the setup from reshade.me for those.";
+    std::wstring dir = DirOf(g.exe);
+    std::wstring cache = ReShadeCacheDir(version);
+    std::wstring src = Join(cache, g.bits == 32 ? L"ReShade32.dll" : L"ReShade64.dll");
+    if (!Exists(src)) return "ReShade " + version + " isn't downloaded yet.";
+    std::wstring dest;
+    std::string oldV;
+    if (g.reshade) { dest = g.reshadeDll.path; oldV = g.reshadeDll.version; }    // change version: same file
+    else
+    {
+        std::wstring name;
+        if (g.optiscaler) name = g.bits == 32 ? L"ReShade32.dll" : L"ReShade64.dll";   // OptiScaler loads it (LoadReshade=true)
+        else if ((g.apis & ApiD3D9) && !(g.apis & (ApiD3D11 | ApiD3D12))) name = L"d3d9.dll";
+        else if ((g.apis & ApiGL) && !(g.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12))) name = L"opengl32.dll";
+        else name = L"dxgi.dll";
+        dest = Join(dir, name);
+        if (Exists(dest))
+        {
+            DllInfo d = ReadDllInfo(dest);
+            std::string what = d.product.empty() ? std::string("another program") : d.product;
+            return U8(name) + " in the game folder belongs to " + what + ". Remove it first, or install ReShade with its own setup.";
+        }
+    }
+    Txn t(g);
+    std::string err = CopyIn(t, src, dest);
+    t.Finish();
+    if (!err.empty()) return err;
+    Log(oldV.empty() ? "install ReShade" : "change ReShade", g.name, dest, oldV, version);
+    if (g.optiscaler && !g.reshade && note)
+        *note = "ReShade copied as " + U8(NameOf(dest)) + ". Set LoadReshade=true in OptiScaler.ini so OptiScaler loads it.";
+    Detect(g);
+    return {};
 }
 
 void OpenInExplorer(const std::wstring &path, bool select)

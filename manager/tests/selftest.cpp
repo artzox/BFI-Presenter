@@ -107,6 +107,23 @@ int wmain(int argc, wchar_t **argv)
     UninstallVulkanLayer();
     CHECK(!DetectVulkanLayer().installed, "layer unregistered");
 
+    // ReShade from a setup exe (a zip appended to an exe), then installed and changed
+    {
+        std::wstring rsDir = DataDir() + L"\\reshade\\9.9.8";
+        CreateDirectoryW((DataDir() + L"\\reshade").c_str(), nullptr);
+        CreateDirectoryW(rsDir.c_str(), nullptr);
+        CopyFileW((std::wstring(argv[1]) + L"\\..\\bin\\rssetup.exe").c_str(), (rsDir + L"\\ReShade_Setup_9.9.8_Addon.exe").c_str(), FALSE);
+        DeleteFileW((rsDir + L"\\ReShade64.dll").c_str());
+        DeleteFileW((rsDir + L"\\ReShade32.dll").c_str());
+        e = EnsureReShade("9.9.8", nullptr);
+        CHECK(e.empty() && ReadDllInfo(rsDir + L"\\ReShade64.dll").product == "ReShade", "ReShade unpacked from its setup (%s)", e.c_str());
+        e = InstallReShade(*nr, "9.9.8");
+        CHECK(e.empty() && nr->reshade && nr->reshadeDll.path.find(L"dxgi.dll") != std::wstring::npos, "NoReShade: ReShade installed as dxgi.dll (%s)", e.c_str());
+        e = InstallReShade(*op, "9.9.8");
+        CHECK(e.empty() && op->reshadeDll.path.find(L"ReShade64.dll") != std::wstring::npos, "OptiGame: ReShade64.dll replaced in place (%s)", e.c_str());
+        CHECK(CanRevert(*op) && Revert(*op).empty() && op->reshadeDll.version == "6.4.1", "OptiGame: ReShade change undone (%s)", op->reshadeDll.version.c_str());
+    }
+
     printf(g_fail ? "\n%d FAILED\n" : "\nall passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

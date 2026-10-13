@@ -58,6 +58,11 @@ struct Game {
     Route        route = Route::Unknown;
     std::vector<std::string> notes;   // shown in the detail pane
     std::string  tested;         // matching line from the tested-games list
+    // NVIDIA profile (filled by the app from nvdrs)
+    bool         nvKnown = false;
+    std::wstring nvProfile;
+    long long    nvVrr = -1, nvVsync = -1;
+    bool         nvVrrOwn = false, nvVsyncOwn = false;
     bool         hidden = false;
 };
 
@@ -119,6 +124,14 @@ RemoteRelease ParseRelease(const std::string &json);           // blocking (call
 std::string DownloadRelease(const RemoteRelease &r, Source &out,
                             const std::function<void(const std::string &)> &progress);
 Source CachedRelease();                        // newest release already downloaded, if any
+
+// ----- ReShade (the add-on build from reshade.me)
+std::string FetchReShadeVersions(std::vector<std::string> &out);     // newest first, from GitHub tags
+std::vector<std::string> CachedReShadeVersions();                    // already downloaded
+std::string EnsureReShade(const std::string &version, const std::function<void(const std::string &)> &progress);
+// Installs (no ReShade yet) or changes the version of (ReShade present) ReShade for the game. "" = done;
+// *note gets a hint that isn't an error (OptiScaler).
+std::string InstallReShade(Game &g, const std::string &version, std::string *note = nullptr);
 
 // Open a folder or file in Explorer.
 void OpenInExplorer(const std::wstring &path, bool select);

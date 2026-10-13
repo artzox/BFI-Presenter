@@ -15,10 +15,11 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include "core.h"
+#include "nvdrs.h"
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.0.0 (test 5)"
+#define MANAGER_VERSION "1.0.0 (test 6)"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -149,14 +150,69 @@ struct App {
     std::string latestTag;             // newest tag seen on GitHub this session
     bool scannedOnce = false, checkedOnce = false;   // GitHub is checked once, after the first scan
 
-    void SetMsg(const std::string &m, bool err) { msg = m; msgErr = err; }
+    // NVIDIA profiles
+    bool nvOk = false;
+    bool needAdmin = false;            // last NVIDIA change needs administrator rights
+    // ReShade versions and downloads
+    std::vector<std::string> rsVersions;   // guarded by lock while the worker fills it
+    std::string rsVersion;                 // the version chosen in the UI
+    bool rsDone = false;                   // guarded by lock: a download finished
+    std::string rsErr, rsPendingVer;       // guarded by lock
+    std::vector<std::wstring> rsPending;   // games to install ReShade in after the download
+    // install question (NVIDIA settings)
+    std::vector<std::wstring> instPending;
+    bool openInstall = false;
+
+    void SetMsg(const std::string &m, bool err) { msg = m; msgErr = err; needAdmin = false; }
 };
 
 static App g_app;
+static void RestartAsAdmin();
+static void ReShadeVersionCombo(float width);
 
 static void JoinWorker()
 {
     if (g_app.worker.joinable()) g_app.worker.join();
+}
+
+static void NvFill(std::vector<Game> &games)
+{
+    if (!NvAvailable()) return;
+    std::vector<std::wstring> names;
+    for (auto &g : games)
+    {
+        std::wstring n = g.exe.substr(g.exe.find_last_of(L'\\') + 1);
+        names.push_back(Lower(n));
+    }
+    std::vector<NvState> st;
+    if (!NvRead(names, st).empty()) return;
+    for (size_t i = 0; i < games.size(); i++)
+    {
+        Game &g = games[i];
+        g.nvKnown = st[i].known;
+        g.nvProfile = st[i].profile;
+        g.nvVrr = st[i].vrr; g.nvVrrOwn = st[i].vrrOwn;
+        g.nvVsync = st[i].vsync; g.nvVsyncOwn = st[i].vsyncOwn;
+    }
+}
+
+static void NvFillOne(Game &g)
+{
+    std::vector<Game> one{ g };
+    NvFill(one);
+    g.nvKnown = one[0].nvKnown; g.nvProfile = one[0].nvProfile;
+    g.nvVrr = one[0].nvVrr; g.nvVrrOwn = one[0].nvVrrOwn;
+    g.nvVsync = one[0].nvVsync; g.nvVsyncOwn = one[0].nvVsyncOwn;
+}
+
+static std::wstring ExeName(const Game &g) { return g.exe.substr(g.exe.find_last_of(L'\\') + 1); }
+
+// vrr / vsync: -2 leave, -1 use global, else the value. Returns "" or the error (needAdmin set when that's the cause).
+static std::string NvSet(Game &g, long long vrr, long long vsync)
+{
+    std::string e = NvWrite(ExeName(g), W(g.name), vrr, vsync);
+    NvFillOne(g);
+    return e;
 }
 
 static void SetBusy(const std::string &t)
@@ -186,12 +242,37 @@ static void StartScan(bool fresh)
             DetectAll(games, SetBusy);
         }
         SaveGameList(games);
+        NvFill(games);
+        std::vector<std::string> rsv;
+        {
+            std::lock_guard<std::mutex> l(g_app.lock);
+            rsv = g_app.rsVersions;
+        }
+        if (rsv.empty()) { SetBusy("Getting the list of ReShade versions..."); FetchReShadeVersions(rsv); }
         auto vk = DetectVulkanLayer();
         std::lock_guard<std::mutex> l(g_app.lock);
+        if (!rsv.empty()) g_app.rsVersions = rsv;
         g_app.scanned = std::move(games);
         g_app.vk = vk;
         g_app.scanErr = err;
         g_app.scanDone = true;
+        g_app.busy = false;
+    });
+}
+
+static void StartReShade(const std::string &ver, const std::vector<std::wstring> &roots)
+{
+    if (g_app.busy || ver.empty()) return;
+    JoinWorker();
+    g_app.busy = true;
+    g_app.rsPending = roots;
+    SetBusy("Getting ReShade " + ver + "...");
+    g_app.worker = std::thread([ver] {
+        std::string e = EnsureReShade(ver, SetBusy);
+        std::lock_guard<std::mutex> l(g_app.lock);
+        g_app.rsErr = e;
+        g_app.rsPendingVer = ver;
+        g_app.rsDone = true;
         g_app.busy = false;
     });
 }
@@ -243,6 +324,27 @@ static void PollWorker()
         g_app.SetMsg((g_app.lastFresh ? "Found " : "Checked ") + std::to_string(g_app.games.size()) + " games." +
                      (g_app.scanErr.empty() ? "" : " (" + g_app.scanErr + ")"), false);
         g_app.scannedOnce = true;
+    }
+    if (g_app.rsDone)
+    {
+        g_app.rsDone = false;
+        if (!g_app.rsErr.empty()) g_app.SetMsg(g_app.rsErr, true);
+        else
+        {
+            int ok = 0, fail = 0;
+            std::string firstErr, note;
+            for (auto &root : g_app.rsPending)
+                for (auto &g : g_app.games)
+                    if (g.root == root)
+                    {
+                        std::string n, e = InstallReShade(g, g_app.rsPendingVer, &n);
+                        if (e.empty()) ok++; else { fail++; if (firstErr.empty()) firstErr = g.name + ": " + e; }
+                        if (!n.empty()) note = n;
+                    }
+            g_app.SetMsg("ReShade " + g_app.rsPendingVer + " installed in " + std::to_string(ok) + " game" + (ok == 1 ? "" : "s") +
+                         (fail ? ", failed " + std::to_string(fail) + ". " + firstErr : ".") + (note.empty() ? "" : " " + note), fail != 0);
+        }
+        g_app.rsPending.clear();
     }
     if (g_app.releaseDone)
     {
@@ -445,8 +547,12 @@ static void DrawTop(HWND hwnd)
     bool vkOld = g_app.vk.installed && !g_app.src.vkVersion.empty() && CompareVersions(g_app.vk.version, g_app.src.vkVersion) < 0;
     ImGui::BeginDisabled(!g_app.src.ok() || (nUpd == 0 && !vkOld));
     char lbl[64];
-    snprintf(lbl, 64, "Update all (%d%s)", nUpd, vkOld ? " + layer" : "");
-    if (ImGui::Button(lbl))
+    snprintf(lbl, 64, "Update outdated (%d%s)", nUpd, vkOld ? " + layer" : "");
+    bool clicked = ImGui::Button(lbl);
+    Tooltip("Updates every game whose BFI Presenter add-on is older than the selected release (or built for the wrong "
+            "bitness), and the Vulkan layer if it is older. No ticks needed; for a chosen set of games, tick them and "
+            "use the buttons on the right.");
+    if (clicked)
     {
         int ok = 0, fail = 0;
         std::string firstErr;
@@ -469,6 +575,12 @@ static void DrawTop(HWND hwnd)
     ImGui::SameLine();
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
     ImGui::InputTextWithHint("##search", "Search games", g_app.search, sizeof(g_app.search));
+    if (g_app.search[0])
+    {
+        ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
+        if (ImGui::Button("x##clearsearch")) g_app.search[0] = 0;
+        Tooltip("Clear the search");
+    }
     ImGui::SameLine();
     ImGui::Checkbox("Only games with ReShade, BFI or a tested entry", &g_app.onlyRelevant);
 
@@ -479,6 +591,11 @@ static void DrawTop(HWND hwnd)
     }
     else if (!g_app.msg.empty())
     {
+        if (g_app.needAdmin)
+        {
+            if (ImGui::SmallButton("Restart as administrator")) RestartAsAdmin();
+            ImGui::SameLine();
+        }
         ImGui::PushTextWrapPos(0);
         ImGui::TextColored(g_app.msgErr ? kRed : kGreen, "%s", g_app.msg.c_str());
         ImGui::PopTextWrapPos();
@@ -490,7 +607,7 @@ static void DrawTable(float height)
 {
     ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY |
                          ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
-    if (!ImGui::BeginTable("games", 8, tf, ImVec2(0, height))) return;
+    if (!ImGui::BeginTable("games", 10, tf, ImVec2(0, height))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("##pick", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize, ImGui::GetFrameHeight());
     ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch, 2.6f);
@@ -499,6 +616,8 @@ static void DrawTable(float height)
     ImGui::TableSetupColumn("API", ImGuiTableColumnFlags_WidthStretch, 1.0f);
     ImGui::TableSetupColumn("ReShade", ImGuiTableColumnFlags_WidthStretch, 0.7f);
     ImGui::TableSetupColumn("BFI Presenter", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+    ImGui::TableSetupColumn("G-SYNC", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+    ImGui::TableSetupColumn("VSync", ImGuiTableColumnFlags_WidthStretch, 0.75f);
     ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch, 1.3f);
     std::vector<int> vis;
     for (int i = 0; i < (int)g_app.games.size(); i++)
@@ -521,12 +640,13 @@ static void DrawTable(float height)
         int n = 0;
         for (int i : vis) if (picked(i)) n++;
         bool all = !vis.empty() && n == (int)vis.size();
-        if (n > 0 && !all) ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
+        bool mixed = n > 0 && !all;
+        if (mixed) ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
         if (ImGui::Checkbox("##all", &all)) for (int i : vis) setPicked(i, all);
-        if (n > 0 && !all) ImGui::PopItemFlag();
+        if (mixed) ImGui::PopItemFlag();     // pop what was pushed, whatever the click changed
         Tooltip("Tick or clear all games shown (Ctrl+A ticks all, Esc clears)");
     }
-    for (int c = 1; c < 8; c++) { ImGui::TableSetColumnIndex(c); ImGui::TableHeader(ImGui::TableGetColumnName(c)); }
+    for (int c = 1; c < 10; c++) { ImGui::TableSetColumnIndex(c); ImGui::TableHeader(ImGui::TableGetColumnName(c)); }
 
     // Keyboard: Up/Down/PageUp/PageDown/Home/End move the selection itself (Shift extends the ticks),
     // Ctrl+A ticks every game shown, Esc clears the ticks.
@@ -584,10 +704,18 @@ static void DrawTable(float height)
         if (g.route == Route::Vulkan) { if (g.ini) ImGui::Text("Vulkan (ini)"); else ImGui::TextColored(kGrey, "-"); }
         else if (!g.addonPath.empty()) ImGui::Text("%s%s", g.addonVersion.c_str(), g.addonWrongBits ? " (wrong bits)" : "");
         else ImGui::TextColored(kGrey, "-");
+        ImGui::TableNextColumn();
+        if (!g.nvKnown) ImGui::TextColored(kGrey, "-");
+        else ImGui::TextColored(g.nvVrrOwn ? (g.nvVrr == kVrrForceOff || g.nvVrr == kVrrFixedRefresh ? kGreen : kText) : kGrey, "%s", VrrText(g.nvVrr).c_str());
+        ImGui::TableNextColumn();
+        if (!g.nvKnown) ImGui::TextColored(kGrey, "-");
+        else ImGui::TextColored(g.nvVsyncOwn ? (g.nvVsync == kVsyncForceOff || g.nvVsync == kVsyncFast ? kRed : kText) : kGrey, "%s", VsyncText(g.nvVsync).c_str());
         ImGui::TableNextColumn(); StatusText(g);
     }
     ImGui::EndTable();
 }
+
+static void RequestInstall(const std::vector<Game *> &list);
 
 static void DrawActions(Game &g)
 {
@@ -597,7 +725,7 @@ static void DrawActions(Game &g)
                        ((g.route == Route::Addon64 || g.route == Route::Addon32) && g.reshade && !g_app.src.dxDir.empty()));
     const char *verb = (s == St::Update || s == St::WrongBits) ? "Update" : (s == St::Installed ? "Reinstall" : "Install");
     ImGui::BeginDisabled(!canInstall || (s == St::Installed && g.route == Route::Vulkan));
-    if (ImGui::Button(verb)) DoAction(std::string(verb) + " done: " + g.name, InstallOrUpdate(g, g_app.src));
+    if (ImGui::Button(verb)) RequestInstall({ &g });
     ImGui::EndDisabled();
     if (!g_app.src.ok()) { ImGui::SameLine(); ImGui::TextColored(kGrey, "(pick a release first)"); }
     SameLineIfFits(ButtonW("Remove"));
@@ -638,6 +766,90 @@ static std::string BatchSkip(const Game &g)
     return {};
 }
 
+// Install or update, then (if chosen) set G-SYNC off / Vertical Sync Force on in each game's NVIDIA profile.
+static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsync)
+{
+    int ok = 0, fail = 0, nvFail = 0;
+    std::string firstErr, nvErr;
+    for (auto *g : list)
+    {
+        std::string e = InstallOrUpdate(*g, g_app.src);
+        if (!e.empty()) { fail++; if (firstErr.empty()) firstErr = g->name + ": " + e; continue; }
+        ok++;
+        if (g_app.nvOk && (nvGsync || nvVsync))
+        {
+            std::string ne = NvSet(*g, nvGsync ? kVrrForceOff : -2, nvVsync ? kVsyncForceOn : -2);
+            if (!ne.empty()) { nvFail++; if (nvErr.empty()) nvErr = ne; }
+        }
+    }
+    g_app.vk = DetectVulkanLayer();
+    std::string m = (list.size() == 1 && ok == 1) ? "Installed in " + list[0]->name + "."
+                                                  : "Installed or updated " + std::to_string(ok) + ".";
+    if (fail) m += " Failed " + std::to_string(fail) + ": " + firstErr;
+    if (nvFail) m += " NVIDIA settings not changed: " + nvErr;
+    else if (ok && (nvGsync || nvVsync) && g_app.nvOk) m += std::string(" NVIDIA:") + (nvGsync ? " G-SYNC off" : "") + (nvVsync ? " VSync force on" : "") + ".";
+    g_app.SetMsg(m, fail || nvFail);
+    if (nvFail && NvNeedsAdmin(nvErr)) g_app.needAdmin = true;
+}
+
+static void RequestInstall(const std::vector<Game *> &list)
+{
+    if (list.empty()) return;
+    bool ask = g_app.nvOk && LoadSetting(L"NvAskOnInstall", L"1") == L"1";
+    if (ask)
+    {
+        g_app.instPending.clear();
+        for (auto *g : list) g_app.instPending.push_back(g->root);
+        g_app.openInstall = true;
+        return;
+    }
+    RunInstall(list, g_app.nvOk && LoadSetting(L"NvGsyncOff", L"1") == L"1" && LoadSetting(L"NvAskOnInstall", L"1") == L"0",
+               g_app.nvOk && LoadSetting(L"NvVsyncOn", L"1") == L"1" && LoadSetting(L"NvAskOnInstall", L"1") == L"0");
+}
+
+static void DrawInstallQuestion()
+{
+    static bool open = false;
+    if (g_app.openInstall) { g_app.openInstall = false; ImGui::OpenPopup("Install BFI Presenter"); open = true; }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Install BFI Presenter", &open, ImGuiWindowFlags_NoSavedSettings)) return;
+    std::vector<Game *> list;
+    for (auto &root : g_app.instPending)
+        for (auto &g : g_app.games) if (g.root == root) list.push_back(&g);
+    if (list.size() == 1) ImGui::TextWrapped("Install BFI Presenter in %s.", list[0]->name.c_str());
+    else ImGui::TextWrapped("Install or update BFI Presenter in %d games.", (int)list.size());
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Also change these NVIDIA settings in the game's profile:");
+    static bool gs = true, vs = true, askAgain = true, init = false;
+    if (!init)
+    {
+        init = true;
+        gs = LoadSetting(L"NvGsyncOff", L"1") == L"1";
+        vs = LoadSetting(L"NvVsyncOn", L"1") == L"1";
+    }
+    ImGui::Checkbox("G-SYNC off for the game (fixed 120 Hz)", &gs);
+    Tooltip("With G-SYNC on, VRR can take over from the presenter's steady presents and the strobe flickers or drops "
+            "below 120 Hz (Control, Undying). Same as NVIDIA Profile Inspector: G-SYNC = Force off.");
+    ImGui::Checkbox("Vertical Sync: Force on", &vs);
+    Tooltip("Games that ignore VSync otherwise tear or run unpaced (Resonance). Never use Force off or Fast Sync with BFI.");
+    ImGui::Spacing();
+    ImGui::Checkbox("Ask every time", &askAgain);
+    Tooltip("Off: the choices above are used for every install without asking. Turn it back on under Libraries...");
+    ImGui::Separator();
+    if (ImGui::Button("Install"))
+    {
+        SaveSetting(L"NvGsyncOff", gs ? L"1" : L"0");
+        SaveSetting(L"NvVsyncOn", vs ? L"1" : L"0");
+        SaveSetting(L"NvAskOnInstall", askAgain ? L"1" : L"0");
+        ImGui::CloseCurrentPopup();
+        RunInstall(list, gs, vs);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
 static void DrawBatch()
 {
     std::vector<Game *> sel;
@@ -654,16 +866,9 @@ static void DrawBatch()
     ImGui::BeginDisabled(nInst == 0 || g_app.busy);
     if (ImGui::Button(lbl))
     {
-        int ok = 0, fail = 0;
-        std::string firstErr;
-        for (auto *g : sel)
-        {
-            if (!BatchSkip(*g).empty()) continue;
-            std::string e = InstallOrUpdate(*g, g_app.src);
-            if (e.empty()) ok++; else { fail++; if (firstErr.empty()) firstErr = g->name + ": " + e; }
-        }
-        g_app.vk = DetectVulkanLayer();
-        g_app.SetMsg("Installed or updated " + std::to_string(ok) + (fail ? ", failed " + std::to_string(fail) + ". " + firstErr : "."), fail != 0);
+        std::vector<Game *> todo;
+        for (auto *g : sel) if (BatchSkip(*g).empty()) todo.push_back(g);
+        RequestInstall(todo);
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
@@ -694,6 +899,74 @@ static void DrawBatch()
         if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
+
+    // ReShade for the ticked games that use the add-on
+    {
+        std::vector<std::wstring> need, change;
+        for (auto *g : sel)
+            if (g->route == Route::Addon64 || g->route == Route::Addon32)
+            {
+                if (!g->reshade) need.push_back(g->root);
+                else if (CompareVersions(g->reshadeDll.version, g_app.rsVersion) != 0) change.push_back(g->root);
+            }
+        ImGui::Spacing();
+        ReShadeVersionCombo(ImGui::GetFontSize() * 11);
+        ImGui::SameLine();
+        snprintf(lbl, 64, "Install ReShade (%d)", (int)need.size());
+        ImGui::BeginDisabled(need.empty() || g_app.busy || g_app.rsVersion.empty());
+        if (ImGui::Button(lbl)) StartReShade(g_app.rsVersion, need);
+        ImGui::EndDisabled();
+        Tooltip("Installs the chosen ReShade version in the ticked games that don't have ReShade yet.");
+        ImGui::SameLine();
+        snprintf(lbl, 64, "Change version (%d)", (int)change.size());
+        ImGui::BeginDisabled(change.empty() || g_app.busy || g_app.rsVersion.empty());
+        if (ImGui::Button(lbl)) StartReShade(g_app.rsVersion, change);
+        ImGui::EndDisabled();
+        Tooltip("Switches the ticked games that have another ReShade version to the chosen one (backed up first).");
+    }
+
+    // NVIDIA settings for the ticked games
+    if (g_app.nvOk)
+    {
+        static int gi = 2, vi = 2;
+        const char *gItems[] = { "leave", "use global", "on", "off (fixed refresh)" };
+        const char *vItems[] = { "leave", "use global", "3D application setting", "force on" };
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(kGrey, "G-SYNC");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+        ImGui::Combo("##bg", &gi, gItems, 4);
+        ImGui::SameLine();
+        ImGui::TextColored(kGrey, "VSync");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
+        ImGui::Combo("##bv", &vi, vItems, 4);
+        ImGui::SameLine();
+        snprintf(lbl, 64, "Apply (%d)", (int)sel.size());
+        ImGui::BeginDisabled(gi == 0 && vi == 0);
+        if (ImGui::Button(lbl))
+        {
+            long long vrr = gi == 0 ? -2 : gi == 1 ? -1 : gi == 2 ? kVrrAllow : kVrrForceOff;
+            long long vs = vi == 0 ? -2 : vi == 1 ? -1 : vi == 2 ? kVsyncApp : kVsyncForceOn;
+            int ok = 0, fail = 0;
+            std::string firstErr;
+            for (auto *g : sel)
+            {
+                if (g->exe.empty()) continue;
+                std::string e = NvWrite(ExeName(*g), W(g->name), vrr, vs);
+                if (e.empty()) ok++; else { fail++; if (firstErr.empty()) firstErr = e; }
+                if (fail && NvNeedsAdmin(firstErr)) break;
+            }
+            std::vector<Game> copy;
+            for (auto *g : sel) copy.push_back(*g);
+            NvFill(copy);
+            for (size_t k = 0; k < sel.size(); k++) *sel[k] = copy[k];
+            g_app.SetMsg("NVIDIA settings changed for " + std::to_string(ok) + " game" + (ok == 1 ? "" : "s") +
+                         (fail ? ". " + firstErr : "."), fail != 0);
+            if (fail && NvNeedsAdmin(firstErr)) g_app.needAdmin = true;
+        }
+        ImGui::EndDisabled();
+    }
     ImGui::Separator();
     if (ImGui::BeginTable("batch", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 0)))
     {
@@ -713,6 +986,90 @@ static void DrawBatch()
             else ImGui::TextColored(skip == "up to date" ? kGrey : kOrange, "skip: %s", skip.c_str());
         }
         ImGui::EndTable();
+    }
+}
+
+static void RestartAsAdmin()
+{
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    if ((INT_PTR)ShellExecuteW(nullptr, L"runas", self, nullptr, nullptr, SW_SHOWNORMAL) > 32) PostQuitMessage(0);
+}
+
+// The ReShade version used for installs (newest by default); shared by the detail pane and the batch pane.
+static void ReShadeVersionCombo(float width)
+{
+    std::vector<std::string> list;
+    {
+        std::lock_guard<std::mutex> l(g_app.lock);
+        list = g_app.rsVersions;
+    }
+    for (auto &v : CachedReShadeVersions()) if (std::find(list.begin(), list.end(), v) == list.end()) list.push_back(v);
+    std::sort(list.begin(), list.end(), [](const std::string &a, const std::string &b) { return CompareVersions(a, b) > 0; });
+    if (g_app.rsVersion.empty())
+    {
+        std::string saved = U8(LoadSetting(L"ReShadeVersion", L""));
+        g_app.rsVersion = !saved.empty() ? saved : (list.empty() ? "" : list[0]);
+    }
+    ImGui::SetNextItemWidth(width);
+    if (ImGui::BeginCombo("##rsver", g_app.rsVersion.empty() ? "no versions" : ("ReShade " + g_app.rsVersion).c_str()))
+    {
+        for (size_t i = 0; i < list.size(); i++)
+        {
+            std::string label = list[i] + (i == 0 ? "  (newest)" : "");
+            if (ImGui::Selectable(label.c_str(), list[i] == g_app.rsVersion))
+            {
+                g_app.rsVersion = list[i];
+                SaveSetting(L"ReShadeVersion", W(list[i]));
+            }
+        }
+        ImGui::EndCombo();
+    }
+    Tooltip("ReShade version to install (the build with full add-on support, downloaded from reshade.me). "
+            "Some games only start with an older one. Direct3D 9 games need 6.8 or newer for BFI Presenter.");
+}
+
+static void NvidiaControls(Game &g, float lab)
+{
+    if (!g_app.nvOk) { ImGui::TextColored(kGrey, "NVIDIA"); ImGui::SameLine(lab); ImGui::TextColored(kGrey, "no NVIDIA driver found"); return; }
+    ImGui::TextColored(kGrey, "NVIDIA profile"); ImGui::SameLine(lab);
+    if (!g.nvProfile.empty()) ImGui::TextUnformatted(U8(g.nvProfile).c_str());
+    else ImGui::TextColored(kGrey, "none yet (made on the first change, named after the game)");
+
+    const char *gItems[] = { "Use global setting", "On (G-SYNC allowed)", "Off (fixed refresh)" };
+    int gi = !g.nvVrrOwn ? 0 : (g.nvVrr == kVrrForceOff || g.nvVrr == kVrrFixedRefresh || g.nvVrr == 2) ? 2 : 1;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(kGrey, "G-SYNC"); ImGui::SameLine(lab);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11);
+    if (ImGui::Combo("##gsync", &gi, gItems, 3))
+    {
+        std::string e = NvSet(g, gi == 0 ? -1 : gi == 1 ? kVrrAllow : kVrrForceOff, -2);
+        if (e.empty()) g_app.SetMsg("G-SYNC for " + g.name + ": " + std::string(gItems[gi]) + ".", false);
+        else { g_app.SetMsg(e, true); g_app.needAdmin = NvNeedsAdmin(e); }
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(kGrey, "now: %s%s", VrrText(g.nvVrr).c_str(), g.nvVrrOwn ? "" : " (global)");
+
+    const char *vItems[] = { "Use global setting", "Use the 3D application setting", "Force on", "Force off", "Fast Sync" };
+    const long long vVals[] = { -1, kVsyncApp, kVsyncForceOn, kVsyncForceOff, kVsyncFast };
+    int vi = 0;
+    if (g.nvVsyncOwn) for (int k = 1; k < 5; k++) if (g.nvVsync == vVals[k]) vi = k;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(kGrey, "Vertical Sync"); ImGui::SameLine(lab);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11);
+    if (ImGui::Combo("##vsync", &vi, vItems, 5))
+    {
+        std::string e = NvSet(g, -2, vVals[vi]);
+        if (e.empty()) g_app.SetMsg("Vertical Sync for " + g.name + ": " + std::string(vItems[vi]) + ".", false);
+        else { g_app.SetMsg(e, true); g_app.needAdmin = NvNeedsAdmin(e); }
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(g.nvVsync == kVsyncForceOff || g.nvVsync == kVsyncFast ? kRed : kGrey, "now: %s%s",
+                       VsyncText(g.nvVsync).c_str(), g.nvVsyncOwn ? "" : " (global)");
+    if (g.nvVsync == kVsyncForceOff || g.nvVsync == kVsyncFast)
+    {
+        ImGui::TextColored(kYellow, "  *"); ImGui::SameLine(lab);
+        ImGui::TextWrapped("Force off and Fast Sync break the strobe's cadence: use the 3D application setting or Force on.");
     }
 }
 
@@ -796,6 +1153,20 @@ static void DrawDetail(HWND)
         ImGui::PopTextWrapPos();
     }
     else ImGui::TextColored(kOrange, "not found next to the executable");
+    if (g.route == Route::Addon64 || g.route == Route::Addon32)
+    {
+        ImGui::Dummy(ImVec2(lab - ImGui::GetStyle().ItemSpacing.x, 0)); ImGui::SameLine(lab);
+        ReShadeVersionCombo(ImGui::GetFontSize() * 11);
+        ImGui::SameLine();
+        bool same = g.reshade && CompareVersions(g.reshadeDll.version, g_app.rsVersion) == 0;
+        std::string b = g.reshade ? (same ? "Reinstall" : "Change to " + g_app.rsVersion) : "Install ReShade";
+        ImGui::BeginDisabled(g_app.busy || g_app.rsVersion.empty());
+        if (ImGui::Button(b.c_str())) StartReShade(g_app.rsVersion, { g.root });
+        ImGui::EndDisabled();
+        Tooltip(g.reshade ? "Replaces the ReShade DLL with the chosen version, keeping its name. The old one is backed up (Undo last change)."
+                          : "Downloads ReShade with add-on support from reshade.me and puts it next to the game's exe "
+                            "(dxgi.dll; d3d9.dll or opengl32.dll for those games; ReShade64.dll next to OptiScaler).");
+    }
     std::string extra;
     if (g.optiscaler) extra += "OptiScaler  ";
     if (g.dxvk) extra += "DXVK  ";
@@ -813,6 +1184,9 @@ static void DrawDetail(HWND)
         ImGui::TextUnformatted(g.tested.c_str());
         ImGui::PopTextWrapPos();
     }
+    ImGui::Spacing();
+    NvidiaControls(g, lab);
+    ImGui::Spacing();
     for (auto &n : g.notes)
     {
         ImGui::TextColored(kYellow, "  *"); ImGui::SameLine(lab);
@@ -857,6 +1231,8 @@ static void DrawLibraries(HWND hwnd)
     {
         bool pw = LoadSetting(L"PCGamingWiki", L"1") == L"1";
         if (ImGui::Checkbox("Look up each game's graphics APIs on PCGamingWiki", &pw)) SaveSetting(L"PCGamingWiki", pw ? L"1" : L"0");
+        bool ask = LoadSetting(L"NvAskOnInstall", L"1") == L"1";
+        if (ImGui::Checkbox("Ask about G-SYNC and Vertical Sync when installing", &ask)) SaveSetting(L"NvAskOnInstall", ask ? L"1" : L"0");
         Tooltip("Asks pcgamingwiki.com which APIs a game supports (Steam games by app id, others by name). More reliable than "
                 "reading the executable, for example for games that load Vulkan or Direct3D 12 at run time. Results are cached.");
     }
@@ -917,6 +1293,7 @@ static void DrawFrame(HWND hwnd)
     DrawDetail(hwnd);
     ImGui::EndChild();
     DrawLibraries(hwnd);
+    DrawInstallQuestion();
     ImGui::End();
 }
 
@@ -1026,6 +1403,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     if (!srcDir.empty()) g_app.src = SourceFromFolder(srcDir);
     if (!g_app.src.ok()) g_app.src = CachedRelease();
     g_app.vk = DetectVulkanLayer();
+    g_app.nvOk = NvAvailable();
     if (LoadGameList(g_app.games)) StartScan(false);      // the saved list, re-checked in the background
     else g_app.showLibraries = true;                      // first start: choose libraries, then scan
 
