@@ -1232,7 +1232,8 @@ static void DrawDetail(HWND)
         ReShadeVersionCombo(ImGui::GetFontSize() * 11);
         ImGui::SameLine();
         bool same = g.reshade && CompareVersions(g.reshadeDll.version, g_app.rsVersion) == 0;
-        std::string b = g.reshade ? (same ? "Reinstall" : "Change to " + g_app.rsVersion) : "Install ReShade";
+        std::string b = g.reshade ? (same ? "Reinstall ReShade" : "Change to " + g_app.rsVersion) : "Install ReShade";
+        b += "##reshade";
         ImGui::BeginDisabled(g_app.busy || g_app.rsVersion.empty());
         if (ImGui::Button(b.c_str())) StartReShade(g_app.rsVersion, { g.root });
         ImGui::EndDisabled();
@@ -1465,6 +1466,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.IniFilename = nullptr;
+    io.ConfigDebugHighlightIdConflicts = false;     // never show ImGui's programmer popup to users
     SetupStyle(g_dpiScale);
     LoadFonts(g_dpiScale);
     ImGui_ImplWin32_Init(hwnd);
