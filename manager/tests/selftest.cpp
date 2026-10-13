@@ -160,6 +160,12 @@ int wmain(int argc, wchar_t **argv)
         }
     }
 
+    {
+        Game *ou = Find(all, "OldUnity");
+        CHECK(ou && (ou->apis & ApiD3D11) && !(ou->apis & ApiGL), "OldUnity: engine in the exe with _Data\\Managed -> D3D11 (%s)", ou ? ApiText(ou->apis).c_str() : "-");
+        Source none = SourceFromFolder(games);
+        CHECK(!none.shaderFile.empty() && none.shaderVersion == src.shaderVersion, "a release without the shader gets the built-in one (v%s)", none.shaderVersion.c_str());
+    }
     printf(g_fail ? "\n%d FAILED\n" : "\nall passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

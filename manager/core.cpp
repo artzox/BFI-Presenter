@@ -448,6 +448,34 @@ int CompareVersions(const std::string &a, const std::string &b)
 // The DX add-on carries "BFI Presenter v1.0.2"; the Vulkan layer "BFI Presenter (Vulkan layer) v1.0.2".
 const wchar_t *const kShaderFile = L"BFIPresenter_Shader.fx";
 
+#include "shader_fx.inc"
+
+// The app carries the shader too: releases before 1.0.5 don't have it, and a newer app may carry a newer one.
+static void UseBundledShader(Source &s)
+{
+    std::string bundled(kBundledShader);
+    const char *key = "BFI Presenter shader v";
+    size_t p = bundled.find(key);
+    std::string v;
+    if (p != std::string::npos)
+        for (size_t i = p + strlen(key); i < bundled.size() && (isdigit((unsigned char)bundled[i]) || bundled[i] == '.'); i++) v += bundled[i];
+    while (!v.empty() && v.back() == '.') v.pop_back();
+    if (!s.shaderFile.empty() && CompareVersions(s.shaderVersion, v) >= 0) return;
+    std::wstring d = Join(DataDir(), L"shader");
+    CreateDirectoryW(d.c_str(), nullptr);
+    std::wstring f = Join(d, kShaderFile);
+    std::string have;
+    { std::ifstream in{fs::path(f), std::ios::binary}; have.assign(std::istreambuf_iterator<char>(in), {}); }
+    if (have != bundled)
+    {
+        std::ofstream o{fs::path(f), std::ios::binary | std::ios::trunc};
+        o << bundled;
+        if (!o) return;
+    }
+    s.shaderFile = f;
+    s.shaderVersion = v;
+}
+
 std::string ShaderVersionOf(const std::wstring &file)
 {
     auto v = ReadBytes(file, 1u << 20);
@@ -633,7 +661,7 @@ static void SaveCache()
 static ExeFacts AnalyzeExe(const std::wstring &exe)
 {
     std::wstring key = Lower(exe);
-    std::wstring stamp = std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));
+    std::wstring stamp = L"2_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
     {
         std::lock_guard<std::mutex> l(g_cacheLock);
         LoadCache();
@@ -648,7 +676,10 @@ static ExeFacts AnalyzeExe(const std::wstring &exe)
     r.apis = ApisFromImports(pi.imports);
     const unsigned strong = ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL | ApiVulkan;
     std::wstring dir = DirOf(exe);
-    if (Exists(Join(dir, L"UnityPlayer.dll")))
+    std::wstring stem = NameOf(exe);
+    if (stem.size() > 4) stem.resize(stem.size() - 4);
+    // Unity: UnityPlayer.dll (2017.2 and later), or before that the engine inside the exe with a <exe>_Data\Managed folder
+    if (Exists(Join(dir, L"UnityPlayer.dll")) || DirExists(Join(Join(dir, stem + L"_Data"), L"Managed")))
     {
         // Unity links opengl32 and loads Direct3D at run time; Direct3D 11 is its Windows default
         // (PCGamingWiki, when it knows the game, says otherwise).
@@ -1677,6 +1708,7 @@ Source SourceFromFolder(const std::wstring &dir)
     }
     std::wstring shDir = FindFileUnder(dir, kShaderFile, 2);
     if (!shDir.empty()) { s.shaderFile = Join(shDir, kShaderFile); s.shaderVersion = ShaderVersionOf(s.shaderFile); }
+    UseBundledShader(s);
     s.label = U8(dir);
     return s;
 }
