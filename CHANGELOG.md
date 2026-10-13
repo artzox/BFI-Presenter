@@ -7,7 +7,7 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## Manager — unreleased
+## Manager 1.2.0 — 2026-10-13
 
 - **[Manager] Batch actions no longer freeze the window.** Update outdated, Install / update and Remove for ticked games, and installing ReShade in many games now run a few games per frame with a progress dialog (game n of N, the current game, a Stop button) instead of blocking until the last game is done.
 - **[Manager] Readable, adjustable game list.** Columns keep their own width (drag a header border), can be reordered and hidden (right-click a header), and the list scrolls sideways instead of squeezing the headers; widths, order and sort are remembered (`manager_ui.ini`). A splitter between the list and the game details can be dragged to give either side more room, and is remembered too.
