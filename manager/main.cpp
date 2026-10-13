@@ -1132,7 +1132,7 @@ static void NvidiaControls(Game &g, float lab)
     int oi = 0;
     if (g.nvGlOwn) for (int k = 1; k < 4; k++) if (g.nvGl == oVals[k]) oi = k;
     ImGui::AlignTextToFramePadding();
-    ImGui::TextColored(kGrey, "OpenGL present"); ImGui::SameLine(lab);
+    ImGui::TextColored(kGrey, "OpenGL"); ImGui::SameLine(lab);
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11);
     if (ImGui::Combo("##glpresent", &oi, oItems, 4))
     {
