@@ -64,6 +64,8 @@ struct Game {
     std::wstring nvProfile;
     long long    nvVrr = -1, nvVsync = -1;
     bool         nvVrrOwn = false, nvVsyncOwn = false;
+    long long    nvGl = -1;      // Vulkan/OpenGL present method
+    bool         nvGlOwn = false;
     bool         hidden = false;
 };
 
