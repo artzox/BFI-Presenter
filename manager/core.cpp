@@ -1531,7 +1531,17 @@ Source SourceFromFolder(const std::wstring &dir)
         if (!Exists(a)) a = Join(s.dxDir, L"BFIPresenter.addon32");
         s.dxVersion = BfiVersionOf(a, false);
     }
-    if (!s.vkDir.empty()) s.vkVersion = BfiVersionOf(Join(s.vkDir, L"BFIPresenterVK.dll"), true);
+    if (!s.vkDir.empty())
+    {
+        // The layer needs its manifests too; a folder with only the DLL (a hand-made test folder) can still
+        // serve the DX add-on, but not a Vulkan layer install.
+        std::string missing;
+        for (auto n : { L"BFIPresenterVK.dll", L"BFIPresenterVK32.dll", L"VkLayer_BFI_presenter.json",
+                        L"VkLayer_BFI_presenter32.json", L"BFIPresenter.ini" })
+            if (!Exists(Join(s.vkDir, n))) missing += (missing.empty() ? "" : ", ") + U8(n);
+        if (missing.empty()) s.vkVersion = BfiVersionOf(Join(s.vkDir, L"BFIPresenterVK.dll"), true);
+        else { s.vkMissing = missing; s.vkDir.clear(); }
+    }
     s.label = U8(dir);
     return s;
 }

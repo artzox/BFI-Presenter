@@ -19,7 +19,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.0.0 (test 9)"
+#define MANAGER_VERSION "1.0.0 (test 10)"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -484,6 +484,13 @@ static void DrawTop(HWND hwnd)
         ImGui::SameLine();
         ImGui::TextColored(kGrey, "(add-on %s, Vulkan layer %s)", g_app.src.dxVersion.empty() ? "-" : g_app.src.dxVersion.c_str(),
                            g_app.src.vkVersion.empty() ? "-" : g_app.src.vkVersion.c_str());
+        if (!g_app.src.vkMissing.empty())
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(kOrange, "(no Vulkan layer: missing %s)", g_app.src.vkMissing.c_str());
+            Tooltip("The DX add-on installs from this folder. To install or update the Vulkan layer, use the folder of the "
+                    "extracted Vulkan zip (BFIPresenterVK), or a folder with both zips extracted into it.");
+        }
     }
     else ImGui::TextColored(kOrange, "None yet: check GitHub or pick an extracted release folder");
     ImGui::SameLine();

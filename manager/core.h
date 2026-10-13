@@ -30,6 +30,7 @@ struct Source {
     std::wstring vkDir;          // folder with BFIPresenterVK.dll / json / ready ini
     std::string  dxVersion, vkVersion;
     std::string  label;          // "GitHub v1.0.2" or the folder
+    std::string  vkMissing;      // Vulkan layer files missing from the folder (then vkDir is empty)
     bool ok() const { return !dxDir.empty() || !vkDir.empty(); }
 };
 
