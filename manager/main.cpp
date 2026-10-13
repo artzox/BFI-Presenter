@@ -16,7 +16,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.0.0"
+#define MANAGER_VERSION "1.0.0 (test 4)"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -497,6 +497,31 @@ static void DrawTable(float height)
     ImGui::TableSetupColumn("BFI Presenter", ImGuiTableColumnFlags_WidthStretch, 0.9f);
     ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch, 1.3f);
     ImGui::TableHeadersRow();
+
+    // Keyboard: Up/Down/PageUp/PageDown/Home/End move the selection itself (not just a highlight).
+    std::vector<int> vis;
+    for (int i = 0; i < (int)g_app.games.size(); i++)
+        if (Matches(g_app.games[i], g_app.search) && (!g_app.onlyRelevant || Relevant(g_app.games[i]))) vis.push_back(i);
+    bool scrollToSel = false;
+    if (!vis.empty() && !ImGui::GetIO().WantTextInput && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId))
+    {
+        int pos = -1;
+        for (int k = 0; k < (int)vis.size(); k++) if (vis[k] == g_app.sel) pos = k;
+        int page = std::max(1, (int)(height / ImGui::GetFrameHeightWithSpacing()) - 2), np = pos;
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) np = pos < 0 ? 0 : pos + 1;
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) np = pos < 0 ? 0 : pos - 1;
+        if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) np = pos < 0 ? 0 : pos + page;
+        if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) np = pos < 0 ? 0 : pos - page;
+        if (ImGui::IsKeyPressed(ImGuiKey_Home)) np = 0;
+        if (ImGui::IsKeyPressed(ImGuiKey_End)) np = (int)vis.size() - 1;
+        if (np != pos)
+        {
+            np = std::max(0, std::min(np, (int)vis.size() - 1));
+            g_app.sel = vis[np];
+            scrollToSel = true;
+        }
+    }
+
     for (int i = 0; i < (int)g_app.games.size(); i++)
     {
         Game &g = g_app.games[i];
@@ -505,7 +530,7 @@ static void DrawTable(float height)
         ImGui::TableNextColumn();
         ImGui::PushID(i);
         if (ImGui::Selectable(g.name.c_str(), g_app.sel == i, ImGuiSelectableFlags_SpanAllColumns)) g_app.sel = i;
-        if (ImGui::IsItemFocused() && g_app.sel != i) g_app.sel = i;   // arrow keys move the selection too
+        if (scrollToSel && g_app.sel == i) ImGui::SetScrollHereY(0.5f);
         ImGui::PopID();
         ImGui::TableNextColumn(); ImGui::TextColored(kGrey, "%s", g.store.c_str());
         ImGui::TableNextColumn(); if (g.bits) ImGui::Text("%d", g.bits); else ImGui::TextColored(kGrey, "?");
@@ -850,7 +875,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     SetupStyle(g_dpiScale);
     LoadFonts(g_dpiScale);
     ImGui_ImplWin32_Init(hwnd);
