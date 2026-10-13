@@ -1,0 +1,34 @@
+# BFI Presenter Manager
+
+A small Windows app that finds your games, works out what each one needs, and installs, updates or removes BFI Presenter in them. It is one `.exe` with nothing to install; settings and backups live in `%LOCALAPPDATA%\BFIPresenter`.
+
+## What it does
+
+- **Finds games** in the libraries you choose under **Libraries...** (Steam, Epic, GOG, Xbox) plus any folders you add there (each sub-folder is taken as one game). On first start that window opens before anything is scanned. The game list is kept between runs: later starts only re-check the known games in the background; **Rescan** searches the libraries again.
+- **Picks the game's executable.** An exe whose name matches the game or its folder wins (`DOOMEternalx64vk.exe` over `idTechLauncher.exe`, `Hades II\Ship\Hades2.exe` over tools); launchers, trials and demos lose; for Unreal games it takes `<Game>\Binaries\Win64\<Game>-Win64-Shipping.exe`; any folder that already has ReShade or the add-on wins. You can choose another `.exe` per game.
+- **Works out the graphics API** from [PCGamingWiki](https://www.pcgamingwiki.com) (Steam games by app id, others by name; cached for a month; can be turned off under **Libraries...**) and from the executable: its imports (a `d3d9.dll` import used only for profiler markers doesn't count), the renderer DLLs next to it, Unity's `UnityPlayer.dll`. The executable also tells 32- from 64-bit. Games the tested-games list marks as Vulkan (Red Dead Redemption 2) default to the Vulkan layer. From that it picks the route: `BFIPresenter.addon64`, `BFIPresenter.addon32` or the Vulkan layer. Games that support both Direct3D 12 and Vulkan can be switched with **Install as**.
+- **Finds ReShade by what the DLL is, not by its name:** `dxgi.dll`, `d3d9.dll`, `d3d11.dll`, `d3d12.dll`, `opengl32.dll`, `dinput8.dll`, and `ReShade64.dll` / `ReShade32.dll` as loaded by OptiScaler or other loaders. Each candidate's version information is checked, so OptiScaler's `dxgi.dll` isn't mistaken for ReShade. The add-on goes into the folder of the ReShade DLL (or the add-on folder set in `ReShade.ini`).
+- **Shows what else is there:** OptiScaler, DXVK, dgVoodoo, Special K, the ReShade version (Direct3D 9 needs 6.8+), and the game's entry from the [tested-games list](../docs/tested-games.md) with its key requirement.
+- **Installs, updates, removes.** Every file it replaces or deletes is kept in `%LOCALAPPDATA%\BFIPresenter\backups`; **Undo last change** puts it back (click again to go one more step back). Each change is listed in `manager_log.csv` (created with the first change).
+- **Update all** brings every game with an older add-on (or one for the wrong bitness) to the selected release, and the Vulkan layer too.
+- **Several games at once:** tick them in the first column (the header box ticks or clears every game shown), Ctrl+click or Shift+click a row, Shift+arrow keys, or Ctrl+A; Esc clears. The right pane then lists what **Install / update** and **Remove** will do for each ticked game and which ones are skipped (up to date, needs ReShade).
+- **ReShade:** installs ReShade with full add-on support for a game, or switches it to another version, from a version list (newest first; some games only start with an older one). The setup is downloaded from reshade.me and the DLL taken out of it; it goes in as `dxgi.dll` (`d3d9.dll` / `opengl32.dll` for those games, `ReShade64.dll` next to OptiScaler) or replaces the existing ReShade DLL under its own name. Vulkan games still need ReShade's own setup (it registers a system-wide layer).
+- **NVIDIA G-SYNC and Vertical Sync** per game, in the game's driver profile, the way NVIDIA Profile Inspector sets them (a profile is made for games that have none). The list shows both; values set in the game's own profile are bright, inherited global ones grey. When installing BFI Presenter the app asks whether to also set G-SYNC off and Vertical Sync Force on (can be made the default). Changing driver profiles may need administrator rights; the app offers to restart itself as administrator.
+- **Vulkan layer:** installs it for your Windows user (no admin rights), the same way `install_vulkan_layer.bat` does, and copies `BFIPresenter.ini` next to Vulkan games' executables (that file turns the layer on in a game).
+
+## Where the files come from
+
+- **Check GitHub** downloads the latest release of [artzox/BFI-Presenter](https://github.com/artzox/BFI-Presenter) into `%LOCALAPPDATA%\BFIPresenter\releases`. When you use a downloaded release, the app checks once per start for a newer one (`AutoCheck=0` under `[Manager]` in `manager.ini` turns that off).
+- **Use folder...** takes an extracted release or a test build from any folder instead.
+
+## What it doesn't do
+
+- Install ReShade itself: get it from [reshade.me](https://reshade.me) (the build with full add-on support).
+- Change NVIDIA driver profiles: the notes say when a game needs a setting there.
+- Edit `BFIPresenter.ini`: the add-on writes it on first start, and the overlay in the game changes it.
+
+## Building
+
+`./build_mingw.sh` (MinGW-w64 on Linux, WSL or MSYS2) builds `BFIPresenterManager.exe`. It first turns `docs/tested-games.md` into `tested_games.inc` with `gen_tested.py`. Dear ImGui is vendored in `third_party/imgui`.
+
+`tests/run_selftest.sh` builds a fake game library (D3D11, D3D9, OpenGL, Vulkan, an Unreal-style layout, OptiScaler with `ReShade64.dll`) and checks detection, install, update, wrong-bitness replacement, remove, undo and the Vulkan layer under Wine.
