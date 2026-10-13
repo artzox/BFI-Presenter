@@ -16,7 +16,11 @@ enum Api : unsigned { ApiD3D9 = 1, ApiD3D10 = 2, ApiD3D11 = 4, ApiD3D12 = 8, Api
 std::string ApiText(unsigned apis);
 
 // What BFI Presenter files a game needs.
-enum class Route { Unknown, Addon64, Addon32, Vulkan, Unsupported };
+enum class Route { Unknown, Addon64, Addon32, Vulkan, Shader, Unsupported };
+inline bool IsAddonRoute(Route r) { return r == Route::Addon64 || r == Route::Addon32; }
+inline bool UsesReShadeRoute(Route r) { return IsAddonRoute(r) || r == Route::Shader; }   // needs ReShade next to the game
+extern const wchar_t *const kShaderFile;           // BFIPresenter_Shader.fx
+
 const char *RouteText(Route r);
 
 struct DllInfo {
@@ -31,6 +35,8 @@ struct Source {
     std::string  dxVersion, vkVersion;
     std::string  label;          // "GitHub v1.0.2" or the folder
     std::string  vkMissing;      // Vulkan layer files missing from the folder (then vkDir is empty)
+    std::wstring shaderFile;     // BFIPresenter_Shader.fx (the shader version), if the release has it
+    std::string  shaderVersion;
     bool ok() const { return !dxDir.empty() || !vkDir.empty(); }
 };
 
@@ -54,6 +60,11 @@ struct Game {
     std::wstring addonPath;      // installed BFIPresenter.addon64/32, if any
     std::string  addonVersion;
     bool         addonWrongBits = false;
+    std::wstring shaderPath;     // installed BFIPresenter_Shader.fx, if any
+    std::string  shaderVersion;
+    bool         shaderOn = false;          // enabled in the active ReShade preset
+    std::wstring shaderDir, presetPath;     // where ReShade looks for effects / its active preset
+    bool         shaderRecommended = false; // the tested-games list recommends the shader for this game
     bool         ini = false;    // BFIPresenter.ini next to the add-on or the exe
     std::wstring iniPath;
     Route        route = Route::Unknown;
@@ -105,6 +116,7 @@ void Detect(Game &g);                          // (re)detects everything for g.e
 VulkanLayerState DetectVulkanLayer();
 DllInfo ReadDllInfo(const std::wstring &path);
 std::string BfiVersionOf(const std::wstring &file, bool vulkan);
+std::string ShaderVersionOf(const std::wstring &file);
 
 // ----- Sources
 Source SourceFromFolder(const std::wstring &dir);    // searches dir (2 levels) for the release files

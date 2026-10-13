@@ -19,7 +19,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.0.2"
+#define MANAGER_VERSION "1.1.0"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -399,6 +399,13 @@ static St StatusOf(const Game &g)
         if (!g_app.src.vkVersion.empty() && CompareVersions(g_app.vk.version, g_app.src.vkVersion) < 0) return St::Update;
         return St::Installed;
     }
+    if (g.route == Route::Shader)
+    {
+        if (!g.reshade) return St::NeedsReShade;
+        if (g.shaderPath.empty() || !g.shaderOn) return St::NotInstalled;
+        if (!g_app.src.shaderVersion.empty() && CompareVersions(g.shaderVersion, g_app.src.shaderVersion) < 0) return St::Update;
+        return St::Installed;
+    }
     if (g.addonWrongBits) return St::WrongBits;
     if (!g.addonPath.empty())
     {
@@ -485,8 +492,9 @@ static void DrawTop(HWND hwnd)
     {
         ImGui::Text("%s", g_app.src.label.c_str());
         ImGui::SameLine();
-        ImGui::TextColored(kGrey, "(add-on %s, Vulkan layer %s)", g_app.src.dxVersion.empty() ? "-" : g_app.src.dxVersion.c_str(),
-                           g_app.src.vkVersion.empty() ? "-" : g_app.src.vkVersion.c_str());
+        ImGui::TextColored(kGrey, "(add-on %s, Vulkan layer %s%s%s)", g_app.src.dxVersion.empty() ? "-" : g_app.src.dxVersion.c_str(),
+                           g_app.src.vkVersion.empty() ? "-" : g_app.src.vkVersion.c_str(),
+                           g_app.src.shaderVersion.empty() ? "" : ", shader ", g_app.src.shaderVersion.c_str());
         if (!g_app.src.vkMissing.empty())
         {
             ImGui::SameLine();
@@ -647,7 +655,7 @@ static void DrawTable(float height)
             case 3: snprintf(b, 32, "%02d", g.bits); return b;
             case 4: return ApiText(g.apis);
             case 5: return g.reshade ? g.reshadeDll.version : std::string();
-            case 6: return g.route == Route::Vulkan ? (g.ini ? "vulkan" : "") : g.addonVersion;
+            case 6: return g.route == Route::Vulkan ? (g.ini ? "vulkan" : "") : g.route == Route::Shader ? g.shaderVersion : g.addonVersion;
             case 7: return g.nvKnown ? std::string(g.nvVrrOwn ? "0" : "1") + VrrText(g.nvVrr) : "2";
             case 8: return g.nvKnown ? std::string(g.nvVsyncOwn ? "0" : "1") + VsyncText(g.nvVsync) : "2";
             case 9: snprintf(b, 32, "%02d", (int)StatusOf(g)); return b;
@@ -742,6 +750,7 @@ static void DrawTable(float height)
         else ImGui::TextColored(kGrey, "-");
         ImGui::TableNextColumn();
         if (g.route == Route::Vulkan) { if (g.ini) ImGui::Text("Vulkan (ini)"); else ImGui::TextColored(kGrey, "-"); }
+        else if (g.route == Route::Shader && !g.shaderPath.empty()) ImGui::Text("shader %s%s", g.shaderVersion.c_str(), g.shaderOn ? "" : " (off)");
         else if (!g.addonPath.empty()) ImGui::Text("%s%s", g.addonVersion.c_str(), g.addonWrongBits ? " (wrong bits)" : "");
         else ImGui::TextColored(kGrey, "-");
         ImGui::TableNextColumn();
@@ -762,6 +771,7 @@ static void DrawActions(Game &g)
     St s = StatusOf(g);
     bool canInstall = g_app.src.ok() && !g.exe.empty() &&
                       ((g.route == Route::Vulkan && !g_app.src.vkDir.empty()) ||
+                       (g.route == Route::Shader && g.reshade && !g_app.src.shaderFile.empty()) ||
                        ((g.route == Route::Addon64 || g.route == Route::Addon32) && g.reshade && !g_app.src.dxDir.empty()));
     const char *verb = (s == St::Update || s == St::WrongBits) ? "Update" : (s == St::Installed ? "Reinstall" : "Install");
     ImGui::BeginDisabled(!canInstall || (s == St::Installed && g.route == Route::Vulkan));
@@ -769,7 +779,7 @@ static void DrawActions(Game &g)
     ImGui::EndDisabled();
     if (!g_app.src.ok()) { ImGui::SameLine(); ImGui::TextColored(kGrey, "(pick a release first)"); }
     SameLineIfFits(ButtonW("Remove"));
-    bool installed = !g.addonPath.empty() || g.ini;
+    bool installed = !g.addonPath.empty() || g.ini || !g.shaderPath.empty();
     ImGui::BeginDisabled(!installed);
     if (ImGui::Button("Remove")) DoAction("Removed from " + g.name, Remove(g, g_app.removeIni));
     SameLineIfFits(ImGui::GetFrameHeight() + ButtonW("Remove deletes the ini too"));
@@ -792,6 +802,7 @@ static bool CanInstall(const Game &g)
 {
     return g_app.src.ok() && !g.exe.empty() &&
            ((g.route == Route::Vulkan && !g_app.src.vkDir.empty()) ||
+            (g.route == Route::Shader && g.reshade && !g_app.src.shaderFile.empty()) ||
             ((g.route == Route::Addon64 || g.route == Route::Addon32) && g.reshade && !g_app.src.dxDir.empty()));
 }
 
@@ -960,7 +971,7 @@ static void DrawBatch()
     {
         std::vector<std::wstring> need, change;
         for (auto *g : sel)
-            if (g->route == Route::Addon64 || g->route == Route::Addon32)
+            if (UsesReShadeRoute(g->route))
             {
                 if (!g->reshade) need.push_back(g->root);
                 else if (CompareVersions(g->reshadeDll.version, g_app.rsVersion) != 0) change.push_back(g->root);
@@ -1191,16 +1202,19 @@ static void DrawDetail(HWND)
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(kGrey, "Install as"); ImGui::SameLine(lab);
     {
-        const char *items[] = { "Automatic", "DX add-on", "Vulkan layer" };
+        const char *items[] = { "Automatic", "DX add-on", "Vulkan layer", "BFI shader" };
         std::wstring key = RouteKey(g.root);
         std::wstring v = LoadSetting(key.c_str(), L"");
-        int r = v == L"dx" ? 1 : v == L"vulkan" ? 2 : 0;
+        int r = v == L"dx" ? 1 : v == L"vulkan" ? 2 : v == L"shader" ? 3 : 0;
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10);
-        if (ImGui::Combo("##route", &r, items, 3))
+        if (ImGui::Combo("##route", &r, items, 4))
         {
-            SaveSetting(key.c_str(), r == 1 ? L"dx" : r == 2 ? L"vulkan" : L"");
+            SaveSetting(key.c_str(), r == 1 ? L"dx" : r == 2 ? L"vulkan" : r == 3 ? L"shader" : L"");
             Detect(g);
         }
+        Tooltip("BFI shader: the strobe as a ReShade effect, clocked by the game's own frames. Only for games that hold a "
+                "rock-steady frame rate equal to the refresh rate and whose engine stutters with the presenter "
+                "(Moons of Madness). Everywhere else the DX add-on is better: with the shader a late frame flashes.");
         ImGui::SameLine();
         ImGui::TextColored(kAccent, "%s", RouteText(g.route));
     }
@@ -1227,7 +1241,7 @@ static void DrawDetail(HWND)
         ImGui::PopTextWrapPos();
     }
     else ImGui::TextColored(kOrange, "not found next to the executable");
-    if (g.route == Route::Addon64 || g.route == Route::Addon32)
+    if (UsesReShadeRoute(g.route))
     {
         ImGui::Dummy(ImVec2(lab - ImGui::GetStyle().ItemSpacing.x, 0)); ImGui::SameLine(lab);
         ReShadeVersionCombo(ImGui::GetFontSize() * 11);
@@ -1250,6 +1264,14 @@ static void DrawDetail(HWND)
     if (!extra.empty()) { ImGui::TextColored(kGrey, "Also found"); ImGui::SameLine(lab); ImGui::Text("%s", extra.c_str()); }
     ImGui::TextColored(kGrey, "BFI Presenter"); ImGui::SameLine(lab);
     if (g.route == Route::Vulkan) ImGui::Text(g.ini ? "BFIPresenter.ini present (the Vulkan layer is active in this game)" : "no BFIPresenter.ini next to the exe");
+    else if (g.route == Route::Shader)
+    {
+        ImGui::PushTextWrapPos(0);
+        if (g.shaderPath.empty()) ImGui::TextColored(kGrey, "shader not installed");
+        else ImGui::Text("shader v%s, %s", g.shaderVersion.c_str(), g.shaderOn ? "on in the ReShade preset (last in the list)" : "installed but off in the ReShade preset");
+        if (!g.addonPath.empty()) ImGui::TextColored(kOrange, "The add-on is installed too: installing the shader removes it (never use both).");
+        ImGui::PopTextWrapPos();
+    }
     else if (!g.addonPath.empty()) ImGui::Text("v%s  %s", g.addonVersion.c_str(), g.ini ? "(with BFIPresenter.ini)" : "");
     else ImGui::TextColored(kGrey, "not installed");
     if (!g.tested.empty())
@@ -1257,6 +1279,13 @@ static void DrawDetail(HWND)
         ImGui::TextColored(kGrey, "Tested"); ImGui::SameLine(lab);
         ImGui::PushTextWrapPos(0);
         ImGui::TextUnformatted(g.tested.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    if (g.shaderRecommended && g.route != Route::Shader)
+    {
+        ImGui::TextColored(kYellow, "  *"); ImGui::SameLine(lab);
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextWrapped("The tested-games list recommends the BFI shader for this game: Install as -> BFI shader.");
         ImGui::PopTextWrapPos();
     }
     ImGui::Spacing();
