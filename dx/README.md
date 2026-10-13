@@ -16,7 +16,7 @@ The [Vulkan layer](../vulkan/README.md) covers Vulkan games and DirectX 9–11 g
 
 - ReShade **6.4 or newer, the build with full add-on support** (tested on 6.8).
 - A **Direct3D 12, 11, 9 or OpenGL** game (ReShade installed for that API; for OpenGL it is `opengl32.dll`). The same add-on handles all four. 64-bit games use `BFIPresenter.addon64`; 32-bit games use `BFIPresenter.addon32` (with the 32-bit ReShade). Direct3D 9 needs ReShade 6.8 or newer. OpenGL needs an NVIDIA GPU (`WGL_NV_DX_interop2`).
-- **Fixed refresh (120 Hz), VRR off for the game** (G-SYNC off in its NVIDIA profile, or VRR off on the TV), unless the presenter holds 120 Hz on its own (the overlay warns when it doesn't).
+- **A fixed refresh rate, VRR off for the game** (G-SYNC off in its NVIDIA profile, or VRR off on the TV), unless the presenter holds the refresh rate on its own (the overlay warns when it doesn't). Tested at 120 Hz; the examples below use it.
 - **No frame limiter acting on the presenter:** RTSS limit 0 for BFI games, NVIDIA Max Frame Rate off (also in NVIDIA Profile Inspector).
 - **NVIDIA Vertical Sync:** "Use the 3D application setting" or Force on, never Force off or Fast Sync.
 - Windows 10/11 (uses the built-in `d3dcompiler_47.dll`).

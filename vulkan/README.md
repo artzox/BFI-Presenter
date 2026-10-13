@@ -26,7 +26,7 @@ The same presenter-clocked black frame insertion as the [DX add-on](../dx/README
 1. Copy `BFIPresenter.ini` from the package into the game folder, next to its `.exe` (the layer doesn't create it; it only switches on where the file exists). The ini from a DX game works as-is. For emulators, put it next to the emulator's `.exe`.
 2. Start the game. `BFIPresenterVK.log` appears next to the ini, and the ReShade overlay gets the **BFI Presenter (Vulkan)** tab.
 3. Use the same per-game setup as for DX games:
-   - G-SYNC off in the game's NVIDIA profile if the display doesn't hold a fixed 120 Hz.
+   - G-SYNC off in the game's NVIDIA profile if the display doesn't hold its fixed refresh rate (120 Hz in testing).
    - VSync never Force off or Fast Sync.
    - RTSS limit 0 for the game.
    - Reflex off.
