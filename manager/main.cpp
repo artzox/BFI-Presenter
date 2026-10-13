@@ -19,7 +19,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.0.0 (test 7)"
+#define MANAGER_VERSION "1.0.0 (test 8)"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -602,11 +602,11 @@ static void DrawTop(HWND hwnd)
 static void DrawTable(float height)
 {
     ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY |
-                         ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
+                         ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable;
     if (!ImGui::BeginTable("games", 10, tf, ImVec2(0, height))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
-    ImGui::TableSetupColumn("##pick", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize, ImGui::GetFrameHeight());
-    ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch, 2.6f);
+    ImGui::TableSetupColumn("##pick", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize | ImGuiTableColumnFlags_NoSort, ImGui::GetFrameHeight());
+    ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_DefaultSort, 2.6f);
     ImGui::TableSetupColumn("Store", ImGuiTableColumnFlags_WidthStretch, 0.6f);
     ImGui::TableSetupColumn("Bits", ImGuiTableColumnFlags_WidthStretch, 0.35f);
     ImGui::TableSetupColumn("API", ImGuiTableColumnFlags_WidthStretch, 1.0f);
@@ -618,6 +618,41 @@ static void DrawTable(float height)
     std::vector<int> vis;
     for (int i = 0; i < (int)g_app.games.size(); i++)
         if (Matches(g_app.games[i], g_app.search) && (!g_app.onlyRelevant || Relevant(g_app.games[i]))) vis.push_back(i);
+    // Sorting: click a header (again to reverse). The order is applied to the rows shown, the list itself stays.
+    static int sortCol = 1;
+    static bool sortAsc = true;
+    if (ImGuiTableSortSpecs *ss = ImGui::TableGetSortSpecs())
+        if (ss->SpecsCount > 0)
+        {
+            sortCol = ss->Specs[0].ColumnIndex;
+            sortAsc = ss->Specs[0].SortDirection != ImGuiSortDirection_Descending;
+        }
+    {
+        auto low = [](std::string s) { for (auto &c : s) c = (char)tolower((unsigned char)c); return s; };
+        auto key = [&](const Game &g) -> std::string {
+            char b[32];
+            switch (sortCol)
+            {
+            case 2: return low(g.store);
+            case 3: snprintf(b, 32, "%02d", g.bits); return b;
+            case 4: return ApiText(g.apis);
+            case 5: return g.reshade ? g.reshadeDll.version : std::string();
+            case 6: return g.route == Route::Vulkan ? (g.ini ? "vulkan" : "") : g.addonVersion;
+            case 7: return g.nvKnown ? std::string(g.nvVrrOwn ? "0" : "1") + VrrText(g.nvVrr) : "2";
+            case 8: return g.nvKnown ? std::string(g.nvVsyncOwn ? "0" : "1") + VsyncText(g.nvVsync) : "2";
+            case 9: snprintf(b, 32, "%02d", (int)StatusOf(g)); return b;
+            default: return low(g.name);
+            }
+        };
+        auto ver = sortCol == 5 || sortCol == 6;
+        std::stable_sort(vis.begin(), vis.end(), [&](int a, int b) {
+            const Game &x = g_app.games[a], &y = g_app.games[b];
+            std::string kx = key(x), ky = key(y);
+            int c = ver ? CompareVersions(kx, ky) : kx.compare(ky);
+            if (c == 0) return low(x.name) < low(y.name);
+            return sortAsc ? c < 0 : c > 0;
+        });
+    }
     auto picked = [](int i) { return g_app.picked.count(g_app.games[i].root) != 0; };
     auto setPicked = [](int i, bool on) { if (on) g_app.picked.insert(g_app.games[i].root); else g_app.picked.erase(g_app.games[i].root); };
     auto pickRange = [&](int fromIdx, int toIdx, bool add) {
@@ -670,10 +705,9 @@ static void DrawTable(float height)
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) g_app.picked.clear();
     }
 
-    for (int i = 0; i < (int)g_app.games.size(); i++)
+    for (int i : vis)
     {
         Game &g = g_app.games[i];
-        if (!Matches(g, g_app.search) || (g_app.onlyRelevant && !Relevant(g))) continue;
         ImGui::TableNextRow();
         ImGui::PushID(i);
         ImGui::TableNextColumn();
