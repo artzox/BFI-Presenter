@@ -19,7 +19,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.0.0 (test 8)"
+#define MANAGER_VERSION "1.0.0 (test 9)"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 

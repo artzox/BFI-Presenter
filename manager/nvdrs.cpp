@@ -50,6 +50,7 @@ const NvStatus NV_OK = 0, NV_SETTING_NOT_FOUND = -160, NV_PROFILE_NOT_FOUND = -1
 const NvU32 VSYNCMODE_ID = 0x00A879CF;
 const NvU32 VRR_APP_OVERRIDE_ID = 0x10A879CF;
 const NvU32 VRR_APP_OVERRIDE_REQUEST_STATE_ID = 0x10A879AC;
+const NvU32 VRRFEATUREINDICATOR_ID = 0x1094F157;      // "Toggle the VRR global feature" (NVPI: GSYNC - Enable)
 
 #pragma pack(push, 4)
 struct NvBinary { NvU32 len; uint8_t data[4096]; };
@@ -285,8 +286,12 @@ std::string NvWrite(const std::wstring &exeName, const std::wstring &profileName
     };
     // G-SYNC is two settings in the driver (the app override and its requested state); NVIDIA Profile
     // Inspector writes both, so do the same.
+    // Profiles saved from NVIDIA Profile Inspector with G-SYNC off also turn the VRR feature off for the game;
+    // match them: off -> 0, on -> 1, use global -> removed.
+    long long feature = vrr == -2 ? -2 : vrr == -1 ? -1 : (vrr == kVrrAllow ? 1 : 0);
     if ((r = set(VRR_APP_OVERRIDE_ID, vrr)) != NV_OK) err = Err("Setting G-SYNC", r);
     else if ((r = set(VRR_APP_OVERRIDE_REQUEST_STATE_ID, vrr)) != NV_OK) err = Err("Setting G-SYNC", r);
+    else if ((r = set(VRRFEATUREINDICATOR_ID, feature)) != NV_OK) err = Err("Setting G-SYNC", r);
     else if ((r = set(VSYNCMODE_ID, vsync)) != NV_OK) err = Err("Setting Vertical Sync", r);
     if (err.empty() && (r = a.SaveSettings(ses.s)) != NV_OK) err = Err("Saving the NVIDIA settings", r);
     return err;
