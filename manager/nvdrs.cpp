@@ -19,6 +19,24 @@ std::string U8(const std::wstring &w);
 
 namespace {
 
+// NVAPI matches profiles best with the full path in the form c:/folder/app.exe: games whose profile names the
+// exe with its folder (Burnout Paradise) or tells apart games by a file next to the exe (Dead Space 2008 vs
+// the 2023 remake, same dead space.exe) are only found that way.
+std::wstring NvPath(const std::wstring &path)
+{
+    std::wstring p = path;
+    for (auto &c : p) { if (c == L'\\') c = L'/'; c = (wchar_t)towlower(c); }
+    return p;
+}
+
+std::wstring FileName(const std::wstring &path)
+{
+    size_t k = path.find_last_of(L"\\/");
+    std::wstring n = k == std::wstring::npos ? path : path.substr(k + 1);
+    for (auto &c : n) c = (wchar_t)towlower(c);
+    return n;
+}
+
 typedef uint32_t NvU32;
 typedef uint64_t NvU64;
 typedef int NvStatus;
@@ -182,9 +200,16 @@ std::string NvRead(const std::vector<std::wstring> &exeNames, std::vector<NvStat
         memset(app, 0, sizeof(*app));
         app->version = Ver(sizeof(NvApplication), 4);
         NvUStr name;
-        ToNv(name, exeNames[i]);
+        ToNv(name, NvPath(exeNames[i]));
         NvProfile p = nullptr;
-        if (a.FindApplicationByName(ses.s, name, &p, app) != NV_OK || !p) continue;
+        if (a.FindApplicationByName(ses.s, name, &p, app) != NV_OK || !p)
+        {
+            memset(app, 0, sizeof(*app));
+            app->version = Ver(sizeof(NvApplication), 4);
+            ToNv(name, FileName(exeNames[i]));
+            if (a.FindApplicationByName(ses.s, name, &p, app) != NV_OK) p = nullptr;
+        }
+        if (!p) continue;
         memset(pi, 0, sizeof(*pi));
         pi->version = Ver(sizeof(NvProfileInfo), 1);
         if (a.GetProfileInfo(ses.s, p, pi) == NV_OK) o.profile = FromNv(pi->profileName);
@@ -207,9 +232,16 @@ std::string NvWrite(const std::wstring &exeName, const std::wstring &profileName
     NvApplication *app = new NvApplication();
     app->version = Ver(sizeof(NvApplication), 4);
     NvUStr name;
-    ToNv(name, exeName);
+    ToNv(name, NvPath(exeName));
     NvProfile p = nullptr;
     NvStatus r = a.FindApplicationByName(ses.s, name, &p, app);
+    if (r != NV_OK || !p)
+    {
+        memset(app, 0, sizeof(*app));
+        app->version = Ver(sizeof(NvApplication), 4);
+        ToNv(name, FileName(exeName));
+        r = a.FindApplicationByName(ses.s, name, &p, app);
+    }
     std::string err;
     if (r != NV_OK || !p)
     {
@@ -219,9 +251,9 @@ std::string NvWrite(const std::wstring &exeName, const std::wstring &profileName
         {
             memset(pi, 0, sizeof(*pi));
             pi->version = Ver(sizeof(NvProfileInfo), 1);
-            std::wstring n = profileName.empty() ? exeName : profileName;
+            std::wstring n = profileName.empty() ? FileName(exeName) : profileName;
             if (attempt == 1) n += L" (BFI Presenter)";
-            if (attempt == 2) n = exeName;
+            if (attempt == 2) n = FileName(exeName);
             ToNv(pi->profileName, n);
             r = a.CreateProfile(ses.s, pi, &p);
             if (r != NV_OK && r != NV_PROFILE_NAME_IN_USE) break;
@@ -230,7 +262,7 @@ std::string NvWrite(const std::wstring &exeName, const std::wstring &profileName
         if (!p) { delete app; return Err("Creating an NVIDIA profile", r); }
         memset(app, 0, sizeof(*app));
         app->version = Ver(sizeof(NvApplication), 4);
-        ToNv(app->appName, exeName);
+        ToNv(app->appName, FileName(exeName));
         r = a.CreateApplication(ses.s, p, app);
         if (r != NV_OK) { delete app; return Err("Adding the game to its NVIDIA profile", r); }
     }

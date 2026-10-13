@@ -20,10 +20,10 @@ struct NvState {
 };
 
 bool NvAvailable();                                        // an NVIDIA driver with NVAPI is present
-std::string NvRead(const std::vector<std::wstring> &exeNames, std::vector<NvState> &out);
+std::string NvRead(const std::vector<std::wstring> &exePaths, std::vector<NvState> &out);   // full paths
 // vrr / vsync: -2 = leave as is, -1 = remove from the game's profile (use global), otherwise the value.
 // Creates a profile named profileName for the exe if it has none.
-std::string NvWrite(const std::wstring &exeName, const std::wstring &profileName, long long vrr, long long vsync);
+std::string NvWrite(const std::wstring &exePath, const std::wstring &profileName, long long vrr, long long vsync);
 bool NvNeedsAdmin(const std::string &err);                 // the error means "run as administrator"
 
 std::string VrrText(long long v);

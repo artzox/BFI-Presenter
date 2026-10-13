@@ -19,7 +19,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.0.0 (test 6)"
+#define MANAGER_VERSION "1.0.0 (test 7)"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -179,11 +179,7 @@ static void NvFill(std::vector<Game> &games)
 {
     if (!NvAvailable()) return;
     std::vector<std::wstring> names;
-    for (auto &g : games)
-    {
-        std::wstring n = g.exe.substr(g.exe.find_last_of(L'\\') + 1);
-        names.push_back(Lower(n));
-    }
+    for (auto &g : games) names.push_back(g.exe);
     std::vector<NvState> st;
     if (!NvRead(names, st).empty()) return;
     for (size_t i = 0; i < games.size(); i++)
@@ -210,7 +206,7 @@ static std::wstring ExeName(const Game &g) { return g.exe.substr(g.exe.find_last
 // vrr / vsync: -2 leave, -1 use global, else the value. Returns "" or the error (needAdmin set when that's the cause).
 static std::string NvSet(Game &g, long long vrr, long long vsync)
 {
-    std::string e = NvWrite(ExeName(g), W(g.name), vrr, vsync);
+    std::string e = NvWrite(g.exe, W(g.name), vrr, vsync);
     NvFillOne(g);
     return e;
 }
@@ -953,7 +949,7 @@ static void DrawBatch()
             for (auto *g : sel)
             {
                 if (g->exe.empty()) continue;
-                std::string e = NvWrite(ExeName(*g), W(g->name), vrr, vs);
+                std::string e = NvWrite(g->exe, W(g->name), vrr, vs);
                 if (e.empty()) ok++; else { fail++; if (firstErr.empty()) firstErr = e; }
                 if (fail && NvNeedsAdmin(firstErr)) break;
             }
