@@ -11,6 +11,8 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 
 First public release of this round of changes. (1.0.2 was used only for test builds, so installs from those report 1.0.2 and update tools see 1.0.3 as newer.)
 
+- **[Both] BFI Presenter Manager** (`BFIPresenterManager.exe`, a separate download): finds games in Steam, Epic, GOG, Xbox and other folders, works out what each needs (32/64-bit add-on or Vulkan layer), installs, updates or removes BFI Presenter with backups and undo, installs or changes ReShade, and sets G-SYNC and Vertical Sync in each game's NVIDIA profile. The PowerShell Find/Update scripts are no longer in the release zips (they stay in the repository).
+
 
 - **[DX] Direct3D 9 games.** The add-on now manages Direct3D 9 games (32- and 64-bit) through the same presenter as DX11 games. It asks ReShade (6.8 or newer) to create the game's device as Direct3D 9Ex, the only kind that can share its frames. Each finished frame (ReShade's effects applied) is copied into a texture shared with the add-on's own D3D11 device, then into the presenter's staging ring, and shown with the strobe through a window laid over the game's. The game's own Present is skipped. Tested: Alan Wake and Lara Croft and the Guardian of Light (both 32-bit).
   - The game stays windowed (borderless at full size). Direct3D 9Ex can't take an exclusive-fullscreen device the way older games ask for one, and the presenter needs a window anyway.

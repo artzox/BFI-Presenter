@@ -28,7 +28,7 @@ The [Vulkan layer](../vulkan/README.md) covers Vulkan games and DirectX 9–11 g
 3. Start the game and open the ReShade overlay. The **BFI Presenter** tab shows the version, whether the swap chain is managed (and why not, if it isn't), and live timing.
 4. BFI starts at the game's first swap-chain resize (nearly all games resize at start-up). If it doesn't start, change resolution or display mode once.
 
-**Updating many games:** `Find-BFIPresenter.ps1` lists every game folder with the add-on (and its version) into `BFIPresenter_locations.txt`. `Update-BFIPresenter.ps1 -Source <folder with the new build>` copies the new add-on into all of them; `-DryRun` previews, `-Backup` keeps `.bak` copies. Neither script touches your `BFIPresenter.ini` files.
+**Updating many games:** use the BFI Presenter Manager (`BFIPresenterManager.exe` on the release page): it finds every game with the add-on and updates them all, with backups.
 
 **Uninstall:** delete `BFIPresenter.addon64` / `.addon32` (and the ini) from the game folder.
 

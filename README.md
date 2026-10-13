@@ -32,7 +32,7 @@ Each [release](../../releases) has two packages with the same version number:
 
 | Package | For | What's in it |
 |---|---|---|
-| `BFIPresenter-DX-v<version>.zip` | **Direct3D 12, 11 and 9 and OpenGL** games, 64- and 32-bit (Direct3D 9 needs ReShade 6.8+; OpenGL needs an NVIDIA GPU) | `BFIPresenter.addon64` / `BFIPresenter.addon32` (ReShade add-ons), example ini, update scripts |
+| `BFIPresenter-DX-v<version>.zip` | **Direct3D 12, 11 and 9 and OpenGL** games, 64- and 32-bit (Direct3D 9 needs ReShade 6.8+; OpenGL needs an NVIDIA GPU) | `BFIPresenter.addon64` / `BFIPresenter.addon32` (ReShade add-ons), example ini |
 | `BFIPresenter-Vulkan-v<version>.zip` | **Vulkan** games, emulators (PCSX2, RPCS3, shadPS4…), and **DirectX 8–11** games run through [DXVK](https://github.com/doitsujin/dxvk) — 64- and 32-bit | `BFIPresenterVK.dll` / `BFIPresenterVK32.dll` (a Vulkan layer), installer, a ready `BFIPresenter.ini` to copy into games |
 
 Both read the same `BFIPresenter.ini` with the same keys, so one ini works for either.
@@ -81,20 +81,9 @@ If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that
 
 ## Updating many games
 
-The [manager app](manager/README.md) does all of this with a window; the scripts below do the same from PowerShell.
+Use the [manager app](manager/README.md): point it at the new release (**Check GitHub**, or **Use folder...** with both zips extracted into one folder) and press **Update outdated**. Every replaced file is backed up, and **Undo last change** puts it back per game.
 
-`scripts/Find-BFIPresenter.ps1` finds every game folder with the add-on or an ini (Steam, Epic, GOG and Xbox folders, plus any `-Roots` you pass) and shows each one's version. `scripts/Update-BFIPresenter.ps1 -Source <extracted release>` copies a new build into all of them and updates the installed Vulkan layer; `-DryRun` previews. Your `BFIPresenter.ini` files are never changed. Every replaced file is kept in `BFIPresenter_backups` next to the script and listed, with its old and new version, in `BFIPresenter_update_log.csv`; if a new version misbehaves, `-Revert` puts back what the last update replaced (run it again to go one more update back).
-
-**Easiest:** double-click `Find-BFIPresenter.bat`, then `Update-BFIPresenter.bat`, from the extracted release folder (the new build next to the scripts). The `.bat` files start PowerShell with the right options, so Windows' script policy and the "downloaded from the internet" block don't stop them.
-
-From a command prompt, extra options pass through the `.bat` files:
-
-```bat
-Find-BFIPresenter.bat -Roots "D:\Games"
-Update-BFIPresenter.bat -DryRun
-Update-BFIPresenter.bat -Source "D:\Downloads\BFIPresenter-1.0.0" -Backup
-Update-BFIPresenter.bat -Revert
-```
+The older PowerShell scripts (`scripts/Find-BFIPresenter.ps1`, `scripts/Update-BFIPresenter.ps1`) stay in the repository for anyone who prefers them, but are no longer part of the release zips.
 
 ## Building from source
 
@@ -112,7 +101,7 @@ All headers needed are in [`third_party`](third_party/README.md).
 dx/          DX add-on source, build scripts, reference
 vulkan/      Vulkan layer source, GLSL shaders, manifests, installer, reference
 manager/     BFIPresenterManager.exe source (finds games, installs and updates)
-scripts/     Find-/Update-BFIPresenter.ps1
+scripts/     Find-/Update-BFIPresenter.ps1 (older command-line updater)
 docs/        tested games, latency estimates
 third_party/ ReShade, Dear ImGui and Vulkan headers
 BFIPresenter.example.ini   shared settings reference
