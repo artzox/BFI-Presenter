@@ -505,6 +505,7 @@ static void DrawTable(float height)
         ImGui::TableNextColumn();
         ImGui::PushID(i);
         if (ImGui::Selectable(g.name.c_str(), g_app.sel == i, ImGuiSelectableFlags_SpanAllColumns)) g_app.sel = i;
+        if (ImGui::IsItemFocused() && g_app.sel != i) g_app.sel = i;   // arrow keys move the selection too
         ImGui::PopID();
         ImGui::TableNextColumn(); ImGui::TextColored(kGrey, "%s", g.store.c_str());
         ImGui::TableNextColumn(); if (g.bits) ImGui::Text("%d", g.bits); else ImGui::TextColored(kGrey, "?");
