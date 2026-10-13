@@ -19,7 +19,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.0.0"
+#define MANAGER_VERSION "1.0.1"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -189,6 +189,7 @@ static void NvFill(std::vector<Game> &games)
         g.nvProfile = st[i].profile;
         g.nvVrr = st[i].vrr; g.nvVrrOwn = st[i].vrrOwn;
         g.nvVsync = st[i].vsync; g.nvVsyncOwn = st[i].vsyncOwn;
+        g.nvGl = st[i].glPresent; g.nvGlOwn = st[i].glPresentOwn;
     }
 }
 
@@ -199,14 +200,15 @@ static void NvFillOne(Game &g)
     g.nvKnown = one[0].nvKnown; g.nvProfile = one[0].nvProfile;
     g.nvVrr = one[0].nvVrr; g.nvVrrOwn = one[0].nvVrrOwn;
     g.nvVsync = one[0].nvVsync; g.nvVsyncOwn = one[0].nvVsyncOwn;
+    g.nvGl = one[0].nvGl; g.nvGlOwn = one[0].nvGlOwn;
 }
 
 static std::wstring ExeName(const Game &g) { return g.exe.substr(g.exe.find_last_of(L'\\') + 1); }
 
 // vrr / vsync: -2 leave, -1 use global, else the value. Returns "" or the error (needAdmin set when that's the cause).
-static std::string NvSet(Game &g, long long vrr, long long vsync)
+static std::string NvSet(Game &g, long long vrr, long long vsync, long long gl = -2)
 {
-    std::string e = NvWrite(g.exe, W(g.name), vrr, vsync);
+    std::string e = NvWrite(g.exe, W(g.name), vrr, vsync, gl);
     NvFillOne(g);
     return e;
 }
@@ -769,9 +771,10 @@ static void DrawActions(Game &g)
     bool installed = !g.addonPath.empty() || g.ini;
     ImGui::BeginDisabled(!installed);
     if (ImGui::Button("Remove")) DoAction("Removed from " + g.name, Remove(g, g_app.removeIni));
-    SameLineIfFits(ImGui::GetFrameHeight() + ButtonW("also BFIPresenter.ini"));
-    ImGui::Checkbox("also BFIPresenter.ini", &g_app.removeIni);
-    Tooltip("The ini holds this game's settings. For Vulkan games the ini is what turns the layer on, so Remove always deletes it there.");
+    SameLineIfFits(ImGui::GetFrameHeight() + ButtonW("Remove deletes the ini too"));
+    ImGui::Checkbox("Remove deletes the ini too", &g_app.removeIni);
+    Tooltip("For Remove only. The ini holds this game's settings; the add-on writes it on the game's first start, so installing never needs it. "
+            "For Vulkan games the ini is what turns the layer on, so Remove always deletes it there.");
     ImGui::EndDisabled();
     SameLineIfFits(ButtonW("Undo last change"));
     ImGui::BeginDisabled(!CanRevert(g));
@@ -803,8 +806,11 @@ static std::string BatchSkip(const Game &g)
     return {};
 }
 
-// Install or update, then (if chosen) set G-SYNC off / Vertical Sync Force on in each game's NVIDIA profile.
-static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsync)
+static bool IsGlAddon(const Game &g) { return (g.apis & ApiGL) && (g.route == Route::Addon64 || g.route == Route::Addon32); }
+
+// Install or update, then (if chosen) set G-SYNC off / Vertical Sync Force on in each game's NVIDIA profile,
+// and for OpenGL games the Vulkan/OpenGL present method to Prefer layered on DXGI swapchain.
+static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsync, bool nvGl)
 {
     int ok = 0, fail = 0, nvFail = 0;
     std::string firstErr, nvErr;
@@ -813,9 +819,10 @@ static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsy
         std::string e = InstallOrUpdate(*g, g_app.src);
         if (!e.empty()) { fail++; if (firstErr.empty()) firstErr = g->name + ": " + e; continue; }
         ok++;
-        if (g_app.nvOk && (nvGsync || nvVsync))
+        const bool gl = nvGl && IsGlAddon(*g);
+        if (g_app.nvOk && (nvGsync || nvVsync || gl))
         {
-            std::string ne = NvSet(*g, nvGsync ? kVrrForceOff : -2, nvVsync ? kVsyncForceOn : -2);
+            std::string ne = NvSet(*g, nvGsync ? kVrrForceOff : -2, nvVsync ? kVsyncForceOn : -2, gl ? kGlPresentLayered : -2);
             if (!ne.empty()) { nvFail++; if (nvErr.empty()) nvErr = ne; }
         }
     }
@@ -824,7 +831,7 @@ static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsy
                                                   : "Installed or updated " + std::to_string(ok) + ".";
     if (fail) m += " Failed " + std::to_string(fail) + ": " + firstErr;
     if (nvFail) m += " NVIDIA settings not changed: " + nvErr;
-    else if (ok && (nvGsync || nvVsync) && g_app.nvOk) m += std::string(" NVIDIA:") + (nvGsync ? " G-SYNC off" : "") + (nvVsync ? " VSync force on" : "") + ".";
+    else if (ok && (nvGsync || nvVsync) && g_app.nvOk) m += std::string(" NVIDIA:") + (nvGsync ? " G-SYNC off" : "") + (nvVsync ? " VSync force on" : "") + (nvGl ? " (OpenGL: present layered on DXGI)" : "") + ".";
     g_app.SetMsg(m, fail || nvFail);
     if (nvFail && NvNeedsAdmin(nvErr)) g_app.needAdmin = true;
 }
@@ -841,7 +848,8 @@ static void RequestInstall(const std::vector<Game *> &list)
         return;
     }
     RunInstall(list, g_app.nvOk && LoadSetting(L"NvGsyncOff", L"1") == L"1" && LoadSetting(L"NvAskOnInstall", L"1") == L"0",
-               g_app.nvOk && LoadSetting(L"NvVsyncOn", L"1") == L"1" && LoadSetting(L"NvAskOnInstall", L"1") == L"0");
+               g_app.nvOk && LoadSetting(L"NvVsyncOn", L"1") == L"1" && LoadSetting(L"NvAskOnInstall", L"1") == L"0",
+               g_app.nvOk && LoadSetting(L"NvGlLayered", L"1") == L"1" && LoadSetting(L"NvAskOnInstall", L"1") == L"0");
 }
 
 static void DrawInstallQuestion()
@@ -858,18 +866,27 @@ static void DrawInstallQuestion()
     else ImGui::TextWrapped("Install or update BFI Presenter in %d games.", (int)list.size());
     ImGui::Spacing();
     ImGui::TextUnformatted("Also change these NVIDIA settings in the game's profile:");
-    static bool gs = true, vs = true, askAgain = true, init = false;
+    static bool gs = true, vs = true, gl = true, askAgain = true, init = false;
     if (!init)
     {
         init = true;
         gs = LoadSetting(L"NvGsyncOff", L"1") == L"1";
         vs = LoadSetting(L"NvVsyncOn", L"1") == L"1";
+        gl = LoadSetting(L"NvGlLayered", L"1") == L"1";
     }
+    bool anyGl = false;
+    for (auto *g : list) if (IsGlAddon(*g)) anyGl = true;
     ImGui::Checkbox("G-SYNC off for the game (fixed 120 Hz)", &gs);
     Tooltip("With G-SYNC on, VRR can take over from the presenter's steady presents and the strobe flickers or drops "
             "below 120 Hz (Control, Undying). Same as NVIDIA Profile Inspector: G-SYNC = Force off.");
     ImGui::Checkbox("Vertical Sync: Force on", &vs);
     Tooltip("Games that ignore VSync otherwise tear or run unpaced (Resonance). Never use Force off or Fast Sync with BFI.");
+    if (anyGl)
+    {
+        ImGui::Checkbox("OpenGL: present method Prefer layered on DXGI swapchain", &gl);
+        Tooltip("Older OpenGL games (Need for Speed: Porsche Unleashed, DOOM 3 BFG) block the presenter -- it runs at 20-30 fps -- "
+                "until their NVIDIA profile has Vulkan/OpenGL present method = Prefer layered on DXGI swapchain.");
+    }
     ImGui::Spacing();
     ImGui::Checkbox("Ask every time", &askAgain);
     Tooltip("Off: the choices above are used for every install without asking. Turn it back on under Libraries...");
@@ -878,9 +895,10 @@ static void DrawInstallQuestion()
     {
         SaveSetting(L"NvGsyncOff", gs ? L"1" : L"0");
         SaveSetting(L"NvVsyncOn", vs ? L"1" : L"0");
+        if (anyGl) SaveSetting(L"NvGlLayered", gl ? L"1" : L"0");
         SaveSetting(L"NvAskOnInstall", askAgain ? L"1" : L"0");
         ImGui::CloseCurrentPopup();
-        RunInstall(list, gs, vs);
+        RunInstall(list, gs, vs, anyGl && gl);
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
@@ -914,7 +932,7 @@ static void DrawBatch()
     if (ImGui::Button(lbl)) ImGui::OpenPopup("Remove ticked");
     ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::Checkbox("also BFIPresenter.ini", &g_app.removeIni);
+    ImGui::Checkbox("Remove deletes the ini too", &g_app.removeIni);
     if (ImGui::BeginPopupModal("Remove ticked", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
     {
         ImGui::Text("Remove BFI Presenter from %d games%s?", nRem, g_app.removeIni ? ", with their BFIPresenter.ini" : "");
@@ -1108,6 +1126,24 @@ static void NvidiaControls(Game &g, float lab)
         ImGui::TextColored(kYellow, "  *"); ImGui::SameLine(lab);
         ImGui::TextWrapped("Force off and Fast Sync break the strobe's cadence: use the 3D application setting or Force on.");
     }
+    if (!(g.apis & ApiGL)) return;
+    const char *oItems[] = { "Use global setting", "Auto", "Prefer layered on DXGI swapchain", "Prefer native" };
+    const long long oVals[] = { -1, kGlPresentAuto, kGlPresentLayered, kGlPresentNative };
+    int oi = 0;
+    if (g.nvGlOwn) for (int k = 1; k < 4; k++) if (g.nvGl == oVals[k]) oi = k;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(kGrey, "OpenGL present"); ImGui::SameLine(lab);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11);
+    if (ImGui::Combo("##glpresent", &oi, oItems, 4))
+    {
+        std::string e = NvSet(g, -2, -2, oVals[oi]);
+        if (e.empty()) g_app.SetMsg("Vulkan/OpenGL present method for " + g.name + ": " + std::string(oItems[oi]) + ".", false);
+        else { g_app.SetMsg(e, true); g_app.needAdmin = NvNeedsAdmin(e); }
+    }
+    Tooltip("NVIDIA's Vulkan/OpenGL present method. Older OpenGL games (Need for Speed: Porsche Unleashed, DOOM 3 BFG) "
+            "block the presenter until it is Prefer layered on DXGI swapchain.");
+    ImGui::SameLine();
+    ImGui::TextColored(g.nvGl == kGlPresentLayered ? kGreen : kGrey, "now: %s%s", GlPresentText(g.nvGl).c_str(), g.nvGlOwn ? "" : " (global)");
 }
 
 static void DrawDetail(HWND)

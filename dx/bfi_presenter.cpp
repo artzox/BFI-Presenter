@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.3"
+#define BFI_ADDON_VERSION "1.0.4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -388,6 +388,7 @@ struct Status
     double displayHz = 0.0;                     // the display's own refresh rate (frame statistics)
     bool   vrrSuspect = false;
     bool   limitSuspect = false;
+    bool   glPresentBlocked = false;            // OpenGL: the presenter's own presents block (NVIDIA present method)
     int    lrState = 0;         // later release: 0 off, 1 measuring, 2 active, 3 paused (frames take too long)
     double lrEst = 0.0, lrMargin = 0.0;
     int    lrMisses = 0;
@@ -403,6 +404,7 @@ static char   g_hooksSeen[256] = "";               // other Present hooks found 
 static char   g_fgSeen[256] = "";                  // frame-generation components found in the process
 static char   g_scOwner[128] = "";                 // module that implements the swap chain ReShade sees
 static std::atomic<bool> g_firstStaged{false}, g_firstPresented{false};
+static std::atomic<bool> g_glActive{false};       // an OpenGL game is managed
 static std::atomic<double> g_lastPresentT{0.0};   // presenter heartbeat
 static std::atomic<bool>   g_stallLogged{false};
 static std::atomic<int> g_stagedThisSecond{0};
@@ -2062,6 +2064,8 @@ static DWORD WINAPI PresenterThread(void *)
     int    vrrSlowSecs = 0;
     bool   vrrLogged = false;
     int    limitSecs = 0;          // presenter held below a fixed display refresh
+    int    secSlowPres = 0, glBlockSecs = 0;   // presents that blocked for most of a refresh
+    bool   glBlockLogged = false;
     bool   limitLogged = false;
     bool   lostLogged = false;
     bool   hitchPaused = false;
@@ -2480,6 +2484,7 @@ static DWORD WINAPI PresenterThread(void *)
         HRESULT hr;
         hr = OwnPresent();
         const double tPres = Now();
+        if (tPres - tSub > 0.75 / (modeHz > 0.0 ? modeHz : 120.0)) secSlowPres++;
         PresStage(ST_IDLE);
         g_lastPresentHr.store(hr);
         g_lastPresentT.store(Now());
@@ -2613,6 +2618,22 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.displayHz    = displayHz;
             g_status.vrrSuspect   = vrrSlowSecs >= 3;
             g_status.limitSuspect = limitSecs >= 3;
+            // OpenGL games that present by exchange (Need for Speed: Porsche
+            // Unleashed, DOOM 3 BFG) block the presenter's own presents for
+            // several refreshes until the game's NVIDIA profile presents
+            // OpenGL through DXGI ("Prefer layered on DXGI swapchain").
+            {
+                const double hzNow = secPresents / (t - secStart), want = modeHz > 0.0 ? modeHz : peakHz;
+                glBlockSecs = (g_glActive.load() && want > 0.0 && hzNow < 0.8 * want && secSlowPres * 2 >= secPresents) ? glBlockSecs + 1 : 0;
+                if (glBlockSecs == 3 && !glBlockLogged)
+                {
+                    glBlockLogged = true;
+                    LOGW("BFI Presenter: OpenGL: the presenter's own presents block (%.0f of %.0f per second) -- set "
+                         "'Vulkan/OpenGL present method' to 'Prefer layered on DXGI swapchain' in this game's NVIDIA profile "
+                         "(the BFI Presenter Manager or NVIDIA Profile Inspector)", hzNow, want);
+                }
+                g_status.glPresentBlocked = glBlockSecs >= 3;
+            }
             {
                 const int lost = g_lostFrames.exchange(0);
                 if (lost > 0 && !lostLogged)
@@ -2665,7 +2686,7 @@ static DWORD WINAPI PresenterThread(void *)
             secRepU = secSkipU = 0;
             g_status.outType    = (int)c.outType;
             LeaveCriticalSection(&g_cfgLock);
-            secStart = t; secPresents = 0; secLate = 0; ageSum = 0.0;
+            secStart = t; secPresents = 0; secLate = 0; ageSum = 0.0; secSlowPres = 0;
             if (g_device->GetDeviceRemovedReason() != S_OK) { DumpDeviceRemoved(g_device, "presenter check"); break; }
             if (g_dx11.load()) Sync11Window();
         }
@@ -5463,6 +5484,7 @@ static void on_present9(reshade::api::command_queue *, reshade::api::swapchain *
 static void InitDx9(reshade::api::swapchain *swapchain)
 {
     ReleaseDx9();
+    LoadShared();                       // reads (and on first start creates) BFIPresenter.ini
     IDirect3DDevice9 *dev = reinterpret_cast<IDirect3DDevice9 *>(swapchain->get_device()->get_native());
     IDirect3DSwapChain9 *sc9 = reinterpret_cast<IDirect3DSwapChain9 *>(swapchain->get_native());
     if (!dev || !sc9) return;
@@ -5672,7 +5694,6 @@ struct GlState
 };
 static GlState g_gl;
 static GlFns   g_glf;
-static std::atomic<bool> g_glActive{false};
 
 static bool LoadGlFns()
 {
@@ -5789,6 +5810,7 @@ static HRESULT CreateAddonD3D11(ID3D11Device **dev, ID3D11DeviceContext **ctx, L
 static void InitGl(reshade::api::swapchain *swapchain)
 {
     ReleaseGl();
+    LoadShared();                       // reads (and on first start creates) BFIPresenter.ini
     if (GetPrivateProfileIntA("BFI", "OpenGLSupport", 1, g_iniPath) == 0)
     {
         SetReason(0, "Not managed: OpenGL support is off (OpenGLSupport=0).");
@@ -6295,6 +6317,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::TextColored(kRed, "The display is refreshing slower than it can: VRR (G-SYNC) is active.\nTurn G-SYNC off for this game in the NVIDIA profile, or turn on Queue one refresh ahead.");
         if (st.limitSuspect)
             ImGui::TextColored(kRed, "A frame limiter is holding the presenter below the display's refresh rate.\nSet the RTSS frame limit to 0 for this game (and check NVIDIA Profile Inspector).");
+        if (st.glPresentBlocked)
+            ImGui::TextColored(kRed, "The presenter's presents are blocked (OpenGL). In this game's NVIDIA profile set\n"
+                               "Vulkan/OpenGL present method = Prefer layered on DXGI swapchain (BFI Presenter Manager does it).");
         if (st.vsyncOverridden)
             ImGui::TextColored(kRed, "The driver is ignoring VSync (NVIDIA profile: Force off / Fast Sync?).\nPacing to vblank instead; tearing is likely. Set Vertical Sync to Force on.");
         if (st.repeats > 0 || st.late > 0)
