@@ -7,6 +7,11 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## Manager — unreleased
+
+- **[Manager] Batch actions no longer freeze the window.** Update outdated, Install / update and Remove for ticked games, and installing ReShade in many games now run a few games per frame with a progress dialog (game n of N, the current game, a Stop button) instead of blocking until the last game is done.
+- **[Manager] AnyCPU .NET games run 64-bit:** a PE32 .NET assembly without the 32-bit flags (FNA games) is shown and installed as 64-bit.
+
 ## [1.0.5] — 2026-10-13
 
 - **[DX] BFI shader** (`BFIPresenter_Shader.fx`, in the DX zip): the presenter's strobe as a ReShade effect, clocked by the game's own frames (one game frame per sub-frame): BFI with highlight roll-off, Variable MPRT, sine and inverted cycles, rolling scan with phosphor decay and the ABL guard, output format from ReShade. A hitch guard sums each frame's time minus one refresh; a missed refresh, a game faster than the display or an average off the refresh rate shows the strobe's average brightness for 500 ms instead of a flash. Only for games that hold a rock-steady 120 fps and whose engine stutters with the presenter (Moons of Madness); everywhere else the add-on is better.
