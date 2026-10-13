@@ -506,7 +506,7 @@ std::string BfiVersionOf(const std::wstring &file, bool vulkan)
 
 // ------------------------------------------------------------------ PE analysis
 
-struct PeInfo { int bits = 0; std::set<std::string> imports; bool ok = false; bool d3d9PerfOnly = false; };
+struct PeInfo { int bits = 0; std::set<std::string> imports; bool ok = false; bool d3d9PerfOnly = false; bool dotnet = false; };
 // Many Direct3D 11/12 games import d3d9.dll only for the D3DPERF_* profiler markers: that isn't Direct3D 9.
 
 static PeInfo ReadPe(std::string_view f)
@@ -534,6 +534,19 @@ static PeInfo ReadPe(std::string_view f)
         }
         return (size_t)-1;
     };
+    // .NET: a PE32 "AnyCPU" assembly (IL only, neither 32BITREQUIRED nor 32BITPREFERRED) runs as a 64-bit
+    // process on 64-bit Windows (Celeste and other FNA games), so ReShade must be the 64-bit one.
+    if (magic == 0x10b && nDirs > 14)
+    {
+        unsigned cliRva = rd32(dd + 14 * 8);
+        size_t co = cliRva ? rva2off(cliRva) : (size_t)-1;
+        if (co != (size_t)-1 && co + 20 <= f.size())
+        {
+            unsigned flags = rd32(co + 16);
+            pi.dotnet = true;
+            if ((flags & 1) && !(flags & 2) && !(flags & 0x20000)) pi.bits = 64;
+        }
+    }
     auto readName = [&](unsigned rva) -> std::string {
         size_t o = rva2off(rva);
         std::string s;
@@ -661,7 +674,7 @@ static void SaveCache()
 static ExeFacts AnalyzeExe(const std::wstring &exe)
 {
     std::wstring key = Lower(exe);
-    std::wstring stamp = L"2_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
+    std::wstring stamp = L"3_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
     {
         std::lock_guard<std::mutex> l(g_cacheLock);
         LoadCache();
