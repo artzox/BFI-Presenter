@@ -10,6 +10,7 @@
 #include <mutex>
 #include <thread>
 #include <set>
+#include <functional>
 #include "imgui.h"
 #include "imgui_internal.h"   // ImGuiItemFlags_MixedValue (tri-state checkbox)
 #include "imgui_impl_win32.h"
@@ -19,7 +20,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.1.0"
+#define MANAGER_VERSION "1.2.0"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -168,6 +169,102 @@ struct App {
 
 static App g_app;
 static void RestartAsAdmin();
+
+// ------------------------------------------------------------------ batch jobs
+// Installs, updates and removes over many games run a few per frame, so the window keeps drawing (a progress
+// dialog with the current game) instead of freezing until the last one is done.
+struct Job {
+    bool active = false, cancel = false;
+    std::string title;
+    std::vector<std::wstring> roots;
+    size_t next = 0;
+    int ok = 0, fail = 0, nvFail = 0;
+    std::string firstErr, nvErr, note, current;
+    std::function<std::string(Game &, Job &)> fn;      // "" = done, else the error
+    std::function<void(Job &)> finish;                 // after the last game (or Cancel)
+    double started = 0.0;
+};
+static Job g_job;
+
+static double NowSec() { return GetTickCount64() / 1000.0; }
+
+static void StartJob(const std::string &title, std::vector<std::wstring> roots,
+                     std::function<std::string(Game &, Job &)> fn, std::function<void(Job &)> finish)
+{
+    g_job = Job();
+    g_job.active = true;
+    g_job.title = title;
+    g_job.roots = std::move(roots);
+    g_job.fn = std::move(fn);
+    g_job.finish = std::move(finish);
+    g_job.started = NowSec();
+}
+
+// Runs games for up to ~40 ms per frame.
+static void StepJob()
+{
+    if (!g_job.active) return;
+    double t0 = NowSec();
+    while (g_job.next < g_job.roots.size() && !g_job.cancel)
+    {
+        const std::wstring &root = g_job.roots[g_job.next++];
+        for (auto &g : g_app.games)
+            if (g.root == root)
+            {
+                g_job.current = g.name;
+                std::string e = g_job.fn(g, g_job);
+                if (e.empty()) g_job.ok++;
+                else { g_job.fail++; if (g_job.firstErr.empty()) g_job.firstErr = g.name + ": " + e; }
+                break;
+            }
+        if (NowSec() - t0 > 0.04) return;
+    }
+    g_job.active = false;
+    if (g_job.finish) g_job.finish(g_job);
+}
+
+static void DrawJob()
+{
+    // only for jobs that take a moment; a single quick install shows no dialog
+    if (!g_job.active)
+    {
+        if (ImGui::IsPopupOpen("Working##job") && ImGui::BeginPopupModal("Working##job", nullptr, ImGuiWindowFlags_NoTitleBar))
+        {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        return;
+    }
+    if (g_job.roots.size() < 2 && NowSec() - g_job.started < 0.3) return;
+    if (!ImGui::IsPopupOpen("Working##job")) ImGui::OpenPopup("Working##job");
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 28, 0), ImGuiCond_Always);
+    if (!ImGui::BeginPopupModal("Working##job", nullptr, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove))
+        return;
+    size_t n = g_job.roots.size(), done = std::min(g_job.next, n);
+    ImGui::TextUnformatted(g_job.title.c_str());
+    char ov[64];
+    snprintf(ov, sizeof(ov), "%zu of %zu", done, n);
+    ImGui::ProgressBar(n ? (float)done / (float)n : 1.0f, ImVec2(-1, 0), ov);
+    ImGui::TextDisabled("%s", g_job.current.c_str());
+    ImGui::BeginDisabled(g_job.cancel);
+    if (ImGui::Button(g_job.cancel ? "Stopping..." : "Stop")) g_job.cancel = true;
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("Stop finishes the current game; games already done stay done (Undo last change per game).");
+    ImGui::PopTextWrapPos();
+    ImGui::EndPopup();
+}
+
+static std::string JobSummary(const Job &j, const std::string &verb)
+{
+    std::string m = verb + " " + std::to_string(j.ok) + (j.ok == 1 ? " game" : " games");
+    if (j.cancel && j.next < j.roots.size()) m += " (stopped, " + std::to_string(j.roots.size() - j.next) + " not done)";
+    if (j.fail) m += ", failed " + std::to_string(j.fail) + ". " + j.firstErr;
+    else m += ".";
+    return m;
+}
 static void ReShadeVersionCombo(float width);
 
 static void JoinWorker()
@@ -330,18 +427,16 @@ static void PollWorker()
         if (!g_app.rsErr.empty()) g_app.SetMsg(g_app.rsErr, true);
         else
         {
-            int ok = 0, fail = 0;
-            std::string firstErr, note;
-            for (auto &root : g_app.rsPending)
-                for (auto &g : g_app.games)
-                    if (g.root == root)
-                    {
-                        std::string n, e = InstallReShade(g, g_app.rsPendingVer, &n);
-                        if (e.empty()) ok++; else { fail++; if (firstErr.empty()) firstErr = g.name + ": " + e; }
-                        if (!n.empty()) note = n;
-                    }
-            g_app.SetMsg("ReShade " + g_app.rsPendingVer + " installed in " + std::to_string(ok) + " game" + (ok == 1 ? "" : "s") +
-                         (fail ? ", failed " + std::to_string(fail) + ". " + firstErr : ".") + (note.empty() ? "" : " " + note), fail != 0);
+            std::string ver = g_app.rsPendingVer;
+            StartJob("Installing ReShade " + ver + " in " + std::to_string(g_app.rsPending.size()) + " games...", g_app.rsPending,
+                     [ver](Game &g, Job &j) {
+                         std::string n, e = InstallReShade(g, ver, &n);
+                         if (!n.empty()) j.note = n;
+                         return e;
+                     },
+                     [ver](Job &j) {
+                         g_app.SetMsg("ReShade " + ver + ": " + JobSummary(j, "installed in") + (j.note.empty() ? "" : " " + j.note), j.fail != 0);
+                     });
         }
         g_app.rsPending.clear();
     }
@@ -568,21 +663,22 @@ static void DrawTop(HWND hwnd)
             "use the buttons on the right.");
     if (clicked)
     {
-        int ok = 0, fail = 0;
-        std::string firstErr;
-        if (vkOld) { std::string e = InstallVulkanLayer(g_app.src); if (e.empty()) ok++; else { fail++; firstErr = e; } }
+        std::string layerErr;
+        if (vkOld) layerErr = InstallVulkanLayer(g_app.src);
+        std::vector<std::wstring> roots;
         for (auto &g : g_app.games)
         {
             St s = StatusOf(g);
-            if ((s == St::Update || s == St::WrongBits) && g.route != Route::Vulkan)
-            {
-                std::string e = InstallOrUpdate(g, g_app.src);
-                if (e.empty()) ok++; else { fail++; if (firstErr.empty()) firstErr = g.name + ": " + e; }
-            }
+            if ((s == St::Update || s == St::WrongBits) && g.route != Route::Vulkan) roots.push_back(g.root);
         }
-        g_app.vk = DetectVulkanLayer();
-        if (fail) g_app.SetMsg("Updated " + std::to_string(ok) + ", failed " + std::to_string(fail) + ". " + firstErr, true);
-        else g_app.SetMsg("Updated " + std::to_string(ok) + ".", false);
+        StartJob("Updating BFI Presenter in " + std::to_string(roots.size()) + " games...", roots,
+                 [](Game &g, Job &) { return InstallOrUpdate(g, g_app.src); },
+                 [vkOld, layerErr](Job &j) {
+                     g_app.vk = DetectVulkanLayer();
+                     std::string m = JobSummary(j, "Updated");
+                     if (vkOld) m += layerErr.empty() ? " Vulkan layer updated." : " Vulkan layer: " + layerErr;
+                     g_app.SetMsg(m, j.fail || !layerErr.empty());
+                 });
     }
     ImGui::EndDisabled();
     ImGui::EndDisabled();
@@ -619,20 +715,24 @@ static void DrawTop(HWND hwnd)
 
 static void DrawTable(float height)
 {
-    ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY |
-                         ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable;
+    // Columns keep their own width (drag the header borders; remembered in manager_ui.ini) and the table scrolls
+    // sideways when the pane is narrower than all of them, instead of squeezing the headers to "St..." / "G-...".
+    ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+                         ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
+                         ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Sortable;
+    const float em = ImGui::GetFontSize();
     if (!ImGui::BeginTable("games", 10, tf, ImVec2(0, height))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("##pick", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize | ImGuiTableColumnFlags_NoSort, ImGui::GetFrameHeight());
-    ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_DefaultSort, 2.6f);
-    ImGui::TableSetupColumn("Store", ImGuiTableColumnFlags_WidthStretch, 0.6f);
-    ImGui::TableSetupColumn("Bits", ImGuiTableColumnFlags_WidthStretch, 0.35f);
-    ImGui::TableSetupColumn("API", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-    ImGui::TableSetupColumn("ReShade", ImGuiTableColumnFlags_WidthStretch, 0.7f);
-    ImGui::TableSetupColumn("BFI Presenter", ImGuiTableColumnFlags_WidthStretch, 0.9f);
-    ImGui::TableSetupColumn("G-SYNC", ImGuiTableColumnFlags_WidthStretch, 0.6f);
-    ImGui::TableSetupColumn("VSync", ImGuiTableColumnFlags_WidthStretch, 0.75f);
-    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch, 1.3f);
+    ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_NoHide, em * 15.0f);
+    ImGui::TableSetupColumn("Store", ImGuiTableColumnFlags_WidthFixed, em * 4.0f);
+    ImGui::TableSetupColumn("Bits", ImGuiTableColumnFlags_WidthFixed, em * 3.2f);
+    ImGui::TableSetupColumn("API", ImGuiTableColumnFlags_WidthFixed, em * 8.0f);
+    ImGui::TableSetupColumn("ReShade", ImGuiTableColumnFlags_WidthFixed, em * 5.5f);
+    ImGui::TableSetupColumn("BFI Presenter", ImGuiTableColumnFlags_WidthFixed, em * 8.5f);
+    ImGui::TableSetupColumn("G-SYNC", ImGuiTableColumnFlags_WidthFixed, em * 4.5f);
+    ImGui::TableSetupColumn("VSync", ImGuiTableColumnFlags_WidthFixed, em * 6.0f);
+    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoHide, em * 8.0f);
     std::vector<int> vis;
     for (int i = 0; i < (int)g_app.games.size(); i++)
         if (Matches(g_app.games[i], g_app.search) && (!g_app.onlyRelevant || Relevant(g_app.games[i]))) vis.push_back(i);
@@ -824,28 +924,31 @@ static bool IsGlAddon(const Game &g) { return (g.apis & ApiGL) && (g.route == Ro
 // and for OpenGL games the Vulkan/OpenGL present method to Prefer layered on DXGI swapchain.
 static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsync, bool nvGl)
 {
-    int ok = 0, fail = 0, nvFail = 0;
-    std::string firstErr, nvErr;
-    for (auto *g : list)
-    {
-        std::string e = InstallOrUpdate(*g, g_app.src);
-        if (!e.empty()) { fail++; if (firstErr.empty()) firstErr = g->name + ": " + e; continue; }
-        ok++;
-        const bool gl = nvGl && IsGlAddon(*g);
-        if (g_app.nvOk && (nvGsync || nvVsync || gl))
-        {
-            std::string ne = NvSet(*g, nvGsync ? kVrrForceOff : -2, nvVsync ? kVsyncForceOn : -2, gl ? kGlPresentLayered : -2);
-            if (!ne.empty()) { nvFail++; if (nvErr.empty()) nvErr = ne; }
-        }
-    }
-    g_app.vk = DetectVulkanLayer();
-    std::string m = (list.size() == 1 && ok == 1) ? "Installed in " + list[0]->name + "."
-                                                  : "Installed or updated " + std::to_string(ok) + ".";
-    if (fail) m += " Failed " + std::to_string(fail) + ": " + firstErr;
-    if (nvFail) m += " NVIDIA settings not changed: " + nvErr;
-    else if (ok && (nvGsync || nvVsync) && g_app.nvOk) m += std::string(" NVIDIA:") + (nvGsync ? " G-SYNC off" : "") + (nvVsync ? " VSync force on" : "") + (nvGl ? " (OpenGL: present layered on DXGI)" : "") + ".";
-    g_app.SetMsg(m, fail || nvFail);
-    if (nvFail && NvNeedsAdmin(nvErr)) g_app.needAdmin = true;
+    std::vector<std::wstring> roots;
+    for (auto *g : list) roots.push_back(g->root);
+    std::string one = list.size() == 1 ? list[0]->name : "";
+    StartJob("Installing BFI Presenter in " + std::to_string(roots.size()) + " games...", roots,
+             [nvGsync, nvVsync, nvGl](Game &g, Job &j) {
+                 std::string e = InstallOrUpdate(g, g_app.src);
+                 if (!e.empty()) return e;
+                 const bool gl = nvGl && IsGlAddon(g);
+                 if (g_app.nvOk && (nvGsync || nvVsync || gl))
+                 {
+                     std::string ne = NvSet(g, nvGsync ? kVrrForceOff : -2, nvVsync ? kVsyncForceOn : -2, gl ? kGlPresentLayered : -2);
+                     if (!ne.empty()) { j.nvFail++; if (j.nvErr.empty()) j.nvErr = ne; }
+                 }
+                 return std::string();
+             },
+             [one, nvGsync, nvVsync, nvGl](Job &j) {
+                 g_app.vk = DetectVulkanLayer();
+                 std::string m = (!one.empty() && j.ok == 1) ? "Installed in " + one + "." : JobSummary(j, "Installed or updated");
+                 if (!one.empty() && j.fail) m = "Failed: " + j.firstErr;
+                 if (j.nvFail) m += " NVIDIA settings not changed: " + j.nvErr;
+                 else if (j.ok && (nvGsync || nvVsync) && g_app.nvOk)
+                     m += std::string(" NVIDIA:") + (nvGsync ? " G-SYNC off" : "") + (nvVsync ? " VSync force on" : "") + (nvGl ? " (OpenGL: present layered on DXGI)" : "") + ".";
+                 g_app.SetMsg(m, j.fail || j.nvFail);
+                 if (j.nvFail && NvNeedsAdmin(j.nvErr)) g_app.needAdmin = true;
+             });
 }
 
 static void RequestInstall(const std::vector<Game *> &list)
@@ -922,7 +1025,7 @@ static void DrawBatch()
     std::vector<Game *> sel;
     for (auto &g : g_app.games) if (g_app.picked.count(g.root)) sel.push_back(&g);
     int nInst = 0, nRem = 0;
-    for (auto *g : sel) { if (BatchSkip(*g).empty()) nInst++; if (!g->addonPath.empty() || g->ini) nRem++; }
+    for (auto *g : sel) { if (BatchSkip(*g).empty()) nInst++; if (!g->addonPath.empty() || g->ini || !g->shaderPath.empty()) nRem++; }
 
     ImGui::Text("%d games ticked", (int)sel.size());
     ImGui::SameLine();
@@ -951,16 +1054,13 @@ static void DrawBatch()
         ImGui::TextColored(kGrey, "Every removed file is backed up; Undo last change in each game puts it back.");
         if (ImGui::Button("Remove"))
         {
-            int ok = 0, fail = 0;
-            std::string firstErr;
-            for (auto *g : sel)
-            {
-                if (g->addonPath.empty() && !g->ini) continue;
-                std::string e = Remove(*g, g_app.removeIni);
-                if (e.empty()) ok++; else { fail++; if (firstErr.empty()) firstErr = g->name + ": " + e; }
-            }
-            g_app.SetMsg("Removed from " + std::to_string(ok) + (fail ? ", failed " + std::to_string(fail) + ". " + firstErr : "."), fail != 0);
+            std::vector<std::wstring> roots;
+            for (auto *g : sel) if (!g->addonPath.empty() || g->ini || !g->shaderPath.empty()) roots.push_back(g->root);
+            bool alsoIni = g_app.removeIni;
             ImGui::CloseCurrentPopup();
+            StartJob("Removing BFI Presenter from " + std::to_string(roots.size()) + " games...", roots,
+                     [alsoIni](Game &g, Job &) { return Remove(g, alsoIni); },
+                     [](Job &j) { g_app.SetMsg(JobSummary(j, "Removed from"), j.fail != 0); });
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
@@ -1384,20 +1484,36 @@ static void DrawFrame(HWND hwnd)
     ImGuiViewport *vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
-    ImGui::Begin("main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-                                   ImGuiWindowFlags_NoBringToFrontOnFocus);
+    // (no NoSavedSettings: the game table's column widths, order and sort are kept in manager_ui.ini)
+    ImGui::Begin("main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
     DrawTop(hwnd);
+    // Table | splitter | detail pane. Drag the splitter to give either side more room; the share is remembered.
+    static float split = -1.0f;
+    if (split < 0.0f) { split = (float)_wtof(LoadSetting(L"Split", L"0.6").c_str()); if (split < 0.2f || split > 0.9f) split = 0.6f; }
     float avail = ImGui::GetContentRegionAvail().x;
-    float tableW = std::max(avail * 0.56f, avail - ImGui::GetFontSize() * 34);
+    const float sw = std::max(6.0f, ImGui::GetFontSize() * 0.4f);
+    float tableW = std::clamp(avail * split, ImGui::GetFontSize() * 12, avail - sw - ImGui::GetFontSize() * 16);
     ImGui::BeginChild("left", ImVec2(tableW, 0));
     DrawTable(ImGui::GetContentRegionAvail().y);
     ImGui::EndChild();
-    ImGui::SameLine();
+    ImGui::SameLine(0, 0);
+    ImGui::InvisibleButton("##split", ImVec2(sw, ImGui::GetContentRegionAvail().y));
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    if (ImGui::IsItemActive())
+    {
+        split = std::clamp((tableW + ImGui::GetIO().MouseDelta.x) / std::max(avail, 1.0f), 0.2f, 0.9f);
+        ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        ImGui::GetWindowDrawList()->AddRectFilled(ImVec2((a.x + b.x) * 0.5f - 1, a.y), ImVec2((a.x + b.x) * 0.5f + 1, b.y),
+                                                  ImGui::GetColorU32(ImGuiCol_SeparatorActive));
+    }
+    if (ImGui::IsItemDeactivated()) SaveSetting(L"Split", std::to_wstring(split));
+    ImGui::SameLine(0, 0);
     ImGui::BeginChild("detail", ImVec2(0, 0), ImGuiChildFlags_Borders);
     DrawDetail(hwnd);
     ImGui::EndChild();
     DrawLibraries(hwnd);
     DrawInstallQuestion();
+    DrawJob();
     ImGui::End();
 }
 
@@ -1495,7 +1611,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
-    io.IniFilename = nullptr;
+    // ImGui's own settings file: only the game table's columns (widths, order, hidden, sort) are worth keeping
+    static std::string uiIni = U8(DataDir() + L"\\manager_ui.ini");
+    io.IniFilename = uiIni.c_str();
     io.ConfigDebugHighlightIdConflicts = false;     // never show ImGui's programmer popup to users
     SetupStyle(g_dpiScale);
     LoadFonts(g_dpiScale);
@@ -1539,6 +1657,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
             ImGui_ImplDX11_InvalidateDeviceObjects();
         }
         PollWorker();
+        StepJob();
         // Using a downloaded release (not a folder picked by hand): look for a newer one once per session.
         if (g_app.scannedOnce && !g_app.checkedOnce && !g_app.busy)
         {
@@ -1555,7 +1674,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         g_ctx->ClearRenderTargetView(g_rtv, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_sc->Present(1, 0);
-        if (!g_app.busy && !ImGui::IsAnyItemActive()) MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
+        if (!g_app.busy && !g_job.active && !ImGui::IsAnyItemActive()) MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
     }
     JoinWorker();
     ImGui_ImplDX11_Shutdown();

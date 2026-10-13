@@ -674,7 +674,7 @@ static void SaveCache()
 static ExeFacts AnalyzeExe(const std::wstring &exe)
 {
     std::wstring key = Lower(exe);
-    std::wstring stamp = L"3_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
+    std::wstring stamp = L"4_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
     {
         std::lock_guard<std::mutex> l(g_cacheLock);
         LoadCache();
@@ -729,6 +729,9 @@ static ExeFacts AnalyzeExe(const std::wstring &exe)
         }
     }
     std::lock_guard<std::mutex> l(g_cacheLock);
+    // Engines link renderers the game doesn't ship on Windows (Unreal links opengl32 next to Direct3D): when the
+    // executable also uses Direct3D, OpenGL isn't the game's renderer. It stays when it is the only one (Doom 3 BFG).
+    if ((r.apis & ApiGL) && (r.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12))) r.apis &= ~ApiGL;
     g_cache[key] = { stamp, r };
     return r;
 }
