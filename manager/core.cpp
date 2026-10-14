@@ -962,7 +962,7 @@ struct PcgwEntry { long long when = 0; bool found = false; unsigned apis = 0; st
 static std::map<std::string, PcgwEntry> g_pcgw;
 static bool g_pcgwLoaded = false;
 static std::mutex g_pcgwLock;
-static std::wstring PcgwPath() { return Join(DataDir(), L"pcgw_cache.txt"); }
+static std::wstring PcgwPath() { return Join(DataDir(), L"pcgw_cache2.txt"); }   // 2: best page per AppID
 
 static std::string PcgwKey(const Game &g)
 {
@@ -1044,8 +1044,10 @@ static void PcgwParseRow(const std::string &d3d, const std::string &vk, const st
         else if (x == 1 || x == 0) continue;
         if (x >= 2) t += (t.empty() ? "Direct3D " : ", ") + std::to_string(x);
     }
-    if (!vk.empty() && LowerA(vk) != "false") { apis |= ApiVulkan; t += (t.empty() ? "" : "; ") + std::string("Vulkan"); }
-    if (!gl.empty() && LowerA(gl) != "false") { apis |= ApiGL; t += (t.empty() ? "" : "; ") + std::string("OpenGL ") + gl; }
+    // "false", "unknown", "n/a" ... in a version field: not supported (or not known to be)
+    auto yes = [](const std::string &v) { std::string l = LowerA(v); return !l.empty() && l != "false" && l != "no" && l != "unknown" && l != "n/a" && l != "na" && l != "none"; };
+    if (yes(vk)) { apis |= ApiVulkan; t += (t.empty() ? "" : "; ") + std::string("Vulkan"); }
+    if (yes(gl)) { apis |= ApiGL; t += (t.empty() ? "" : "; ") + std::string("OpenGL ") + gl; }
     text = t;
 }
 
@@ -1091,6 +1093,7 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
         if (!HttpGet(W(url), body, e)) { err = "PCGamingWiki: " + e; break; }
         std::lock_guard<std::mutex> l(g_pcgwLock);
         std::set<std::string> hit;
+        std::map<std::string, int> hitScore;   // several pages can list the same Steam AppID (mods, remasters): best name wins
         for (size_t p = 0; (p = body.find("\"title\"", p)) != std::string::npos; p += 7)
         {
             size_t end = body.find('}', p);
@@ -1111,7 +1114,14 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
                     match = list.find("," + g.appid + ",") != std::string::npos;
                 }
                 else match = LowerA(page) == LowerA(g.name);
-                if (match) { g_pcgw[PcgwKey(g)] = en; hit.insert(PcgwKey(g)); }
+                if (!match) continue;
+                // The page named like the game beats other pages with its AppID; otherwise the first page stays.
+                const int score = NormName(page) == NormName(g.name) ? 2 : 1;
+                const std::string key = PcgwKey(g);
+                if (hit.count(key) && hitScore[key] >= score) continue;
+                PcgwEntry e2 = en;
+                if (score < 2 && !page.empty()) e2.text += " (page \"" + page + "\")";
+                g_pcgw[key] = e2; hit.insert(key); hitScore[key] = score;
             }
         }
         for (size_t k = i; k < std::min(want.size(), i + batch); k++)
