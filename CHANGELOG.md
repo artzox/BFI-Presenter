@@ -7,6 +7,16 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.7] — test build
+
+- **[DX] [Vulkan] Two new game frame caps for fast displays.**
+  - **One game frame per strobe cycle**: the refresh rate ÷ Frames per cycle, for example 60 fps at 360 Hz with 6 frames, 90 fps at 360 Hz with 4, or 80 fps at 240 Hz with 3. Each game frame gets exactly one lit refresh, as Half refresh does with 2 frames at 120 Hz.
+  - **Custom**: a new game frame every `CapDivisor` refreshes (1–8).
+  - Both are counted against the presenter's refreshes like the other caps, so they stay in step with the strobe. Just-in-time release works with them whenever the interval is a whole number of strobe cycles.
+  - The overlay shows the cap's frame rate, and warns when the interval doesn't fit the cycle (some game frames would start on a dark refresh).
+  - Frame-rate limiters that only target an fps value (made for VRR) can't do this: at a rate that isn't the refresh ÷ a whole number, game frames drift across lit and dark refreshes.
+- **[Docs]** README: Special K's SDR-to-HDR doesn't work with the presenter.
+
 ## [1.0.6] — 2026-10-14 (Manager 1.3.0)
 
 - **[DX]** No changes apart from the version number.

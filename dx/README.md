@@ -95,7 +95,7 @@ Settings apply immediately. **Save to BFIPresenter.ini** keeps them; **Reload in
 
 | Control | ini key (default) | What it does |
 |---|---|---|
-| Game frame cap | `CapGameToRefresh` (1) | 0 off, 1 Refresh rate, 2 Half refresh (60 fps at 120 Hz, every frame lit once), 3 Quarter refresh (30 fps, every frame lit twice). Counted against the presenter's refreshes, so it stays in step with the strobe |
+| Game frame cap | `CapGameToRefresh` (1) | 0 off, 1 Refresh rate, 2 Half refresh (60 fps at 120 Hz, every frame lit once), 3 Quarter refresh (30 fps, every frame lit twice), 4 one game frame per strobe cycle (refresh ÷ Frames: 60 fps at 360 Hz with 6 frames, 90 fps with 4), 5 custom (refresh ÷ `CapDivisor`, 1–8; use a multiple of Frames). Counted against the presenter's refreshes, so it stays in step with the strobe |
 | Frame pacing | `FramePacing` (0) | 0 Smooth: every game frame shown once, in order, one held in reserve. 1 Lowest latency: the newest finished frame (waits up to 3 ms for an expected frame that is about to finish) |
 | Just-in-time release at Half / Quarter cap | `CapJustInTime` (1) | Each frame targets a lit refresh and the game is released at that refresh's vblank minus its measured frame time and the margin. No repeat-then-skip at Half, no 1-then-3-cycle frames at Quarter. At its limit it releases as early as the cap allows |
 | Later release at Refresh cap | `LaterRelease` (0) | Refresh cap + Lowest latency: releases the game just in time for the pick instead of a full refresh earlier, so its input is read later. Helps light games; does nothing while frames take nearly a whole refresh. Not for frame generation |

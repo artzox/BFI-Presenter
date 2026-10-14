@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.6"
+#define BFI_ADDON_VERSION "1.0.7"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -107,7 +107,9 @@ struct Settings
     float knee     = 0.75f;
     float peakNits = 1400.0f; // display peak (HDR ceiling)
     int   output   = -1;      // -1 auto, 0 SDR, 1 scRGB, 2 HDR10
-    int   gameCap  = 1;       // 0 off, 1 = refresh rate, 2 = half refresh, 3 = quarter refresh (30 fps at 120 Hz)
+    int   gameCap  = 1;       // 0 off, 1 = refresh rate, 2 = half refresh, 3 = quarter refresh (30 fps at 120 Hz),
+                              // 4 = one game frame per strobe cycle (refresh / Frames), 5 = refresh / CapDivisor
+    int   capDivisor = 3;    // cap 5: release the game every this many refreshes (1-8)
     int   ownQueue = 1;       // present on the add-on's own queue (read when a swap chain is set up)
     int   pacingMode = 0;     // 0 = smooth (every game frame shown once, in order), 1 = lowest latency (newest)
     int   maxAhead = 1;       // game may run this many frames ahead of the GPU (0 = no limit)
@@ -144,6 +146,13 @@ static char     g_dredPath[MAX_PATH] = {};
 static CRITICAL_SECTION g_cfgLock;             // guards g_shared and g_status
 static Settings g_shared;                      // edited by overlay / hotkeys, read per refresh
 static std::atomic<int> g_gameCap{1};
+static std::atomic<int> g_capPer{1};          // refreshes per game frame for the cap (0 = no cap)
+// Refreshes per game frame for a cap setting: Refresh 1, Half 2, Quarter 4,
+// per strobe cycle = Frames, custom = CapDivisor.
+static int CapPeriod(int cap, int frames, int divisor)
+{
+    return cap == 1 ? 1 : cap == 2 ? 2 : cap == 3 ? 4 : cap == 4 ? frames : cap == 5 ? divisor : 0;
+}
 static std::atomic<UINT64> g_tickCount{0};             // refreshes presented, for the game frame cap
 static std::atomic<int> g_tickSlot{0};        // strobe slot of the refresh about to be drawn at the last tick
 static std::atomic<int> g_strobeFrames{2};
@@ -207,7 +216,10 @@ static void LoadSettings(Settings &s)
     s.knee     = IniFloat("RolloffKnee", 0.75f);
     s.peakNits = IniFloat("DisplayPeakNits", 1400.0f);
     s.gameCap  = IniInt("CapGameToRefresh", 1);
-    if (s.gameCap < 0 || s.gameCap > 3) s.gameCap = 1;
+    if (s.gameCap < 0 || s.gameCap > 5) s.gameCap = 1;
+    s.capDivisor = IniInt("CapDivisor", 3);
+    if (s.capDivisor < 1) s.capDivisor = 1;
+    if (s.capDivisor > 8) s.capDivisor = 8;
     s.ownQueue = IniInt("PresentOnOwnQueue", 1);
     s.pacingMode = IniInt("FramePacing", 0) ? 1 : 0;
     s.maxAhead = IniInt("MaxFramesAhead", 1);
@@ -261,6 +273,7 @@ static void LoadSettings(Settings &s)
     GetPrivateProfileStringA("BFI", "Output", "auto", out, sizeof(out), g_iniPath);
     s.output = !_stricmp(out, "sdr") ? 0 : !_stricmp(out, "scrgb") ? 1 : !_stricmp(out, "hdr10") ? 2 : -1;
     g_gameCap.store(s.gameCap);
+    g_capPer.store(CapPeriod(s.gameCap, s.frames, s.capDivisor));
 }
 
 // When g_iniOnlyMissing is set, writes go only to keys the file doesn't have
@@ -341,6 +354,7 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("DisplayPeakNits", s.peakNits);
     IniWrite("Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto");
     IniWriteInt("CapGameToRefresh", s.gameCap);
+    IniWriteInt("CapDivisor", s.capDivisor);
     IniWriteInt("PresentOnOwnQueue", s.ownQueue);
     IniWriteInt("FramePacing", s.pacingMode);
     IniWriteInt("MaxFramesAhead", s.maxAhead);
@@ -2112,15 +2126,16 @@ static DWORD WINAPI PresenterThread(void *)
         g_releaseOnSubmit.store(s.pacingMode == 1 || s.gameCap >= 1);
         LeaveCriticalSection(&g_cfgLock);
         {
-            const int per = s.gameCap == 2 ? 2 : s.gameCap == 3 ? 4 : 1;
-            const bool capOk = s.capJit && s.gameCap >= 2 && s.frames >= 2 && per % s.frames == 0;
-            const bool llOk  = s.laterRelease && s.pacingMode == 1 && s.gameCap == 1;
+            const int per = std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
+            const bool capOk = s.capJit && per >= 2 && s.frames >= 2 && per % s.frames == 0;
+            const bool llOk  = s.laterRelease && s.pacingMode == 1 && per == 1 && s.gameCap >= 1;
             g_lrAllowed.store((capOk || llOk) && s.pacing && !vsyncOverridden && output);
             g_lrWindow.store(per / (modeHz > 0.0 ? modeHz : 120.0));
         }
         g_lrBaseMs.store(s.laterReleaseMs);
         g_lrPeriod.store(1.0 / (modeHz > 0.0 ? modeHz : 120.0));
         g_gameCap.store(s.gameCap);
+    g_capPer.store(CapPeriod(s.gameCap, s.frames, s.capDivisor));
 
         PresStage(ST_VBLANK);
         // Timing log, switchable at any time from the overlay. Each session
@@ -2284,7 +2299,7 @@ static DWORD WINAPI PresenterThread(void *)
         if (cycleStart && lastShownId && pickId >= lastShownId)
         {
             const int step = (int)(pickId - lastShownId);
-            if (s.gameCap == 3) { if (step >= 2) secSkipU++; }        // Quarter: 0/1 alternate normally
+            if (CapPeriod(s.gameCap, s.frames, s.capDivisor) > s.frames) { if (step >= 2) secSkipU++; }   // frame lit over several cycles: 0/1 steps are normal
             else
             {
                 const int expect = std::max(1, (int)std::floor(llStep + 0.5));
@@ -3143,7 +3158,7 @@ static HRESULT SubmitGameFrameLocked()
     // Release the game every 1, 2 or 4 refreshes, counted against the
     // presenter's refreshes so the rate is exact and stays in step with the
     // strobe (a game that runs slower is simply released when it arrives).
-    const UINT64 per = cap == 1 ? 1 : cap == 2 ? 2 : cap == 3 ? 4 : 0;
+    const UINT64 per = cap >= 1 ? (UINT64)std::max(0, g_capPer.load()) : 0;
     if (per && g_running.load()) CapWait(per);
 
     const double since = Now() - g_lastPresentT.load();
@@ -4785,7 +4800,7 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
     g_gtAhead = Now();
     if (g_releaseOnSubmit.load()) ReleaseUpTo(g_frameId);   // lowest latency: the game is not paced by the strobe
     const int cap = g_gameCap.load();
-    const UINT64 per = cap == 1 ? 1 : cap == 2 ? 2 : cap == 3 ? 4 : 0;
+    const UINT64 per = cap >= 1 ? (UINT64)std::max(0, g_capPer.load()) : 0;
     if (per && g_running.load()) CapWait(per);
     g_gtExit = Now();
     WriteGameLog();
@@ -6330,7 +6345,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         // Only when it persists: a stray repeat now and then is not worth a warning.
         if (st.unevenRep + st.unevenSkip >= 3)
         {
-            const double capRate = st.refreshHz / (s.gameCap == 2 ? 2.0 : s.gameCap == 3 ? 4.0 : 1.0);
+            const double capRate = st.refreshHz / std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
             if (s.gameCap >= 1 && st.gameFps < 0.97 * capRate)
                 ImGui::TextColored(kAmber, "The game is below the cap's frame rate (%.0f of %.0f fps): motion stutters.\n"
                                    "Lower its settings or resolution, or use a lower cap (Half refresh).", st.gameFps, capRate);
@@ -6401,8 +6416,25 @@ static void draw_overlay(reshade::api::effect_runtime *)
     // ================================================================ 3. frame pacing and latency
     if (ImGui::CollapsingHeader("Frame pacing and latency", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::Combo("Game frame cap", &s.gameCap, "Off\0Refresh rate\0Half refresh (one game frame per lit + dark pair)\0Quarter refresh (30 fps at 120 Hz)\0");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it.\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI, and the best choice when the game can't hold 120. With frame generation use Refresh rate:\nHalf throws away half the generated frames.");
+        ImGui::Combo("Game frame cap", &s.gameCap, "Off\0Refresh rate\0Half refresh (one game frame per lit + dark pair)\0Quarter refresh (30 fps at 120 Hz)\0One game frame per strobe cycle (refresh / Frames)\0Custom (refresh / divisor)\0");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it.\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI, and the best choice when the game can't hold 120. With frame generation use Refresh rate:\nHalf throws away half the generated frames.\nOne game frame per strobe cycle: refresh / Frames per cycle -- 60 fps at 360 Hz with 6 frames,\n90 fps at 360 Hz with 4, 80 fps at 240 Hz with 3.\nCustom: the game gets a new frame every N refreshes.");
+        if (s.gameCap == 5)
+        {
+            ImGui::Indent(16.0f);
+            ImGui::SliderInt("Refreshes per game frame", &s.capDivisor, 1, 8);
+            ImGui::Unindent(16.0f);
+        }
+        {
+            const int per = CapPeriod(s.gameCap, s.frames, s.capDivisor);
+            if (per >= 1)
+            {
+                const double hz = st.refreshHz > 1.0 ? st.refreshHz : 0.0;
+                if (hz > 0.0) ImGui::Text("Cap: %.0f fps (a new game frame every %d refresh%s)", hz / per, per, per == 1 ? "" : "es");
+                if (per >= 2 && per % s.frames != 0)
+                    ImGui::TextColored(kAmber, "%d refreshes per game frame doesn't fit %d frames per cycle: some game frames start\n"
+                                       "on a dark refresh and motion judders. Use a multiple of %d.", per, s.frames, s.frames);
+            }
+        }
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest latency shows the newest frame -- best at the Refresh cap.\nSmooth holds up to one finished frame in reserve (about one refresh more latency) so every\nframe is lit once and in order -- it only helps at the Half or Quarter cap.");
         if (s.pacingMode == 0)
@@ -6415,14 +6447,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "latency -- a second stutter shortly after the first.");
         }
         bool cj = s.capJit != 0;
-        if (ImGui::Checkbox("Just-in-time release at Half / Quarter cap", &cj)) s.capJit = cj ? 1 : 0;
+        if (ImGui::Checkbox("Just-in-time release at caps below the refresh rate", &cj)) s.capJit = cj ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Releases the game for each frame at the lit refresh minus its measured frame time and a\n"
                                                       "margin, so every frame lands on the same lit refresh: no repeat-then-skip at Half, no\n"
                                                       "1-then-3 cycle frames at Quarter. Light games also get fresher frames.");
         bool lr = s.laterRelease != 0;
         if (ImGui::Checkbox("Later release at Refresh cap (Lowest latency, no frame generation)", &lr)) s.laterRelease = lr ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lets the game start each frame just in time for the refresh that shows it, instead of\na full refresh earlier, so its input is read later -- up to ~5 ms less latency in games\nthat render well within a refresh. Does nothing while frames take nearly a whole refresh.");
-        if (s.laterRelease || (s.capJit && s.gameCap >= 2))
+        if (s.laterRelease || (s.capJit && CapPeriod(s.gameCap, s.frames, s.capDivisor) >= 2))
         {
             ImGui::Indent(16.0f);
             ImGui::SliderFloat("Just-in-time safety margin (ms)", &s.laterReleaseMs, 0.5f, 5.0f, "%.1f");
@@ -6498,6 +6530,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         g_shared = s;
         LeaveCriticalSection(&g_cfgLock);
         g_gameCap.store(s.gameCap);
+    g_capPer.store(CapPeriod(s.gameCap, s.frames, s.capDivisor));
         if (!s.autoAhead) g_maxAhead.store(s.maxAhead);
         g_virtualStats.store(s.virtualStats);
     }

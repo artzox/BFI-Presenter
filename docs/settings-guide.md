@@ -95,6 +95,8 @@ Limits how fast the game runs so it stays in step with the flashing.
 - **Refresh rate** (120 fps at 120 Hz): for games that easily hold 120.
 - **Half refresh** (60 fps): for games that can't hold 120. Every game image gets exactly one flash, which is the smoothest look.
 - **Quarter** (30 fps): for very heavy games; each image is flashed twice, evenly.
+- **One game frame per strobe cycle**: the refresh rate divided by Frames per cycle. Made for fast displays with longer cycles: 60 fps at 360 Hz with 6 frames, 90 fps at 360 Hz with 4, 80 fps at 240 Hz with 3. Each game image gets exactly one flash.
+- **Custom** (`CapDivisor`): a new game image every N refreshes (1–8). Pick a multiple of Frames per cycle, or some images start on a dark refresh and motion judders; the overlay warns when it doesn't fit.
 - **Off**: no limit (not recommended).
 
 *When to change it:* if the game can hold 120, use Refresh. If it dips below, use Half. With frame generation (DLSS FG, FSR FG, Lossless Scaling) always use Refresh, never Half.

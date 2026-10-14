@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.6"
+#define BFI_VERSION "1.0.7"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -256,7 +256,9 @@ struct Settings
     float knee     = 0.75f;
     float peakNits = 1400.0f; // display peak (HDR ceiling)
     int   output   = -1;      // -1 auto, 0 SDR, 1 scRGB, 2 HDR10
-    int   gameCap  = 1;       // 0 off, 1 refresh rate, 2 half refresh, 3 quarter refresh
+    int   gameCap  = 1;       // 0 off, 1 refresh rate, 2 half refresh, 3 quarter refresh,
+                              // 4 one game frame per strobe cycle (refresh / Frames), 5 refresh / CapDivisor
+    int   capDivisor = 3;    // cap 5: release the game every this many refreshes (1-8)
     int   pacingMode = 0;     // 0 smooth (every game frame once, in order), 1 lowest latency (newest)
     int   capJit   = 1;       // Half / Quarter cap: release just in time for the lit refresh
     int   laterRelease = 0;   // Refresh cap + Lowest latency: release just in time for the pick
@@ -298,6 +300,13 @@ static float KvFloat(const std::map<std::string, std::string> &kv, const char *k
 }
 template <class T> static T Clamp(T v, T lo, T hi) { return v < lo ? lo : v > hi ? hi : v; }
 
+// Refreshes per game frame for a cap setting: Refresh 1, Half 2, Quarter 4,
+// per strobe cycle = Frames, custom = CapDivisor.
+static int CapPeriod(int cap, int frames, int divisor)
+{
+    return cap == 1 ? 1 : cap == 2 ? 2 : cap == 3 ? 4 : cap == 4 ? frames : cap == 5 ? divisor : 0;
+}
+
 static void LoadSettings(Settings &s)
 {
     const auto kv = ReadIni();
@@ -315,7 +324,8 @@ static void LoadSettings(Settings &s)
     s.knee     = KvFloat(kv, "RolloffKnee", 0.75f);
     s.peakNits = Clamp(KvFloat(kv, "DisplayPeakNits", 1400.0f), 80.0f, 10000.0f);
     s.gameCap  = KvInt(kv, "CapGameToRefresh", 1);
-    if (s.gameCap < 0 || s.gameCap > 3) s.gameCap = 1;
+    if (s.gameCap < 0 || s.gameCap > 5) s.gameCap = 1;
+    s.capDivisor = Clamp(KvInt(kv, "CapDivisor", 3), 1, 8);
     s.pacingMode = KvInt(kv, "FramePacing", 0) ? 1 : 0;
     s.capJit = KvInt(kv, "CapJustInTime", 1) ? 1 : 0;
     s.laterRelease = KvInt(kv, "LaterRelease", 0) ? 1 : 0;
@@ -355,7 +365,7 @@ static void LoadSettings(Settings &s)
     I("CapJustInTime", s.capJit); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
-    I("CapGameToRefresh", s.gameCap); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
+    I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
     I("AutoFramesAhead", s.autoAhead); I("SmoothCatchUp", s.smoothCatchUp); I("PresenterBuffers", s.presBuffers); I("AblGuard", s.ablGuard);
     I("AblGuardBudgetNits", s.ablBudget); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs);
     I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue);
@@ -1360,9 +1370,9 @@ static void PresenterThread(Swapchain *sc)
             // Just-in-time release: Half / Quarter cap (any pacing) when the
             // cap interval is a whole number of strobe cycles, or the Refresh
             // cap with Lowest latency + Later release. Needs vblank ticks.
-            const int per = s.gameCap == 2 ? 2 : s.gameCap == 3 ? 4 : 1;
-            const bool capOk = s.capJit && s.gameCap >= 2 && s.frames >= 2 && per % s.frames == 0;
-            const bool llOk  = s.laterRelease && s.pacingMode == 1 && s.gameCap == 1;
+            const int per = std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
+            const bool capOk = s.capJit && per >= 2 && s.frames >= 2 && per % s.frames == 0;
+            const bool llOk  = s.laterRelease && s.pacingMode == 1 && per == 1 && s.gameCap >= 1;
             const double hz = vb.modeHz > 0.0 ? vb.modeHz : 120.0;
             sc->period.store(1.0 / hz);
             sc->lrWindow.store(per / hz);
@@ -1469,7 +1479,7 @@ static void PresenterThread(Swapchain *sc)
                     if (lastShownId && pickId >= lastShownId)
                     {
                         const int step = (int)(pickId - lastShownId);
-                        if (s.gameCap == 3) { if (step >= 2) secSkipU++; }   // Quarter: 0/1 alternate normally
+                        if (CapPeriod(s.gameCap, s.frames, s.capDivisor) > s.frames) { if (step >= 2) secSkipU++; }   // frame lit over several cycles: 0/1 steps are normal
                         else
                         {
                             const int expect = std::max(1, (int)std::floor(llStep + 0.5));
@@ -2345,11 +2355,12 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
     }
     // Frame cap: release the game every 1, 2 or 4 refreshes, counted against
     // the presenter's refreshes so it stays in step with the strobe.
-    int cap, pacingLL;
+    int cap, pacingLL, capPer;
     {
         std::lock_guard<std::mutex> l(g_cfgLock);
         cap = g_shared.gameCap;
         pacingLL = g_shared.pacingMode;
+        capPer = CapPeriod(g_shared.gameCap, g_shared.frames, g_shared.capDivisor);
     }
     // Lowest latency, and Smooth with a frame cap: the game's present counts
     // as done once it is handed over, not when the strobe takes it. Completing
@@ -2364,7 +2375,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
         }
         sc->presIdCv.notify_all();
     }
-    const uint64_t per = cap == 1 ? 1 : cap == 2 ? 2 : cap == 3 ? 4 : 0;
+    const uint64_t per = cap >= 1 ? (uint64_t)std::max(0, capPer) : 0;
     if (per && sc->running.load()) CapWait(sc, per);
     const int st2 = sc->status.load();
     if (st2 != VK_SUCCESS) return (VkResult)st2;
@@ -3472,7 +3483,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::TextColored(kAmber, "Hitch guard: BFI paused (loading or missed refreshes)");
         if (st.unevenRep + st.unevenSkip >= 3)
         {
-            const double capRate = st.refreshHz / (s.gameCap == 2 ? 2.0 : s.gameCap == 3 ? 4.0 : 1.0);
+            const double capRate = st.refreshHz / std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
             if (s.gameCap >= 1 && st.gameFps < 0.97 * capRate)
                 ImGui::TextColored(kAmber, "The game is below the cap's frame rate (%.0f of %.0f fps): motion stutters.\n"
                                    "Lower its settings or resolution, or use a lower cap (Half refresh).", st.gameFps, capRate);
@@ -3553,8 +3564,25 @@ static void draw_overlay(reshade::api::effect_runtime *)
     // ================================================================ 3. frame pacing and latency
     if (ImGui::CollapsingHeader("Frame pacing and latency", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::Combo("Game frame cap", &s.gameCap, "Off\0Refresh rate\0Half refresh (one game frame per lit + dark pair)\0Quarter refresh (30 fps at 120 Hz)\0");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it.\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI, and the best choice when the game can't hold 120. With frame generation use Refresh rate:\nHalf throws away half the generated frames.");
+        ImGui::Combo("Game frame cap", &s.gameCap, "Off\0Refresh rate\0Half refresh (one game frame per lit + dark pair)\0Quarter refresh (30 fps at 120 Hz)\0One game frame per strobe cycle (refresh / Frames)\0Custom (refresh / divisor)\0");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it.\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI, and the best choice when the game can't hold 120. With frame generation use Refresh rate:\nHalf throws away half the generated frames.\nOne game frame per strobe cycle: refresh / Frames per cycle -- 60 fps at 360 Hz with 6 frames,\n90 fps at 360 Hz with 4, 80 fps at 240 Hz with 3.\nCustom: the game gets a new frame every N refreshes.");
+        if (s.gameCap == 5)
+        {
+            ImGui::Indent(16.0f);
+            ImGui::SliderInt("Refreshes per game frame", &s.capDivisor, 1, 8);
+            ImGui::Unindent(16.0f);
+        }
+        {
+            const int per = CapPeriod(s.gameCap, s.frames, s.capDivisor);
+            if (per >= 1)
+            {
+                const double hz = st.refreshHz > 1.0 ? st.refreshHz : 0.0;
+                if (hz > 0.0) ImGui::Text("Cap: %.0f fps (a new game frame every %d refresh%s)", hz / per, per, per == 1 ? "" : "es");
+                if (per >= 2 && per % s.frames != 0)
+                    ImGui::TextColored(kAmber, "%d refreshes per game frame doesn't fit %d frames per cycle: some game frames start\n"
+                                       "on a dark refresh and motion judders. Use a multiple of %d.", per, s.frames, s.frames);
+            }
+        }
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest latency shows the newest frame -- best at the Refresh cap.\nSmooth holds up to one finished frame in reserve (about one refresh more latency) so every\nframe is lit once and in order -- it only helps at the Half or Quarter cap.");
         if (s.pacingMode == 0)
@@ -3567,14 +3595,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "latency -- a second stutter shortly after the first.");
         }
         bool cj = s.capJit != 0;
-        if (ImGui::Checkbox("Just-in-time release at Half / Quarter cap", &cj)) s.capJit = cj ? 1 : 0;
+        if (ImGui::Checkbox("Just-in-time release at caps below the refresh rate", &cj)) s.capJit = cj ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Releases the game for each frame at the lit refresh minus its measured frame time and a\n"
                                                       "margin, so every frame lands on the same lit refresh: no repeat-then-skip at Half, no\n"
                                                       "1-then-3 cycle frames at Quarter. Light games also get fresher frames.");
         bool lr = s.laterRelease != 0;
         if (ImGui::Checkbox("Later release at Refresh cap (Lowest latency, no frame generation)", &lr)) s.laterRelease = lr ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lets the game start each frame just in time for the refresh that shows it, instead of\na full refresh earlier, so its input is read later -- up to ~5 ms less latency in games\nthat render well within a refresh. Does nothing while frames take nearly a whole refresh.");
-        if (s.laterRelease || (s.capJit && s.gameCap >= 2))
+        if (s.laterRelease || (s.capJit && CapPeriod(s.gameCap, s.frames, s.capDivisor) >= 2))
         {
             ImGui::Indent(16.0f);
             ImGui::SliderFloat("Just-in-time safety margin (ms)", &s.laterReleaseMs, 0.5f, 5.0f, "%.1f");
