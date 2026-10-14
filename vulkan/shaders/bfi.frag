@@ -138,5 +138,13 @@ void main()
         if (w > 0.0) o = mix(o, Strobe(lin, (pc.slot + pc.frames - nb) % pc.frames, litGain), w);
     }
     else o = Strobe(lin, pc.slot, litGain);
+    if (pc.soften > 0.0 && pc.method < 2u)
+    {
+        // LCD phase swap: fade toward the steady average picture (the hitch guard's), which keeps the light
+        // of every cycle the same while the strobe's depth goes down and back up.
+        float a = 0.0;
+        for (uint j = 0u; j < 8u; j++) if (j < pc.frames) a += Target(j, litGain, pc.dfloor);
+        o = mix(o, lin * (a / float(pc.frames)), pc.soften);
+    }
     outColor = vec4(Encode(o), 1.0);
 }
