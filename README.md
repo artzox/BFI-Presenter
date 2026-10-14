@@ -73,6 +73,9 @@ More in the [DX reference](dx/README.md#recommended-setups).
 
 If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that off (`ENABLE_DECAY=0`) so the two don't stack.
 
+> [!IMPORTANT]
+> **Special K's SDR-to-HDR (HDR retrofit) does not work with the presenter.** Special K applies its HDR processing, and draws its menu, in its own Present hook, and the presenter takes the game's frames before that hook runs. The image then reaches the display unprocessed but flagged as HDR, and looks heavily over-contrasted, and Special K's menu doesn't open. For SDR games in HDR use **RTX HDR** or a ReShade AutoHDR effect (for example Pumbo's AutoHDR add-on with AdvancedAutoHDR) instead, and turn Special K off for that game (in SKIF, stop global injection or blacklist the game's `.exe`).
+
 ## Documentation
 
 - [DX add-on reference](dx/README.md): how it works, every overlay setting, ini-only keys, hotkeys, files written, known limits.
