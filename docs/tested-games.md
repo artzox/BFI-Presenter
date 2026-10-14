@@ -315,7 +315,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### P.T. (native PC port)
 
-- A Vulkan game: use the Vulkan layer (`BFIPresenter.ini` next to `pt.exe`) and nothing else in the folder. With ReShade installed as `dxgi.dll` and the DX add-on next to it, NVIDIA's Vulkan driver presented through a hidden DXGI swap chain that ReShade, the add-on and RTSS all hooked, and the game crashed in the driver half a second after BFI started.
+- A Vulkan game: use the Vulkan layer (`BFIPresenter.ini` next to `pt.exe`) and nothing else in the folder. Manager 1.2.0 took it for a DirectX game (the SDL library next to it names every renderer) and installed ReShade as `dxgi.dll` and the DX add-on; with those, NVIDIA's Vulkan driver presented through a hidden DXGI swap chain that ReShade, the add-on and RTSS all hooked, and the game crashed in the driver half a second after BFI started.
 - Without ReShade, change settings in `BFIPresenter.ini` and reload with Ctrl+Shift+R (as in DOOM Eternal).
 - With ray tracing on: Half refresh + Lowest latency + Just-in-time release for smooth motion.
 

@@ -675,7 +675,7 @@ static void SaveCache()
 static ExeFacts AnalyzeExe(const std::wstring &exe)
 {
     std::wstring key = Lower(exe);
-    std::wstring stamp = L"5_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
+    std::wstring stamp = L"6_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
     {
         std::lock_guard<std::mutex> l(g_cacheLock);
         LoadCache();
@@ -709,7 +709,8 @@ static ExeFacts AnalyzeExe(const std::wstring &exe)
         static const wchar_t *skip[] = { L"dxgi", L"d3d9", L"d3d10", L"d3d11", L"d3d12", L"opengl32", L"vulkan-1", L"dinput8",
             L"version", L"winmm", L"dbghelp", L"reshade", L"optiscaler", L"d3dcompiler", L"dxcompiler", L"dxil", L"nvngx",
             L"sl.", L"amd_", L"ffx", L"libxess", L"xess", L"nvapi", L"gfsdk", L"steam_api", L"eossdk", L"galaxy", L"discord",
-            L"bink", L"fmod", L"wwise", L"physx", L"openal", L"dstorage", L"nvidia", L"igxess", L"renderdoc" };
+            L"bink", L"fmod", L"wwise", L"physx", L"openal", L"dstorage", L"nvidia", L"igxess", L"renderdoc",
+            L"sdl" };   // SDL names every renderer it could use (d3d11, d3d12, opengl32, vulkan-1): says nothing about the game's
         // DLLs next to the exe and in the usual sub-folders (FNA's x86/x64, lib, bin), and HashLink's .hdll
         // modules (Dead Cells). Imports first; if none of them names a graphics API, the renderer loads it at run
         // time, so look for the API's DLL name in their strings too.
@@ -1317,12 +1318,22 @@ void Detect(Game &g)
     else if (g.shaderRecommended && g.addonPath.empty() && (g.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL)))
         g.route = Route::Shader;                                                          // the tested list suggests it
     else if (g.dxvk) g.route = Route::Vulkan;
+    // The executable itself can only load Vulkan: that beats a store page or wiki listing Direct3D too (P.T. port).
+    else if ((g.exeApis & ApiVulkan) && !(g.exeApis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL))) g.route = Route::Vulkan;
     else if ((g.apis & ApiVulkan) && g.tested.find("(Vulkan") != std::string::npos) g.route = Route::Vulkan;
     else if (dxApis) g.route = g.bits == 32 ? Route::Addon32 : Route::Addon64;
     else if (g.apis & ApiVulkan) g.route = Route::Vulkan;
     else if (g.apis & ApiD3D10) g.route = Route::Unsupported;
     else g.route = g.bits == 32 ? Route::Addon32 : g.bits == 64 ? Route::Addon64 : Route::Unknown;
 
+    if (g.route == Route::Vulkan && (g.reshade || !g.addonPath.empty()))
+    {
+        std::string what = g.reshade ? "ReShade as " + U8(NameOf(g.reshadeDll.path)) : "";
+        if (!g.addonPath.empty()) what += (what.empty() ? "" : " and ") + std::string("the DX add-on");
+        g.notes.push_back("Vulkan game with " + what + " in its folder: remove them (Remove, Undo or by hand). They hook the "
+                          "hidden DXGI swap chain NVIDIA's Vulkan driver presents through, next to the Vulkan layer -- P.T. crashed "
+                          "this way. For ReShade effects use ReShade's own setup with its Vulkan option.");
+    }
     if (Exists(Join(dir, L"FNA.dll")))
         g.notes.push_back("FNA game: add --graphics D3D11 to its launch options so ReShade (as dxgi.dll) and BFI Presenter run "
                           "on Direct3D 11 (the game's log.txt shows the driver in use).");

@@ -7,6 +7,11 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## Manager — unreleased
+
+- **[Manager] Vulkan games that ship SDL are no longer taken for DirectX games** (P.T. native port). SDL's DLL names every renderer it could use, so it is now left out of the API scan, and an executable that can only load Vulkan goes to the Vulkan layer even when a wiki lists Direct3D too. Before, such a game got ReShade as `dxgi.dll` and the DX add-on, and crashed.
+- **[Manager] Warning for Vulkan games with a DirectX ReShade or the DX add-on in their folder**, with what to remove.
+
 ## Manager 1.2.0 — 2026-10-13
 
 - **[Manager] Batch actions no longer freeze the window.** Update outdated, Install / update and Remove for ticked games, and installing ReShade in many games now run a few games per frame with a progress dialog (game n of N, the current game, a Stop button) instead of blocking until the last game is done.
