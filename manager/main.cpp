@@ -1365,7 +1365,7 @@ static void DrawDetail(HWND)
                 else g_app.SetMsg(e, true);
             }
             Tooltip("Vulkan games use ReShade's system-wide Vulkan layer, which loads in a game that has a ReShade.ini next to its exe. "
-                    "Turn on writes that file (and lists the game in ReShade's own setup); Turn off removes it (backed up, Undo works). "
+                    "Turn on writes that file (and, with administrator rights, lists the game in ReShade's own setup); Turn off removes it (backed up, Undo works). "
                     "With ReShade on, the BFI Presenter (Vulkan) tab in its overlay changes the settings live.");
         }
         ImGui::PopTextWrapPos();
