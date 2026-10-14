@@ -253,7 +253,7 @@ struct Settings
     int   rolling  = 0;       // rolling scan: one band per sub-frame, rolling down the screen
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
-    int   lcdSwapSec = 10;   // seconds between phase shifts (1-60)
+    int   lcdSwapSec = 30;   // seconds between phase shifts (1-300)
     float rollSeam = 0.08f;   // blended zone between bands, fraction of the screen height
     float rollDecay = 0.0f;   // rolling scan phosphor decay, in sub-frames (0 = hard bands + seam)
     float knee     = 0.75f;
@@ -323,7 +323,7 @@ static void LoadSettings(Settings &s)
     s.rolloff  = KvInt(kv, "HighlightRolloff", 1);
     s.rolling  = KvInt(kv, "RollingScan", 0) ? 1 : 0;
     s.lcdSwap  = KvInt(kv, "LcdPhaseSwap", 0) ? 1 : 0;
-    s.lcdSwapSec = Clamp(KvInt(kv, "LcdPhaseSwapSeconds", 10), 1, 60);
+    s.lcdSwapSec = Clamp(KvInt(kv, "LcdPhaseSwapSeconds", 30), 1, 300);
     s.rollSeam = Clamp(KvFloat(kv, "RollingSeam", 0.08f), 0.0f, 0.5f);
     s.rollDecay = Clamp(KvFloat(kv, "RollingPhosphorDecay", 0.0f), 0.0f, 1.0f);
     s.knee     = KvFloat(kv, "RolloffKnee", 0.75f);
@@ -1252,6 +1252,7 @@ static void PresenterThread(Swapchain *sc)
     // LCD phase swap: refreshes held back from the strobe count (see the DX add-on).
     uint64_t phaseShift = 0;
     double   lastPhaseSwapT = 0.0;
+    bool     phaseFill = false;      // this refresh is the one the phase swap inserts
     uint64_t bufSub[kMaxImg] = {}, bufFrame[kMaxImg] = {};
     Constants bufConst[kMaxImg] = {};
     bool bufValid[kMaxImg] = {};
@@ -1520,6 +1521,9 @@ static void PresenterThread(Swapchain *sc)
         c.frames = (uint32_t)s.frames;
         c.slot   = slotNow;
         c.method = (!s.enabled || copyMode) ? 2u : hitchPaused ? 3u : (uint32_t)s.method;
+        // The refresh a phase swap inserts shows the strobe's average brightness (as the hitch guard does), not a
+        // second dark refresh: two dark refreshes in a row are a visible flicker, an average one keeps the light even.
+        if (phaseFill && c.method < 2u) c.method = 3u;
 
         // ABL guard (HDR): read the last measurement once its draw is done and
         // find the highest lit-refresh ceiling whose screen average stays
@@ -1775,6 +1779,8 @@ static void PresenterThread(Swapchain *sc)
             if (doneSub > sc->presDoneSub.load()) sc->presDoneSub.store(doneSub);
         }
         presents++;
+        const bool wasFill = phaseFill;
+        phaseFill = false;
         // LCD phase swap: with an even cycle every lit refresh gets the same LCD drive polarity (DC bias, image
         // retention on IPS/VA). Every few seconds, after a dark refresh, repeat it once to move the lit refreshes
         // to the other polarity.
@@ -1782,10 +1788,11 @@ static void PresenterThread(Swapchain *sc)
         {
             const double tNow = Now();
             if (lastPhaseSwapT <= 0.0) lastPhaseSwapT = tNow;
-            else if (slotNow == (uint32_t)s.frames - 1 && tNow - lastPhaseSwapT >= (double)s.lcdSwapSec)
+            else if (!wasFill && slotNow == (uint32_t)s.frames - 1 && tNow - lastPhaseSwapT >= (double)s.lcdSwapSec)
             {
                 phaseShift++;
                 lastPhaseSwapT = tNow;
+                phaseFill = true;          // the next refresh (the repeated slot) is the filler
             }
         }
         if (!vblank && !primeIter)
@@ -3537,13 +3544,13 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("For LCD monitors (IPS, VA, TN) -- not needed on OLED.\n"
                                                       "An LCD drives each refresh with the opposite voltage of the one before. With an even\n"
                                                       "number of frames per cycle every lit refresh gets the same voltage, and the panel can\n"
-                                                      "keep a ghost of the image (temporary image retention). This repeats one dark refresh\n"
+                                                      "keep a ghost of the image (temporary image retention). This inserts one refresh\n"
                                                       "every few seconds, so the lit refreshes alternate between the two voltages.\n"
-                                                      "Costs one slightly longer dark moment per interval.");
+                                                      "The inserted refresh shows the average brightness, like the hitch guard: a brief, slight blur once per interval.");
         if (s.lcdSwap)
         {
             ImGui::Indent(16.0f);
-            ImGui::SliderInt("Seconds between phase swaps", &s.lcdSwapSec, 1, 60);
+            ImGui::SliderInt("Seconds between phase swaps", &s.lcdSwapSec, 1, 300);
             if (s.frames % 2) ImGui::TextDisabled("Odd frames per cycle: the lit refresh already alternates, nothing to do.");
             ImGui::Unindent(16.0f);
         }

@@ -104,7 +104,7 @@ struct Settings
     int   rolling  = 0;       // rolling scan: one band per sub-frame, rolling down the screen
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
-    int   lcdSwapSec = 10;   // seconds between phase shifts (1-60)
+    int   lcdSwapSec = 30;   // seconds between phase shifts (1-300)
     float rollSeam = 0.08f;   // blended zone between bands, fraction of the screen height
     float rollDecay = 0.0f;   // rolling scan phosphor decay, in sub-frames (0 = off: hard bands + seam)
     float knee     = 0.75f;
@@ -211,9 +211,9 @@ static void LoadSettings(Settings &s)
     s.rolloff  = IniInt("HighlightRolloff", 1);
     s.rolling  = IniInt("RollingScan", 0) ? 1 : 0;
     s.lcdSwap  = IniInt("LcdPhaseSwap", 0) ? 1 : 0;
-    s.lcdSwapSec = IniInt("LcdPhaseSwapSeconds", 10);
+    s.lcdSwapSec = IniInt("LcdPhaseSwapSeconds", 30);
     if (s.lcdSwapSec < 1) s.lcdSwapSec = 1;
-    if (s.lcdSwapSec > 60) s.lcdSwapSec = 60;
+    if (s.lcdSwapSec > 300) s.lcdSwapSec = 300;
     s.rollSeam = IniFloat("RollingSeam", 0.08f);
     if (s.rollSeam < 0.0f) s.rollSeam = 0.0f;
     if (s.rollSeam > 0.5f) s.rollSeam = 0.5f;
@@ -2060,6 +2060,7 @@ static DWORD WINAPI PresenterThread(void *)
     // refresh once, so with an even cycle the lit refresh moves to the panel's other drive polarity.
     uint64_t phaseShift = 0;
     double   lastPhaseSwapT = 0.0;
+    bool     phaseFill = false;      // this refresh is the one the phase swap inserts
     int secFrameRepeats = 0, secFrameSkips = 0, extraCycles = 0;
     // Strobe cycles whose step differs from the expected one: at the Refresh
     // cap at 120 fps every lit refresh moves on 2 frames (the one between is
@@ -2344,6 +2345,9 @@ static DWORD WINAPI PresenterThread(void *)
         c.frames  = (uint32_t)s.frames;
         c.slot    = slotNow;
         c.method  = !s.enabled ? 2u : hitchPaused ? 3u : (uint32_t)s.method;
+        // The refresh a phase swap inserts shows the strobe's average brightness (as the hitch guard does), not a
+        // second dark refresh: two dark refreshes in a row are a visible flicker, an average one keeps the light even.
+        if (phaseFill && c.method < 2u) c.method = 3u;
         // ABL guard: read the last measurement (non-blocking) and steer the
         // boost so a lit refresh stays under AblGuardNits on average -- never
         // below 0.5 (the lit refresh then equals the original image).
@@ -2526,6 +2530,8 @@ static DWORD WINAPI PresenterThread(void *)
             break;
         }
         presents++;
+        const bool wasFill = phaseFill;
+        phaseFill = false;
         // LCD phase swap: an LCD drives each refresh with the opposite polarity of the one before. With an
         // even cycle (lit, dark) every lit refresh gets the same polarity, the panel sees a DC bias and ions
         // build up in the liquid crystal: image retention ("burn-in") on IPS/VA. Every few seconds, after a
@@ -2534,10 +2540,11 @@ static DWORD WINAPI PresenterThread(void *)
         {
             const double tNow = Now();
             if (lastPhaseSwapT <= 0.0) lastPhaseSwapT = tNow;
-            else if (slotNow == (uint32_t)s.frames - 1 && tNow - lastPhaseSwapT >= (double)s.lcdSwapSec)
+            else if (!wasFill && slotNow == (uint32_t)s.frames - 1 && tNow - lastPhaseSwapT >= (double)s.lcdSwapSec)
             {
                 phaseShift++;
                 lastPhaseSwapT = tNow;
+                phaseFill = true;          // the next refresh (the repeated slot) is the filler
             }
         }
         if (!tickedAtVb)
@@ -6406,13 +6413,13 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("For LCD monitors (IPS, VA, TN) -- not needed on OLED.\n"
                                                       "An LCD drives each refresh with the opposite voltage of the one before. With an even\n"
                                                       "number of frames per cycle every lit refresh gets the same voltage, and the panel can\n"
-                                                      "keep a ghost of the image (temporary image retention). This repeats one dark refresh\n"
+                                                      "keep a ghost of the image (temporary image retention). This inserts one refresh\n"
                                                       "every few seconds, so the lit refreshes alternate between the two voltages.\n"
-                                                      "Costs one slightly longer dark moment per interval.");
+                                                      "The inserted refresh shows the average brightness, like the hitch guard: a brief, slight blur once per interval.");
         if (s.lcdSwap)
         {
             ImGui::Indent(16.0f);
-            ImGui::SliderInt("Seconds between phase swaps", &s.lcdSwapSec, 1, 60);
+            ImGui::SliderInt("Seconds between phase swaps", &s.lcdSwapSec, 1, 300);
             if (s.frames % 2) ImGui::TextDisabled("Odd frames per cycle: the lit refresh already alternates, nothing to do.");
             ImGui::Unindent(16.0f);
         }

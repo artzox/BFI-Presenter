@@ -9,7 +9,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 
 ## [1.0.8] — test build
 
-- **[DX] [Vulkan] LCD: prevent image retention** (`LcdPhaseSwap`, `LcdPhaseSwapSeconds`, off by default). An LCD drives each refresh with the opposite polarity of the one before; with an even number of frames per cycle every lit refresh got the same polarity, a DC bias that can leave temporary image retention on IPS/VA/TN panels after long sessions. On, the strobe repeats one dark refresh every N seconds (10 by default), so the lit refreshes alternate between the two polarities. Not needed on OLED or with an odd number of frames per cycle.
+- **[DX] [Vulkan] LCD: prevent image retention** (`LcdPhaseSwap`, `LcdPhaseSwapSeconds`, off by default). An LCD drives each refresh with the opposite polarity of the one before; with an even number of frames per cycle every lit refresh got the same polarity, a DC bias that can leave temporary image retention on IPS/VA/TN panels after long sessions. On, the strobe inserts one refresh at the average brightness (as the hitch guard shows) every N seconds (30 by default, 1–300), so the lit refreshes alternate between the two polarities. A second dark refresh was tried first and flickered visibly. Not needed on OLED or with an odd number of frames per cycle.
 - **[Docs]** README warning for LCD users; settings guide and DX reference entries.
 
 ## [1.0.7] — 2026-10-14 (Manager 1.3.1)

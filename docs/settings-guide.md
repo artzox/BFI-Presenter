@@ -74,8 +74,8 @@ Makes each line fade out after the "beam" passes, like the glow of a real CRT, i
 
 ## Your display
 
-**LCD: prevent image retention** · `LcdPhaseSwap`, `LcdPhaseSwapSeconds` · default: off, 10 s\
-**Turn this on if you have an LCD monitor (IPS, VA or TN).** An LCD drives every refresh with the opposite voltage of the one before, so over time it all evens out. With BFI's "lit, dark, lit, dark" every lit picture lands on the same voltage, and after a long session the screen can keep a faint ghost of the image (HUDs, menus). It's usually temporary, but annoying. This option repeats one dark refresh every few seconds, so the lit pictures switch to the other voltage and it evens out again. You may notice a tiny dip in brightness at each swap.\
+**LCD: prevent image retention** · `LcdPhaseSwap`, `LcdPhaseSwapSeconds` · default: off, 30 s\
+**Turn this on if you have an LCD monitor (IPS, VA or TN).** An LCD drives every refresh with the opposite voltage of the one before, so over time it all evens out. With BFI's "lit, dark, lit, dark" every lit picture lands on the same voltage, and after a long session the screen can keep a faint ghost of the image (HUDs, menus). It's usually temporary, but annoying. This option slips in one extra refresh at half brightness every 30 seconds or so, so the lit pictures switch to the other voltage and it evens out again. At most you'll notice a brief, slight softening of motion at each swap.\
 *When to change it:* on for every LCD; leave off for OLED, which doesn't work this way. Not needed with an odd number of frames per cycle (3), where the lit refresh alternates anyway.
 
 **Output** · `Output` · default: auto\
