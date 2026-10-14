@@ -142,6 +142,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 | `StartBFIAfterGameResize` (1) | Every swap chain shows the game's own frames until its first resize, then BFI starts on the presenter's queue (0 deadlocked Pragmata) |
 | `WaitForResizeOnRecreatedSwapChain` (1) | Same for swap chains the game destroys and recreates (God of War Ragnarök on loading) |
 | `GameFrameStatistics` (1) | Frame statistics and present counts the game reads describe its own frames, not the presenter's 120 presents a second |
+| Show overlays (Advanced) | `ShowOverlays` (0) | 1 = the presenter's presents go through overlay hooks, so the RTSS OSD and the Steam overlay draw on the strobed frames (the resize stays direct). Steam's Present hook crashed Pragmata and Resident Evil 4 this way: turn it off if a game crashes. Keep RTSS's limiter off. Applies at the next game start |
 | `BypassOverlayResizeHooks` (1) | The add-on's own presents and resizes call DXGI directly, past overlay hooks (Steam's overlay hung Pragmata). Overlays then don't draw on the strobed frames |
 | `TypedBackBufferDesc` (1) | Stand-in back buffers report the swap chain's typed format, as real ones do (The Last of Us Part I crashed without it) |
 | `Diagnostics` (1) | 1 = D3D12 DRED: on a device-removed crash, the last GPU operations go to `ReShade.log` and `BFIPresenter_dred.txt`. 2 = also the D3D12 debug layer into `BFIPresenter_debug.txt` (needs "Graphics Tools"; slower) |

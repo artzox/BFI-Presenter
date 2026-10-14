@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.8"
+#define BFI_ADDON_VERSION "1.0.9"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -128,6 +128,8 @@ struct Settings
     int   reuseBuffers = 1;   // present an already-drawn buffer again instead of redrawing it
     int   waitResizeAll = 1;  // every swap chain: no BFI until the game first resizes it
     int   bypassResizeHooks = 1; // move to the presenter queue with DXGI's own ResizeBuffers1
+    int   showOverlays = 0;   // 1 = the presenter's presents go through overlay hooks (RTSS OSD, Steam overlay
+                              // draw on the strobed frames); read once, at the presenter's first present
     int   ablGuard = 1;       // lower the boost while a lit refresh would be too bright overall (panel ABL)
     int   ablNits = 700;      // lit-refresh ceiling (nits) while the guard is engaged
     int   ablTrigNits = 400;  // (v0.51 area mode, kept for the ini only)
@@ -244,6 +246,7 @@ static void LoadSettings(Settings &s)
     s.reuseBuffers = IniInt("ReuseDrawnBuffers", 1) ? 1 : 0;
     s.waitResizeAll = IniInt("StartBFIAfterGameResize", 1) ? 1 : 0;
     s.bypassResizeHooks = IniInt("BypassOverlayResizeHooks", 1) ? 1 : 0;
+    s.showOverlays = IniInt("ShowOverlays", 0) ? 1 : 0;
     s.reportTyped = IniInt("TypedBackBufferDesc", 1) ? 1 : 0;
     s.hitchGuard = IniInt("HitchGuard", 1) ? 1 : 0;
     s.ablGuard = IniInt("AblGuard", 1) ? 1 : 0;
@@ -379,6 +382,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("ReuseDrawnBuffers", s.reuseBuffers);
     IniWriteInt("StartBFIAfterGameResize", s.waitResizeAll);
     IniWriteInt("BypassOverlayResizeHooks", s.bypassResizeHooks);
+    IniWriteInt("ShowOverlays", s.showOverlays);
     IniWriteInt("PresenterQueuePriority", s.queuePriority);
     IniWriteInt("TypedBackBufferDesc", s.reportTyped);
     IniWriteInt("HitchGuard", s.hitchGuard);
@@ -3769,9 +3773,28 @@ static void PrepareDirectCalls()
     }
 }
 
+// ShowOverlays, as it was when the presenter first presented: overlays set themselves up on the first
+// present they see and remember things such as the queue (God of War Ragnarok crashed when that changed),
+// so the path is not switched while the game runs.
+static int g_showOverlaysBoot = -1;
+
 static HRESULT OwnPresent()
 {
     OwnCall own;
+    if (g_showOverlaysBoot < 0)
+    {
+        g_showOverlaysBoot = g_shared.showOverlays ? 1 : 0;
+        if (g_showOverlaysBoot)
+            LOGI("BFI Presenter: ShowOverlays=1 -- the presenter's presents go through overlay hooks (RTSS OSD, Steam "
+                 "overlay); keep RTSS's frame limiter off");
+    }
+    if (g_showOverlaysBoot == 1)
+    {
+        // Through the hooks: the swap chain's vtable (this add-on's hook passes own calls straight on) for
+        // the DX11-mode swap chain, the original Present below this add-on's hook for a DX12 game's.
+        if (g_dx11.load()) return g_sc->Present(1, 0);
+        return o_Present(g_sc, 1, 0);
+    }
     if (g_dx11.load())
     {
         // The add-on's own swap chain: DXGI's Present past any inline hooks
@@ -6584,6 +6607,18 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::Indent(16.0f);
             ImGui::SliderInt("Loading: no new frame for (ms)", &s.hitchGapMs, 150, 5000);
             ImGui::Unindent(16.0f);
+        }
+        bool so = s.showOverlays != 0;
+        if (ImGui::Checkbox("Show overlays (RTSS OSD, Steam) on the strobed frames", &so)) s.showOverlays = so ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Sends the presenter's presents through overlay hooks, so RivaTuner's OSD and the Steam\n"
+                                                      "overlay draw on what you see. Off by default: Steam's hook crashed some games this way\n"
+                                                      "(Pragmata, Resident Evil 4) -- turn it off again if the game crashes or hangs.\n"
+                                                      "Keep RTSS's frame limiter off: it would hold back the presenter and break the strobe.\n"
+                                                      "Applies at the next game start.");
+        if (g_showOverlaysBoot >= 0 && s.showOverlays != g_showOverlaysBoot)
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(kAmber, "restart the game to apply");
         }
         ImGui::Text("Game frames that waited for the presenter: %d/s (should be 0)", st.slotWaits);
         if (st.queued >= 0) ImGui::Text("Presents queued: %d", st.queued);

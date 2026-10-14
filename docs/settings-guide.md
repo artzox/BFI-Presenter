@@ -172,6 +172,10 @@ If the next flash would be identical to one already prepared, it's reused instea
 **Bypass overlay hooks** · `BypassOverlayResizeHooks` · default: on\
 Overlays like Steam's or RivaTuner's don't draw on the flashed frames. This prevented hangs in some games.
 
+**Show overlays** · `ShowOverlays` · default: off\
+Lets RivaTuner's on-screen display (fps counter) and the Steam overlay draw on the picture you see. Normally they're skipped, because Steam's overlay crashed a few games when the flashed frames went through it.\
+*When to change it:* turn it on if you want the RTSS OSD in a DirectX game, and off again if the game then crashes or hangs. Keep RivaTuner's frame limiter off. It takes effect the next time you start the game. Vulkan games show the OSD without it.
+
 **DirectX 11 / 9 / OpenGL support** · `DX11Support`, `DX9Support`, `OpenGLSupport` · default: on\
 Lets the add-on handle older games. They're shown through BFI Presenter's own window over the game, so these games need borderless or windowed mode (it switches them automatically).
 
