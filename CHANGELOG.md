@@ -16,7 +16,12 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
   - The overlay shows the cap's frame rate, and warns when the interval doesn't fit the cycle (some game frames would start on a dark refresh).
   - Frame-rate limiters that only target an fps value (made for VRR) can't do this: at a rate that isn't the refresh ÷ a whole number, game frames drift across lit and dark refreshes.
 - **[Docs]** README: Special K's SDR-to-HDR doesn't work with the presenter.
-- **[Manager 1.3.1] The Witcher 3 is no longer shown as OpenGL.** Its executable links `opengl32.dll` but loads Direct3D at run time; an executable whose only graphics import is OpenGL is now also checked for Direct3D 11/12 names, and OpenGL is dropped when it has them.
+- **[Manager 1.3.1] Graphics API detection fixes.**
+  - **The Witcher 3 (GOG) is no longer shown as OpenGL.** Its executable links `opengl32.dll` and loads Direct3D at run time. When OpenGL is the only API found, the exe is now also checked for the Direct3D 11/12 DLL and entry-point names and for a `dx12` / `dx11` folder (`bin\x64_dx12`).
+  - **PCGamingWiki lookups for store titles with an edition name** (GOG's "The Witcher 3: Wild Hunt - Game of the Year Edition") also try the name without it.
+  - **When several wiki pages list the same Steam AppID**, the page named like the game is used.
+  - **"unknown" or "n/a" in a wiki API field** no longer counts as supported.
+  - **An error or rate-limit answer from the wiki** is no longer recorded as "not on the wiki" for a week.
 
 ## [1.0.6] — 2026-10-14 (Manager 1.3.0)
 
