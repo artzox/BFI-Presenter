@@ -847,6 +847,7 @@ static void DrawTable(float height)
         ImGui::TableNextColumn(); ImGui::TextUnformatted(g.exe.empty() ? "" : ApiText(g.apis).c_str());
         ImGui::TableNextColumn();
         if (g.reshade) ImGui::Text("%s", g.reshadeDll.version.empty() ? "yes" : g.reshadeDll.version.c_str());
+        else if (g.route == Route::Vulkan && g.reshadeVkIni && g_app.vk.reshadeLayer) ImGui::Text("Vulkan %s", g_app.vk.reshadeVersion.c_str());
         else ImGui::TextColored(kGrey, "-");
         ImGui::TableNextColumn();
         if (g.route == Route::Vulkan) { if (g.ini) ImGui::Text("Vulkan (ini)"); else ImGui::TextColored(kGrey, "-"); }
@@ -922,15 +923,20 @@ static bool IsGlAddon(const Game &g) { return (g.apis & ApiGL) && (g.route == Ro
 
 // Install or update, then (if chosen) set G-SYNC off / Vertical Sync Force on in each game's NVIDIA profile,
 // and for OpenGL games the Vulkan/OpenGL present method to Prefer layered on DXGI swapchain.
-static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsync, bool nvGl)
+static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsync, bool nvGl, bool rsVk = false)
 {
     std::vector<std::wstring> roots;
     for (auto *g : list) roots.push_back(g->root);
     std::string one = list.size() == 1 ? list[0]->name : "";
     StartJob("Installing BFI Presenter in " + std::to_string(roots.size()) + " games...", roots,
-             [nvGsync, nvVsync, nvGl](Game &g, Job &j) {
+             [nvGsync, nvVsync, nvGl, rsVk](Game &g, Job &j) {
                  std::string e = InstallOrUpdate(g, g_app.src);
                  if (!e.empty()) return e;
+                 // Vulkan games: ReShade's Vulkan layer for the settings window, unless the tested list says the game
+                 // doesn't start with ReShade (DOOM Eternal)
+                 if (rsVk && g.route == Route::Vulkan && g_app.vk.reshadeLayer && !g.reshadeVkIni &&
+                     g.tested.find("without ReShade") == std::string::npos)
+                     SetReShadeVulkan(g, true, nullptr);
                  const bool gl = nvGl && IsGlAddon(g);
                  if (g_app.nvOk && (nvGsync || nvVsync || gl))
                  {
@@ -989,8 +995,9 @@ static void DrawInstallQuestion()
         vs = LoadSetting(L"NvVsyncOn", L"1") == L"1";
         gl = LoadSetting(L"NvGlLayered", L"1") == L"1";
     }
-    bool anyGl = false;
-    for (auto *g : list) if (IsGlAddon(*g)) anyGl = true;
+    bool anyGl = false, anyVk = false;
+    for (auto *g : list) { if (IsGlAddon(*g)) anyGl = true; if (g->route == Route::Vulkan && !g->reshadeVkIni) anyVk = true; }
+    static bool rsVk = true;
     ImGui::Checkbox("G-SYNC off for the game (fixed 120 Hz)", &gs);
     Tooltip("With G-SYNC on, VRR can take over from the presenter's steady presents and the strobe flickers or drops "
             "below 120 Hz (Control, Undying). Same as NVIDIA Profile Inspector: G-SYNC = Force off.");
@@ -1001,6 +1008,13 @@ static void DrawInstallQuestion()
         ImGui::Checkbox("OpenGL: present method Prefer layered on DXGI swapchain", &gl);
         Tooltip("Older OpenGL games (Need for Speed: Porsche Unleashed, DOOM 3 BFG) block the presenter -- it runs at 20-30 fps -- "
                 "until their NVIDIA profile has Vulkan/OpenGL present method = Prefer layered on DXGI swapchain.");
+    }
+    if (anyVk && g_app.vk.reshadeLayer)
+    {
+        ImGui::Checkbox("Vulkan games: turn on ReShade (the BFI Presenter settings window in the game)", &rsVk);
+        Tooltip("Writes a ReShade.ini next to the game's exe, so ReShade's Vulkan layer loads there. Without it, settings are "
+                "changed in BFIPresenter.ini (picked up while the game runs) and with the hotkeys. Skipped for games the "
+                "tested list runs without ReShade (DOOM Eternal).");
     }
     ImGui::Spacing();
     ImGui::Checkbox("Ask every time", &askAgain);
@@ -1013,7 +1027,7 @@ static void DrawInstallQuestion()
         if (anyGl) SaveSetting(L"NvGlLayered", gl ? L"1" : L"0");
         SaveSetting(L"NvAskOnInstall", askAgain ? L"1" : L"0");
         ImGui::CloseCurrentPopup();
-        RunInstall(list, gs, vs, anyGl && gl);
+        RunInstall(list, gs, vs, anyGl && gl, anyVk && g_app.vk.reshadeLayer && rsVk);
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
@@ -1337,7 +1351,23 @@ static void DrawDetail(HWND)
     else if (g.route == Route::Vulkan)
     {
         ImGui::PushTextWrapPos(0);
-        ImGui::TextColored(kGrey, "%s", g_app.vk.reshadeLayer ? "through ReShade's Vulkan layer" : "optional for Vulkan games (ReShade's Vulkan layer isn't installed)");
+        if (!g_app.vk.reshadeLayer)
+            ImGui::TextColored(kGrey, "not installed. Optional: ReShade gives the BFI Presenter settings window in the game. Run ReShade's "
+                                      "setup once with its Vulkan option (for any game); then it can be turned on here per game.");
+        else
+        {
+            ImGui::Text("%s", g.reshadeVkIni ? "on (ReShade's Vulkan layer, ReShade.ini next to the exe)" : "off for this game (ReShade's Vulkan layer is installed)");
+            ImGui::SameLine();
+            if (ImGui::SmallButton(g.reshadeVkIni ? "Turn off##rsvk" : "Turn on##rsvk"))
+            {
+                std::string note, e = SetReShadeVulkan(g, !g.reshadeVkIni, &note);
+                if (e.empty()) g_app.SetMsg(std::string("ReShade ") + (g.reshadeVkIni ? "on" : "off") + " in " + g.name + "." + (note.empty() ? "" : " " + note), false);
+                else g_app.SetMsg(e, true);
+            }
+            Tooltip("Vulkan games use ReShade's system-wide Vulkan layer, which loads in a game that has a ReShade.ini next to its exe. "
+                    "Turn on writes that file (and lists the game in ReShade's own setup); Turn off removes it (backed up, Undo works). "
+                    "With ReShade on, the BFI Presenter (Vulkan) tab in its overlay changes the settings live.");
+        }
         ImGui::PopTextWrapPos();
     }
     else ImGui::TextColored(kOrange, "not found next to the executable");

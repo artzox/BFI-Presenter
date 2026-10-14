@@ -26,6 +26,7 @@
 #ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
+#include <sys/stat.h>
 #include <windows.h>
 #define VK_USE_PLATFORM_WIN32_KHR
 #define BFI_EXPORT extern "C" __declspec(dllexport)
@@ -1280,6 +1281,20 @@ static void PresenterThread(Swapchain *sc)
         }
         krs = rs;
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
+        // BFIPresenter.ini edited while the game runs (no ReShade overlay in the game): picked up within a second.
+        {
+            static double iniCheckT = 0.0;
+            static long long iniStamp = -1;
+            const double tc = Now();
+            if (tc - iniCheckT > 1.0)
+            {
+                iniCheckT = tc;
+                struct stat st;
+                const long long stamp = stat(g_iniPath.c_str(), &st) == 0 ? (long long)st.st_mtime * 1000 + (long long)st.st_size % 1000 : -2;
+                if (iniStamp != -1 && stamp != iniStamp && stamp != -2) { LoadShared(); LOGI("BFI Presenter: BFIPresenter.ini changed -- settings reloaded"); }
+                iniStamp = stamp;
+            }
+        }
         kb = b; km = m; kr = r;
         {
             std::lock_guard<std::mutex> l(g_cfgLock);
