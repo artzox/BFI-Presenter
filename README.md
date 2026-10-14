@@ -77,6 +77,7 @@ If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that
 
 - [DX add-on reference](dx/README.md): how it works, every overlay setting, ini-only keys, hotkeys, files written, known limits.
 - [Vulkan layer reference](vulkan/README.md): install, DXVK, log checks, Vulkan-only keys.
+- [Settings guide](docs/settings-guide.md): every setting in plain words, what you'd notice and when to change it.
 - [Tested games](docs/tested-games.md) and per-game notes.
 - [Latency estimates](docs/latency.md) for the main setups.
 - [Changelog](CHANGELOG.md).
