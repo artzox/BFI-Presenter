@@ -39,6 +39,9 @@ printf 'const char *n[] = {"d3d11.dll","d3d12.dll","opengl32.dll","vulkan-1.dll"
 mk SdlVk vkstr_64.exe SdlVk.exe; cp "$B/SDL3.dll" "$G/SdlVk/SDL3.dll"; cp "$B/rs_64.dll" "$G/SdlVk/dxgi.dll"
 printf '#include <windows.h>\n#include <GL/gl.h>\nint main(){ if (GetTickCount()==1) { glFlush(); LoadLibraryA("d3d11.dll"); } return 0; }\n' > "$B/gld3d.c"; x86_64-w64-mingw32-gcc "$B/gld3d.c" -o "$B/gld3d_64.exe" -lopengl32
 mk "The Witcher 3" gld3d_64.exe witcher3.exe
+printf '#include <windows.h>\nint main(){ if (GetTickCount()==1) LoadLibraryA("d3d12.dll"); return 0; }\n' > "$B/d3dstr.c"; x86_64-w64-mingw32-gcc "$B/d3dstr.c" -o "$B/d3dstr_64.exe"
+printf '#include <windows.h>\n#include <GL/gl.h>\nBOOL WINAPI DllMain(HINSTANCE a, DWORD b, LPVOID c){ if (b == 99) glFlush(); return TRUE; }\n' > "$B/gldll.c"; x86_64-w64-mingw32-gcc -shared "$B/gldll.c" -o "$B/gldll.dll" -lopengl32
+mk "GlDllGame" d3dstr_64.exe GlDllGame.exe; cp "$B/gldll.dll" "$G/GlDllGame/helper_gl.dll"
 mk OldUnity ggl_32.exe OldUnity.exe; mkdir -p "$G/OldUnity/OldUnity_Data/Managed"
 mk ShaderGame g11_64.exe ShaderGame.exe; cp "$B/rs_64.dll" "$G/ShaderGame/dxgi.dll"
 printf '[GENERAL]\r\nEffectSearchPaths=.\\fx\\Shaders\\**,.\\other\r\nPresetPath=.\\MyPreset.ini\r\n' > "$G/ShaderGame/ReShade.ini"
