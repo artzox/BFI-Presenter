@@ -37,6 +37,8 @@ mk HlGame plain_64.exe HlGame.exe; cp "$B/g11_64.exe" "$G/HlGame/directx.hdll"
 printf '#include <stdio.h>\nint main(){ puts("vulkan-1.dll"); return 0; }\n' > "$B/vkstr.c"; x86_64-w64-mingw32-gcc "$B/vkstr.c" -o "$B/vkstr_64.exe"
 printf 'const char *n[] = {"d3d11.dll","d3d12.dll","opengl32.dll","vulkan-1.dll"};\n' > "$B/sdl.c"; x86_64-w64-mingw32-gcc -shared "$B/sdl.c" -o "$B/SDL3.dll"
 mk SdlVk vkstr_64.exe SdlVk.exe; cp "$B/SDL3.dll" "$G/SdlVk/SDL3.dll"; cp "$B/rs_64.dll" "$G/SdlVk/dxgi.dll"
+printf '#include <windows.h>\n#include <GL/gl.h>\nint main(){ if (GetTickCount()==1) { glFlush(); LoadLibraryA("d3d11.dll"); } return 0; }\n' > "$B/gld3d.c"; x86_64-w64-mingw32-gcc "$B/gld3d.c" -o "$B/gld3d_64.exe" -lopengl32
+mk "The Witcher 3" gld3d_64.exe witcher3.exe
 mk OldUnity ggl_32.exe OldUnity.exe; mkdir -p "$G/OldUnity/OldUnity_Data/Managed"
 mk ShaderGame g11_64.exe ShaderGame.exe; cp "$B/rs_64.dll" "$G/ShaderGame/dxgi.dll"
 printf '[GENERAL]\r\nEffectSearchPaths=.\\fx\\Shaders\\**,.\\other\r\nPresetPath=.\\MyPreset.ini\r\n' > "$G/ShaderGame/ReShade.ini"

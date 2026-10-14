@@ -7,7 +7,7 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [1.0.7] — test build
+## [1.0.7] — test build (Manager 1.3.1)
 
 - **[DX] [Vulkan] Two new game frame caps for fast displays.**
   - **One game frame per strobe cycle**: the refresh rate ÷ Frames per cycle, for example 60 fps at 360 Hz with 6 frames, 90 fps at 360 Hz with 4, or 80 fps at 240 Hz with 3. Each game frame gets exactly one lit refresh, as Half refresh does with 2 frames at 120 Hz.
@@ -16,6 +16,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
   - The overlay shows the cap's frame rate, and warns when the interval doesn't fit the cycle (some game frames would start on a dark refresh).
   - Frame-rate limiters that only target an fps value (made for VRR) can't do this: at a rate that isn't the refresh ÷ a whole number, game frames drift across lit and dark refreshes.
 - **[Docs]** README: Special K's SDR-to-HDR doesn't work with the presenter.
+- **[Manager 1.3.1] The Witcher 3 is no longer shown as OpenGL.** Its executable links `opengl32.dll` but loads Direct3D at run time; an executable whose only graphics import is OpenGL is now also checked for Direct3D 11/12 names, and OpenGL is dropped when it has them.
 
 ## [1.0.6] — 2026-10-14 (Manager 1.3.0)
 

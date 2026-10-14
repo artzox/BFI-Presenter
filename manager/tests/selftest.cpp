@@ -164,6 +164,8 @@ int wmain(int argc, wchar_t **argv)
         Game *ou = Find(all, "OldUnity");
         CHECK(ou && (ou->apis & ApiD3D11) && !(ou->apis & ApiGL), "OldUnity: engine in the exe with _Data\\Managed -> D3D11 (%s)", ou ? ApiText(ou->apis).c_str() : "-");
         Game *qr = Find(all, "QuakeRef"), *hl = Find(all, "HlGame");
+        Game *w3 = Find(all, "The Witcher 3");
+        CHECK(w3 && (w3->apis & ApiD3D11) && !(w3->apis & ApiGL), "Witcher 3: imports opengl32, loads d3d11 -> D3D11 (%s)", w3 ? ApiText(w3->apis).c_str() : "-");
         CHECK(qr && (qr->apis & ApiGL), "QuakeRef: LoadLibrary(\"opengl32\") in ref_gl.dll -> OpenGL (%s)", qr ? ApiText(qr->apis).c_str() : "-");
         CHECK(hl && (hl->apis & ApiD3D11), "HlGame: directx.hdll imports d3d11 -> D3D11 (%s)", hl ? ApiText(hl->apis).c_str() : "-");
         Game *sv = Find(all, "SdlVk");

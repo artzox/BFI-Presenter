@@ -675,7 +675,7 @@ static void SaveCache()
 static ExeFacts AnalyzeExe(const std::wstring &exe)
 {
     std::wstring key = Lower(exe);
-    std::wstring stamp = L"6_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
+    std::wstring stamp = L"7_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
     {
         std::lock_guard<std::mutex> l(g_cacheLock);
         LoadCache();
@@ -703,6 +703,12 @@ static ExeFacts AnalyzeExe(const std::wstring &exe)
         r.apis = ApiD3D11;                 // FNA: FNA3D picks Direct3D 11, Vulkan or OpenGL at run time
     else if (pi.dotnet && FindNoCase(f.view(), "Microsoft.Xna.Framework"))
         r.apis = ApiD3D9;                  // XNA 4.0: Direct3D 9 through Microsoft's shared XNA runtime
+    else if ((r.apis & strong) == ApiGL)
+    {
+        // Imports only OpenGL, but loads Direct3D 11/12 at run time (The Witcher 3 links opengl32): the Direct3D
+        // DLL names in the exe count, and OpenGL is dropped below. Only 11/12: old OpenGL games may name d3d9.
+        r.apis |= ApisFromStrings(f.view()) & (ApiD3D11 | ApiD3D12);
+    }
     else if (!(r.apis & strong))
     {
         // Engines that keep the renderer in a DLL (Northlight: Control, Alan Wake 2)
