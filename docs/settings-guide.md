@@ -74,6 +74,10 @@ Makes each line fade out after the "beam" passes, like the glow of a real CRT, i
 
 ## Your display
 
+**LCD: prevent image retention** · `LcdPhaseSwap`, `LcdPhaseSwapSeconds` · default: off, 10 s\
+**Turn this on if you have an LCD monitor (IPS, VA or TN).** An LCD drives every refresh with the opposite voltage of the one before, so over time it all evens out. With BFI's "lit, dark, lit, dark" every lit picture lands on the same voltage, and after a long session the screen can keep a faint ghost of the image (HUDs, menus). It's usually temporary, but annoying. This option repeats one dark refresh every few seconds, so the lit pictures switch to the other voltage and it evens out again. You may notice a tiny dip in brightness at each swap.\
+*When to change it:* on for every LCD; leave off for OLED, which doesn't work this way. Not needed with an odd number of frames per cycle (3), where the lit refresh alternates anyway.
+
 **Output** · `Output` · default: auto\
 Whether the game's picture is SDR or HDR (and which HDR format). Auto reads it from the game.\
 *When to change it:* leave on auto. Only force it if colours look obviously wrong.

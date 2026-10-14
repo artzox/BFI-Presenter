@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.7"
+#define BFI_ADDON_VERSION "1.0.8"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -102,6 +102,9 @@ struct Settings
     int   invert   = 0;
     int   rolloff  = 1;       // BFI highlight roll-off
     int   rolling  = 0;       // rolling scan: one band per sub-frame, rolling down the screen
+    int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
+                              // refreshes alternate between the panel's + and - drive polarity (no image retention)
+    int   lcdSwapSec = 10;   // seconds between phase shifts (1-60)
     float rollSeam = 0.08f;   // blended zone between bands, fraction of the screen height
     float rollDecay = 0.0f;   // rolling scan phosphor decay, in sub-frames (0 = off: hard bands + seam)
     float knee     = 0.75f;
@@ -207,6 +210,10 @@ static void LoadSettings(Settings &s)
     s.invert   = IniInt("InvertCycle", 0);
     s.rolloff  = IniInt("HighlightRolloff", 1);
     s.rolling  = IniInt("RollingScan", 0) ? 1 : 0;
+    s.lcdSwap  = IniInt("LcdPhaseSwap", 0) ? 1 : 0;
+    s.lcdSwapSec = IniInt("LcdPhaseSwapSeconds", 10);
+    if (s.lcdSwapSec < 1) s.lcdSwapSec = 1;
+    if (s.lcdSwapSec > 60) s.lcdSwapSec = 60;
     s.rollSeam = IniFloat("RollingSeam", 0.08f);
     if (s.rollSeam < 0.0f) s.rollSeam = 0.0f;
     if (s.rollSeam > 0.5f) s.rollSeam = 0.5f;
@@ -348,6 +355,8 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("InvertCycle", s.invert);
     IniWriteInt("HighlightRolloff", s.rolloff);
     IniWriteInt("RollingScan", s.rolling);
+    IniWriteInt("LcdPhaseSwap", s.lcdSwap);
+    IniWriteInt("LcdPhaseSwapSeconds", s.lcdSwapSec);
     IniWriteFloat("RollingSeam", s.rollSeam);
     IniWriteFloat("RollingPhosphorDecay", s.rollDecay);
     IniWriteFloat("RolloffKnee", s.knee);
@@ -2047,6 +2056,10 @@ static DWORD WINAPI PresenterThread(void *)
     LeaveCriticalSection(&g_cfgLock);
 
     uint64_t presents = 0, lastShownId = 0;
+    // LCD phase swap: refreshes held back from the strobe count. Each one repeats the cycle's last (dark)
+    // refresh once, so with an even cycle the lit refresh moves to the panel's other drive polarity.
+    uint64_t phaseShift = 0;
+    double   lastPhaseSwapT = 0.0;
     int secFrameRepeats = 0, secFrameSkips = 0, extraCycles = 0;
     // Strobe cycles whose step differs from the expected one: at the Refresh
     // cap at 120 fps every lit refresh moves on 2 frames (the one between is
@@ -2185,7 +2198,7 @@ static DWORD WINAPI PresenterThread(void *)
         {
             output->WaitForVBlank();
             g_strobeFrames.store(s.frames);
-            g_tickSlot.store((int)(presents % (uint64_t)s.frames));
+            g_tickSlot.store((int)((presents - phaseShift) % (uint64_t)s.frames));
             g_tickT.store(Now());
             g_tickCount.fetch_add(1);
             SetEvent(g_tickEvent);
@@ -2209,7 +2222,7 @@ static DWORD WINAPI PresenterThread(void *)
         //   Lowest latency: the newest finished frame (v0.12 behaviour).
         // g_lock is held from the pick until the read is submitted, so the
         // game's staging submissions are ordered around it.
-        const uint32_t slotNow = (uint32_t)(presents % (uint64_t)s.frames);
+        const uint32_t slotNow = (uint32_t)((presents - phaseShift) % (uint64_t)s.frames);
         int pick = -1;
         UINT64 reserve = 0, pickId = 0;
         double pickTime = 0.0;
@@ -2329,7 +2342,7 @@ static DWORD WINAPI PresenterThread(void *)
             lastOutType = (int)c.outType;
         }
         c.frames  = (uint32_t)s.frames;
-        c.slot    = (uint32_t)(presents % (uint64_t)s.frames);
+        c.slot    = slotNow;
         c.method  = !s.enabled ? 2u : hitchPaused ? 3u : (uint32_t)s.method;
         // ABL guard: read the last measurement (non-blocking) and steer the
         // boost so a lit refresh stays under AblGuardNits on average -- never
@@ -2513,6 +2526,20 @@ static DWORD WINAPI PresenterThread(void *)
             break;
         }
         presents++;
+        // LCD phase swap: an LCD drives each refresh with the opposite polarity of the one before. With an
+        // even cycle (lit, dark) every lit refresh gets the same polarity, the panel sees a DC bias and ions
+        // build up in the liquid crystal: image retention ("burn-in") on IPS/VA. Every few seconds, after a
+        // dark refresh, the strobe repeats it once, and the lit refreshes move to the other polarity.
+        if (s.lcdSwap && s.enabled && (s.frames % 2) == 0)
+        {
+            const double tNow = Now();
+            if (lastPhaseSwapT <= 0.0) lastPhaseSwapT = tNow;
+            else if (slotNow == (uint32_t)s.frames - 1 && tNow - lastPhaseSwapT >= (double)s.lcdSwapSec)
+            {
+                phaseShift++;
+                lastPhaseSwapT = tNow;
+            }
+        }
         if (!tickedAtVb)
         {
             g_tickT.store(Now());
@@ -6373,6 +6400,22 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (ImGui::Checkbox("Sine BFI", &sine)) s.sine = sine ? 1 : 0;
         ImGui::SameLine();
         if (ImGui::Checkbox("Invert cycle (frames > 2)", &inv)) s.invert = inv ? 1 : 0;
+
+        bool lcd = s.lcdSwap != 0;
+        if (ImGui::Checkbox("LCD: prevent image retention (phase swap)", &lcd)) s.lcdSwap = lcd ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("For LCD monitors (IPS, VA, TN) -- not needed on OLED.\n"
+                                                      "An LCD drives each refresh with the opposite voltage of the one before. With an even\n"
+                                                      "number of frames per cycle every lit refresh gets the same voltage, and the panel can\n"
+                                                      "keep a ghost of the image (temporary image retention). This repeats one dark refresh\n"
+                                                      "every few seconds, so the lit refreshes alternate between the two voltages.\n"
+                                                      "Costs one slightly longer dark moment per interval.");
+        if (s.lcdSwap)
+        {
+            ImGui::Indent(16.0f);
+            ImGui::SliderInt("Seconds between phase swaps", &s.lcdSwapSec, 1, 60);
+            if (s.frames % 2) ImGui::TextDisabled("Odd frames per cycle: the lit refresh already alternates, nothing to do.");
+            ImGui::Unindent(16.0f);
+        }
 
         bool rsc = s.rolling != 0;
         if (ImGui::Checkbox("Rolling scan (Ctrl+Shift+S)", &rsc)) s.rolling = rsc ? 1 : 0;
