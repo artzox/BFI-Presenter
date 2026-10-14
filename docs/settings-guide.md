@@ -37,7 +37,7 @@ The main switch. Off, BFI Presenter still shows the game but without any dark fr
 
 **Frames per cycle** · `Frames` · default: 2\
 How many refreshes make up one flash cycle: 2 means "one lit, one dark". 3 or 4 means one lit and two or three dark, which is even sharper but darker, and flickers at a lower rate.\
-*When to change it:* keep 2 at 120 Hz. Higher values are for 240 Hz+ displays.
+*When to change it:* keep 2 at 120 Hz. Higher values are for 240 Hz+ displays; pair them with the **One game frame per strobe cycle** frame cap, so each game image gets exactly one flash.
 
 **Gain vs blur** · `Gain` · default: 0.5 (recommended 1.0)\
 How much of the lost brightness to win back. At 0.5 the lit frame looks exactly like the normal picture, so the overall image is half as bright. At 1.0 the lit frame is boosted to make up the difference, so the average brightness is close to normal.\
@@ -112,7 +112,7 @@ After a stutter, Smooth mode can skip one frame to get back to the lowest delay.
 *When to change it:* leave off. Turn on only if you prefer lower delay over perfectly even motion.
 
 **Just-in-time release** · `CapJustInTime` · default: on\
-With the Half or Quarter cap, BFI Presenter learns how long the game takes to draw a frame and tells it to start at exactly the right moment, so each frame finishes just before its flash. Even motion, no waiting around.\
+With any cap below the refresh rate (Half, Quarter, one frame per strobe cycle, Custom), BFI Presenter learns how long the game takes to draw a frame and tells it to start at exactly the right moment, so each frame finishes just before its flash. Even motion, no waiting around.\
 *When to change it:* leave on.
 
 **Later release** and **margin** · `LaterRelease`, `LaterReleaseMarginMs` · default: off, 1.5 ms\
