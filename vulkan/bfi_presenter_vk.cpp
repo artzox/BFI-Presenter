@@ -522,6 +522,7 @@ struct Constants
     float    sdrPeak;     // expanded SDR white (80-nit units); <= sdrScale = off
     float    seam;        // rolling scan: blended zone between bands (fraction of the height)
     float    decay;       // rolling scan: phosphor decay time in sub-frames (0 = hard bands)
+    float    soften;      // 0..1: blend toward the steady average picture (LCD phase swap fade)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -1252,7 +1253,8 @@ static void PresenterThread(Swapchain *sc)
     // LCD phase swap: refreshes held back from the strobe count (see the DX add-on).
     uint64_t phaseShift = 0;
     double   lastPhaseSwapT = 0.0;
-    bool     phaseFill = false;      // this refresh is the one the phase swap inserts
+    int      swapState = 0;          // 0 idle, 1 fading to the steady picture, 2 fading back
+    float    soften = 0.0f;          // current fade (0 = full strobe, 1 = steady average)
     uint64_t bufSub[kMaxImg] = {}, bufFrame[kMaxImg] = {};
     Constants bufConst[kMaxImg] = {};
     bool bufValid[kMaxImg] = {};
@@ -1521,9 +1523,7 @@ static void PresenterThread(Swapchain *sc)
         c.frames = (uint32_t)s.frames;
         c.slot   = slotNow;
         c.method = (!s.enabled || copyMode) ? 2u : hitchPaused ? 3u : (uint32_t)s.method;
-        // The refresh a phase swap inserts shows the strobe's average brightness (as the hitch guard does), not a
-        // second dark refresh: two dark refreshes in a row are a visible flicker, an average one keeps the light even.
-        if (phaseFill && c.method < 2u) c.method = 3u;
+        c.soften = (c.method < 2u) ? soften : 0.0f;   // LCD phase swap fade
 
         // ABL guard (HDR): read the last measurement once its draw is done and
         // find the highest lit-refresh ceiling whose screen average stays
@@ -1779,22 +1779,35 @@ static void PresenterThread(Swapchain *sc)
             if (doneSub > sc->presDoneSub.load()) sc->presDoneSub.store(doneSub);
         }
         presents++;
-        const bool wasFill = phaseFill;
-        phaseFill = false;
-        // LCD phase swap: with an even cycle every lit refresh gets the same LCD drive polarity (DC bias, image
-        // retention on IPS/VA). Every few seconds, after a dark refresh, repeat it once to move the lit refreshes
-        // to the other polarity.
+        // LCD phase swap: an LCD drives each refresh with the opposite polarity of the one before. With an
+        // even cycle (lit, dark) every lit refresh gets the same polarity, the panel sees a DC bias and ions
+        // build up in the liquid crystal: image retention ("burn-in") on IPS/VA. Every N seconds the strobe
+        // fades to the steady average picture (as the hitch guard shows) over about 0.4 s, repeats one refresh
+        // while every refresh looks the same -- invisible -- and fades back; the lit refreshes then sit on
+        // the other polarity. Fading keeps the light of every cycle the same, so nothing flickers.
         if (s.lcdSwap && s.enabled && (s.frames % 2) == 0)
         {
             const double tNow = Now();
+            const float step = 1.0f / (float)std::max(8, (int)(0.4 * (vb.modeHz > 0.0 ? vb.modeHz : 120.0)));
             if (lastPhaseSwapT <= 0.0) lastPhaseSwapT = tNow;
-            else if (!wasFill && slotNow == (uint32_t)s.frames - 1 && tNow - lastPhaseSwapT >= (double)s.lcdSwapSec)
+            if (swapState == 0 && tNow - lastPhaseSwapT >= (double)s.lcdSwapSec) swapState = 1;
+            if (swapState == 1)
             {
-                phaseShift++;
-                lastPhaseSwapT = tNow;
-                phaseFill = true;          // the next refresh (the repeated slot) is the filler
+                soften = std::min(1.0f, soften + step);
+                if (soften >= 1.0f && slotNow == (uint32_t)s.frames - 1)
+                {
+                    phaseShift++;              // the next refresh repeats this slot, at the steady average
+                    swapState = 2;
+                    lastPhaseSwapT = tNow;
+                }
+            }
+            else if (swapState == 2)
+            {
+                soften = std::max(0.0f, soften - step);
+                if (soften <= 0.0f) swapState = 0;
             }
         }
+        else { soften = 0.0f; swapState = 0; }
         if (!vblank && !primeIter)
         {
             sc->tickT.store(Now());
@@ -3544,9 +3557,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("For LCD monitors (IPS, VA, TN) -- not needed on OLED.\n"
                                                       "An LCD drives each refresh with the opposite voltage of the one before. With an even\n"
                                                       "number of frames per cycle every lit refresh gets the same voltage, and the panel can\n"
-                                                      "keep a ghost of the image (temporary image retention). This inserts one refresh\n"
-                                                      "every few seconds, so the lit refreshes alternate between the two voltages.\n"
-                                                      "The inserted refresh shows the average brightness, like the hitch guard: a brief, slight blur once per interval.");
+                                                      "keep a ghost of the image (temporary image retention). Every N seconds this fades the\n"
+                                                      "strobe to a steady picture for about half a second, shifts it by one refresh and fades\n"
+                                                      "it back, so the lit refreshes alternate between the two voltages. No flicker; motion is\n"
+                                                      "briefly a little softer.");
         if (s.lcdSwap)
         {
             ImGui::Indent(16.0f);

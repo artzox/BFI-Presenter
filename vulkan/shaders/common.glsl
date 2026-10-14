@@ -15,6 +15,7 @@ layout(push_constant) uniform C
     float sdrPeak;    // SDR white highlights expand to this (80-nit units); <= sdrScale = off
     float seam;       // rolling scan (flags & 8): blended zone between bands, fraction of the screen height
     float decay;      // rolling scan: phosphor decay time in sub-frames (0 = hard bands + seam)
+    float soften;     // 0..1: blend toward the steady average picture (LCD phase swap fade)
 } pc;
 layout(set = 0, binding = 0) uniform sampler2D src;
 

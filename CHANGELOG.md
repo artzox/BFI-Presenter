@@ -9,7 +9,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 
 ## [1.0.8] — test build
 
-- **[DX] [Vulkan] LCD: prevent image retention** (`LcdPhaseSwap`, `LcdPhaseSwapSeconds`, off by default). An LCD drives each refresh with the opposite polarity of the one before; with an even number of frames per cycle every lit refresh got the same polarity, a DC bias that can leave temporary image retention on IPS/VA/TN panels after long sessions. On, the strobe inserts one refresh at the average brightness (as the hitch guard shows) every N seconds (30 by default, 1–300), so the lit refreshes alternate between the two polarities. A second dark refresh was tried first and flickered visibly. Not needed on OLED or with an odd number of frames per cycle.
+- **[DX] [Vulkan] LCD: prevent image retention** (`LcdPhaseSwap`, `LcdPhaseSwapSeconds`, off by default). An LCD drives each refresh with the opposite polarity of the one before; with an even number of frames per cycle every lit refresh got the same polarity, a DC bias that can leave temporary image retention on IPS/VA/TN panels after long sessions. On, every N seconds (30 by default, 1–300) the strobe fades over about 0.4 s to the steady average picture the hitch guard shows, repeats one refresh while every refresh looks the same, and fades back: the lit refreshes then sit on the other polarity. The fade keeps every cycle's light the same, so nothing flickers; motion is briefly a little softer. (A second dark refresh, then a single average-brightness refresh, were tried first and both flickered.) Not needed on OLED or with an odd number of frames per cycle.
 - **[Docs]** README warning for LCD users; settings guide and DX reference entries.
 
 ## [1.0.7] — 2026-10-14 (Manager 1.3.1)
