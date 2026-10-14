@@ -675,7 +675,7 @@ static void SaveCache()
 static ExeFacts AnalyzeExe(const std::wstring &exe)
 {
     std::wstring key = Lower(exe);
-    std::wstring stamp = L"6_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
+    std::wstring stamp = L"9_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
     {
         std::lock_guard<std::mutex> l(g_cacheLock);
         LoadCache();
@@ -749,6 +749,20 @@ static ExeFacts AnalyzeExe(const std::wstring &exe)
             if (pi.d3d9PerfOnly) str &= ~ApiD3D9;   // the import table's own "d3d9.dll"
             r.apis |= str;
         }
+    }
+    // Only OpenGL found (in the exe's imports or in a DLL next to it), but the exe loads Direct3D 11/12 at run
+    // time (The Witcher 3): the Direct3D DLL names in the exe count, and OpenGL is dropped below. Only 11/12:
+    // old OpenGL games may name d3d9.
+    if ((r.apis & strong) == ApiGL)
+    {
+        r.apis |= ApisFromStrings(f.view()) & (ApiD3D11 | ApiD3D12);
+        // ...or only the entry points it looks up (GetProcAddress names are always ASCII), or the build sits in
+        // a "dx12" / "dx11" folder (The Witcher 3: bin\x64_dx12)
+        if (FindNoCase(f.view(), "D3D12CreateDevice")) r.apis |= ApiD3D12;
+        if (FindNoCase(f.view(), "D3D11CreateDevice")) r.apis |= ApiD3D11;
+        const std::wstring ld = Lower(dir);
+        if (ld.find(L"dx12") != std::wstring::npos) r.apis |= ApiD3D12;
+        else if (ld.find(L"dx11") != std::wstring::npos) r.apis |= ApiD3D11;
     }
     std::lock_guard<std::mutex> l(g_cacheLock);
     // Engines link renderers the game doesn't ship on Windows (Unreal links opengl32 next to Direct3D): when the
@@ -957,7 +971,7 @@ struct PcgwEntry { long long when = 0; bool found = false; unsigned apis = 0; st
 static std::map<std::string, PcgwEntry> g_pcgw;
 static bool g_pcgwLoaded = false;
 static std::mutex g_pcgwLock;
-static std::wstring PcgwPath() { return Join(DataDir(), L"pcgw_cache.txt"); }
+static std::wstring PcgwPath() { return Join(DataDir(), L"pcgw_cache3.txt"); }   // 3: best page per AppID, error answers not cached
 
 static std::string PcgwKey(const Game &g)
 {
@@ -1039,9 +1053,32 @@ static void PcgwParseRow(const std::string &d3d, const std::string &vk, const st
         else if (x == 1 || x == 0) continue;
         if (x >= 2) t += (t.empty() ? "Direct3D " : ", ") + std::to_string(x);
     }
-    if (!vk.empty() && LowerA(vk) != "false") { apis |= ApiVulkan; t += (t.empty() ? "" : "; ") + std::string("Vulkan"); }
-    if (!gl.empty() && LowerA(gl) != "false") { apis |= ApiGL; t += (t.empty() ? "" : "; ") + std::string("OpenGL ") + gl; }
+    // "false", "unknown", "n/a" ... in a version field: not supported (or not known to be)
+    auto yes = [](const std::string &v) { std::string l = LowerA(v); return !l.empty() && l != "false" && l != "no" && l != "unknown" && l != "n/a" && l != "na" && l != "none"; };
+    if (yes(vk)) { apis |= ApiVulkan; t += (t.empty() ? "" : "; ") + std::string("Vulkan"); }
+    if (yes(gl)) { apis |= ApiGL; t += (t.empty() ? "" : "; ") + std::string("OpenGL ") + gl; }
     text = t;
+}
+
+// Store titles carry edition names the wiki's page names don't: "The Witcher 3: Wild Hunt - Game of the Year
+// Edition" is the page "The Witcher 3: Wild Hunt". Tried: the name itself, then without such a suffix.
+static std::vector<std::string> PcgwNames(const std::string &name)
+{
+    std::vector<std::string> out{ name };
+    std::string l = LowerA(name);
+    static const char *ed[] = { "edition", "goty", "game of the year", "remaster", "director's cut", "complete", "deluxe", "enhanced" };
+    size_t dash = name.rfind(" - ");
+    if (dash != std::string::npos && dash > 0)
+    {
+        std::string tail = l.substr(dash);
+        for (auto e : ed) if (tail.find(e) != std::string::npos) { out.push_back(name.substr(0, dash)); break; }
+    }
+    for (auto suf : { " goty", " game of the year edition", " complete edition", " definitive edition", " deluxe edition" })
+    {
+        const size_t n = strlen(suf);
+        if (l.size() > n && l.compare(l.size() - n, n, suf) == 0) out.push_back(name.substr(0, name.size() - n));
+    }
+    return out;
 }
 
 std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const std::string &)> &progress)
@@ -1071,11 +1108,13 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
             if (!where.empty()) where += " OR ";
             if (!g.appid.empty()) where += "Infobox_game.Steam_AppID HOLDS \"" + g.appid + "\"";
             else
-            {
-                std::string n;
-                for (char c : g.name) { if (c == '"' || c == '\\') n += '\\'; n += c; }
-                where += "Infobox_game._pageName=\"" + n + "\"";
-            }
+                for (const std::string &v : PcgwNames(g.name))
+                {
+                    std::string n;
+                    for (char c : v) { if (c == '"' || c == '\\') n += '\\'; n += c; }
+                    if (where.size() >= 4 && where.compare(where.size() - 4, 4, " OR ") != 0) where += " OR ";
+                    where += "Infobox_game._pageName=\"" + n + "\"";
+                }
         }
         std::string url = "https://www.pcgamingwiki.com/w/api.php?action=cargoquery&format=json&limit=500"
                           "&tables=Infobox_game,API&join_on=Infobox_game._pageName%3DAPI._pageName"
@@ -1084,8 +1123,13 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
                           "&where=" + UrlEncode(where);
         std::string body, e;
         if (!HttpGet(W(url), body, e)) { err = "PCGamingWiki: " + e; break; }
+        // An error page or a rate-limit answer has no "cargoquery" list: don't record every game as "not on the
+        // wiki" for a week because of it.
+        if (body.find("\"cargoquery\"") == std::string::npos) { err = "PCGamingWiki: unexpected answer (try Look up again later)"; break; }
+        if (i + batch < want.size()) Sleep(500);   // be gentle with the wiki between batches
         std::lock_guard<std::mutex> l(g_pcgwLock);
         std::set<std::string> hit;
+        std::map<std::string, int> hitScore;   // several pages can list the same Steam AppID (mods, remasters): best name wins
         for (size_t p = 0; (p = body.find("\"title\"", p)) != std::string::npos; p += 7)
         {
             size_t end = body.find('}', p);
@@ -1105,8 +1149,15 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
                     for (auto &c : list) if (c == ' ') c = ',';
                     match = list.find("," + g.appid + ",") != std::string::npos;
                 }
-                else match = LowerA(page) == LowerA(g.name);
-                if (match) { g_pcgw[PcgwKey(g)] = en; hit.insert(PcgwKey(g)); }
+                else for (const std::string &v : PcgwNames(g.name)) if (LowerA(page) == LowerA(v)) match = true;
+                if (!match) continue;
+                // The page named like the game beats other pages with its AppID; otherwise the first page stays.
+                const int score = NormName(page) == NormName(g.name) ? 2 : 1;
+                const std::string key = PcgwKey(g);
+                if (hit.count(key) && hitScore[key] >= score) continue;
+                PcgwEntry e2 = en;
+                if (score < 2 && !page.empty()) e2.text += " (page \"" + page + "\")";
+                g_pcgw[key] = e2; hit.insert(key); hitScore[key] = score;
             }
         }
         for (size_t k = i; k < std::min(want.size(), i + batch); k++)

@@ -7,6 +7,22 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.7] — 2026-10-14 (Manager 1.3.1)
+
+- **[DX] [Vulkan] Two new game frame caps for fast displays.**
+  - **One game frame per strobe cycle**: the refresh rate ÷ Frames per cycle, for example 60 fps at 360 Hz with 6 frames, 90 fps at 360 Hz with 4, or 80 fps at 240 Hz with 3. Each game frame gets exactly one lit refresh, as Half refresh does with 2 frames at 120 Hz.
+  - **Custom**: a new game frame every `CapDivisor` refreshes (1–8).
+  - Both are counted against the presenter's refreshes like the other caps, so they stay in step with the strobe. Just-in-time release works with them whenever the interval is a whole number of strobe cycles.
+  - The overlay shows the cap's frame rate, and warns when the interval doesn't fit the cycle (some game frames would start on a dark refresh).
+  - Frame-rate limiters that only target an fps value (made for VRR) can't do this: at a rate that isn't the refresh ÷ a whole number, game frames drift across lit and dark refreshes.
+- **[Docs]** README: Special K's SDR-to-HDR doesn't work with the presenter.
+- **[Manager 1.3.1] Graphics API detection fixes.**
+  - **The Witcher 3 (GOG) is no longer shown as OpenGL.** Its executable links `opengl32.dll` and loads Direct3D at run time. When OpenGL is the only API found, the exe is now also checked for the Direct3D 11/12 DLL and entry-point names and for a `dx12` / `dx11` folder (`bin\x64_dx12`).
+  - **PCGamingWiki lookups for store titles with an edition name** (GOG's "The Witcher 3: Wild Hunt - Game of the Year Edition") also try the name without it.
+  - **When several wiki pages list the same Steam AppID**, the page named like the game is used.
+  - **"unknown" or "n/a" in a wiki API field** no longer counts as supported.
+  - **An error or rate-limit answer from the wiki** is no longer recorded as "not on the wiki" for a week.
+
 ## [1.0.6] — 2026-10-14 (Manager 1.3.0)
 
 - **[DX]** No changes apart from the version number.
