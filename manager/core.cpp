@@ -675,7 +675,7 @@ static void SaveCache()
 static ExeFacts AnalyzeExe(const std::wstring &exe)
 {
     std::wstring key = Lower(exe);
-    std::wstring stamp = L"5_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
+    std::wstring stamp = L"6_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
     {
         std::lock_guard<std::mutex> l(g_cacheLock);
         LoadCache();
@@ -709,7 +709,8 @@ static ExeFacts AnalyzeExe(const std::wstring &exe)
         static const wchar_t *skip[] = { L"dxgi", L"d3d9", L"d3d10", L"d3d11", L"d3d12", L"opengl32", L"vulkan-1", L"dinput8",
             L"version", L"winmm", L"dbghelp", L"reshade", L"optiscaler", L"d3dcompiler", L"dxcompiler", L"dxil", L"nvngx",
             L"sl.", L"amd_", L"ffx", L"libxess", L"xess", L"nvapi", L"gfsdk", L"steam_api", L"eossdk", L"galaxy", L"discord",
-            L"bink", L"fmod", L"wwise", L"physx", L"openal", L"dstorage", L"nvidia", L"igxess", L"renderdoc" };
+            L"bink", L"fmod", L"wwise", L"physx", L"openal", L"dstorage", L"nvidia", L"igxess", L"renderdoc",
+            L"sdl" };   // SDL names every renderer it could use (d3d11, d3d12, opengl32, vulkan-1): says nothing about the game's
         // DLLs next to the exe and in the usual sub-folders (FNA's x86/x64, lib, bin), and HashLink's .hdll
         // modules (Dead Cells). Imports first; if none of them names a graphics API, the renderer loads it at run
         // time, so look for the API's DLL name in their strings too.
@@ -1309,6 +1310,7 @@ void Detect(Game &g)
     std::wstring ro = LoadSetting(RouteKey(g.root).c_str(), L"");
     unsigned dxApis = g.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL);
     DetectShader(g);
+    g.reshadeVkIni = Exists(Join(dir, L"ReShade.ini"));
     g.shaderRecommended = g.tested.find("BFI shader recommended") != std::string::npos;
     if (ro == L"vulkan") g.route = Route::Vulkan;
     else if (ro == L"dx") g.route = g.bits == 32 ? Route::Addon32 : Route::Addon64;
@@ -1317,12 +1319,22 @@ void Detect(Game &g)
     else if (g.shaderRecommended && g.addonPath.empty() && (g.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL)))
         g.route = Route::Shader;                                                          // the tested list suggests it
     else if (g.dxvk) g.route = Route::Vulkan;
+    // The executable itself can only load Vulkan: that beats a store page or wiki listing Direct3D too (P.T. port).
+    else if ((g.exeApis & ApiVulkan) && !(g.exeApis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL))) g.route = Route::Vulkan;
     else if ((g.apis & ApiVulkan) && g.tested.find("(Vulkan") != std::string::npos) g.route = Route::Vulkan;
     else if (dxApis) g.route = g.bits == 32 ? Route::Addon32 : Route::Addon64;
     else if (g.apis & ApiVulkan) g.route = Route::Vulkan;
     else if (g.apis & ApiD3D10) g.route = Route::Unsupported;
     else g.route = g.bits == 32 ? Route::Addon32 : g.bits == 64 ? Route::Addon64 : Route::Unknown;
 
+    if (g.route == Route::Vulkan && (g.reshade || !g.addonPath.empty()))
+    {
+        std::string what = g.reshade ? "ReShade as " + U8(NameOf(g.reshadeDll.path)) : "";
+        if (!g.addonPath.empty()) what += (what.empty() ? "" : " and ") + std::string("the DX add-on");
+        g.notes.push_back("Vulkan game with " + what + " in its folder: remove them (Remove, Undo or by hand). They hook the "
+                          "hidden DXGI swap chain NVIDIA's Vulkan driver presents through, next to the Vulkan layer -- P.T. crashed "
+                          "this way. For ReShade effects use ReShade's own setup with its Vulkan option.");
+    }
     if (Exists(Join(dir, L"FNA.dll")))
         g.notes.push_back("FNA game: add --graphics D3D11 to its launch options so ReShade (as dxgi.dll) and BFI Presenter run "
                           "on Direct3D 11 (the game's log.txt shows the driver in use).");
@@ -2338,6 +2350,80 @@ std::string InstallReShade(Game &g, const std::string &version, std::string *not
     Log(oldV.empty() ? "install ReShade" : "change ReShade", g.name, dest, oldV, version);
     if (g.optiscaler && !g.reshade && note)
         *note = "ReShade copied as " + U8(NameOf(dest)) + ". Set LoadReshade=true in OptiScaler.ini so OptiScaler loads it.";
+    Detect(g);
+    return {};
+}
+
+// ReShade's setup keeps the games it installed its Vulkan layer for in %ProgramData%\ReShade\ReShadeApps.ini
+// ("Apps=path,path,..." before any section). Only the setup reads it (to offer Uninstall); the layer itself loads
+// in any game that has a ReShade.ini next to its exe.
+static bool ReShadeAppsEdit(const std::wstring &exe, bool add)
+{
+    wchar_t pd[MAX_PATH] = {};
+    if (!GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH)) return false;
+    std::wstring f = Join(Join(pd, L"ReShade"), L"ReShadeApps.ini");
+    if (!Exists(f)) return false;
+    std::vector<std::string> lines = ReadLines(f);
+    std::string target = U8(exe);
+    bool changed = false, found = false;
+    for (auto &l : lines)
+    {
+        if (!l.empty() && l[0] == '[') break;
+        if (l.rfind("Apps=", 0) != 0) continue;
+        found = true;
+        std::vector<std::string> items;
+        std::string v = l.substr(5);
+        size_t p = 0;
+        while (p <= v.size())
+        {
+            size_t c = v.find(',', p);
+            std::string it = v.substr(p, c == std::string::npos ? std::string::npos : c - p);
+            if (!it.empty() && LowerA(it) != LowerA(target)) items.push_back(it);
+            else if (!it.empty()) changed |= !add;
+            if (c == std::string::npos) break;
+            p = c + 1;
+        }
+        if (add) { items.push_back(target); changed = true; }
+        l = "Apps=";
+        for (size_t i = 0; i < items.size(); i++) l += (i ? "," : "") + items[i];
+        break;
+    }
+    if (!found && add) { lines.insert(lines.begin(), "Apps=" + target); changed = true; }
+    if (!changed) return true;
+    std::ofstream o{fs::path(f), std::ios::binary | std::ios::trunc};
+    if (!o) return false;
+    for (auto &l : lines) o << l << "\r\n";
+    return (bool)o;
+}
+
+std::string SetReShadeVulkan(Game &g, bool on, std::string *note)
+{
+    if (g.exe.empty()) return "No game executable.";
+    std::wstring dir = DirOf(g.exe), ini = Join(dir, L"ReShade.ini");
+    Txn t(g);
+    std::string err;
+    if (on && !Exists(ini))
+    {
+        if (!t.Keep(ini)) err = LastError("Couldn't back up", ini);
+        else
+        {
+            // what ReShade's setup writes for a game, minus its download of the standard shaders
+            std::ofstream o{fs::path(ini), std::ios::binary};
+            o << "[GENERAL]\r\nEffectSearchPaths=.\\reshade-shaders\\Shaders\\**\r\nTextureSearchPaths=.\\reshade-shaders\\Textures\\**\r\n"
+                 "PresetPath=.\\ReShadePreset.ini\r\n\r\n[INPUT]\r\nKeyOverlay=36,0,0,0\r\n";
+            if (!o) err = LastError("Couldn't write", ini);
+            std::error_code ec;
+            fs::create_directories(fs::path(Join(dir, L"reshade-shaders\\Shaders")), ec);
+            fs::create_directories(fs::path(Join(dir, L"reshade-shaders\\Textures")), ec);
+        }
+    }
+    else if (!on) err = DeleteKept(t, ini);
+    t.Finish();
+    if (!err.empty()) return err;
+    if (!ReShadeAppsEdit(g.exe, on) && note)
+        *note = "(ReShade's setup list ReShadeApps.ini wasn't updated -- it needs administrator rights or doesn't exist; "
+                "ReShade works anyway, only its setup won't list the game.)";
+    Log(on ? "ReShade Vulkan on" : "ReShade Vulkan off", g.name, ini, "", "");
     Detect(g);
     return {};
 }

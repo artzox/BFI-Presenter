@@ -166,6 +166,18 @@ int wmain(int argc, wchar_t **argv)
         Game *qr = Find(all, "QuakeRef"), *hl = Find(all, "HlGame");
         CHECK(qr && (qr->apis & ApiGL), "QuakeRef: LoadLibrary(\"opengl32\") in ref_gl.dll -> OpenGL (%s)", qr ? ApiText(qr->apis).c_str() : "-");
         CHECK(hl && (hl->apis & ApiD3D11), "HlGame: directx.hdll imports d3d11 -> D3D11 (%s)", hl ? ApiText(hl->apis).c_str() : "-");
+        Game *sv = Find(all, "SdlVk");
+        bool warned = false;
+        if (sv) for (auto &n : sv->notes) if (n.find("Vulkan game with ReShade") != std::string::npos) warned = true;
+        CHECK(sv && sv->route == Route::Vulkan && warned, "SdlVk: SDL3.dll ignored, Vulkan-only exe -> Vulkan layer, warns about dxgi.dll ReShade (%s)",
+              sv ? ApiText(sv->apis).c_str() : "-");
+        {
+            std::string note;
+            std::string e1 = SetReShadeVulkan(*rd, true, &note);
+            bool on = rd->reshadeVkIni;
+            std::string e2 = SetReShadeVulkan(*rd, false, &note);
+            CHECK(e1.empty() && on && e2.empty() && !rd->reshadeVkIni, "RDR2: ReShade Vulkan on (ReShade.ini written) and off (%s%s)", e1.c_str(), e2.c_str());
+        }
         Source none = SourceFromFolder(games);
         CHECK(!none.shaderFile.empty() && none.shaderVersion == src.shaderVersion, "a release without the shader gets the built-in one (v%s)", none.shaderVersion.c_str());
     }

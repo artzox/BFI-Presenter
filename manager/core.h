@@ -65,6 +65,7 @@ struct Game {
     bool         shaderOn = false;          // enabled in the active ReShade preset
     std::wstring shaderDir, presetPath;     // where ReShade looks for effects / its active preset
     bool         shaderRecommended = false; // the tested-games list recommends the shader for this game
+    bool         reshadeVkIni = false;      // ReShade.ini next to the exe: ReShade's Vulkan layer is on for this game
     bool         ini = false;    // BFIPresenter.ini next to the add-on or the exe
     std::wstring iniPath;
     Route        route = Route::Unknown;
@@ -147,6 +148,9 @@ std::string EnsureReShade(const std::string &version, const std::function<void(c
 // Installs (no ReShade yet) or changes the version of (ReShade present) ReShade for the game. "" = done;
 // *note gets a hint that isn't an error (OptiScaler).
 std::string InstallReShade(Game &g, const std::string &version, std::string *note = nullptr);
+// Vulkan games: turns ReShade's own (system-wide) Vulkan layer on or off for the game, the way ReShade's setup
+// does: ReShade.ini next to the exe (what the layer looks for) and the exe in ReShadeApps.ini (the setup's list).
+std::string SetReShadeVulkan(Game &g, bool on, std::string *note = nullptr);
 
 // Open a folder or file in Explorer.
 void OpenInExplorer(const std::wstring &path, bool select);

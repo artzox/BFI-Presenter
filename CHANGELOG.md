@@ -7,6 +7,16 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.6] — 2026-10-14 (Manager 1.3.0)
+
+- **[DX]** No changes apart from the version number.
+- **[Docs]** README: "No warranty — use at your own risk" and a list of everything BFI Presenter and the manager change on a PC.
+- **[Tested games]** P.T. (native PC port).
+- **[Manager] ReShade for Vulkan games:** a **Turn on / Turn off** button in the game's ReShade row switches ReShade's own Vulkan layer on for the game, the way ReShade's setup does (a `ReShade.ini` next to the exe, which is what the layer loads on, and the game in `ReShadeApps.ini`), so the BFI Presenter (Vulkan) tab is there in the game. The install question offers it for Vulkan games when ReShade's Vulkan layer is installed (skipped for games the tested list runs without ReShade). Before, "Install ReShade" put the DirectX ReShade into Vulkan games.
+- **[Vulkan] `BFIPresenter.ini` is reloaded when it changes** while the game runs (checked once a second), so without ReShade a setting can be edited in the ini and seen at once, without Ctrl+Shift+R or a restart.
+- **[Manager] Vulkan games that ship SDL are no longer taken for DirectX games** (P.T. native port). SDL's DLL names every renderer it could use, so it is now left out of the API scan, and an executable that can only load Vulkan goes to the Vulkan layer even when a wiki lists Direct3D too. Before, such a game got ReShade as `dxgi.dll` and the DX add-on, and crashed.
+- **[Manager] Warning for Vulkan games with a DirectX ReShade or the DX add-on in their folder**, with what to remove.
+
 ## Manager 1.2.0 — 2026-10-13
 
 - **[Manager] Batch actions no longer freeze the window.** Update outdated, Install / update and Remove for ticked games, and installing ReShade in many games now run a few games per frame with a progress dialog (game n of N, the current game, a Stop button) instead of blocking until the last game is done.
