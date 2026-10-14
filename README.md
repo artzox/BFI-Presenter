@@ -117,3 +117,9 @@ BFI Presenter is free software under the [GNU General Public License v3.0](LICEN
 ## Safety
 
 Strobing flickers at 60 Hz by design (rolling scan with phosphor fade softens it). If you are sensitive to flicker or flashing images, take care, and use the hotkey (Ctrl+Shift+B by default) to turn the strobe off.
+
+## No warranty — use at your own risk
+
+BFI Presenter is provided "as is", without warranty of any kind, and the author is not liable for any damage or loss arising from its use, as set out in sections 15 and 16 of the [GPL](LICENSE). You install it into your own games, together with third-party tools such as ReShade, and you are responsible for your own hardware, drivers and settings.
+
+What it does and doesn't touch: it only changes the frames a game shows while it runs. It does not change clocks, voltages, firmware, boot settings or the display's own settings. The manager writes only to game folders (every replaced file is backed up, with undo), one per-user registry entry for the Vulkan layer, ReShade's own files (`ReShade.ini`, its preset, `ReShadeApps.ini`), the games' NVIDIA driver profiles (the settings NVIDIA Profile Inspector changes) and its own folder in `%LOCALAPPDATA%\BFIPresenter`.
