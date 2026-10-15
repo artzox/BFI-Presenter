@@ -78,6 +78,18 @@ Makes each line fade out after the "beam" passes, like the glow of a real CRT, i
 **Turn this on if you have an LCD monitor (IPS, VA or TN).** An LCD drives every refresh with the opposite voltage of the one before, so over time it all evens out. With BFI's "lit, dark, lit, dark" every lit picture lands on the same voltage, and after a long session the screen can keep a faint ghost of the image (HUDs, menus). It's usually temporary, but annoying. This option, every few seconds, briefly fades the flashing out to a steady picture (about half a second), shifts it by one refresh where nobody can see it, and fades it back in, so the lit pictures switch to the other voltage and it evens out again. At most you'll notice motion getting a little softer for a moment.\
 *When to change it:* on for every LCD; leave off for OLED, which doesn't work this way. Not needed with an odd number of frames per cycle (3), where the lit refresh alternates anyway.
 
+```
+One box = one refresh. Under each box: the voltage the LCD drives that refresh with.
+█ lit   ░ dark   ▓ lit, fading   ▒ steady, half bright   (the real fade is ~0.4 s, about 48 refreshes at 120 Hz)
+
+Without the option   █ ░ █ ░ █ ░ █ ░ █ ░ █ ░ █ ░ █ ░
+                     + − + − + − + − + − + − + − + −    every lit picture gets +: the panel slowly charges up
+
+With the option      █ ░ █ ░ ▓ ▒ ▒ ▒ ▒ ▓ ▒ █ ░ █ ░ █
+                     + − + − + − + − + − + − + − + −    after the swap every lit picture gets −: the charge evens out
+                                     ↑ one extra refresh while the picture is steady (nobody can see it)
+```
+
 **Output** · `Output` · default: auto\
 Whether the game's picture is SDR or HDR (and which HDR format). Auto reads it from the game.\
 *When to change it:* leave on auto. Only force it if colours look obviously wrong.
