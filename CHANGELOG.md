@@ -7,10 +7,15 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [1.0.9] — test build
+## [1.0.9] — test build (Manager 1.3.2)
 
-- **[DX] Show overlays** (`ShowOverlays`, Advanced section, off by default). The presenter's presents go through overlay hooks again, so the RivaTuner OSD and the Steam overlay draw on the strobed frames in DirectX 12, 11, 9 and OpenGL games. The move onto the presenter queue stays direct. Off by default because Steam's Present hook crashed Pragmata and Resident Evil 4 this way; it applies at the next game start, since overlays set themselves up on the first present they see. Keep RTSS's frame limiter off. Vulkan games already show overlays.
+- **[DX] Show overlays** (`ShowOverlays`, Advanced section, off by default). The presenter's presents go through overlay hooks again, so the RivaTuner OSD and the Steam overlay draw on the strobed frames in 64-bit DirectX 12, 11 and 9 games. Ignored in 32-bit games (they crashed or still showed no overlay in testing) and OpenGL games (no effect). The move onto the presenter queue stays direct. Off by default because Steam's Present hook crashed Pragmata and Resident Evil 4 this way; it applies at the next game start, since overlays set themselves up on the first present they see. Keep RTSS's frame limiter off. Vulkan games already show overlays.
 - **[DX] [Vulkan] LCD phase swap: 5 seconds by default** (was 30), counted from the end of each fade, so the strobe runs at full depth for the whole interval. An IPS user still saw image retention at 30 s; at 1 s it was almost gone, but with 0.8 s of fading per swap the strobe was then softened most of the time. Existing `BFIPresenter.ini` files keep their `LcdPhaseSwapSeconds`: set it to 5 by hand.
+- **[Shader 1.0.9] LCD: prevent image retention**, the add-on's phase swap for the BFI shader (LCD category, off by default, 5 s).
+- **[Shader] Fixed: the hitch guard's refresh drift never added up.** The state copy wrote the first state value into every slot, so the drift was reset each frame and only a single frame more than 0.6 refreshes off counted as a miss. Frame times are now summed as described, so a slow drift (a missed refresh hidden by jitter) pauses BFI too.
+- **[DX] [Vulkan] Frame cap list:** Quarter refresh now reads "one game frame per two lit + dark pairs" instead of "30 fps at 120 Hz", which confused people on other refresh rates. The guide says "half / a quarter of the refresh rate".
+- **[Docs]** Settings guide: diagrams for frames per cycle, the LCD phase swap, frame pacing and delay, as images in light and dark.
+- **[Manager 1.3.2]** Carries the 1.0.9 shader.
 
 ## [1.0.8] — 2026-10-15
 

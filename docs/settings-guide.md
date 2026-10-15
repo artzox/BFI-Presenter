@@ -113,8 +113,8 @@ BFI only looks right if every new game image lands exactly on a lit refresh. The
 **Game frame cap** · `CapGameToRefresh` · default: Refresh rate\
 Limits how fast the game runs so it stays in step with the flashing.
 - **Refresh rate** (120 fps at 120 Hz): for games that easily hold 120.
-- **Half refresh** (60 fps): for games that can't hold 120. Every game image gets exactly one flash, which is the smoothest look.
-- **Quarter** (30 fps): for very heavy games; each image is flashed twice, evenly.
+- **Half refresh** (half the refresh rate: 60 fps at 120 Hz): for games that can't hold 120. Every game image gets exactly one flash, which is the smoothest look.
+- **Quarter** (a quarter of the refresh rate: 30 fps at 120 Hz): for very heavy games; each image is flashed twice, evenly.
 - **One game frame per strobe cycle**: the refresh rate divided by Frames per cycle. Made for fast displays with longer cycles: 60 fps at 360 Hz with 6 frames, 90 fps at 360 Hz with 4, 80 fps at 240 Hz with 3. Each game image gets exactly one flash.
 - **Custom** (`CapDivisor`): a new game image every N refreshes (1–8). Pick a multiple of Frames per cycle, or some images start on a dark refresh and motion judders; the overlay warns when it doesn't fit.
 - **Off**: no limit (not recommended).
@@ -189,7 +189,7 @@ If the next flash would be identical to one already prepared, it's reused instea
 Overlays like Steam's or RivaTuner's don't draw on the flashed frames. This prevented hangs in some games.
 
 **Show overlays** · `ShowOverlays` · default: off\
-Lets RivaTuner's on-screen display (fps counter) and the Steam overlay draw on the picture you see. Normally they're skipped, because Steam's overlay crashed a few games when the flashed frames went through it.\
+Lets RivaTuner's on-screen display (fps counter) and the Steam overlay draw on the picture you see, in 64-bit DirectX games. Normally they're skipped, because Steam's overlay crashed a few games when the flashed frames went through it. It does nothing in 32-bit games (they crashed or still showed nothing) and OpenGL games.\
 *When to change it:* turn it on if you want the RTSS OSD in a DirectX game, and off again if the game then crashes or hangs. Keep RivaTuner's frame limiter off. It takes effect the next time you start the game. Vulkan games show the OSD without it.
 
 **DirectX 11 / 9 / OpenGL support** · `DX11Support`, `DX9Support`, `OpenGLSupport` · default: on\

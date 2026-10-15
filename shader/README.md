@@ -19,6 +19,10 @@ The shader can't see the display's refreshes, only the time between the game's f
 
 **Show status square** puts a small square in the top-left corner: green = strobing, amber = paused by the hitch guard, red = the game isn't running at the refresh rate.
 
+## LCD monitors
+
+On an LCD (IPS, VA, TN) turn on **LCD: prevent image retention**. An LCD drives each refresh with the opposite voltage of the one before; with an even number of frames per cycle every lit frame gets the same voltage, and long sessions can leave a ghost of the image. Every **Seconds of full strobe between swaps** (5 by default) the shader fades to the steady picture for about half a second, shifts the cycle by one frame and fades back, so the lit frames alternate between the two voltages. Not needed on OLED or with an odd number of frames.
+
 ## Differences from the add-on
 
 - No frame cap or pacing: the game's own VSync does that.
