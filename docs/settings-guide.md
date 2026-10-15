@@ -35,6 +35,11 @@ The main switch. Off, BFI Presenter still shows the game but without any dark fr
 How many refreshes make up one flash cycle: 2 means "one lit, one dark". 3 or 4 means one lit and two or three dark, which is even sharper but darker, and flickers at a lower rate.\
 *When to change it:* keep 2 at 120 Hz. Higher values are for 240 Hz+ displays; pair them with the **One game frame per strobe cycle** frame cap, so each game image gets exactly one flash.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/frames-per-cycle-dark.png">
+  <img src="img/frames-per-cycle-light.png" alt="The same 1/15 s at 120 Hz with 2 frames, 240 Hz with 4, 360 Hz with 6, 360 Hz with 6 inverted, and 120 Hz with 2 frames at 30 fps: more frames per cycle give a shorter flash but less light; inverted is bright but barely sharper; at 30 fps each image is flashed twice." width="760">
+</picture>
+
 **Gain vs blur** · `Gain` · default: 0.5 (recommended 1.0)\
 How much of the lost brightness to win back. At 0.5 the lit frame looks exactly like the normal picture, so the overall image is half as bright. At 1.0 the lit frame is boosted to make up the difference, so the average brightness is close to normal.\
 *When to change it:* use 1.0 on bright displays (most OLEDs in HDR). Lower it if highlights look washed out or the screen dims in bright scenes.
@@ -94,6 +99,16 @@ OLED screens have a power limit: when a lot of the screen is bright at once, the
 ## Smoothness and latency
 
 BFI only looks right if every new game image lands exactly on a lit refresh. These settings decide how BFI Presenter paces the game to make that happen, and how much input delay you trade for smoothness.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/frame-pipeline-dark.png">
+  <img src="img/frame-pipeline-light.png" alt="Where a frame waits: the game starts it (frame cap, just-in-time release), the graphics card draws it (frames ahead), finished images wait for a lit refresh (Smooth or Lowest latency), and the presenter shows one present per refresh (presenter buffers, queue one refresh ahead)." width="760">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/frame-pacing-dark.png">
+  <img src="img/frame-pacing-light.png" alt="Image D finishes too late. Lowest latency shows C twice and skips D; Smooth shows C twice and then every image in order, one flash later." width="760">
+</picture>
 
 **Game frame cap** · `CapGameToRefresh` · default: Refresh rate\
 Limits how fast the game runs so it stays in step with the flashing.
