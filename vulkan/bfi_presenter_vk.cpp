@@ -253,7 +253,7 @@ struct Settings
     int   rolling  = 0;       // rolling scan: one band per sub-frame, rolling down the screen
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
-    int   lcdSwapSec = 30;   // seconds between phase shifts (1-300)
+    int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
     float rollSeam = 0.08f;   // blended zone between bands, fraction of the screen height
     float rollDecay = 0.0f;   // rolling scan phosphor decay, in sub-frames (0 = hard bands + seam)
     float knee     = 0.75f;
@@ -323,7 +323,7 @@ static void LoadSettings(Settings &s)
     s.rolloff  = KvInt(kv, "HighlightRolloff", 1);
     s.rolling  = KvInt(kv, "RollingScan", 0) ? 1 : 0;
     s.lcdSwap  = KvInt(kv, "LcdPhaseSwap", 0) ? 1 : 0;
-    s.lcdSwapSec = Clamp(KvInt(kv, "LcdPhaseSwapSeconds", 30), 1, 300);
+    s.lcdSwapSec = Clamp(KvInt(kv, "LcdPhaseSwapSeconds", 5), 1, 300);
     s.rollSeam = Clamp(KvFloat(kv, "RollingSeam", 0.08f), 0.0f, 0.5f);
     s.rollDecay = Clamp(KvFloat(kv, "RollingPhosphorDecay", 0.0f), 0.0f, 1.0f);
     s.knee     = KvFloat(kv, "RolloffKnee", 0.75f);
@@ -1798,13 +1798,12 @@ static void PresenterThread(Swapchain *sc)
                 {
                     phaseShift++;              // the next refresh repeats this slot, at the steady average
                     swapState = 2;
-                    lastPhaseSwapT = tNow;
                 }
             }
             else if (swapState == 2)
             {
                 soften = std::max(0.0f, soften - step);
-                if (soften <= 0.0f) swapState = 0;
+                if (soften <= 0.0f) { swapState = 0; lastPhaseSwapT = tNow; }   // interval counts full-strobe time
             }
         }
         else { soften = 0.0f; swapState = 0; }
