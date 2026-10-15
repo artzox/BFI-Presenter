@@ -107,7 +107,7 @@ BFI only looks right if every new game image lands exactly on a lit refresh. The
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/frame-pacing-dark.png">
-  <img src="img/frame-pacing-light.png" alt="Some images finish just late. Lowest latency repeats the previous image and then jumps two ahead, so C, E and G are never shown; Smooth repeats once and then shows every image in order, one flash later." width="760">
+  <img src="img/frame-pacing-light.png" alt="Example at 120 Hz and 60 fps, flash by flash: every other image finishes just after its flash. Lowest latency shows the newest image, so it repeats one and then jumps over the late one (C, E and G are never shown); Smooth shows the oldest not yet shown, so after one repeat every image appears once, in order, one flash later." width="760">
 </picture>
 
 **Game frame cap** · `CapGameToRefresh` · default: Refresh rate\
