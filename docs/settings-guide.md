@@ -12,14 +12,10 @@ An OLED or LCD keeps each picture lit for the whole time until the next one arri
 
 BFI Presenter brings the flash back. At 120 Hz your screen shows 120 pictures a second; BFI Presenter makes one of them bright and the next one dark, over and over. The game still shows 60 new images a second, but each one is only visible for half the time, so motion looks about twice as sharp. The price is brightness (half the light) and a 60 Hz flicker some people notice.
 
-```
-One box = one refresh at 120 Hz (1/120 s).   █ lit   ░ dark   ▄ partly lit   ▒ steady, half bright
-
-Normal (no BFI)      █ █ █ █ █ █ █ █ █ █ █ █
-BFI, 2 frames        █ ░ █ ░ █ ░ █ ░ █ ░ █ ░
-Variable MPRT        █ ▄ █ ▄ █ ▄ █ ▄ █ ▄ █ ▄    (only the brightest parts spill into the dark refresh)
-Hitch guard pause    █ ░ █ ░ ▒ ▒ ▒ ▒ █ ░ █ ░
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/bfi-refreshes-dark.png">
+  <img src="img/bfi-refreshes-light.png" alt="Refreshes at 120 Hz: normal (all lit), BFI with 2 frames (lit, dark), Variable MPRT (dark refreshes slightly lit) and a hitch guard pause (steady half-bright refreshes)." width="760">
+</picture>
 
 Everything below is a way of tuning that flash: how bright it is, how it handles highlights, and how BFI Presenter keeps the game in step with it.
 
@@ -74,9 +70,14 @@ Makes each line fade out after the "beam" passes, like the glow of a real CRT, i
 
 ## Your display
 
-**LCD: prevent image retention** · `LcdPhaseSwap`, `LcdPhaseSwapSeconds` · default: off, 30 s\
-**Turn this on if you have an LCD monitor (IPS, VA or TN).** An LCD drives every refresh with the opposite voltage of the one before, so over time it all evens out. With BFI's "lit, dark, lit, dark" every lit picture lands on the same voltage, and after a long session the screen can keep a faint ghost of the image (HUDs, menus). It's usually temporary, but annoying. This option, every 30 seconds or so, briefly fades the flashing out to a steady picture (about half a second), shifts it by one refresh where nobody can see it, and fades it back in, so the lit pictures switch to the other voltage and it evens out again. At most you'll notice motion getting a little softer for a moment.\
+**LCD: prevent image retention** · `LcdPhaseSwap`, `LcdPhaseSwapSeconds` · default: off, 5 s\
+**Turn this on if you have an LCD monitor (IPS, VA or TN).** An LCD drives every refresh with the opposite voltage of the one before, so over time it all evens out. With BFI's "lit, dark, lit, dark" every lit picture lands on the same voltage, and after a long session the screen can keep a faint ghost of the image (HUDs, menus). It's usually temporary, but annoying. This option, every few seconds, briefly fades the flashing out to a steady picture (about half a second), shifts it by one refresh where nobody can see it, and fades it back in, so the lit pictures switch to the other voltage and it evens out again. At most you'll notice motion getting a little softer for a moment.\
 *When to change it:* on for every LCD; leave off for OLED, which doesn't work this way. Not needed with an odd number of frames per cycle (3), where the lit refresh alternates anyway.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/lcd-phase-swap-dark.png">
+  <img src="img/lcd-phase-swap-light.png" alt="Without the LCD option every lit refresh gets the same + voltage; with it the strobe fades to a steady picture, one extra refresh is inserted, and afterwards every lit refresh gets the − voltage." width="760">
+</picture>
 
 **Output** · `Output` · default: auto\
 Whether the game's picture is SDR or HDR (and which HDR format). Auto reads it from the game.\
@@ -171,6 +172,10 @@ If the next flash would be identical to one already prepared, it's reused instea
 
 **Bypass overlay hooks** · `BypassOverlayResizeHooks` · default: on\
 Overlays like Steam's or RivaTuner's don't draw on the flashed frames. This prevented hangs in some games.
+
+**Show overlays** · `ShowOverlays` · default: off\
+Lets RivaTuner's on-screen display (fps counter) and the Steam overlay draw on the picture you see. Normally they're skipped, because Steam's overlay crashed a few games when the flashed frames went through it.\
+*When to change it:* turn it on if you want the RTSS OSD in a DirectX game, and off again if the game then crashes or hangs. Keep RivaTuner's frame limiter off. It takes effect the next time you start the game. Vulkan games show the OSD without it.
 
 **DirectX 11 / 9 / OpenGL support** · `DX11Support`, `DX9Support`, `OpenGLSupport` · default: on\
 Lets the add-on handle older games. They're shown through BFI Presenter's own window over the game, so these games need borderless or windowed mode (it switches them automatically).

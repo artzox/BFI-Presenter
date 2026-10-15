@@ -7,6 +7,11 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.9] — test build
+
+- **[DX] Show overlays** (`ShowOverlays`, Advanced section, off by default). The presenter's presents go through overlay hooks again, so the RivaTuner OSD and the Steam overlay draw on the strobed frames in DirectX 12, 11, 9 and OpenGL games. The move onto the presenter queue stays direct. Off by default because Steam's Present hook crashed Pragmata and Resident Evil 4 this way; it applies at the next game start, since overlays set themselves up on the first present they see. Keep RTSS's frame limiter off. Vulkan games already show overlays.
+- **[DX] [Vulkan] LCD phase swap: 5 seconds by default** (was 30), counted from the end of each fade, so the strobe runs at full depth for the whole interval. An IPS user still saw image retention at 30 s; at 1 s it was almost gone, but with 0.8 s of fading per swap the strobe was then softened most of the time. Existing `BFIPresenter.ini` files keep their `LcdPhaseSwapSeconds`: set it to 5 by hand.
+
 ## [1.0.8] — 2026-10-15
 
 - **[DX] [Vulkan] LCD: prevent image retention** (`LcdPhaseSwap`, `LcdPhaseSwapSeconds`, off by default). An LCD drives each refresh with the opposite polarity of the one before; with an even number of frames per cycle every lit refresh got the same polarity, a DC bias that can leave temporary image retention on IPS/VA/TN panels after long sessions. On, every N seconds (30 by default, 1–300) the strobe fades over about 0.4 s to the steady average picture the hitch guard shows, repeats one refresh while every refresh looks the same, and fades back: the lit refreshes then sit on the other polarity. The fade keeps every cycle's light the same, so nothing flickers; motion is briefly a little softer. (A second dark refresh, then a single average-brightness refresh, were tried first and both flickered.) Not needed on OLED or with an odd number of frames per cycle.
