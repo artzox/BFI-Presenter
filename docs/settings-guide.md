@@ -102,12 +102,12 @@ BFI only looks right if every new game image lands exactly on a lit refresh. The
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/frame-pipeline-dark.png">
-  <img src="img/frame-pipeline-light.png" alt="Where a frame waits: the game starts it (frame cap, just-in-time release), the graphics card draws it (frames ahead), finished images wait for a lit refresh (Smooth or Lowest latency), and the presenter shows one present per refresh (presenter buffers, queue one refresh ahead)." width="760">
+  <img src="img/frame-pipeline-light.png" alt="Delay from input to the lit image, in refreshes at 120 Hz: just-in-time release is shortest; releasing at the refresh, Smooth after a late image, a second frame ahead and Queue one refresh ahead each add waiting." width="760">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/frame-pacing-dark.png">
-  <img src="img/frame-pacing-light.png" alt="Image D finishes too late. Lowest latency shows C twice and skips D; Smooth shows C twice and then every image in order, one flash later." width="760">
+  <img src="img/frame-pacing-light.png" alt="Some images finish just late. Lowest latency repeats the previous image and then jumps two ahead, so C, E and G are never shown; Smooth repeats once and then shows every image in order, one flash later." width="760">
 </picture>
 
 **Game frame cap** · `CapGameToRefresh` · default: Refresh rate\
