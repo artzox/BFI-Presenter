@@ -3783,6 +3783,13 @@ static HRESULT OwnPresent()
     if (g_showOverlaysBoot < 0)
     {
         g_showOverlaysBoot = g_shared.showOverlays ? 1 : 0;
+#ifndef _WIN64
+        // 32-bit games crashed or still showed no overlay in testing (Heretic II).
+        if (g_showOverlaysBoot) { g_showOverlaysBoot = 0; LOGW("BFI Presenter: ShowOverlays ignored -- not supported in 32-bit games (crashes or no overlay)"); }
+#endif
+        // OpenGL: RTSS and Steam hook the game's OpenGL presents, which the presenter replaces; going through
+        // DXGI's hooks doesn't bring their overlay back.
+        if (g_showOverlaysBoot && g_glActive.load()) { g_showOverlaysBoot = 0; LOGW("BFI Presenter: ShowOverlays ignored -- not supported in OpenGL games"); }
         if (g_showOverlaysBoot)
             LOGI("BFI Presenter: ShowOverlays=1 -- the presenter's presents go through overlay hooks (RTSS OSD, Steam "
                  "overlay); keep RTSS's frame limiter off");
@@ -6510,7 +6517,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
     // ================================================================ 3. frame pacing and latency
     if (ImGui::CollapsingHeader("Frame pacing and latency", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::Combo("Game frame cap", &s.gameCap, "Off\0Refresh rate\0Half refresh (one game frame per lit + dark pair)\0Quarter refresh (30 fps at 120 Hz)\0One game frame per strobe cycle (refresh / Frames)\0Custom (refresh / divisor)\0");
+        ImGui::Combo("Game frame cap", &s.gameCap, "Off\0Refresh rate\0Half refresh (one game frame per lit + dark pair)\0Quarter refresh (one game frame per two lit + dark pairs)\0One game frame per strobe cycle (refresh / Frames)\0Custom (refresh / divisor)\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it.\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI, and the best choice when the game can't hold 120. With frame generation use Refresh rate:\nHalf throws away half the generated frames.\nOne game frame per strobe cycle: refresh / Frames per cycle -- 60 fps at 360 Hz with 6 frames,\n90 fps at 360 Hz with 4, 80 fps at 240 Hz with 3.\nCustom: the game gets a new frame every N refreshes.");
         if (s.gameCap == 5)
         {
@@ -6610,10 +6617,16 @@ static void draw_overlay(reshade::api::effect_runtime *)
         bool so = s.showOverlays != 0;
         if (ImGui::Checkbox("Show overlays (RTSS OSD, Steam) on the strobed frames", &so)) s.showOverlays = so ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Sends the presenter's presents through overlay hooks, so RivaTuner's OSD and the Steam\n"
-                                                      "overlay draw on what you see. Off by default: Steam's hook crashed some games this way\n"
-                                                      "(Pragmata, Resident Evil 4) -- turn it off again if the game crashes or hangs.\n"
+                                                      "overlay draw on what you see.\n"
+                                                      "64-bit DirectX 12 / 11 / 9 games only: not supported in 32-bit games (they crashed or\n"
+                                                      "still showed no overlay) or OpenGL games, where it is ignored. Some 64-bit games crash\n"
+                                                      "with it too (Steam's hook: Pragmata, Resident Evil 4) -- turn it off if the game crashes.\n"
                                                       "Keep RTSS's frame limiter off: it would hold back the presenter and break the strobe.\n"
-                                                      "Applies at the next game start.");
+                                                      "Applies at the next game start. Vulkan games show overlays without it.");
+#ifndef _WIN64
+        if (s.showOverlays) { ImGui::SameLine(); ImGui::TextColored(kAmber, "not supported in 32-bit games"); }
+#endif
+        if (s.showOverlays && g_glActive.load()) { ImGui::SameLine(); ImGui::TextColored(kAmber, "not supported in OpenGL games"); }
         if (g_showOverlaysBoot >= 0 && s.showOverlays != g_showOverlaysBoot)
         {
             ImGui::SameLine();

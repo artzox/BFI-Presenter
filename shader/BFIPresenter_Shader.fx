@@ -1,4 +1,4 @@
-// BFI Presenter shader v1.0.5 -- the BFI Presenter strobe as a ReShade effect.
+// BFI Presenter shader v1.0.9 -- the BFI Presenter strobe as a ReShade effect.
 // Copyright (C) 2026 artzox. SPDX-License-Identifier: GPL-3.0-or-later
 //
 // The same strobe as the BFI Presenter add-on (BFI with highlight roll-off,
@@ -175,6 +175,24 @@ uniform float bfi_hitch_tol <
                  "runs smoothly (frame times that jitter a lot).";
 > = 0.6;
 
+uniform bool bfi_lcd_swap <
+    ui_category = "LCD";
+    ui_label = "LCD: prevent image retention";
+    ui_tooltip = "For LCD monitors (IPS, VA, TN) -- not needed on OLED.\n"
+                 "An LCD drives each refresh with the opposite voltage of the one before. With an even\n"
+                 "number of frames per cycle every lit frame gets the same voltage, and the panel can\n"
+                 "keep a ghost of the image. Every few seconds this fades the strobe to a steady picture\n"
+                 "for about half a second, shifts the cycle by one frame and fades it back, so the lit\n"
+                 "frames alternate between the two voltages. No flicker; motion is briefly softer.";
+> = false;
+
+uniform int bfi_lcd_swap_sec <
+    ui_type = "slider";
+    ui_category = "LCD";
+    ui_label = "Seconds of full strobe between swaps";
+    ui_min = 1; ui_max = 300;
+> = 5;
+
 uniform bool bfi_show_status <
     ui_category = "Hitch guard";
     ui_label = "Show status square";
@@ -191,8 +209,10 @@ uniform float BFI_FRAMETIME  < source = "frametime"; >;   // ms since the previo
 // texel 0 -- x: hitch-guard pause until (timer, ms)   y: smoothed frame time (ms)
 //            z: lit-frame ceiling now (nits)          w: time the ceiling was last pulled down (ms)
 // texel 1 -- x: refresh drift (ms): frame times minus refreshes, summed
-texture2D bfi_state_tex  { Width = 2; Height = 1; Format = RGBA32F; };
-texture2D bfi_state2_tex { Width = 2; Height = 1; Format = RGBA32F; };
+// texel 2 -- LCD phase swap. x: cycle offset (frames)  y: fade (0 = full strobe, 1 = steady)
+//            z: 0 idle, 1 fading to steady, 2 fading back   w: time of the last swap (ms)
+texture2D bfi_state_tex  { Width = 3; Height = 1; Format = RGBA32F; };
+texture2D bfi_state2_tex { Width = 3; Height = 1; Format = RGBA32F; };
 sampler2D bfi_state  { Texture = bfi_state_tex;  MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 sampler2D bfi_state2 { Texture = bfi_state2_tex; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 
@@ -383,6 +403,35 @@ float4 StatePS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     // jitter in long/short pairs that cancel out; a missed refresh moves the
     // sum by a whole refresh and keeps it there, a game faster than the
     // display pulls it down every frame.
+    if (pos.x >= 2.0)
+    {
+        // LCD phase swap (see the add-on): fade to the steady average picture over ~0.4 s, shift the
+        // cycle by one frame while every frame looks the same, fade back. Interval counted from the
+        // end of the fade-back, so the strobe runs at full depth for the whole interval.
+        float4 s = tex2Dfetch(bfi_state2, int2(2, 0));
+        int n = Frames();
+        if (s.w > now + 10000.0 || s.w <= 0.0) s = float4(0.0, 0.0, 0.0, now);   // first frame, or timer restarted
+        bool hitchPaused = bfi_hitch && now < tex2Dfetch(bfi_state2, int2(0, 0)).x;
+        if (!bfi_lcd_swap || !bfi_enabled || (n % 2) != 0) { s.y = 0.0; s.z = 0.0; s.w = now; return s; }
+        float step = clamp(ft, 0.0, 100.0) / 400.0;
+        if (s.z < 0.5 && !hitchPaused && now - s.w >= float(bfi_lcd_swap_sec) * 1000.0) s.z = 1.0;
+        if (s.z > 0.5 && s.z < 1.5)
+        {
+            s.y = min(1.0, s.y + step);
+            int slot = int((BFI_FRAMECOUNT + uint(s.x)) % uint(n));
+            if (s.y >= 1.0 && slot == n - 1)
+            {
+                s.x = float((int(s.x) + n - 1) % n);   // the next frame repeats this slot, at the steady picture
+                s.z = 2.0;
+            }
+        }
+        else if (s.z > 1.5)
+        {
+            s.y = max(0.0, s.y - step);
+            if (s.y <= 0.0) { s.z = 0.0; s.w = now; }
+        }
+        return s;
+    }
     float d = tex2Dfetch(bfi_state2, int2(1, 0)).x;
     if (abs(d) > 1000.0) d = 0.0;
     d = (d + ft - P) * 0.99;
@@ -427,7 +476,7 @@ float4 StatePS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 
 float4 CopyStatePS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
-    return tex2Dfetch(bfi_state, int2(0, 0));
+    return tex2Dfetch(bfi_state, int2(pos.xy));   // each texel to itself (v1.0.5 copied texel 0 into all)
 }
 
 float4 StrobePS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
@@ -440,7 +489,8 @@ float4 StrobePS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     float3 lin = Decode(c.rgb, t);
     float litGain = LitGain();
     float ceilLin = (t == 0) ? 1.0 : floor(st.z / 10.0 + 0.5) * 10.0 / 80.0;
-    int slot = int(BFI_FRAMECOUNT % uint(n));
+    float4 sw = tex2Dfetch(bfi_state, int2(2, 0));                   // LCD phase swap
+    int slot = int((BFI_FRAMECOUNT + uint(max(sw.x, 0.0))) % uint(n));
     bool paused = bfi_hitch && BFI_TIMER < st.x;
     float3 o;
     if (paused)
@@ -478,6 +528,13 @@ float4 StrobePS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
         if (wn > 0.0) o = lerp(o, Strobe(lin, (slot + n - nb) % n, litGain, ceilLin), wn);
     }
     else o = Strobe(lin, slot, litGain, ceilLin);
+    if (!paused && sw.y > 0.0)
+    {
+        // LCD phase swap fade: toward the steady average picture, which keeps every cycle's light the same.
+        float a = 0.0;
+        [unroll] for (int j = 0; j < 8; j++) if (j < n) a += Target(j, litGain, bfi_floor);
+        o = lerp(o, lin * (a / float(n)), sw.y);
+    }
 
     float4 r = float4(Encode(o, t), c.a);
     if (bfi_show_status && pos.x < 24.0 && pos.y < 24.0)

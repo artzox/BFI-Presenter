@@ -35,6 +35,11 @@ The main switch. Off, BFI Presenter still shows the game but without any dark fr
 How many refreshes make up one flash cycle: 2 means "one lit, one dark". 3 or 4 means one lit and two or three dark, which is even sharper but darker, and flickers at a lower rate.\
 *When to change it:* keep 2 at 120 Hz. Higher values are for 240 Hz+ displays; pair them with the **One game frame per strobe cycle** frame cap, so each game image gets exactly one flash.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/frames-per-cycle-dark.png">
+  <img src="img/frames-per-cycle-light.png" alt="The same 1/15 s at 120 Hz with 2 frames, 240 Hz with 4, 360 Hz with 6, 360 Hz with 6 inverted, and 120 Hz with 2 frames at 30 fps: more frames per cycle give a shorter flash but less light; inverted is bright but barely sharper; at 30 fps each image is flashed twice." width="760">
+</picture>
+
 **Gain vs blur** · `Gain` · default: 0.5 (recommended 1.0)\
 How much of the lost brightness to win back. At 0.5 the lit frame looks exactly like the normal picture, so the overall image is half as bright. At 1.0 the lit frame is boosted to make up the difference, so the average brightness is close to normal.\
 *When to change it:* use 1.0 on bright displays (most OLEDs in HDR). Lower it if highlights look washed out or the screen dims in bright scenes.
@@ -95,11 +100,21 @@ OLED screens have a power limit: when a lot of the screen is bright at once, the
 
 BFI only looks right if every new game image lands exactly on a lit refresh. These settings decide how BFI Presenter paces the game to make that happen, and how much input delay you trade for smoothness.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/frame-pipeline-dark.png">
+  <img src="img/frame-pipeline-light.png" alt="Delay from input to the lit image at 120 Hz: Refresh cap with Later release is quickest (about 8 ms), then Lowest latency without it; at the Half cap just-in-time release is quickest; Smooth after a late image, a second frame ahead and Queue one refresh ahead each add waiting." width="760">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/frame-pacing-dark.png">
+  <img src="img/frame-pacing-light.png" alt="Example at 120 Hz and 60 fps, flash by flash: every other image finishes just after its flash. Lowest latency shows the newest image, so it repeats one and then jumps over the late one (C, E and G are never shown); Smooth shows the oldest not yet shown, so after one repeat every image appears once, in order, one flash later." width="760">
+</picture>
+
 **Game frame cap** · `CapGameToRefresh` · default: Refresh rate\
 Limits how fast the game runs so it stays in step with the flashing.
-- **Refresh rate** (120 fps at 120 Hz): for games that easily hold 120.
-- **Half refresh** (60 fps): for games that can't hold 120. Every game image gets exactly one flash, which is the smoothest look.
-- **Quarter** (30 fps): for very heavy games; each image is flashed twice, evenly.
+- **Refresh rate** (the full refresh rate, e.g. 120 fps at 120 Hz): for games that easily hold 120.
+- **Half refresh** (half the refresh rate, e.g. 60 fps at 120 Hz): for games that can't hold 120. Every game image gets exactly one flash, which is the smoothest look.
+- **Quarter** (a quarter of the refresh rate, e.g. 30 fps at 120 Hz): for very heavy games; each image is flashed twice, evenly.
 - **One game frame per strobe cycle**: the refresh rate divided by Frames per cycle. Made for fast displays with longer cycles: 60 fps at 360 Hz with 6 frames, 90 fps at 360 Hz with 4, 80 fps at 240 Hz with 3. Each game image gets exactly one flash.
 - **Custom** (`CapDivisor`): a new game image every N refreshes (1–8). Pick a multiple of Frames per cycle, or some images start on a dark refresh and motion judders; the overlay warns when it doesn't fit.
 - **Off**: no limit (not recommended).
@@ -174,7 +189,7 @@ If the next flash would be identical to one already prepared, it's reused instea
 Overlays like Steam's or RivaTuner's don't draw on the flashed frames. This prevented hangs in some games.
 
 **Show overlays** · `ShowOverlays` · default: off\
-Lets RivaTuner's on-screen display (fps counter) and the Steam overlay draw on the picture you see. Normally they're skipped, because Steam's overlay crashed a few games when the flashed frames went through it.\
+Lets RivaTuner's on-screen display (fps counter) and the Steam overlay draw on the picture you see, in 64-bit DirectX games. Normally they're skipped, because Steam's overlay crashed a few games when the flashed frames went through it. It does nothing in 32-bit games (they crashed or still showed nothing) and OpenGL games.\
 *When to change it:* turn it on if you want the RTSS OSD in a DirectX game, and off again if the game then crashes or hangs. Keep RivaTuner's frame limiter off. It takes effect the next time you start the game. Vulkan games show the OSD without it.
 
 **DirectX 11 / 9 / OpenGL support** · `DX11Support`, `DX9Support`, `OpenGLSupport` · default: on\
