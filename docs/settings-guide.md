@@ -102,7 +102,7 @@ BFI only looks right if every new game image lands exactly on a lit refresh. The
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/frame-pipeline-dark.png">
-  <img src="img/frame-pipeline-light.png" alt="Delay from input to the lit image, in refreshes at 120 Hz: just-in-time release is shortest; releasing at the refresh, Smooth after a late image, a second frame ahead and Queue one refresh ahead each add waiting." width="760">
+  <img src="img/frame-pipeline-light.png" alt="Delay from input to the lit image at 120 Hz: Refresh cap with Later release is quickest (about 8 ms), then Lowest latency without it; at the Half cap just-in-time release is quickest; Smooth after a late image, a second frame ahead and Queue one refresh ahead each add waiting." width="760">
 </picture>
 
 <picture>
