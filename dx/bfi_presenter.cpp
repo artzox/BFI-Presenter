@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.9"
+#define BFI_ADDON_VERSION "1.0.10"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -105,8 +105,8 @@ struct Settings
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
-    float rollSeam = 0.08f;   // blended zone between bands, fraction of the screen height
-    float rollDecay = 0.0f;   // rolling scan phosphor decay, in sub-frames (0 = off: hard bands + seam)
+    float rollSeam = 0.0f;    // blended zone between bands, fraction of the screen height
+    float rollDecay = 0.2f;   // rolling scan phosphor decay, in sub-frames (0 = off: hard bands + seam)
     float knee     = 0.75f;
     float peakNits = 1400.0f; // display peak (HDR ceiling)
     int   output   = -1;      // -1 auto, 0 SDR, 1 scRGB, 2 HDR10
@@ -216,10 +216,10 @@ static void LoadSettings(Settings &s)
     s.lcdSwapSec = IniInt("LcdPhaseSwapSeconds", 5);
     if (s.lcdSwapSec < 1) s.lcdSwapSec = 1;
     if (s.lcdSwapSec > 300) s.lcdSwapSec = 300;
-    s.rollSeam = IniFloat("RollingSeam", 0.08f);
+    s.rollSeam = IniFloat("RollingSeam", 0.0f);
     if (s.rollSeam < 0.0f) s.rollSeam = 0.0f;
     if (s.rollSeam > 0.5f) s.rollSeam = 0.5f;
-    s.rollDecay = IniFloat("RollingPhosphorDecay", 0.0f);
+    s.rollDecay = IniFloat("RollingPhosphorDecay", 0.2f);
     if (s.rollDecay < 0.0f) s.rollDecay = 0.0f;
     if (s.rollDecay > 1.0f) s.rollDecay = 1.0f;
     s.knee     = IniFloat("RolloffKnee", 0.75f);
@@ -747,6 +747,7 @@ static DWORD WINAPI LrWatchThread(void *)
     UINT64 next = g_lrStaged.load() + 1;
     double builds[128] = {}, sorted[128];
     int nb = 0, wb = 0, state = 0, misses = 0, frames = 0, clean = 0, good = 0;
+    int limitMissSecs = 0, limitMisses = 0, limitFitSecs = 0, limitTrips = 0; bool limitOff = false;   // just-in-time release switched off at its limit
     double margin = g_lrBaseMs.load() * 0.001, est = 0.0, secT = Now(), lastWindow = 0.0;
     while (g_lrRun.load())
     {
@@ -818,7 +819,7 @@ static DWORD WINAPI LrWatchThread(void *)
                 if (good >= 3) { state = 2; good = 0; }
             }
         }
-        if (state != prev && (state == 2 || state == 3))
+        if (state != prev && (state == 2 || state == 3) && !limitOff)
         {
             if (state == 2)
                 LOGI("BFI Presenter: just-in-time release active -- game frames take %.1f ms (95th percentile), released %.1f ms "
@@ -836,7 +837,39 @@ static DWORD WINAPI LrWatchThread(void *)
         // release is the vblank itself, i.e. the normal behaviour.
         double lead = 0.0;
         if (state == 2) lead = est + margin;
-        else if (state == 3 && capMode) lead = period - 0.001;
+        // ... unless frames still miss their lit refresh that way: then
+        // release at the refresh, as with just-in-time release off (the
+        // Uncharted port showed repeat-then-skip at the limit and was even
+        // without it). It stays off until game frames have fitted the
+        // interval for 30 seconds -- switching straight back on brought the
+        // repeats back within a second -- and for the session once that has
+        // happened twice.
+        if (state == 3 && capMode && !limitOff)
+        {
+            // Misses counted over 20-second windows: the repeat-then-skip
+            // hiccups come a few a minute, rarely in consecutive seconds.
+            limitMisses += misses;
+            if (++limitMissSecs >= 20) { limitMissSecs = 0; limitMisses = 0; }
+            if (limitMisses >= 3)
+            {
+                limitOff = true; limitMisses = 0; limitMissSecs = 0; limitFitSecs = 0; limitTrips++;
+                LOGI("BFI Presenter: just-in-time release off -- at its limit frames still missed their lit refresh; "
+                     "released at the refresh, as with it off, %s",
+                     limitTrips >= 2 ? "for the rest of this session" : "until game frames fit the interval for 30 s");
+            }
+        }
+        else if (limitOff && limitTrips < 2)
+        {
+            limitFitSecs = (state != 0 && est + margin < period - 0.002) ? limitFitSecs + 1 : 0;
+            if (limitFitSecs >= 30)
+            {
+                limitOff = false; limitFitSecs = 0;
+                LOGI("BFI Presenter: just-in-time release back on -- game frames take %.1f ms", est * 1000.0);
+            }
+        }
+        if (!allowed) { limitOff = false; limitTrips = 0; limitMisses = limitMissSecs = limitFitSecs = 0; }
+        if (state == 3 && capMode && !limitOff) lead = period - 0.001;
+        if (limitOff) lead = 0.0;
         g_lrLead.store(lead);
         EnterCriticalSection(&g_cfgLock);
         g_status.lrState  = state;
@@ -2086,6 +2119,10 @@ static DWORD WINAPI PresenterThread(void *)
     int secRepU = 0, secSkipU = 0;
     double llStep = 0.0;          // lowest latency: game frames per strobe cycle (average)
     int autoAhead = 1, missSecs = 0, spareSecs = 0;
+    // Uneven strobe cycles over the last 30 seconds (one count per second), so
+    // scattered repeat-then-skip hiccups bring 2 frames ahead back as well as a
+    // run of bad seconds (Uncharted port: ~16 a minute at 1, none at 2).
+    int repWin[30] = {}, repIdx = 0, repSum = 0, repSecsRun = 0;   // repSecsRun: the first seconds (loading) don't count
     int lastOutType = -1;
     double ceilNow = -1.0, ceilTarget = -1.0, hotArea = -1.0, ablSolve = -1.0, ablT = Now();
     double rawAvg = -1.0, ablLowT = 0.0;      // unclipped lit average; last time the guard was pulling down
@@ -2093,6 +2130,7 @@ static DWORD WINAPI PresenterThread(void *)
     bool   aheadLocked = false;    // settled at 2 for this swap chain (no more switching)
     bool refillNow = false;          // present again without waiting for the next vblank
     bool vsyncOverridden = false;    // the driver is not honouring the presenter's VSync
+    int  vsyncFastSecs = 0;          // seconds in a row with presents well above the refresh count
     int  queuedNow = -1;
     int lastShown = -1;
     double lastT = Now(), secStart = Now(), ageSum = 0.0;
@@ -2624,10 +2662,16 @@ static DWORD WINAPI PresenterThread(void *)
             const double rate = secPresents / (t - secStart);
             if (!vsyncOverridden)
             {
-                const bool fast = (sok && haveStats && st.SyncRefreshCount > lastSync)
+                bool fast = (sok && haveStats && st.SyncRefreshCount > lastSync)
                                 ? rate > 1.4 * (double)(st.SyncRefreshCount - lastSync) / (t - secStart)
                                 : rate > 300.0;
-                if (fast && presents > 240)
+                // Two seconds in a row, and above the display mode's rate when it
+                // is known: DXGI's refresh count can lag for a second (frame
+                // generation starting up in Control: Resonant showed 120
+                // presents/s at 120 Hz as "ignoring VSync").
+                if (fast && modeHz > 0.0 && rate < 1.15 * modeHz) fast = false;
+                vsyncFastSecs = fast ? vsyncFastSecs + 1 : 0;
+                if (vsyncFastSecs >= 2 && presents > 240)
                 {
                     vsyncOverridden = true;
                     LOGE("BFI Presenter: %.0f presents/s -- the driver is ignoring VSync (NVIDIA profile: Vertical Sync "
@@ -2729,12 +2773,20 @@ static DWORD WINAPI PresenterThread(void *)
                 const double capWaitMs = n ? us / 1000.0 / n : 0.0;
                 if (s.autoAhead && s.maxAhead != 0)
                 {
+                    repSum -= repWin[repIdx];
+                    repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
+                    repSum += repWin[repIdx];
+                    repIdx = (repIdx + 1) % 30;
                     if (autoAhead == 1)
                     {
                         missSecs = (secRepU >= 2 && s.gameCap >= 1) ? missSecs + 1 : 0;
-                        if (missSecs >= 3)
+                        if (missSecs >= 3 || repSum >= 6)
                         {
+                            if (missSecs < 3)
+                                LOGI("BFI Presenter: %d uneven strobe cycles in the last 30 s at 1 frame ahead", repSum);
                             autoAhead = 2; missSecs = 0; spareSecs = 0;
+                            for (int r = 0; r < 30; r++) repWin[r] = 0;
+                            repSum = 0;
                             // Needed 2 again within a minute of trying 1: the game
                             // is close to the limit -- stay at 2, no more switching.
                             aheadLocked = aheadDropT >= 0.0 && t - aheadDropT < 60.0;
@@ -2748,6 +2800,8 @@ static DWORD WINAPI PresenterThread(void *)
                         if (spareSecs >= 10)
                         {
                             autoAhead = 1; spareSecs = 0; missSecs = 0; aheadDropT = t;
+                        for (int r = 0; r < 30; r++) repWin[r] = 0;
+                        repSum = 0;
                             LOGI("BFI Presenter: automatic frames ahead: 1 (headroom: %.1f ms spare per frame)", capWaitMs);
                         }
                     }
@@ -3675,7 +3729,12 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
     const BYTE *code = (const BYTE *)target;
     size_t patched = 0;
     for (size_t i = 0; i < 32; i++) if (code[i] != orig[i]) patched = i + 1;
-    if (!patched) { snprintf(why, whyLen, "not hooked"); return target; }
+    // Not hooked yet: still build the copy over the first 16 bytes, so a hook
+    // written later (RTSS hooks Present whenever its OSD turns on, even in a
+    // game that started without it -- it crashed Alan Wake 2) is skipped too.
+    // If those bytes can't be relocated, the function itself is still fine.
+    const bool notYet = !patched;
+    if (notYet) patched = 16;
     // Whole original instructions covering the patched bytes.
     int ins[16], rip[16], n = 0;
     size_t len = 0;
@@ -3683,7 +3742,11 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
     {
         int rd;
         const int l = InsnLength(orig + len, &rd);
-        if (l <= 0 || len + l > 48 || n >= 16) { snprintf(why, whyLen, "unsupported instruction at +%zu (%02X)", len, orig[len]); return nullptr; }
+        if (l <= 0 || len + l > 48 || n >= 16)
+        {
+            if (notYet) { snprintf(why, whyLen, "not hooked (start not relocatable: later hooks stay in the path)"); return target; }
+            snprintf(why, whyLen, "unsupported instruction at +%zu (%02X)", len, orig[len]); return nullptr;
+        }
         ins[n] = (int)len; rip[n] = rd; n++;
         len += (size_t)l;
     }
@@ -3691,7 +3754,7 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
     // x86: no RIP-relative operands; copy the instructions and jmp rel32 back.
     {
         BYTE *t = (BYTE *)VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-        if (!t) { snprintf(why, whyLen, "no memory"); return nullptr; }
+        if (!t) { snprintf(why, whyLen, "no memory"); return notYet ? target : nullptr; }
         memcpy(t, orig, len);
         t[len] = 0xE9;
         const int32_t rel = (int32_t)((intptr_t)(code + len) - (intptr_t)(t + len + 5));
@@ -3699,7 +3762,8 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
         DWORD o;
         VirtualProtect(t, 4096, PAGE_EXECUTE_READ, &o);
         FlushInstructionCache(GetCurrentProcess(), t, len + 5);
-        snprintf(why, whyLen, "%zu patched bytes skipped", patched);
+        if (notYet) snprintf(why, whyLen, "not hooked (copy of its start in place, later hooks skipped)");
+        else snprintf(why, whyLen, "%zu patched bytes skipped", patched);
         return t;
     }
 #endif
@@ -3711,7 +3775,7 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
         tramp = (BYTE *)VirtualAlloc((void *)(base - d), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (!tramp) tramp = (BYTE *)VirtualAlloc((void *)(base + d), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     }
-    if (!tramp) { snprintf(why, whyLen, "no memory near the function"); return nullptr; }
+    if (!tramp) { snprintf(why, whyLen, "no memory near the function"); return notYet ? target : nullptr; }
     memcpy(tramp, orig, len);
     for (int k = 0; k < n; k++)
     {
@@ -3721,7 +3785,7 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
         memcpy(&disp, orig + at, 4);
         const int64_t abs = (int64_t)(uintptr_t)code + at + 4 + disp;     // what it pointed at
         const int64_t nd  = abs - ((int64_t)(uintptr_t)tramp + at + 4);
-        if (nd < INT32_MIN || nd > INT32_MAX) { VirtualFree(tramp, 0, MEM_RELEASE); snprintf(why, whyLen, "displacement out of range"); return nullptr; }
+        if (nd < INT32_MIN || nd > INT32_MAX) { VirtualFree(tramp, 0, MEM_RELEASE); snprintf(why, whyLen, "displacement out of range"); return notYet ? target : nullptr; }
         const int32_t nd32 = (int32_t)nd;
         memcpy(tramp + at, &nd32, 4);
     }
@@ -3733,7 +3797,8 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
     DWORD old;
     VirtualProtect(tramp, 4096, PAGE_EXECUTE_READ, &old);
     FlushInstructionCache(GetCurrentProcess(), tramp, len + 14);
-    snprintf(why, whyLen, "%zu patched bytes skipped", patched);
+    if (notYet) snprintf(why, whyLen, "not hooked (copy of its start in place, later hooks skipped)");
+    else snprintf(why, whyLen, "%zu patched bytes skipped", patched);
     return tramp;
 }
 
@@ -6490,6 +6555,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "flicker, but more blur. 0.2-0.4 is a good start; 0 = hard bands with a seam.");
             if (s.rollDecay <= 0.0f)
                 ImGui::SliderFloat("Seam softness (share of screen height)", &s.rollSeam, 0.0f, 0.3f, "%.2f");
+            if (s.rollDecay <= 0.0f && ImGui::IsItemHovered()) ImGui::SetTooltip("Blended zone where two bands meet. Pixels in it share their light between both\n"
+                                                                  "sub-frames, so they are lit longer: visible blur along the seam in motion.\n"
+                                                                  "0 = hard edge, no blur. Phosphor decay (above) hides the edge without a seam.");
             ImGui::Unindent(16.0f);
         }
     }

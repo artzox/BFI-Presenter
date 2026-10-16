@@ -1370,7 +1370,7 @@ void Detect(Game &g)
     else if (g.shaderRecommended && g.addonPath.empty() && (g.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL)))
         g.route = Route::Shader;                                                          // the tested list suggests it
     else if (g.dxvk) g.route = Route::Vulkan;
-    // The executable itself can only load Vulkan: that beats a store page or wiki listing Direct3D too (P.T. port).
+    // The executable itself can only load Vulkan: that beats a store page or wiki listing Direct3D too (PT-PC).
     else if ((g.exeApis & ApiVulkan) && !(g.exeApis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL))) g.route = Route::Vulkan;
     else if ((g.apis & ApiVulkan) && g.tested.find("(Vulkan") != std::string::npos) g.route = Route::Vulkan;
     else if (dxApis) g.route = g.bits == 32 ? Route::Addon32 : Route::Addon64;
@@ -1383,7 +1383,7 @@ void Detect(Game &g)
         std::string what = g.reshade ? "ReShade as " + U8(NameOf(g.reshadeDll.path)) : "";
         if (!g.addonPath.empty()) what += (what.empty() ? "" : " and ") + std::string("the DX add-on");
         g.notes.push_back("Vulkan game with " + what + " in its folder: remove them (Remove, Undo or by hand). They hook the "
-                          "hidden DXGI swap chain NVIDIA's Vulkan driver presents through, next to the Vulkan layer -- P.T. crashed "
+                          "hidden DXGI swap chain NVIDIA's Vulkan driver presents through, next to the Vulkan layer -- PT-PC crashed "
                           "this way. For ReShade effects use ReShade's own setup with its Vulkan option.");
     }
     if (Exists(Join(dir, L"FNA.dll")))

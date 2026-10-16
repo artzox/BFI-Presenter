@@ -7,6 +7,16 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.10] — 2026-10-16 (Manager 1.3.3)
+
+- **[Both] Automatic frames ahead goes back to 2 on scattered hiccups.** It stepped up only after 3 seconds in a row with uneven strobe cycles, so a game that missed a cycle every few seconds stayed at 1 with a repeat-then-skip stutter (Uncharted port: about 16 a minute at 1, none at 2). Now 6 uneven cycles within 30 seconds at 1 frame ahead (not counting loading pauses) also bring it back to 2; needed again within a minute of trying 1, it stays at 2.
+- **[Both] Just-in-time release switches itself off when it doesn't help at its limit.** At the Half / Quarter cap with game frames taking nearly the whole interval, it releases as early as the cap allows (that fixed Obduction). Where frames still miss their lit refresh that way (3 in 20 seconds), it now releases at the refresh as with the option off, until game frames have fitted the interval for 30 seconds, and for the rest of the session once that has happened twice (the Uncharted port: switching straight back on brought the repeats back within a second). The log says when.
+- **[DX] Overlays that hook Present later no longer get into the presenter's presents.** With `ShowOverlays=0` the presenter calls DXGI's Present past any hook found when it starts, but a function that wasn't hooked yet was called as is, so a hook written later still ran: RivaTuner's OSD switches itself on in some games mid-session, drew on the presenter's frames and crashed Alan Wake 2. The presenter now always calls a copy of Present's first instructions, so hooks added later are skipped too.
+- **[DX] No false "driver is ignoring VSync" error with frame generation.** It needs 2 seconds in a row now, and presents clearly above the display's refresh rate: DXGI's refresh count can lag for a second, and DLSS-G starting up in Control: Resonant got flagged at 120 presents/s on a 120 Hz display.
+- **[Both] [Shader] Rolling scan defaults: phosphor decay 0.2 (was 0), seam 0 (was 0.08).** Pixels in the seam's blended zone are lit in both bands' refreshes, so the seam blurred visibly in motion; phosphor decay hides the band edge without that. The seam is now a hard edge unless you set it, and only applies with decay 0. Existing `BFIPresenter.ini` files keep their values. The overlay's seam slider has a tooltip saying so.
+- **[Tested games]** Replaced.
+- **[Docs]** Settings guide: strobe-rate formula for any refresh rate and frame generation; "CRT displays" in the intro; the Gain tip assumes the ABL guard is set up.
+
 ## [1.0.9] — 2026-10-15 (Manager 1.3.2)
 
 - **[DX] Show overlays** (`ShowOverlays`, Advanced section, off by default). The presenter's presents go through overlay hooks again, so the RivaTuner OSD and the Steam overlay draw on the strobed frames in 64-bit DirectX 12, 11 and 9 games. Ignored in 32-bit games (they crashed or still showed no overlay in testing) and OpenGL games (no effect). The move onto the presenter queue stays direct. Off by default because Steam's Present hook crashed Pragmata and Resident Evil 4 this way; it applies at the next game start, since overlays set themselves up on the first present they see. Keep RTSS's frame limiter off. Vulkan games already show overlays.
@@ -42,10 +52,10 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 
 - **[DX]** No changes apart from the version number.
 - **[Docs]** README: "No warranty — use at your own risk" and a list of everything BFI Presenter and the manager change on a PC.
-- **[Tested games]** P.T. (native PC port).
+- **[Tested games]** PT-PC.
 - **[Manager] ReShade for Vulkan games:** a **Turn on / Turn off** button in the game's ReShade row switches ReShade's own Vulkan layer on for the game by writing the `ReShade.ini` next to the exe that the layer loads on, so the BFI Presenter (Vulkan) tab is there in the game. It also tries to add the game to ReShade's setup list (`ReShadeApps.ini`), which usually needs administrator rights; without it ReShade still works, only ReShade's setup won't offer Uninstall for the game. The install question offers it for Vulkan games when ReShade's Vulkan layer is installed (skipped for games the tested list runs without ReShade). Before, "Install ReShade" put the DirectX ReShade into Vulkan games.
 - **[Vulkan] `BFIPresenter.ini` is reloaded when it changes** while the game runs (checked once a second), so without ReShade a setting can be edited in the ini and seen at once, without Ctrl+Shift+R or a restart.
-- **[Manager] Vulkan games that ship SDL are no longer taken for DirectX games** (P.T. native port). SDL's DLL names every renderer it could use, so it is now left out of the API scan, and an executable that can only load Vulkan goes to the Vulkan layer even when a wiki lists Direct3D too. Before, such a game got ReShade as `dxgi.dll` and the DX add-on, and crashed.
+- **[Manager] Vulkan games that ship SDL are no longer taken for DirectX games** (PT-PC). SDL's DLL names every renderer it could use, so it is now left out of the API scan, and an executable that can only load Vulkan goes to the Vulkan layer even when a wiki lists Direct3D too. Before, such a game got ReShade as `dxgi.dll` and the DX add-on, and crashed.
 - **[Manager] Warning for Vulkan games with a DirectX ReShade or the DX add-on in their folder**, with what to remove.
 
 ## Manager 1.2.0 — 2026-10-13
