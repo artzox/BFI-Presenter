@@ -7,8 +7,11 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [1.0.10] — unreleased
+## [1.0.10] — unreleased (Manager 1.3.3)
 
+- **[Both] Automatic frames ahead goes back to 2 on scattered hiccups.** It stepped up only after 3 seconds in a row with uneven strobe cycles, so a game that missed a cycle every few seconds stayed at 1 with a repeat-then-skip stutter (Uncharted port: about 16 a minute at 1, none at 2). Now 6 uneven cycles within 30 seconds also bring it back to 2; needed again within a minute of trying 1, it stays at 2.
+- **[Both] Just-in-time release switches itself off when it doesn't help at its limit.** At the Half / Quarter cap with game frames taking nearly the whole interval, it releases as early as the cap allows (that fixed Obduction). Where frames still miss their lit refresh that way (3 in 20 seconds), it now releases at the refresh as with the option off, until game frames are quicker again; `BFIPresenter.log` says when.
+- **[DX] No false "driver is ignoring VSync" error with frame generation.** It needs 2 seconds in a row now, and presents clearly above the display's refresh rate: DXGI's refresh count can lag for a second, and DLSS-G starting up in Control: Resonant got flagged at 120 presents/s on a 120 Hz display.
 - **[Both] [Shader] Rolling scan defaults: phosphor decay 0.2 (was 0), seam 0 (was 0.08).** Pixels in the seam's blended zone are lit in both bands' refreshes, so the seam blurred visibly in motion; phosphor decay hides the band edge without that. The seam is now a hard edge unless you set it, and only applies with decay 0. Existing `BFIPresenter.ini` files keep their values. The overlay's seam slider has a tooltip saying so.
 - **[Tested games]** Replaced.
 - **[Docs]** Settings guide: strobe-rate formula for any refresh rate and frame generation; "CRT displays" in the intro; the Gain tip assumes the ABL guard is set up.

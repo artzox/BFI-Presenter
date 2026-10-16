@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.9"
+#define BFI_VERSION "1.0.10"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -1272,6 +1272,10 @@ static void PresenterThread(Swapchain *sc)
     bool qaPrimed = false, qaSkipWait = false, qaSkipNext = false;
     int  secQaSkips = 0, secQaPrimes = 0;
     int autoAhead = 1, missSecs = 0, spareSecs = 0;
+    // Uneven strobe cycles over the last 30 seconds (one count per second), so
+    // scattered repeat-then-skip hiccups bring 2 frames ahead back as well as a
+    // run of bad seconds (Uncharted port: ~16 a minute at 1, none at 2).
+    int repWin[30] = {}, repIdx = 0, repSum = 0;
     int lastOutType = -1, lastShown = -1;
     double ceilNow = -1.0, ceilTarget = -1.0, litAvg = -1.0, rawAvg = -1.0, ablSolve = -1.0, ablT = Now(), ablLowT = 0.0;
     double aheadDropT = -1.0;
@@ -1898,12 +1902,20 @@ static void PresenterThread(Swapchain *sc)
             const double capWaitMs = n ? us / 1000.0 / n : 0.0;
             if (s.autoAhead && s.maxAhead != 0)
             {
+                repSum -= repWin[repIdx];
+                repWin[repIdx] = (s.gameCap >= 1) ? secRepU : 0;
+                repSum += repWin[repIdx];
+                repIdx = (repIdx + 1) % 30;
                 if (autoAhead == 1)
                 {
                     missSecs = (secRepU >= 2 && s.gameCap >= 1) ? missSecs + 1 : 0;
-                    if (missSecs >= 3)
+                    if (missSecs >= 3 || repSum >= 6)
                     {
+                        if (missSecs < 3)
+                            LOGI("BFI Presenter: %d uneven strobe cycles in the last 30 s at 1 frame ahead", repSum);
                         autoAhead = 2; missSecs = 0; spareSecs = 0;
+                        for (int r = 0; r < 30; r++) repWin[r] = 0;
+                        repSum = 0;
                         aheadLocked = aheadDropT >= 0.0 && t - aheadDropT < 60.0;
                         LOGI("BFI Presenter: automatic frames ahead: 2 (the game kept missing strobe cycles)%s",
                              aheadLocked ? " -- staying at 2 for this session" : "");
@@ -1986,6 +1998,7 @@ static void LrWatchThread(Swapchain *sc)
     uint64_t next = sc->lrStaged.load() + 1;
     double builds[128] = {}, sorted[128];
     int nb = 0, wb = 0, state = 0, misses = 0, frames = 0, clean = 0, good = 0;
+    int limitMissSecs = 0, limitMisses = 0; bool limitOff = false;   // at its limit: misses per 20 s; released at the refresh
     double margin = sc->lrBaseMs.load() * 0.001, est = 0.0, secT = Now(), lastWindow = 0.0;
     while (sc->lrRun.load())
     {
@@ -2066,7 +2079,25 @@ static void LrWatchThread(Swapchain *sc)
         // the earliest release is the vblank, i.e. the normal behaviour.
         double lead = 0.0;
         if (state == 2) lead = est + margin;
-        else if (state == 3 && capMode) lead = window - 0.001;
+        // ... unless frames still miss their lit refresh that way: then
+        // release at the refresh, as with just-in-time release off (the
+        // Uncharted port showed repeat-then-skip at the limit and was even
+        // without it). Back on once the build time fits again.
+        if (state != 3) { limitMissSecs = 0; limitMisses = 0; limitOff = false; }
+        else if (capMode && !limitOff)
+        {
+            // Misses counted over 20-second windows: the repeat-then-skip
+            // hiccups come a few a minute, rarely in consecutive seconds.
+            limitMisses += misses;
+            if (++limitMissSecs >= 20) { limitMissSecs = 0; limitMisses = 0; }
+            if (limitMisses >= 3)
+            {
+                limitOff = true; limitMisses = 0; limitMissSecs = 0;
+                LOGI("BFI Presenter: just-in-time release off -- at its limit frames still missed their lit refresh; "
+                     "released at the refresh, as with it off, until game frames are quicker again");
+            }
+        }
+        if (state == 3 && capMode && !limitOff) lead = window - 0.001;
         sc->lrLead.store(lead);
         {
             std::lock_guard<std::mutex> l(g_cfgLock);

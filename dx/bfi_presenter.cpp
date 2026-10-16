@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.9"
+#define BFI_ADDON_VERSION "1.0.10"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -747,6 +747,7 @@ static DWORD WINAPI LrWatchThread(void *)
     UINT64 next = g_lrStaged.load() + 1;
     double builds[128] = {}, sorted[128];
     int nb = 0, wb = 0, state = 0, misses = 0, frames = 0, clean = 0, good = 0;
+    int limitMissSecs = 0, limitMisses = 0; bool limitOff = false;   // at its limit: misses per 20 s; released at the refresh
     double margin = g_lrBaseMs.load() * 0.001, est = 0.0, secT = Now(), lastWindow = 0.0;
     while (g_lrRun.load())
     {
@@ -836,7 +837,25 @@ static DWORD WINAPI LrWatchThread(void *)
         // release is the vblank itself, i.e. the normal behaviour.
         double lead = 0.0;
         if (state == 2) lead = est + margin;
-        else if (state == 3 && capMode) lead = period - 0.001;
+        // ... unless frames still miss their lit refresh that way: then
+        // release at the refresh, as with just-in-time release off (the
+        // Uncharted port showed repeat-then-skip at the limit and was even
+        // without it). Back on once the build time fits again.
+        if (state != 3) { limitMissSecs = 0; limitMisses = 0; limitOff = false; }
+        else if (capMode && !limitOff)
+        {
+            // Misses counted over 20-second windows: the repeat-then-skip
+            // hiccups come a few a minute, rarely in consecutive seconds.
+            limitMisses += misses;
+            if (++limitMissSecs >= 20) { limitMissSecs = 0; limitMisses = 0; }
+            if (limitMisses >= 3)
+            {
+                limitOff = true; limitMisses = 0; limitMissSecs = 0;
+                LOGI("BFI Presenter: just-in-time release off -- at its limit frames still missed their lit refresh; "
+                     "released at the refresh, as with it off, until game frames are quicker again");
+            }
+        }
+        if (state == 3 && capMode && !limitOff) lead = period - 0.001;
         g_lrLead.store(lead);
         EnterCriticalSection(&g_cfgLock);
         g_status.lrState  = state;
@@ -2086,6 +2105,10 @@ static DWORD WINAPI PresenterThread(void *)
     int secRepU = 0, secSkipU = 0;
     double llStep = 0.0;          // lowest latency: game frames per strobe cycle (average)
     int autoAhead = 1, missSecs = 0, spareSecs = 0;
+    // Uneven strobe cycles over the last 30 seconds (one count per second), so
+    // scattered repeat-then-skip hiccups bring 2 frames ahead back as well as a
+    // run of bad seconds (Uncharted port: ~16 a minute at 1, none at 2).
+    int repWin[30] = {}, repIdx = 0, repSum = 0;
     int lastOutType = -1;
     double ceilNow = -1.0, ceilTarget = -1.0, hotArea = -1.0, ablSolve = -1.0, ablT = Now();
     double rawAvg = -1.0, ablLowT = 0.0;      // unclipped lit average; last time the guard was pulling down
@@ -2093,6 +2116,7 @@ static DWORD WINAPI PresenterThread(void *)
     bool   aheadLocked = false;    // settled at 2 for this swap chain (no more switching)
     bool refillNow = false;          // present again without waiting for the next vblank
     bool vsyncOverridden = false;    // the driver is not honouring the presenter's VSync
+    int  vsyncFastSecs = 0;          // seconds in a row with presents well above the refresh count
     int  queuedNow = -1;
     int lastShown = -1;
     double lastT = Now(), secStart = Now(), ageSum = 0.0;
@@ -2624,10 +2648,16 @@ static DWORD WINAPI PresenterThread(void *)
             const double rate = secPresents / (t - secStart);
             if (!vsyncOverridden)
             {
-                const bool fast = (sok && haveStats && st.SyncRefreshCount > lastSync)
+                bool fast = (sok && haveStats && st.SyncRefreshCount > lastSync)
                                 ? rate > 1.4 * (double)(st.SyncRefreshCount - lastSync) / (t - secStart)
                                 : rate > 300.0;
-                if (fast && presents > 240)
+                // Two seconds in a row, and above the display mode's rate when it
+                // is known: DXGI's refresh count can lag for a second (frame
+                // generation starting up in Control: Resonant showed 120
+                // presents/s at 120 Hz as "ignoring VSync").
+                if (fast && modeHz > 0.0 && rate < 1.15 * modeHz) fast = false;
+                vsyncFastSecs = fast ? vsyncFastSecs + 1 : 0;
+                if (vsyncFastSecs >= 2 && presents > 240)
                 {
                     vsyncOverridden = true;
                     LOGE("BFI Presenter: %.0f presents/s -- the driver is ignoring VSync (NVIDIA profile: Vertical Sync "
@@ -2729,12 +2759,20 @@ static DWORD WINAPI PresenterThread(void *)
                 const double capWaitMs = n ? us / 1000.0 / n : 0.0;
                 if (s.autoAhead && s.maxAhead != 0)
                 {
+                    repSum -= repWin[repIdx];
+                    repWin[repIdx] = (s.gameCap >= 1) ? secRepU : 0;
+                    repSum += repWin[repIdx];
+                    repIdx = (repIdx + 1) % 30;
                     if (autoAhead == 1)
                     {
                         missSecs = (secRepU >= 2 && s.gameCap >= 1) ? missSecs + 1 : 0;
-                        if (missSecs >= 3)
+                        if (missSecs >= 3 || repSum >= 6)
                         {
+                            if (missSecs < 3)
+                                LOGI("BFI Presenter: %d uneven strobe cycles in the last 30 s at 1 frame ahead", repSum);
                             autoAhead = 2; missSecs = 0; spareSecs = 0;
+                            for (int r = 0; r < 30; r++) repWin[r] = 0;
+                            repSum = 0;
                             // Needed 2 again within a minute of trying 1: the game
                             // is close to the limit -- stay at 2, no more switching.
                             aheadLocked = aheadDropT >= 0.0 && t - aheadDropT < 60.0;
