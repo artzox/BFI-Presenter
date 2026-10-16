@@ -3729,7 +3729,12 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
     const BYTE *code = (const BYTE *)target;
     size_t patched = 0;
     for (size_t i = 0; i < 32; i++) if (code[i] != orig[i]) patched = i + 1;
-    if (!patched) { snprintf(why, whyLen, "not hooked"); return target; }
+    // Not hooked yet: still build the copy over the first 16 bytes, so a hook
+    // written later (RTSS hooks Present whenever its OSD turns on, even in a
+    // game that started without it -- it crashed Alan Wake 2) is skipped too.
+    // If those bytes can't be relocated, the function itself is still fine.
+    const bool notYet = !patched;
+    if (notYet) patched = 16;
     // Whole original instructions covering the patched bytes.
     int ins[16], rip[16], n = 0;
     size_t len = 0;
@@ -3737,7 +3742,11 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
     {
         int rd;
         const int l = InsnLength(orig + len, &rd);
-        if (l <= 0 || len + l > 48 || n >= 16) { snprintf(why, whyLen, "unsupported instruction at +%zu (%02X)", len, orig[len]); return nullptr; }
+        if (l <= 0 || len + l > 48 || n >= 16)
+        {
+            if (notYet) { snprintf(why, whyLen, "not hooked (start not relocatable: later hooks stay in the path)"); return target; }
+            snprintf(why, whyLen, "unsupported instruction at +%zu (%02X)", len, orig[len]); return nullptr;
+        }
         ins[n] = (int)len; rip[n] = rd; n++;
         len += (size_t)l;
     }
@@ -3745,7 +3754,7 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
     // x86: no RIP-relative operands; copy the instructions and jmp rel32 back.
     {
         BYTE *t = (BYTE *)VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-        if (!t) { snprintf(why, whyLen, "no memory"); return nullptr; }
+        if (!t) { snprintf(why, whyLen, "no memory"); return notYet ? target : nullptr; }
         memcpy(t, orig, len);
         t[len] = 0xE9;
         const int32_t rel = (int32_t)((intptr_t)(code + len) - (intptr_t)(t + len + 5));
@@ -3753,7 +3762,8 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
         DWORD o;
         VirtualProtect(t, 4096, PAGE_EXECUTE_READ, &o);
         FlushInstructionCache(GetCurrentProcess(), t, len + 5);
-        snprintf(why, whyLen, "%zu patched bytes skipped", patched);
+        if (notYet) snprintf(why, whyLen, "not hooked (copy of its start in place, later hooks skipped)");
+        else snprintf(why, whyLen, "%zu patched bytes skipped", patched);
         return t;
     }
 #endif
@@ -3765,7 +3775,7 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
         tramp = (BYTE *)VirtualAlloc((void *)(base - d), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (!tramp) tramp = (BYTE *)VirtualAlloc((void *)(base + d), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     }
-    if (!tramp) { snprintf(why, whyLen, "no memory near the function"); return nullptr; }
+    if (!tramp) { snprintf(why, whyLen, "no memory near the function"); return notYet ? target : nullptr; }
     memcpy(tramp, orig, len);
     for (int k = 0; k < n; k++)
     {
@@ -3775,7 +3785,7 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
         memcpy(&disp, orig + at, 4);
         const int64_t abs = (int64_t)(uintptr_t)code + at + 4 + disp;     // what it pointed at
         const int64_t nd  = abs - ((int64_t)(uintptr_t)tramp + at + 4);
-        if (nd < INT32_MIN || nd > INT32_MAX) { VirtualFree(tramp, 0, MEM_RELEASE); snprintf(why, whyLen, "displacement out of range"); return nullptr; }
+        if (nd < INT32_MIN || nd > INT32_MAX) { VirtualFree(tramp, 0, MEM_RELEASE); snprintf(why, whyLen, "displacement out of range"); return notYet ? target : nullptr; }
         const int32_t nd32 = (int32_t)nd;
         memcpy(tramp + at, &nd32, 4);
     }
@@ -3787,7 +3797,8 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
     DWORD old;
     VirtualProtect(tramp, 4096, PAGE_EXECUTE_READ, &old);
     FlushInstructionCache(GetCurrentProcess(), tramp, len + 14);
-    snprintf(why, whyLen, "%zu patched bytes skipped", patched);
+    if (notYet) snprintf(why, whyLen, "not hooked (copy of its start in place, later hooks skipped)");
+    else snprintf(why, whyLen, "%zu patched bytes skipped", patched);
     return tramp;
 }
 
