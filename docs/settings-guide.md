@@ -46,7 +46,7 @@ How many refreshes make up one flash cycle: 2 means "one lit, one dark". 3 or 4 
 
 **Gain vs blur** · `Gain` · default: 0.5 (recommended 1.0)\
 How much of the lost brightness to win back. At 0.5 the lit frame looks exactly like the normal picture, so the overall image is half as bright. At 1.0 the lit frame is boosted to make up the difference, so the average brightness is close to normal.\
-*When to change it:* use 1.0 on bright displays (most OLEDs in HDR). Lower it if highlights look washed out or the screen dims in bright scenes.
+*When to change it:* use 1.0 on bright displays (most OLEDs in HDR). With the **ABL guard** on and its budget set to your panel's full-white brightness, bright scenes stay steady at 1.0. Lower it only if the screen still dims in bright scenes (ABL guard off, or its budget set too high), or in SDR, where there is little room above white and bright highlights get compressed and look flat.
 
 **Dark frame floor** · `DarkFloor` · default: 0\
 How dark the dark refresh is. 0 is pure black. Raising it leaves a faint copy of the picture in the dark refresh: less flicker, a bit more blur.\
