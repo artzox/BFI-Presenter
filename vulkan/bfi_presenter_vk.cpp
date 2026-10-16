@@ -254,8 +254,8 @@ struct Settings
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
-    float rollSeam = 0.08f;   // blended zone between bands, fraction of the screen height
-    float rollDecay = 0.0f;   // rolling scan phosphor decay, in sub-frames (0 = hard bands + seam)
+    float rollSeam = 0.0f;    // blended zone between bands, fraction of the screen height
+    float rollDecay = 0.2f;   // rolling scan phosphor decay, in sub-frames (0 = hard bands + seam)
     float knee     = 0.75f;
     float peakNits = 1400.0f; // display peak (HDR ceiling)
     int   output   = -1;      // -1 auto, 0 SDR, 1 scRGB, 2 HDR10
@@ -324,8 +324,8 @@ static void LoadSettings(Settings &s)
     s.rolling  = KvInt(kv, "RollingScan", 0) ? 1 : 0;
     s.lcdSwap  = KvInt(kv, "LcdPhaseSwap", 0) ? 1 : 0;
     s.lcdSwapSec = Clamp(KvInt(kv, "LcdPhaseSwapSeconds", 5), 1, 300);
-    s.rollSeam = Clamp(KvFloat(kv, "RollingSeam", 0.08f), 0.0f, 0.5f);
-    s.rollDecay = Clamp(KvFloat(kv, "RollingPhosphorDecay", 0.0f), 0.0f, 1.0f);
+    s.rollSeam = Clamp(KvFloat(kv, "RollingSeam", 0.0f), 0.0f, 0.5f);
+    s.rollDecay = Clamp(KvFloat(kv, "RollingPhosphorDecay", 0.2f), 0.0f, 1.0f);
     s.knee     = KvFloat(kv, "RolloffKnee", 0.75f);
     s.peakNits = Clamp(KvFloat(kv, "DisplayPeakNits", 1400.0f), 80.0f, 10000.0f);
     s.gameCap  = KvInt(kv, "CapGameToRefresh", 1);
@@ -3583,6 +3583,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "flicker, but more blur. 0.2-0.4 is a good start; 0 = hard bands with a seam.");
             if (s.rollDecay <= 0.0f)
                 ImGui::SliderFloat("Seam softness (share of screen height)", &s.rollSeam, 0.0f, 0.3f, "%.2f");
+            if (s.rollDecay <= 0.0f && ImGui::IsItemHovered()) ImGui::SetTooltip("Blended zone where two bands meet. Pixels in it share their light between both\n"
+                                                                  "sub-frames, so they are lit longer: visible blur along the seam in motion.\n"
+                                                                  "0 = hard edge, no blur. Phosphor decay (above) hides the edge without a seam.");
             ImGui::Unindent(16.0f);
         }
     }

@@ -103,13 +103,15 @@ uniform float bfi_seam <
     ui_type = "drag";
     ui_label = "Rolling scan: seam";
     ui_min = 0.0; ui_max = 0.3; ui_step = 0.01;
-> = 0.08;
+    ui_tooltip = "Rolling scan with decay 0: blended zone where two bands meet. Pixels in it are\n"
+                 "lit in both sub-frames, so the seam blurs in motion. 0 = hard edge.";
+> = 0.0;
 
 uniform float bfi_decay <
     ui_type = "drag";
     ui_label = "Rolling scan: phosphor decay (frames, 0 = off)";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
-> = 0.0;
+> = 0.2;
 
 uniform int bfi_output <
     ui_type = "combo";
