@@ -747,7 +747,7 @@ static DWORD WINAPI LrWatchThread(void *)
     UINT64 next = g_lrStaged.load() + 1;
     double builds[128] = {}, sorted[128];
     int nb = 0, wb = 0, state = 0, misses = 0, frames = 0, clean = 0, good = 0;
-    int limitMissSecs = 0, limitMisses = 0; bool limitOff = false;   // at its limit: misses per 20 s; released at the refresh
+    int limitMissSecs = 0, limitMisses = 0, limitFitSecs = 0, limitTrips = 0; bool limitOff = false;   // just-in-time release switched off at its limit
     double margin = g_lrBaseMs.load() * 0.001, est = 0.0, secT = Now(), lastWindow = 0.0;
     while (g_lrRun.load())
     {
@@ -819,7 +819,7 @@ static DWORD WINAPI LrWatchThread(void *)
                 if (good >= 3) { state = 2; good = 0; }
             }
         }
-        if (state != prev && (state == 2 || state == 3))
+        if (state != prev && (state == 2 || state == 3) && !limitOff)
         {
             if (state == 2)
                 LOGI("BFI Presenter: just-in-time release active -- game frames take %.1f ms (95th percentile), released %.1f ms "
@@ -840,9 +840,11 @@ static DWORD WINAPI LrWatchThread(void *)
         // ... unless frames still miss their lit refresh that way: then
         // release at the refresh, as with just-in-time release off (the
         // Uncharted port showed repeat-then-skip at the limit and was even
-        // without it). Back on once the build time fits again.
-        if (state != 3) { limitMissSecs = 0; limitMisses = 0; limitOff = false; }
-        else if (capMode && !limitOff)
+        // without it). It stays off until game frames have fitted the
+        // interval for 30 seconds -- switching straight back on brought the
+        // repeats back within a second -- and for the session once that has
+        // happened twice.
+        if (state == 3 && capMode && !limitOff)
         {
             // Misses counted over 20-second windows: the repeat-then-skip
             // hiccups come a few a minute, rarely in consecutive seconds.
@@ -850,12 +852,24 @@ static DWORD WINAPI LrWatchThread(void *)
             if (++limitMissSecs >= 20) { limitMissSecs = 0; limitMisses = 0; }
             if (limitMisses >= 3)
             {
-                limitOff = true; limitMisses = 0; limitMissSecs = 0;
+                limitOff = true; limitMisses = 0; limitMissSecs = 0; limitFitSecs = 0; limitTrips++;
                 LOGI("BFI Presenter: just-in-time release off -- at its limit frames still missed their lit refresh; "
-                     "released at the refresh, as with it off, until game frames are quicker again");
+                     "released at the refresh, as with it off, %s",
+                     limitTrips >= 2 ? "for the rest of this session" : "until game frames fit the interval for 30 s");
             }
         }
+        else if (limitOff && limitTrips < 2)
+        {
+            limitFitSecs = (state != 0 && est + margin < period - 0.002) ? limitFitSecs + 1 : 0;
+            if (limitFitSecs >= 30)
+            {
+                limitOff = false; limitFitSecs = 0;
+                LOGI("BFI Presenter: just-in-time release back on -- game frames take %.1f ms", est * 1000.0);
+            }
+        }
+        if (!allowed) { limitOff = false; limitTrips = 0; limitMisses = limitMissSecs = limitFitSecs = 0; }
         if (state == 3 && capMode && !limitOff) lead = period - 0.001;
+        if (limitOff) lead = 0.0;
         g_lrLead.store(lead);
         EnterCriticalSection(&g_cfgLock);
         g_status.lrState  = state;

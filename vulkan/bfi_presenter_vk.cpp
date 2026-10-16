@@ -2000,7 +2000,7 @@ static void LrWatchThread(Swapchain *sc)
     uint64_t next = sc->lrStaged.load() + 1;
     double builds[128] = {}, sorted[128];
     int nb = 0, wb = 0, state = 0, misses = 0, frames = 0, clean = 0, good = 0;
-    int limitMissSecs = 0, limitMisses = 0; bool limitOff = false;   // at its limit: misses per 20 s; released at the refresh
+    int limitMissSecs = 0, limitMisses = 0, limitFitSecs = 0, limitTrips = 0; bool limitOff = false;   // just-in-time release switched off at its limit
     double margin = sc->lrBaseMs.load() * 0.001, est = 0.0, secT = Now(), lastWindow = 0.0;
     while (sc->lrRun.load())
     {
@@ -2070,10 +2070,10 @@ static void LrWatchThread(Swapchain *sc)
             if (state == 2) { if (est + margin > window - 0.001) { state = 3; good = 0; } }
             else { good = (est + margin < window - 0.002) ? good + 1 : 0; if (good >= 3) { state = 2; good = 0; } }
         }
-        if (state != prev && state == 2)
+        if (state != prev && !limitOff && state == 2)
             LOGI("BFI Presenter: just-in-time release active -- game frames take %.1f ms (95th percentile), released %.1f ms "
                  "before the refresh that shows them (cap interval %.1f ms)", est * 1000.0, (est + margin) * 1000.0, window * 1000.0);
-        else if (state != prev && state == 3)
+        else if (state != prev && !limitOff && state == 3)
             LOGI("BFI Presenter: just-in-time release at its limit -- game frames take %.1f ms, close to the %.1f ms cap interval; %s",
                  est * 1000.0, window * 1000.0, capMode ? "released as early as the cap allows" : "released at the refresh as before");
         // At its limit: at the Half / Quarter cap every frame still targets a
@@ -2084,9 +2084,11 @@ static void LrWatchThread(Swapchain *sc)
         // ... unless frames still miss their lit refresh that way: then
         // release at the refresh, as with just-in-time release off (the
         // Uncharted port showed repeat-then-skip at the limit and was even
-        // without it). Back on once the build time fits again.
-        if (state != 3) { limitMissSecs = 0; limitMisses = 0; limitOff = false; }
-        else if (capMode && !limitOff)
+        // without it). It stays off until game frames have fitted the
+        // interval for 30 seconds -- switching straight back on brought the
+        // repeats back within a second -- and for the session once that has
+        // happened twice.
+        if (state == 3 && capMode && !limitOff)
         {
             // Misses counted over 20-second windows: the repeat-then-skip
             // hiccups come a few a minute, rarely in consecutive seconds.
@@ -2094,12 +2096,24 @@ static void LrWatchThread(Swapchain *sc)
             if (++limitMissSecs >= 20) { limitMissSecs = 0; limitMisses = 0; }
             if (limitMisses >= 3)
             {
-                limitOff = true; limitMisses = 0; limitMissSecs = 0;
+                limitOff = true; limitMisses = 0; limitMissSecs = 0; limitFitSecs = 0; limitTrips++;
                 LOGI("BFI Presenter: just-in-time release off -- at its limit frames still missed their lit refresh; "
-                     "released at the refresh, as with it off, until game frames are quicker again");
+                     "released at the refresh, as with it off, %s",
+                     limitTrips >= 2 ? "for the rest of this session" : "until game frames fit the interval for 30 s");
             }
         }
+        else if (limitOff && limitTrips < 2)
+        {
+            limitFitSecs = (state != 0 && est + margin < window - 0.002) ? limitFitSecs + 1 : 0;
+            if (limitFitSecs >= 30)
+            {
+                limitOff = false; limitFitSecs = 0;
+                LOGI("BFI Presenter: just-in-time release back on -- game frames take %.1f ms", est * 1000.0);
+            }
+        }
+        if (!allowed) { limitOff = false; limitTrips = 0; limitMisses = limitMissSecs = limitFitSecs = 0; }
         if (state == 3 && capMode && !limitOff) lead = window - 0.001;
+        if (limitOff) lead = 0.0;
         sc->lrLead.store(lead);
         {
             std::lock_guard<std::mutex> l(g_cfgLock);
