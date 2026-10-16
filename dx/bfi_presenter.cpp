@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.10"
+#define BFI_ADDON_VERSION "1.0.11"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -838,8 +838,8 @@ static DWORD WINAPI LrWatchThread(void *)
         double lead = 0.0;
         if (state == 2) lead = est + margin;
         // ... unless frames still miss their lit refresh that way: then
-        // release at the refresh, as with just-in-time release off (the
-        // Uncharted port showed repeat-then-skip at the limit and was even
+        // release at the refresh, as with just-in-time release off (a game
+        // tested showed repeat-then-skip at the limit and was even
         // without it). It stays off until game frames have fitted the
         // interval for 30 seconds -- switching straight back on brought the
         // repeats back within a second -- and for the session once that has
@@ -2121,7 +2121,7 @@ static DWORD WINAPI PresenterThread(void *)
     int autoAhead = 1, missSecs = 0, spareSecs = 0;
     // Uneven strobe cycles over the last 30 seconds (one count per second), so
     // scattered repeat-then-skip hiccups bring 2 frames ahead back as well as a
-    // run of bad seconds (Uncharted port: ~16 a minute at 1, none at 2).
+    // run of bad seconds (e.g. ~16 a minute at 1, none at 2).
     int repWin[30] = {}, repIdx = 0, repSum = 0, repSecsRun = 0;   // repSecsRun: the first seconds (loading) don't count
     int lastOutType = -1;
     double ceilNow = -1.0, ceilTarget = -1.0, hotArea = -1.0, ablSolve = -1.0, ablT = Now();

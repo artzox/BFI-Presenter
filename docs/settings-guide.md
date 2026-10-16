@@ -220,6 +220,14 @@ For Vulkan games and emulators: having `BFIPresenter.ini` next to the game turns
 **Own queue** · `VulkanOwnQueue` · default: on\
 Same idea as the DirectX "own GPU queue": the flashes get their own lane.
 
+**Exclusive fullscreen** · `VulkanExclusiveFullscreen` · default: on\
+The presenter's own output runs in exclusive fullscreen; the game's window mode stays as you set it. Without it, opening an overlay (RivaTuner's OSD, ReShade's menu) or alt-tabbing could hand the picture over to Windows' desktop compositor, where the flashes lose their timing and flicker until the game restarts.\
+*When to change it:* only if a game misbehaves with it; it applies at the next game start.
+
+**Recover automatically** · `VulkanAutoRecover` · default: on\
+Some things can still put Windows into that slower mode, and it stays there after they're gone: a window briefly covering the game (a launcher's splash screen) or the ReShade menu. When the presenter sees it for 3 seconds, it has the game rebuild its swap chain, which brings the flashes back in step. That's a short pause (in most games a blink; up to a few seconds in heavy ones), at most every 20 seconds. Ctrl+Shift+O does it by hand.\
+*Tip:* in Vulkan games, change settings in `BFIPresenter.ini` rather than the ReShade menu while playing where you can; the game picks up the change within a second.
+
 **SDR to HDR**, **SDR white**, **SDR highlights** · `SdrToHdr`, `SdrWhiteNits`, `SdrHighlightNits`, `SdrHighlightKnee` · default: on, 200, 800, 0.65\
 For SDR games and emulators with Windows HDR on: the picture is sent as HDR so the lit flash has room to get brighter and BFI doesn't make the image dim. SDR white is how bright normal white looks (match Windows' "SDR content brightness"). Highlights optionally stretches the brightest parts toward a real HDR look.\
 *When to change it:* set SDR white to taste; set highlights to 0 for a faithful SDR look.
@@ -242,6 +250,7 @@ If a game crashes, these write a short report of what went wrong (`BFIPresenter_
 | Ctrl+Shift+M | Switch BFI ↔ Variable MPRT |
 | Ctrl+Shift+S | Rolling scan on / off |
 | Ctrl+Shift+R | Reload `BFIPresenter.ini` after editing it |
+| Ctrl+Shift+O | Vulkan: rebuild the swap chain (if flashes started after an overlay or menu) |
 
 ## Good starting points
 
