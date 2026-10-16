@@ -1275,7 +1275,7 @@ static void PresenterThread(Swapchain *sc)
     // Uneven strobe cycles over the last 30 seconds (one count per second), so
     // scattered repeat-then-skip hiccups bring 2 frames ahead back as well as a
     // run of bad seconds (Uncharted port: ~16 a minute at 1, none at 2).
-    int repWin[30] = {}, repIdx = 0, repSum = 0;
+    int repWin[30] = {}, repIdx = 0, repSum = 0, repSecsRun = 0;   // repSecsRun: the first seconds (loading) don't count
     int lastOutType = -1, lastShown = -1;
     double ceilNow = -1.0, ceilTarget = -1.0, litAvg = -1.0, rawAvg = -1.0, ablSolve = -1.0, ablT = Now(), ablLowT = 0.0;
     double aheadDropT = -1.0;
@@ -1903,7 +1903,7 @@ static void PresenterThread(Swapchain *sc)
             if (s.autoAhead && s.maxAhead != 0)
             {
                 repSum -= repWin[repIdx];
-                repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
+                repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
                 repSum += repWin[repIdx];
                 repIdx = (repIdx + 1) % 30;
                 if (autoAhead == 1)

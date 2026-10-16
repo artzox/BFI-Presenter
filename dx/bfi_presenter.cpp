@@ -2108,7 +2108,7 @@ static DWORD WINAPI PresenterThread(void *)
     // Uneven strobe cycles over the last 30 seconds (one count per second), so
     // scattered repeat-then-skip hiccups bring 2 frames ahead back as well as a
     // run of bad seconds (Uncharted port: ~16 a minute at 1, none at 2).
-    int repWin[30] = {}, repIdx = 0, repSum = 0;
+    int repWin[30] = {}, repIdx = 0, repSum = 0, repSecsRun = 0;   // repSecsRun: the first seconds (loading) don't count
     int lastOutType = -1;
     double ceilNow = -1.0, ceilTarget = -1.0, hotArea = -1.0, ablSolve = -1.0, ablT = Now();
     double rawAvg = -1.0, ablLowT = 0.0;      // unclipped lit average; last time the guard was pulling down
@@ -2760,7 +2760,7 @@ static DWORD WINAPI PresenterThread(void *)
                 if (s.autoAhead && s.maxAhead != 0)
                 {
                     repSum -= repWin[repIdx];
-                    repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
+                    repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
                     repSum += repWin[repIdx];
                     repIdx = (repIdx + 1) % 30;
                     if (autoAhead == 1)
