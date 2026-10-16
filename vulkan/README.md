@@ -8,7 +8,7 @@ The same presenter-clocked black frame insertion as the [DX add-on](../dx/README
   - The game and ReShade render into stand-in images.
   - Each finished frame, with ReShade's effects and the CRT shader already applied, is copied into a small staging ring.
   - The presenter thread strobes it at vblank on its own GPU queue, exactly like the DX version.
-- **Settings window:** when ReShade is in the game, the layer adds a **BFI Presenter (Vulkan)** tab to the ReShade overlay. ReShade isn't required: without it, edit the ini (the layer picks up the change within a second; Ctrl+Shift+R reloads at once) (Ctrl+Shift+B toggles BFI, Ctrl+Shift+M the method, Ctrl+Shift+S rolling scan). DOOM Eternal runs this way.
+- **Settings window:** when ReShade is in the game, the layer adds a **BFI Presenter (Vulkan)** tab to the ReShade overlay. ReShade isn't required: without it, edit the ini (the layer picks up the change within a second; Ctrl+Shift+R reloads at once) (Ctrl+Shift+B toggles BFI, Ctrl+Shift+M the method, Ctrl+Shift+S rolling scan, Ctrl+Shift+O rebuilds the swap chain). DOOM Eternal runs this way.
 - **Off unless asked:** the layer does nothing at all in a game whose folder has no `BFIPresenter.ini`. It writes no files and changes nothing there.
 
 ## Install (once)
@@ -77,6 +77,7 @@ No log at all means the layer isn't active: check that `BFIPresenter.ini` is in 
 - **Pacing:** Smooth and Lowest latency; game frame cap (Refresh / Half / Quarter); just-in-time release at Half / Quarter; Later release at Refresh; automatic frames ahead; queue one refresh ahead.
 - **Guards:** hitch guard and ABL guard.
 - **Logs:** `BFIPresenterVK.log` and a timing log, `BFIPresenterVK_log_<date>_<time>.csv`, with columns close to the DX log's.
+- **Exclusive fullscreen and recovery:** the presenter's swap chain runs in exclusive fullscreen, and presentation that has slowed down for good is recovered with a swap chain rebuild (see `VulkanExclusiveFullscreen`, `VulkanAutoRecover` below).
 - **Swap chain changes:** recreated swap chains (resolution or fullscreen changes) are taken over straight away; there's no "BFI starts after a resize" step in Vulkan.
 - **DXVK pacing:** `VK_KHR_present_wait`, which DXVK uses for frame pacing, is reported in terms of the game's own frames.
 
@@ -88,6 +89,8 @@ All other keys are shared with the DX add-on; see the comments in `BFIPresenter.
 |---|---|---|
 | `VulkanLayer` | 1 | 0 = the layer stays off in this game even though the ini is there |
 | `VulkanOwnQueue` | 1 | 0 = the presenter shares the game's queue (locked) instead of its own |
+| `VulkanExclusiveFullscreen` | 1 | The presenter's own swap chain runs in exclusive fullscreen (`VK_EXT_full_screen_exclusive`, application-controlled), so an overlay or alt-tab can't move presentation into the desktop compositor, where the strobe loses its timing and flashes. The game's own window mode is unchanged. Applies at the next game start |
+| `VulkanAutoRecover` | 1 | When the display keeps handing the presenter's frames back late for 3 seconds (a window covered the game, such as a launcher's splash screen, or the ReShade menu was open), the game is asked to rebuild its swap chain: a short pause, at most every 20 seconds. The log lists the windows over the game when it happens. Ctrl+Shift+O does it by hand |
 | `SdrToHdr` | 1 | SDR games are presented as HDR10 when the display offers it (Windows HDR on), so the lit refresh has headroom. 0 = plain SDR (use Gain 0.5 then). In DXVK games 1 keeps them SDR (HDR10 hung the NVIDIA driver's present there); 2 forces HDR10 there too, together with NVIDIA "Vulkan/OpenGL present method: Prefer native" for the game |
 | `SdrWhiteNits` | 200 | Brightness of SDR white in that mode (Windows: 80 + 4 × the SDR content brightness slider) |
 | `SdrHighlightNits` | 800 | SDR highlights stretch toward this; 0 = no expansion |

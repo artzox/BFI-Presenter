@@ -20,7 +20,7 @@
 //
 // The layer does nothing unless BFIPresenter.ini is next to the game's exe.
 //
-// Hotkeys: Ctrl+Shift+B toggle BFI, Ctrl+Shift+M method, Ctrl+Shift+R reload ini
+// Hotkeys: Ctrl+Shift+B toggle BFI, Ctrl+Shift+M method, Ctrl+Shift+R reload ini, Ctrl+Shift+O rebuild the swap chain (Vulkan)
 // ============================================================================
 #define VK_NO_PROTOTYPES
 #ifdef _WIN32
@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.10"
+#define BFI_VERSION "1.0.11"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -270,6 +270,8 @@ struct Settings
     int   smoothCatchUp = 0;  // Smooth: 1 = skip a frame when two have waited for 3 cycles (standing latency)
     int   autoAhead = 1;      // automatic: 1 frame ahead, 2 while the game keeps missing strobe cycles
     int   presBuffers = 3;    // real swap chain images (read when the swap chain is created)
+    int   vkExclusive = 1;    // presenter's swap chain in exclusive fullscreen (VK_EXT_full_screen_exclusive); read at start
+    int   vkAutoRecover = 1;  // presentation slowed for 3 s (a window covered the game, ReShade's menu): rebuild the swap chain
     int   ablGuard = 1;       // HDR: keep the lit refresh within the panel's full-screen budget
     int   ablBudget = 250;    // panel budget: average nits of a lit refresh after capping
     int   hitchGuard = 1;     // show every refresh lit while refreshes are missed or the game stalls
@@ -339,6 +341,8 @@ static void LoadSettings(Settings &s)
     s.autoAhead = KvInt(kv, "AutoFramesAhead", 1) ? 1 : 0;
     s.smoothCatchUp = KvInt(kv, "SmoothCatchUp", 0) ? 1 : 0;
     s.presBuffers = Clamp(KvInt(kv, "PresenterBuffers", 3), 2, 4);
+    s.vkExclusive = KvInt(kv, "VulkanExclusiveFullscreen", 1) ? 1 : 0;
+    s.vkAutoRecover = KvInt(kv, "VulkanAutoRecover", 1) ? 1 : 0;
     s.ablGuard = KvInt(kv, "AblGuard", 1) ? 1 : 0;
     s.ablBudget = Clamp(KvInt(kv, "AblGuardBudgetNits", 250), 100, 1500);
     s.hitchGuard = KvInt(kv, "HitchGuard", 1) ? 1 : 0;
@@ -371,7 +375,7 @@ static void LoadSettings(Settings &s)
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
-    I("AutoFramesAhead", s.autoAhead); I("SmoothCatchUp", s.smoothCatchUp); I("PresenterBuffers", s.presBuffers); I("AblGuard", s.ablGuard);
+    I("AutoFramesAhead", s.autoAhead); I("SmoothCatchUp", s.smoothCatchUp); I("PresenterBuffers", s.presBuffers); I("VulkanExclusiveFullscreen", s.vkExclusive); I("VulkanAutoRecover", s.vkAutoRecover); I("AblGuard", s.ablGuard);
     I("AblGuardBudgetNits", s.ablBudget); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs);
     I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
@@ -389,6 +393,7 @@ static void LoadShared()
 // ---------------------------------------------------------------- status (overlay)
 struct Status
 {
+    int    fseState = -1;                   // exclusive fullscreen: -1 not used, 0 not held, 1 held
     int    managed = 0;
     char   reason[256] = "Waiting for the game's swap chain.";
     int    running = 0;
@@ -463,7 +468,8 @@ struct InstanceData
 // Optional entry points (may be absent: extension or version not enabled).
 #define BFI_DEVICE_OPT_FUNCS(X) \
     X(QueueSubmit2) X(QueueSubmit2KHR) X(QueueBindSparse) X(AcquireNextImage2KHR) X(WaitForPresentKHR) \
-    X(GetSwapchainStatusKHR) X(ReleaseSwapchainImagesEXT) X(GetDeviceQueue2)
+    X(GetSwapchainStatusKHR) X(ReleaseSwapchainImagesEXT) X(GetDeviceQueue2) \
+    X(AcquireFullScreenExclusiveModeEXT) X(ReleaseFullScreenExclusiveModeEXT)
 
 struct Swapchain;
 struct DeviceData
@@ -471,6 +477,7 @@ struct DeviceData
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice phys = VK_NULL_HANDLE;
     InstanceData *inst = nullptr;
+    bool fse = false;              // VK_EXT_full_screen_exclusive enabled (VulkanExclusiveFullscreen=1)
     PFN_vkGetDeviceProcAddr gdpa = nullptr;
     PFN_vkSetDeviceLoaderData setLoaderData = nullptr;
 #define X(n) PFN_vk##n n = nullptr;
@@ -505,6 +512,7 @@ static DeviceData *GetDev(void *key)
 }
 
 static bool g_active = false;      // BFIPresenter.ini found: the layer manages swap chains in this process
+static std::atomic<bool> g_surfCaps2Ext{false};    // VK_KHR_get_surface_capabilities2 enabled (needed by full_screen_exclusive)
 static std::atomic<bool> g_colorspaceExt{false};   // VK_EXT_swapchain_colorspace enabled (HDR10 presentation possible)
 static int  g_dumpFrames = 0;      // diagnostics: write the first N presented refreshes as PPM files (8-bit formats)
 
@@ -629,6 +637,11 @@ struct Swapchain
     std::condition_variable presIdCv;
     std::atomic<int>  status{VK_SUCCESS};       // VK_ERROR_OUT_OF_DATE_KHR etc. from the real swap chain
     std::atomic<bool> suboptimal{false};
+    bool fse = false;                      // created for application-controlled exclusive fullscreen
+    bool fseHeld = false;                  // exclusive fullscreen currently acquired
+    std::thread       winThread;           // diagnostics: windows over the game
+    std::atomic<bool> winRun{false};
+    std::atomic<bool> winDumpReq{false};   // presentation slowed down: log the windows over the game
     std::atomic<bool> retired{false};
     std::atomic<int>  maxAhead{1};
     std::atomic<long long> capWaitUs{0};
@@ -1216,6 +1229,7 @@ static void DestroyPresenterRes(DeviceData *d, PresenterRes &R)
 }
 
 // ---------------------------------------------------------------- presenter thread
+static double g_lastRebuildT = -1.0e9;      // presentation recovery: when the game was last asked to rebuild
 static void PresenterThread(Swapchain *sc)
 {
     DeviceData *d = sc->d;
@@ -1272,9 +1286,14 @@ static void PresenterThread(Swapchain *sc)
     bool qaPrimed = false, qaSkipWait = false, qaSkipNext = false;
     int  secQaSkips = 0, secQaPrimes = 0;
     int autoAhead = 1, missSecs = 0, spareSecs = 0;
+    double fseRetryT = 0.0; int fseShown = -2;
+    // presentation health: slow image returns per second, automatic rebuild
+    int slowCount = 0, slowRun = 0, goodRun = 0;
+    bool afterRebuild = Now() - g_lastRebuildT < 20.0, rebuildReq = false, kRebuild = false;
+    double slowSecT = Now();
     // Uneven strobe cycles over the last 30 seconds (one count per second), so
     // scattered repeat-then-skip hiccups bring 2 frames ahead back as well as a
-    // run of bad seconds (Uncharted port: ~16 a minute at 1, none at 2).
+    // run of bad seconds (e.g. ~16 a minute at 1, none at 2).
     int repWin[30] = {}, repIdx = 0, repSum = 0, repSecsRun = 0;   // repSecsRun: the first seconds (loading) don't count
     int lastOutType = -1, lastShown = -1;
     double ceilNow = -1.0, ceilTarget = -1.0, litAvg = -1.0, rawAvg = -1.0, ablSolve = -1.0, ablT = Now(), ablLowT = 0.0;
@@ -1587,9 +1606,27 @@ static void PresenterThread(Swapchain *sc)
         VkSemaphore acqSem = R.acq[acqIdx];
         acqIdx = (acqIdx + 1) % (sc->nReal + 1);
         uint32_t idx = 0;
+        {
+            const int fsNow = sc->fse ? (sc->fseHeld ? 1 : 0) : -1;
+            if (fsNow != fseShown) { fseShown = fsNow; std::lock_guard<std::mutex> l(g_cfgLock); g_status.fseState = fsNow; }
+        }
+        if (sc->fse && !sc->fseHeld && Now() - fseRetryT > 0.5)
+        {
+            fseRetryT = Now();
+            const VkResult fr = d->AcquireFullScreenExclusiveModeEXT(dev, sc->real);
+            if (fr == VK_SUCCESS) { sc->fseHeld = true; LOGI("BFI Presenter: exclusive fullscreen acquired"); }
+        }
         VkResult ar = d->AcquireNextImageKHR(dev, sc->real, 100000000ull, acqSem, VK_NULL_HANDLE, &idx);
         const double tAcq = Now();
         if (ar == VK_TIMEOUT || ar == VK_NOT_READY) continue;
+        if (ar == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
+        {
+            if (sc->fseHeld) LOGI("BFI Presenter: exclusive fullscreen lost (alt-tab?) -- reacquired when possible");
+            sc->fseHeld = false;
+            acqIdx = (acqIdx + sc->nReal) % (sc->nReal + 1);   // the semaphore was not used
+            SleepShort(0.005);
+            continue;
+        }
         if (ar == VK_SUBOPTIMAL_KHR) sc->suboptimal.store(true);
         else if (ar != VK_SUCCESS)
         {
@@ -1767,6 +1804,11 @@ static void PresenterThread(Swapchain *sc)
         sc->lastPresentT.store(tPres);
         if (presents == 0) LOGI("BFI Presenter: first frame presented (%d)", (int)pr);
         if (pr == VK_SUBOPTIMAL_KHR) sc->suboptimal.store(true);
+        else if (pr == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
+        {
+            if (sc->fseHeld) LOGI("BFI Presenter: exclusive fullscreen lost (alt-tab?) -- reacquired when possible");
+            sc->fseHeld = false;
+        }
         else if (pr != VK_SUCCESS)
         {
             LOGW("BFI Presenter: real swap chain present returned %d -- the game will be asked to recreate it", (int)pr);
@@ -1854,6 +1896,54 @@ static void PresenterThread(Swapchain *sc)
             }
         }
         else hitchPaused = false;
+
+        // Presentation health: once a window has covered the game (a launcher's
+        // splash screen) or ReShade's menu was open, Windows can stop flipping the
+        // presenter's images straight to the display and hand them back late
+        // (wait_gpu / acquire over 2 ms) -- the strobe loses its timing and
+        // flashes, and it stays that way after the cause is gone. Restarting
+        // exclusive fullscreen didn't help (shadPS4); a new swap
+        // chain does: the game is asked to rebuild it (Ctrl+Shift+O by hand).
+        if ((tFence - tAcq) > 0.002 || (tAcq - tVb) > 0.002) slowCount++;
+        {
+            const bool kNow = KeyCombo('O');
+            if (kNow && !kRebuild) { rebuildReq = true; LOGI("BFI Presenter: Ctrl+Shift+O -- rebuilding the swap chain"); }
+            kRebuild = kNow;
+        }
+        if (t - slowSecT >= 1.0)
+        {
+            slowSecT = t;
+            const bool bad = slowCount >= 8;
+            slowRun = bad ? slowRun + 1 : 0;
+            if (slowRun == 3)
+            {
+                LOGI("BFI Presenter: presentation slowed -- %d slow image returns in the last second, 3 s in a row", slowCount);
+                sc->winDumpReq.store(true);
+            }
+            if (afterRebuild)
+            {
+                goodRun = bad ? 0 : goodRun + 1;
+                if (goodRun == 10) { LOGI("BFI Presenter: presentation steady for 10 s after the rebuild"); afterRebuild = false; }
+            }
+            if (s.vkAutoRecover && slowRun >= 3 && !rebuildReq)
+            {
+                if (t - g_lastRebuildT >= 20.0)
+                {
+                    rebuildReq = true;
+                    LOGI("BFI Presenter: automatic recovery -- rebuilding the swap chain");
+                }
+                else if (slowRun == 3)
+                    LOGI("BFI Presenter: automatic recovery -- waiting: the last rebuild was %.0f s ago (20 s apart)", t - g_lastRebuildT);
+            }
+            slowCount = 0;
+        }
+        if (rebuildReq)
+        {
+            g_lastRebuildT = t;
+            LOGI("BFI Presenter: the game is asked to rebuild its swap chain (presentation recovery)");
+            sc->status.store((int)VK_ERROR_OUT_OF_DATE_KHR);
+            break;
+        }
 
         if (t - secStart >= 1.0)
         {
@@ -2082,8 +2172,8 @@ static void LrWatchThread(Swapchain *sc)
         double lead = 0.0;
         if (state == 2) lead = est + margin;
         // ... unless frames still miss their lit refresh that way: then
-        // release at the refresh, as with just-in-time release off (the
-        // Uncharted port showed repeat-then-skip at the limit and was even
+        // release at the refresh, as with just-in-time release off (a game
+        // tested showed repeat-then-skip at the limit and was even
         // without it). It stays off until game frames have fitted the
         // interval for 30 seconds -- switching straight back on brought the
         // repeats back within a second -- and for the session once that has
@@ -2230,6 +2320,93 @@ static void CapWait(Swapchain *sc, uint64_t per)
     sc->capWaits.fetch_add(1);
 }
 
+// The visible windows above the game's window on its monitor (EnumWindows
+// walks top to bottom), logged when the presenter sees presentation slow
+// down: one covering the game (a launcher's splash screen) can make Windows
+// stop flipping the presenter's images straight to the display.
+#ifdef _WIN32
+typedef HRESULT(WINAPI *PFN_DwmGetWindowAttribute)(HWND, DWORD, PVOID, DWORD);
+struct CoverCtx
+{
+    HWND game;
+    RECT mon;
+    DWORD pid;
+    PFN_DwmGetWindowAttribute dwmGet;
+    bool reached;
+    int n;
+    std::string list;
+};
+static BOOL CALLBACK CoverEnum(HWND h, LPARAM lp)
+{
+    CoverCtx *c = (CoverCtx *)lp;
+    if (h == c->game) { c->reached = true; return FALSE; }
+    if (!IsWindowVisible(h) || IsIconic(h)) return TRUE;
+    if (c->dwmGet)
+    {
+        DWORD cloaked = 0;
+        if (SUCCEEDED(c->dwmGet(h, 14 /* DWMWA_CLOAKED */, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
+    }
+    RECT r, x;
+    if (!GetWindowRect(h, &r) || !IntersectRect(&x, &r, &c->mon)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    char cls[64] = {}, title[48] = {}, exe[MAX_PATH] = "this game";
+    GetClassNameA(h, cls, sizeof(cls));
+    GetWindowTextA(h, title, sizeof(title));
+    if (pid != c->pid)
+    {
+        strcpy(exe, "?");
+        if (HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
+        {
+            char path[MAX_PATH] = {};
+            DWORD len = MAX_PATH;
+            if (QueryFullProcessImageNameA(ph, 0, path, &len))
+            {
+                const char *bn = strrchr(path, '\\');
+                snprintf(exe, sizeof(exe), "%s", bn ? bn + 1 : path);
+            }
+            CloseHandle(ph);
+        }
+    }
+    const LONG ex = GetWindowLongA(h, GWL_EXSTYLE);
+    char b[400];
+    snprintf(b, sizeof(b), "%s[%s \"%s\" %s, %ldx%ld at %ld,%ld%s%s%s]", c->n ? " " : "", cls, title, exe, r.right - r.left, r.bottom - r.top,
+             r.left, r.top, (ex & WS_EX_TOPMOST) ? ", topmost" : "", (ex & WS_EX_LAYERED) ? ", layered" : "",
+             (ex & WS_EX_TRANSPARENT) ? ", click-through" : "");
+    if (c->list.size() < 1500) c->list += b;
+    c->n++;
+    return TRUE;
+}
+#endif
+static void WinWatchThread(Swapchain *sc)
+{
+#ifdef _WIN32
+    HMODULE dwm = LoadLibraryA("dwmapi.dll");
+    PFN_DwmGetWindowAttribute dwmGet = dwm ? (PFN_DwmGetWindowAttribute)(void *)GetProcAddress(dwm, "DwmGetWindowAttribute") : nullptr;
+    while (sc->winRun.load())
+    {
+        for (int i = 0; i < 10 && sc->winRun.load(); i++) SleepShort(0.05);
+        if (!sc->winRun.load()) break;
+        if (!sc->winDumpReq.exchange(false)) continue;
+        HWND game = sc->hwnd ? GetAncestor((HWND)sc->hwnd, GA_ROOT) : nullptr;
+        if (!game) continue;
+        CoverCtx c = {};
+        c.game = game;
+        c.pid = GetCurrentProcessId();
+        c.dwmGet = dwmGet;
+        MONITORINFO mi = { sizeof(mi) };
+        if (!GetMonitorInfoA(MonitorFromWindow(game, MONITOR_DEFAULTTONEAREST), &mi)) continue;
+        c.mon = mi.rcMonitor;
+        EnumWindows(CoverEnum, (LPARAM)&c);
+        LOGI("BFI Presenter: windows over the game: %s%s", c.n ? c.list.c_str() : "none",
+             c.reached ? "" : " (game window not found in the list)");
+    }
+    if (dwm) FreeLibrary(dwm);
+#else
+    (void)sc;
+#endif
+}
+
 static void StartPresenter(Swapchain *sc)
 {
     if (sc->running.load() || sc->failed.load()) return;
@@ -2241,6 +2418,11 @@ static void StartPresenter(Swapchain *sc)
         sc->lrRun.store(true);
         sc->lrThread = std::thread(LrWatchThread, sc);
     }
+    if (!sc->winThread.joinable())
+    {
+        sc->winRun.store(true);
+        sc->winThread = std::thread(WinWatchThread, sc);
+    }
 }
 static void StopPresenter(Swapchain *sc)
 {
@@ -2249,6 +2431,11 @@ static void StopPresenter(Swapchain *sc)
         sc->lrRun.store(false);
         sc->lrCv.notify_all();
         sc->lrThread.join();
+    }
+    if (sc->winThread.joinable())
+    {
+        sc->winRun.store(false);
+        sc->winThread.join();
     }
     sc->lrLead.store(0.0);
     sc->lrAllowed.store(false);
@@ -2655,7 +2842,7 @@ struct ChainCopy
     std::vector<std::vector<uint8_t>> mem;
     const void *head = nullptr;
 };
-static void FilterSwapchainChain(const void *pNext, ChainCopy &out, bool dropFormatList)
+static void FilterSwapchainChain(const void *pNext, ChainCopy &out, bool dropFormatList, bool dropFse = false)
 {
     VkBaseOutStructure *last = nullptr;
     for (const VkBaseInStructure *p = (const VkBaseInStructure *)pNext; p; p = p->pNext)
@@ -2670,8 +2857,8 @@ static void FilterSwapchainChain(const void *pNext, ChainCopy &out, bool dropFor
         case VK_STRUCTURE_TYPE_DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR: sz = sizeof(VkDeviceGroupSwapchainCreateInfoKHR); break;
         case VK_STRUCTURE_TYPE_SWAPCHAIN_DISPLAY_NATIVE_HDR_CREATE_INFO_AMD: sz = sizeof(VkSwapchainDisplayNativeHdrCreateInfoAMD); break;
 #ifdef _WIN32
-        case VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT: sz = sizeof(VkSurfaceFullScreenExclusiveInfoEXT); break;
-        case VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT: sz = sizeof(VkSurfaceFullScreenExclusiveWin32InfoEXT); break;
+        case VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT: sz = dropFse ? 0 : sizeof(VkSurfaceFullScreenExclusiveInfoEXT); break;
+        case VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT: sz = dropFse ? 0 : sizeof(VkSurfaceFullScreenExclusiveWin32InfoEXT); break;
 #endif
         default:
             LOGI("BFI Presenter: swap chain extension structure %d not passed to the real swap chain", (int)p->sType);
@@ -2767,10 +2954,51 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateSwapchainKHR(VkDevice device, co
     }
     if (!upgrade && getenv("BFI_PRESENTER_FAKEHDR")) upgrade = true;   // test builds: PQ into the SDR swap chain
     ChainCopy chainCopy;
-    FilterSwapchainChain(ci->pNext, chainCopy, upgrade);
+    FilterSwapchainChain(ci->pNext, chainCopy, upgrade, d->fse);
     rci.pNext = chainCopy.head;
+    // Exclusive fullscreen for the presenter's own swap chain: Windows then
+    // flips its images straight to the display and overlays (ReShade's,
+    // RivaTuner's) draw into them instead of moving presentation into the
+    // compositor -- which broke the strobe's timing for good once an overlay
+    // had been open (Indiana Jones).
+    VkSurfaceFullScreenExclusiveWin32InfoEXT fseWin = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT };
+    VkSurfaceFullScreenExclusiveInfoEXT fseInfo = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT };
+    bool fseChain = false;
+    if (d->fse)
+    {
+        // The game's own choice (Indiana Jones sets one) is replaced on the
+        // presenter's swap chain: the game never presents to it.
+        int gameMode = -1;
+        for (const VkBaseInStructure *b = (const VkBaseInStructure *)ci->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT)
+                gameMode = (int)((const VkSurfaceFullScreenExclusiveInfoEXT *)b)->fullScreenExclusive;
+        if (gameMode >= 0) LOGI("BFI Presenter: the game asks for full-screen exclusive mode %d -- the presenter's swap chain uses application-controlled", gameMode);
+        HWND wnd = nullptr;
+        {
+            std::lock_guard<std::mutex> l(g_mapLock);
+            auto it = g_surfaceWindow.find((uint64_t)ci->surface);
+            if (it != g_surfaceWindow.end()) wnd = (HWND)it->second;
+        }
+        if (wnd)
+        {
+            fseWin.hmonitor = MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST);
+            fseInfo.fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT;
+            fseInfo.pNext = &fseWin;
+            fseWin.pNext = rci.pNext;
+            rci.pNext = &fseInfo;
+            fseChain = true;
+        }
+        else LOGI("BFI Presenter: exclusive fullscreen not requested (window unknown)");
+    }
     VkSwapchainKHR real = VK_NULL_HANDLE;
     VkResult r = d->CreateSwapchainKHR(device, &rci, alloc, &real);
+    if (r != VK_SUCCESS && fseChain)
+    {
+        LOGW("BFI Presenter: swap chain with exclusive fullscreen refused (%d) -- without it", (int)r);
+        rci.pNext = fseWin.pNext;
+        fseChain = false;
+        r = d->CreateSwapchainKHR(device, &rci, alloc, &real);
+    }
     if (r != VK_SUCCESS && upgrade)
     {
         LOGW("BFI Presenter: HDR10 swap chain refused (%d) -- staying SDR", (int)r);
@@ -2779,7 +3007,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateSwapchainKHR(VkDevice device, co
         rci.imageColorSpace = ci->imageColorSpace;
         rci.flags = ci->flags;
         ChainCopy c2;
-        FilterSwapchainChain(ci->pNext, c2, false);
+        FilterSwapchainChain(ci->pNext, c2, false, d->fse);
         rci.pNext = c2.head;
         r = d->CreateSwapchainKHR(device, &rci, alloc, &real);
     }
@@ -2812,6 +3040,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateSwapchainKHR(VkDevice device, co
     sc->d = d;
     sc->real = real;
     sc->surface = ci->surface;
+    sc->fse = fseChain;
+    if (fseChain)
+    {
+        const VkResult fr = d->AcquireFullScreenExclusiveModeEXT(device, real);
+        sc->fseHeld = fr == VK_SUCCESS;
+        LOGI("BFI Presenter: exclusive fullscreen %s (%d)", sc->fseHeld ? "acquired" : "not acquired yet -- retried while presenting", (int)fr);
+    }
     {
         std::lock_guard<std::mutex> l(g_mapLock);
         auto it = g_surfaceWindow.find((uint64_t)ci->surface);
@@ -3230,21 +3465,41 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateInstance(const VkInstanceCreateI
     // HDR10 presentation of SDR games needs VK_EXT_swapchain_colorspace; add
     // it when the game didn't (and drop it again if the driver refuses).
     std::vector<const char *> exts(ci->ppEnabledExtensionNames, ci->ppEnabledExtensionNames + ci->enabledExtensionCount);
-    bool hasCs = false;
-    for (const char *e : exts) if (!strcmp(e, "VK_EXT_swapchain_colorspace")) hasCs = true;
+    bool hasCs = false, hasSc2 = false;
+    for (const char *e : exts)
+    {
+        if (!strcmp(e, "VK_EXT_swapchain_colorspace")) hasCs = true;
+        if (!strcmp(e, "VK_KHR_get_surface_capabilities2")) hasSc2 = true;
+    }
     VkResult r = VK_ERROR_EXTENSION_NOT_PRESENT;
-    if (g_active && !hasCs)
+    bool wantSc2 = false;
+    if (g_active && !hasSc2)
+    {
+        std::lock_guard<std::mutex> l(g_cfgLock);
+        wantSc2 = g_shared.vkExclusive != 0;
+    }
+    if (g_active && (!hasCs || wantSc2))
     {
         VkInstanceCreateInfo mci = *ci;
-        exts.push_back("VK_EXT_swapchain_colorspace");
-        mci.enabledExtensionCount = (uint32_t)exts.size();
-        mci.ppEnabledExtensionNames = exts.data();
+        std::vector<const char *> e2 = exts;
+        if (!hasCs) e2.push_back("VK_EXT_swapchain_colorspace");
+        if (wantSc2) e2.push_back("VK_KHR_get_surface_capabilities2");
+        mci.enabledExtensionCount = (uint32_t)e2.size();
+        mci.ppEnabledExtensionNames = e2.data();
         r = create(&mci, a, out);
-        if (r == VK_SUCCESS) hasCs = true;
+        if (r == VK_SUCCESS) { hasCs = true; if (wantSc2) hasSc2 = true; }
+        else if (wantSc2 && !hasCs)
+        {
+            e2 = exts; e2.push_back("VK_EXT_swapchain_colorspace");
+            mci.enabledExtensionCount = (uint32_t)e2.size();
+            mci.ppEnabledExtensionNames = e2.data();
+            r = create(&mci, a, out);
+            if (r == VK_SUCCESS) hasCs = true;
+        }
     }
     if (r != VK_SUCCESS) r = create(ci, a, out);
     if (r != VK_SUCCESS) return r;
-    if (g_active) g_colorspaceExt.store(hasCs);
+    if (g_active) { g_colorspaceExt.store(hasCs); g_surfCaps2Ext.store(hasSc2); }
     InstanceData *id = new InstanceData();
     id->instance = *out;
     id->gipa = gipa;
@@ -3314,6 +3569,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateDevice(VkPhysicalDevice phys, co
     std::vector<float> prio;
     uint32_t family = UINT32_MAX, index = 0;
     bool shared = false;
+    bool fseSupported = false, fseOn = false;
+    std::vector<const char *> dexts(ci->ppEnabledExtensionNames, ci->ppEnabledExtensionNames + ci->enabledExtensionCount);
     if (g_active)
     {
         uint32_t nf = 0;
@@ -3328,7 +3585,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateDevice(VkPhysicalDevice phys, co
             std::vector<VkExtensionProperties> ep(ne);
             if (ne) id->EnumerateDeviceExtensionProperties(phys, nullptr, &ne, ep.data());
             bool gpK = false, gpE = false;
-            for (auto &e : ep) { if (!strcmp(e.extensionName, "VK_KHR_global_priority")) gpK = true; if (!strcmp(e.extensionName, "VK_EXT_global_priority")) gpE = true; }
+            for (auto &e : ep)
+            {
+                if (!strcmp(e.extensionName, "VK_KHR_global_priority")) gpK = true;
+                if (!strcmp(e.extensionName, "VK_EXT_global_priority")) gpE = true;
+                if (!strcmp(e.extensionName, "VK_EXT_full_screen_exclusive")) fseSupported = true;
+            }
             std::string fams;
             for (uint32_t i = 0; i < nf; i++)
             {
@@ -3363,11 +3625,39 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateDevice(VkPhysicalDevice phys, co
             else { shared = true; index = 0; }
         }
     }
+    if (g_active)
+    {
+        bool want = false;
+        {
+            std::lock_guard<std::mutex> l(g_cfgLock);
+            want = g_shared.vkExclusive != 0;
+        }
+        bool has = false;
+        for (const char *e : dexts) if (!strcmp(e, "VK_EXT_full_screen_exclusive")) has = true;
+        if (want && fseSupported && g_surfCaps2Ext.load())
+        {
+            if (!has) dexts.push_back("VK_EXT_full_screen_exclusive");
+            mci.enabledExtensionCount = (uint32_t)dexts.size();
+            mci.ppEnabledExtensionNames = dexts.data();
+            fseOn = true;
+        }
+        else if (want)
+            LOGW("BFI Presenter: VulkanExclusiveFullscreen=1 but %s -- not used",
+                 !fseSupported ? "the driver has no VK_EXT_full_screen_exclusive" : "VK_KHR_get_surface_capabilities2 could not be enabled");
+    }
     VkResult r = create(phys, &mci, a, out);
+    if (r != VK_SUCCESS && fseOn)
+    {
+        LOGW("BFI Presenter: device creation with VK_EXT_full_screen_exclusive failed (%d) -- trying without", (int)r);
+        fseOn = false;
+        mci.enabledExtensionCount = ci->enabledExtensionCount;
+        mci.ppEnabledExtensionNames = ci->ppEnabledExtensionNames;
+        r = create(phys, &mci, a, out);
+    }
     if (r != VK_SUCCESS && mci.pQueueCreateInfos != ci->pQueueCreateInfos)
     {
         LOGW("BFI Presenter: device creation with an extra queue failed (%d) -- sharing the game's queue", (int)r);
-        shared = true; index = 0;
+        shared = true; index = 0; fseOn = false;
         r = create(phys, ci, a, out);
     }
     if (r != VK_SUCCESS) return r;
@@ -3386,6 +3676,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateDevice(VkPhysicalDevice phys, co
     BFI_DEVICE_OPT_FUNCS(X)
 #undef X
     d->ok = ok;
+    d->fse = fseOn && d->AcquireFullScreenExclusiveModeEXT;
+    if (fseOn) LOGI("BFI Presenter: VK_EXT_full_screen_exclusive enabled for the presenter's swap chain%s", d->fse ? "" : " -- but its functions are missing");
     for (uint32_t i = 0; i < ci->queueCreateInfoCount; i++)
         if (std::find(d->families.begin(), d->families.end(), ci->pQueueCreateInfos[i].queueFamilyIndex) == d->families.end())
             d->families.push_back(ci->pQueueCreateInfos[i].queueFamilyIndex);
@@ -3755,6 +4047,25 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (s.queueAhead && st.managed)
             ImGui::Text("Queue ahead: %d re-primed, %d drained per second", st.qaPrimes, st.qaSkips);
         ImGui::SliderInt("Presenter buffers (applies when the swap chain is next created)", &s.presBuffers, 2, 4);
+        {
+            bool fx = s.vkExclusive != 0;
+            if (ImGui::Checkbox("Exclusive fullscreen for the presenter (applies at the next game start)", &fx)) s.vkExclusive = fx ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("The presenter's own swap chain in exclusive fullscreen (VK_EXT_full_screen_exclusive).\n"
+                                                          "Windows then flips its frames straight to the display: opening an overlay (RivaTuner's OSD,\n"
+                                                          "ReShade's menu) can't move presentation into the desktop compositor, where the strobe\n"
+                                                          "loses its timing and flashes until the game restarts. The game's own window mode is unchanged.\n"
+                                                          "Needs a window that covers the whole screen (borderless or fullscreen).");
+            int fs;
+            { std::lock_guard<std::mutex> l(g_cfgLock); fs = g_status.fseState; }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", fs < 0 ? "(off)" : fs ? "(held)" : "(not held -- alt-tab or window not fullscreen)");
+            bool ar = s.vkAutoRecover != 0;
+            if (ImGui::Checkbox("Recover presentation automatically", &ar)) s.vkAutoRecover = ar ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("After a window covered the game (a launcher's splash screen) or this menu was open, Windows can\n"
+                                                          "stop showing the presenter's frames straight on the display: the strobe loses its timing and\n"
+                                                          "flashes until the swap chain is made again. When that lasts 3 seconds the game is asked to\n"
+                                                          "rebuild its swap chain (a short pause; at most every 20 s). By hand: Ctrl+Shift+O.");
+        }
         bool hg = s.hitchGuard != 0;
         if (ImGui::Checkbox("Hitch guard (pause BFI during loading and missed refreshes)", &hg)) s.hitchGuard = hg ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("While the presenter misses refreshes or the game delivers no new frame for the loading\ntime, every refresh is shown at the strobe's average brightness instead of strobing.");
