@@ -2760,7 +2760,7 @@ static DWORD WINAPI PresenterThread(void *)
                 if (s.autoAhead && s.maxAhead != 0)
                 {
                     repSum -= repWin[repIdx];
-                    repWin[repIdx] = (s.gameCap >= 1) ? secRepU : 0;
+                    repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
                     repSum += repWin[repIdx];
                     repIdx = (repIdx + 1) % 30;
                     if (autoAhead == 1)
@@ -2786,6 +2786,8 @@ static DWORD WINAPI PresenterThread(void *)
                         if (spareSecs >= 10)
                         {
                             autoAhead = 1; spareSecs = 0; missSecs = 0; aheadDropT = t;
+                        for (int r = 0; r < 30; r++) repWin[r] = 0;
+                        repSum = 0;
                             LOGI("BFI Presenter: automatic frames ahead: 1 (headroom: %.1f ms spare per frame)", capWaitMs);
                         }
                     }
