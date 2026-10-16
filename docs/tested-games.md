@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-99 of 101 tested games and emulators run with BFI: the 49 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; five with the engine's own stutter) and 50 more listed after it. Two are partial.
+99 of 101 tested games and emulators run with BFI: the 50 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; five with the engine's own stutter) and 49 more listed after it. Two are partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -66,9 +66,10 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Burnout Paradise Remastered | Working (DX11, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32`; works with the Luma HDR add-on |
 | Dead Cells | Working (DX11, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32` with ReShade 6.8 (6.5.1 with the Steam overlay crashed at start) |
 | FlatOut: Ultimate Carnage | Working (DX9, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32`; Refresh + Lowest latency (Half refresh doesn't hold it at 60, and an NVIDIA Profile Inspector cap stutters) |
+| Replaced | Working | Not tested | v1.0.9 | Crashes on the first start after installing, until ReShade has created `ReShade2.ini`; from the second start it runs. Good HDR + CRT look with AutoHDR (see notes) |
 | Red Dead Redemption 2 | Working (Vulkan) | Not tested | — | Vulkan renderer; Vulkan layer, `BFIPresenter.ini` next to `RDR2.exe` |
 | DOOM Eternal | Working (Vulkan) | Not tested | v1.0.3 | Vulkan layer without ReShade (the game didn't start with ReShade); `BFIPresenter.ini` next to `DOOMEternalx64vk.exe`; settings in the ini + hotkeys |
-| P.T. (native PC port) | Working (Vulkan) | — | v1.0.5 | Vulkan layer; ReShade only through its Vulkan layer (manager: Turn on), never as `dxgi.dll` and no DX add-on in the folder (crashed). With ray tracing on: Half refresh + Lowest latency + Just-in-time release |
+| PT-PC | Working (Vulkan) | — | v1.0.5 | Vulkan layer; ReShade only through its Vulkan layer (manager: Turn on), never as `dxgi.dll` and no DX add-on in the folder (crashed). With ray tracing on: Half refresh + Lowest latency + Just-in-time release |
 | Kena: Bridge of Spirits | Working, engine stutter | Not tested | v1.0.3 | Standard setup; the stutter is the engine's own |
 | Need for Speed: Porsche Unleashed | Working (OpenGL, 32-bit), engine stutter; not recommended | — | v1.0.3 | `BFIPresenter.addon32`; in the unofficial patch's OGL3 mode: NVIDIA profile Vulkan/OpenGL present method = Prefer layered on DXGI swapchain |
 | Legacy of Kain: Soul Reaver 1 & 2 Remastered | Working (OpenGL) | — | v1.0.3 | With DLSS 5: Half refresh + Lowest latency. Without: Refresh + Lowest latency + Later release (Smooth stutters more) |
@@ -99,7 +100,6 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Hades | Standard setup |
 | Hollow Knight | Standard setup |
 | Hotshot Racing | Standard setup |
-| ICO | Standard setup |
 | INSIDE | Standard setup |
 | Jotun | Standard setup |
 | Journey | Standard setup |
@@ -309,11 +309,16 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 - Works with the standard setup; the remaining stutter is the engine's own and shows without the presenter too.
 
+### Replaced
+
+- The first start after installing crashes: ReShade creates `ReShade2.ini` on that start, and from the second start the game runs. Start it once more after the crash.
+- Otherwise it works great with the presenter. For HDR with a CRT look: the AutoHDR add-on by MajorPainTheCactus with Pumbo's AdvancedAutoHDR shader, plus CRT-Standalone. With AutoHDR, CRT-Standalone must run in Pipeline 1 (`PIPELINE=1`, Soop scRGB).
+
 ### Red Dead Redemption 2
 
 - Use the game's Vulkan renderer with the Vulkan layer installed, and put `BFIPresenter.ini` next to `RDR2.exe`.
 
-### P.T. (native PC port)
+### PT-PC
 
 - A Vulkan game: use the Vulkan layer (`BFIPresenter.ini` next to `pt.exe`) and nothing else in the folder. Manager 1.2.0 took it for a DirectX game (the SDL library next to it names every renderer) and installed ReShade as `dxgi.dll` and the DX add-on; with those, NVIDIA's Vulkan driver presented through a hidden DXGI swap chain that ReShade, the add-on and RTSS all hooked, and the game crashed in the driver half a second after BFI started.
 - ReShade runs through its own Vulkan layer: in the manager, **Turn on** in the game's ReShade row (it writes the `ReShade.ini` next to `pt.exe` that the layer needs; a folder with only `ReShadePreset.ini` and `reshade-shaders` doesn't load it). The BFI Presenter (Vulkan) tab is then in ReShade's overlay. Without ReShade, edit `BFIPresenter.ini`: the layer picks up the change while the game runs.
