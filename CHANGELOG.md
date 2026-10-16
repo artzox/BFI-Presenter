@@ -7,7 +7,7 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [1.0.10] — unreleased (Manager 1.3.3)
+## [1.0.10] — 2026-10-16 (Manager 1.3.3)
 
 - **[Both] Automatic frames ahead goes back to 2 on scattered hiccups.** It stepped up only after 3 seconds in a row with uneven strobe cycles, so a game that missed a cycle every few seconds stayed at 1 with a repeat-then-skip stutter (Uncharted port: about 16 a minute at 1, none at 2). Now 6 uneven cycles within 30 seconds at 1 frame ahead (not counting loading pauses) also bring it back to 2; needed again within a minute of trying 1, it stays at 2.
 - **[Both] Just-in-time release switches itself off when it doesn't help at its limit.** At the Half / Quarter cap with game frames taking nearly the whole interval, it releases as early as the cap allows (that fixed Obduction). Where frames still miss their lit refresh that way (3 in 20 seconds), it now releases at the refresh as with the option off, until game frames have fitted the interval for 30 seconds, and for the rest of the session once that has happened twice (the Uncharted port: switching straight back on brought the repeats back within a second). The log says when.
