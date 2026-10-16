@@ -10,6 +10,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 ## [1.0.10] — unreleased
 
 - **[Both] [Shader] Rolling scan defaults: phosphor decay 0.2 (was 0), seam 0 (was 0.08).** Pixels in the seam's blended zone are lit in both bands' refreshes, so the seam blurred visibly in motion; phosphor decay hides the band edge without that. The seam is now a hard edge unless you set it, and only applies with decay 0. Existing `BFIPresenter.ini` files keep their values. The overlay's seam slider has a tooltip saying so.
+- **[Tested games]** Replaced.
 - **[Docs]** Settings guide: strobe-rate formula for any refresh rate and frame generation; "CRT displays" in the intro; the Gain tip assumes the ABL guard is set up.
 
 ## [1.0.9] — 2026-10-15 (Manager 1.3.2)
