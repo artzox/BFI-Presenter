@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.11"
+#define BFI_VERSION "1.0.11-rfx1"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -259,6 +259,7 @@ struct Settings
     float knee     = 0.75f;
     float peakNits = 1400.0f; // display peak (HDR ceiling)
     int   output   = -1;      // -1 auto, 0 SDR, 1 scRGB, 2 HDR10
+    int   autoCap  = 0;       // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   gameCap  = 1;       // 0 off, 1 refresh rate, 2 half refresh, 3 quarter refresh,
                               // 4 one game frame per strobe cycle (refresh / Frames), 5 refresh / CapDivisor
     int   capDivisor = 3;    // cap 5: release the game every this many refreshes (1-8)
@@ -335,6 +336,7 @@ static void LoadSettings(Settings &s)
     s.capDivisor = Clamp(KvInt(kv, "CapDivisor", 3), 1, 8);
     s.pacingMode = KvInt(kv, "FramePacing", 0) ? 1 : 0;
     s.capJit = KvInt(kv, "CapJustInTime", 1) ? 1 : 0;
+    s.autoCap = KvInt(kv, "AutoFrameCap", 0) ? 1 : 0;
     s.laterRelease = KvInt(kv, "LaterRelease", 0) ? 1 : 0;
     s.laterReleaseMs = Clamp(KvFloat(kv, "LaterReleaseMarginMs", 1.5f), 0.5f, 5.0f);
     s.maxAhead = Clamp(KvInt(kv, "MaxFramesAhead", 1), 0, 3);
@@ -371,7 +373,7 @@ static void LoadSettings(Settings &s)
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
     I("RollingScan", s.rolling); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
-    I("CapJustInTime", s.capJit); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
+    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
@@ -410,6 +412,8 @@ struct Status
     bool   hitchPaused = false;
     bool   limitSuspect = false;   // something caps the presenter below the display refresh
     int    aheadInUse = 1;
+    int    autoCapDown = 0;                 // automatic frame cap: one game frame per strobe cycle in use
+    int    fgActive = 0;                    // a frame-generation DLL is loaded (the automatic cap stays at Refresh)
     double rawAvg = -1.0, litAvg = -1.0, ceilInUse = 0.0;
     int    sharedQueue = 0;
     int    layerOrder = 0;      // 0 unknown, 1 below ReShade (good), 2 ReShade not above the layer
@@ -644,6 +648,7 @@ struct Swapchain
     std::atomic<bool> winDumpReq{false};   // presentation slowed down: log the windows over the game
     std::atomic<bool> retired{false};
     std::atomic<int>  maxAhead{1};
+    std::atomic<bool> autoCapDown{false};       // automatic frame cap: the game gets one frame per strobe cycle
     std::atomic<long long> capWaitUs{0};
     std::atomic<int>  capWaits{0}, slotWaits{0}, staged{0};
     std::atomic<double> lastPresentT{0.0};
@@ -1307,6 +1312,11 @@ static void PresenterThread(Swapchain *sc)
     int lateIdx = 0;
     double lastNewFrameT = 0.0, hitchUntil = 0.0;
     bool hitchPaused = false;
+    // Automatic frame cap (as the DX add-on): at the Refresh cap, one game frame per
+    // strobe cycle while the game can't hold the refresh rate; back when it can.
+    int capDownSecs = 0, capUpSecs = 0, userCap = 1;
+    double capSwitchT = -100.0, capUpT = 0.0;
+    bool capLocked = false, fgWas = false;
     bool kb = false, km = false, kr = false, krs = false;
     FILE *logf = nullptr;
     double monitorCheckT = Now();
@@ -1349,6 +1359,8 @@ static void PresenterThread(Swapchain *sc)
         // and each shown twice (60 Hz motion), which also made a CRT shader's
         // own BFI flicker (Twelve Minutes).
         if (!s.enabled) s.frames = 1;
+        userCap = s.gameCap;
+        if (s.autoCap && userCap == 1 && sc->autoCapDown.load() && s.frames >= 2) s.gameCap = 4;
 
         // timing log: a new time-stamped file each time it is switched on
         if (s.log && !logf)
@@ -2026,6 +2038,51 @@ static void PresenterThread(Swapchain *sc)
             }
             else sc->maxAhead.store(s.maxAhead);
             g_status.aheadInUse = sc->maxAhead.load();
+            {
+                const double hzA = vb.modeHz > 0.0 ? vb.modeHz : 0.0;
+                bool fg = false;
+#ifdef _WIN32
+                for (const char *dll : { "nvngx_dlssg.dll", "sl.dlss_g.dll", "ffx_frameinterpolation_x64.dll", "libxess_fg.dll" })
+                    if (GetModuleHandleA(dll)) fg = true;
+#endif
+                if (fg != fgWas)
+                {
+                    fgWas = fg;
+                    if (fg && s.autoCap) LOGI("BFI Presenter: frame generation DLL loaded -- the automatic frame cap stays at Refresh rate");
+                }
+                const double fpsA = g_status.gameFps;
+                bool down = sc->autoCapDown.load();
+                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0)
+                {
+                    if (!down)
+                    {
+                        capDownSecs = (!fg && !hitchPaused && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;
+                        if (capDownSecs >= 3 && t - capSwitchT > 10.0)
+                        {
+                            down = true; capDownSecs = capUpSecs = 0; capSwitchT = t;
+                            capLocked = capUpT > 0.0 && t - capUpT < 60.0;
+                            LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps) -- the game held "
+                                 "%.0f fps of %.0f, so frames were dropped unevenly%s", hzA / s.frames, fpsA, hzA,
+                                 capLocked ? "; staying there for this session" : "");
+                        }
+                    }
+                    else
+                    {
+                        const double needMs = g_status.lrState >= 2 ? g_status.lrEst + g_status.lrMargin : 1e9;
+                        capUpSecs = (!capLocked && !hitchPaused && needMs < 0.9 * 1000.0 / hzA) ? capUpSecs + 1 : 0;
+                        if (fg || (capUpSecs >= 10 && t - capSwitchT > 10.0))
+                        {
+                            down = false; capDownSecs = capUpSecs = 0; capSwitchT = t; capUpT = t;
+                            if (fg) LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation)");
+                            else LOGI("BFI Presenter: automatic frame cap: Refresh rate -- game frames take %.1f ms, within a refresh", needMs);
+                        }
+                    }
+                }
+                else if (down) { down = false; capDownSecs = capUpSecs = 0; }
+                sc->autoCapDown.store(down);
+                g_status.autoCapDown = down ? 1 : 0;
+                g_status.fgActive = fg ? 1 : 0;
+            }
             secFrameRepeats = secFrameSkips = secReused = 0;
             secRepU = secSkipU = 0;
             secStart = t; secPresents = 0; secLate = 0; ageSum = 0.0;
@@ -2633,8 +2690,9 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
     {
         std::lock_guard<std::mutex> l(g_cfgLock);
         cap = g_shared.gameCap;
+        if (g_shared.autoCap && cap == 1 && sc->autoCapDown.load() && g_shared.enabled && g_shared.frames >= 2) cap = 4;
         pacingLL = g_shared.pacingMode;
-        capPer = CapPeriod(g_shared.gameCap, g_shared.frames, g_shared.capDivisor);
+        capPer = CapPeriod(cap, g_shared.frames, g_shared.capDivisor);
     }
     // Lowest latency, and Smooth with a frame cap: the game's present counts
     // as done once it is handed over, not when the strobe takes it. Completing
@@ -3992,6 +4050,22 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "more latency) and shows every frame once, in order.\n"
                                                           "On: when two finished frames keep waiting, one is skipped to get back to the lowest\n"
                                                           "latency -- a second stutter shortly after the first.");
+        }
+        {
+            bool ac = s.autoCap != 0;
+            if (ImGui::Checkbox("Automatic frame cap (test)", &ac)) s.autoCap = ac ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the Refresh rate cap: while the game can't hold the refresh rate, the cap drops to one\n"
+                                                          "game frame per strobe cycle (60 fps at 120 Hz with 2 frames), so every flash shows the next\n"
+                                                          "frame instead of frames dropped unevenly (judder). Back to Refresh rate when the game's frames\n"
+                                                          "fit a refresh again. Not with frame generation.");
+            if (s.autoCap)
+            {
+                int down, fgA;
+                { std::lock_guard<std::mutex> l(g_cfgLock); down = g_status.autoCapDown; fgA = g_status.fgActive; }
+                ImGui::SameLine();
+                if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
+                else ImGui::TextDisabled("%s", fgA ? "(Refresh rate: frame generation)" : down ? "(in use: one game frame per strobe cycle)" : "(in use: Refresh rate)");
+            }
         }
         bool cj = s.capJit != 0;
         if (ImGui::Checkbox("Just-in-time release at caps below the refresh rate", &cj)) s.capJit = cj ? 1 : 0;
