@@ -32,10 +32,26 @@ int wmain(int argc, wchar_t **argv)
     if (argc < 3) { printf("usage: selftest <games dir> <release dir>\n"); return 2; }
     std::wstring games = argv[1], rel = argv[2];
     ScanOptions o;
-    o.steam = o.epic = o.gog = o.xbox = false;
+    o.steam = o.epic = o.gog = o.xbox = o.bnet = false;
     o.folders = { games };
-    auto all = FindGames(o);
+    int vrLeft = 0;
+    auto all = FindGames(o, nullptr, &vrLeft);
     printf("found %zu games\n", all.size());
+    CHECK(!Find(all, "Skyrim VR") && vrLeft == 1, "folder game with VR in its title left out (%d)", vrLeft);
+    {
+        ScanOptions s2;
+        s2.epic = s2.gog = s2.xbox = false;
+        int vr2 = 0;
+        auto st = FindGames(s2, nullptr, &vr2);
+        Game *fl = Find(st, "Flat Game"), *ho = Find(st, "Headset Only"), *sv = Find(st, "Sim VR"), *d4 = Find(st, "Diablo IV");
+        CHECK(fl && fl->store == "Steam" && fl->appid == "10", "Steam: library from the registry and libraryfolders.vdf");
+        CHECK(!ho && vr2 == 1, "Steam: onlyvrsupport in appinfo.vdf left out (%d)", vr2);
+        CHECK(sv != nullptr, "Steam: \"VR\" in the title but not VR-only in appinfo.vdf kept");
+        CHECK(d4 && d4->store == "Battle.net" && !Find(st, "Battle.net"), "Battle.net: game from its uninstall entry, not the launcher");
+        s2.skipVr = false;
+        st = FindGames(s2);
+        CHECK(Find(st, "Headset Only") != nullptr, "VR-only game listed with the option off");
+    }
     for (auto &g : all) Dump(g);
 
     Game *wf = Find(all, "Wreckfest"), *aw = Find(all, "Alan Wake"), *op = Find(all, "OptiGame"), *rd = Find(all, "Red Dead Redemption 2"),

@@ -20,7 +20,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.3.3"
+#define MANAGER_VERSION "1.3.4"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -31,6 +31,7 @@ static ID3D11RenderTargetView *g_rtv = nullptr;
 static UINT g_resizeW = 0, g_resizeH = 0;
 static float g_dpiScale = 1.0f;
 static bool g_dpiChanged = false;
+static ULONGLONG g_driveArrived = 0;   // a drive was connected (WM_DEVICECHANGE): rescan shortly after
 
 static void CreateRT()
 {
@@ -113,6 +114,12 @@ static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
+    case WM_DEVICECHANGE:
+        // A drive was connected (an external disk with a Steam library or a games folder): the main
+        // loop rescans a few seconds later, once Windows has mounted it.
+        if (wp == 0x8000 /* DBT_DEVICEARRIVAL */ && lp && ((const DWORD *)lp)[1] == 2 /* DBT_DEVTYP_VOLUME */)
+            g_driveArrived = GetTickCount64();
+        return TRUE;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -134,6 +141,7 @@ struct App {
     std::atomic<bool> busy{ false };
     std::string busyText;              // guarded by lock
     bool scanDone = false;             // guarded by lock
+    int  vrSkipped = 0;                // guarded by lock: VR-only games left out by the last fresh scan
     std::vector<Game> scanned;         // guarded by lock
     std::string scanErr;               // guarded by lock
     bool lastFresh = false;
@@ -328,7 +336,8 @@ static void StartScan(bool fresh)
     std::vector<Game> current = g_app.games;
     g_app.worker = std::thread([opt, fresh, current]() mutable {
         std::vector<Game> games;
-        if (fresh) games = FindGames(opt, SetBusy);
+        int vrSkipped = 0;
+        if (fresh) games = FindGames(opt, SetBusy, &vrSkipped);
         else { games = std::move(current); DetectAll(games, SetBusy); }
         std::string err;
         if (LoadSetting(L"PCGamingWiki", L"1") == L"1")
@@ -350,6 +359,7 @@ static void StartScan(bool fresh)
         g_app.scanned = std::move(games);
         g_app.vk = vk;
         g_app.scanErr = err;
+        g_app.vrSkipped = vrSkipped;
         g_app.scanDone = true;
         g_app.busy = false;
     });
@@ -417,7 +427,9 @@ static void PollWorker()
         g_app.sel = -1;
         for (int i = 0; i < (int)g_app.games.size(); i++)
             if (g_app.games[i].root == selRoot) g_app.sel = i;
+        const int vr = g_app.lastFresh ? g_app.vrSkipped : 0;
         g_app.SetMsg((g_app.lastFresh ? "Found " : "Checked ") + std::to_string(g_app.games.size()) + " games." +
+                     (vr ? " " + std::to_string(vr) + " VR-only game" + (vr > 1 ? "s" : "") + " left out." : "") +
                      (g_app.scanErr.empty() ? "" : " (" + g_app.scanErr + ")"), false);
         g_app.scannedOnce = true;
     }
@@ -646,7 +658,8 @@ static void DrawTop(HWND hwnd)
     // Toolbar
     ImGui::BeginDisabled(g_app.busy);
     if (ImGui::Button("Rescan")) StartScan(true);
-    Tooltip("Searches the selected libraries again (new or removed games). Games already known are checked again quickly.");
+    Tooltip("Searches the selected libraries again (new or removed games). Games already known are checked again quickly.\n"
+            "Connecting a drive (an external disk with a Steam library) starts a rescan by itself.");
     ImGui::SameLine();
     if (ImGui::Button("Libraries...")) g_app.showLibraries = true;
     Tooltip("Choose which stores to search and add folders with other games.");
@@ -1462,6 +1475,10 @@ static void DrawLibraries(HWND hwnd)
     lib("Epic Games", &o.epic, li.epic, li.epicText);
     lib("GOG", &o.gog, li.gog, li.gogText);
     lib("Xbox", &o.xbox, li.xbox, li.xboxText);
+    lib("Battle.net", &o.bnet, li.bnet, li.bnetText);
+    ImGui::Checkbox("Leave out VR-only games", &o.skipVr);
+    Tooltip("Games that play only in a VR headset (Steam's own flag; elsewhere a title with \"VR\" in it). BFI Presenter "
+            "strobes a monitor or TV, so it can't help there. Games with an optional VR mode stay in the list.");
     {
         bool pw = LoadSetting(L"PCGamingWiki", L"1") == L"1";
         if (ImGui::Checkbox("Look up each game's graphics APIs on PCGamingWiki", &pw)) SaveSetting(L"PCGamingWiki", pw ? L"1" : L"0");
@@ -1494,7 +1511,7 @@ static void DrawLibraries(HWND hwnd)
     }
     ImGui::Spacing();
     ImGui::Separator();
-    bool any = o.steam || o.epic || o.gog || o.xbox || !o.folders.empty();
+    bool any = o.steam || o.epic || o.gog || o.xbox || o.bnet || !o.folders.empty();
     ImGui::BeginDisabled(!any || g_app.busy);
     if (ImGui::Button("Scan"))
     {
@@ -1688,6 +1705,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         }
         PollWorker();
         StepJob();
+        // A drive was connected: rescan once it has settled, if a list was made before and nothing else runs.
+        if (g_driveArrived && GetTickCount64() - g_driveArrived > 3000 && !g_app.busy && g_app.scannedOnce && !g_job.active)
+        {
+            g_driveArrived = 0;
+            StartScan(true);
+        }
         // Using a downloaded release (not a folder picked by hand): look for a newer one once per session.
         if (g_app.scannedOnce && !g_app.checkedOnce && !g_app.busy)
         {

@@ -41,8 +41,9 @@ struct Source {
 };
 
 struct Game {
-    std::string  name, store;    // store: Steam, Epic, GOG, Xbox, Folder
+    std::string  name, store;    // store: Steam, Epic, GOG, Xbox, Battle.net, Folder
     std::string  appid;          // Steam app id, if any
+    bool         vrOnly = false; // found while scanning: plays only in a VR headset
     std::wstring root;           // install folder
     std::vector<std::wstring> exes;   // candidates, best first
     std::wstring exe;            // chosen (best or the user's override)
@@ -100,13 +101,18 @@ std::wstring LoadExeOverride(const std::wstring &root);
 void SaveExeOverride(const std::wstring &root, const std::wstring &exe);
 
 // ----- Discovery and detection
-struct ScanOptions { bool steam = true, epic = true, gog = true, xbox = true; std::vector<std::wstring> folders; };
+struct ScanOptions {
+    bool steam = true, epic = true, gog = true, xbox = true, bnet = true;
+    bool skipVr = true;          // leave out VR-only games (BFI needs a monitor or TV)
+    std::vector<std::wstring> folders;
+};
 ScanOptions LoadScanOptions();
 void SaveScanOptions(const ScanOptions &o);
-struct LibraryInfo { bool steam = false, epic = false, gog = false, xbox = false; std::string steamText, epicText, gogText, xboxText; };
+struct LibraryInfo { bool steam = false, epic = false, gog = false, xbox = false, bnet = false; std::string steamText, epicText, gogText, xboxText, bnetText; };
 LibraryInfo FindLibraries();                    // which stores are installed (quick)
 std::vector<Game> FindGames(const ScanOptions &opt,
-                            const std::function<void(const std::string &)> &progress = nullptr);
+                            const std::function<void(const std::string &)> &progress = nullptr,
+                            int *vrSkipped = nullptr);    // how many VR-only games were left out
 // The game list is kept between runs: saved after each scan, loaded (and re-detected) at start.
 void SaveGameList(const std::vector<Game> &games);
 bool LoadGameList(std::vector<Game> &games);    // false if there is no saved list

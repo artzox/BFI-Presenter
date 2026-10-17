@@ -7,6 +7,12 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Unreleased] (Manager 1.3.4)
+
+- **[Manager] Battle.net games** are found too (Blizzard's and Activision's games, from their uninstall entries), on by default under **Libraries...**.
+- **[Manager] VR-only games are left out** (**Leave out VR-only games**, on by default): Steam's own "VR only" flag, elsewhere a title with "VR" as a word. BFI strobes a monitor or TV, so a headset game can't use it; games with an optional VR mode stay in the list. The scan result says how many were left out.
+- **[Manager] Connecting a drive rescans.** An external disk with a Steam library plugged in while the Manager was open wasn't picked up until **Rescan**; the Manager now rescans a few seconds after a drive is connected.
+
 ## [1.0.11] — 2026-10-16
 
 - **[Vulkan] Exclusive fullscreen for the presenter's swap chain** (`VulkanExclusiveFullscreen`, on by default; overlay checkbox with its state). The presenter's own swap chain takes application-controlled exclusive fullscreen (`VK_EXT_full_screen_exclusive`); the game's window mode is unchanged, and a game's own exclusive-fullscreen choice is replaced on that swap chain only (the game never presents to it). Opening the RivaTuner OSD or alt-tabbing could move presentation into the desktop compositor for good: the display then handed the presenter's images back late and out of order, and the strobe flashed until the game restarted. Indiana Jones and the Great Circle now stays steady, also after alt-tab. Applies at the next game start.

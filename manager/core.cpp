@@ -8,6 +8,7 @@
 #include <shlobj.h>
 #include <winhttp.h>
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -273,6 +274,9 @@ static std::wstring RegString(HKEY root, const wchar_t *sub, const wchar_t *val,
     DWORD sz = sizeof(buf);
     if (RegGetValueW(root, sub, val, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | extra, nullptr, buf, &sz) == ERROR_SUCCESS)
         return buf;
+    sz = sizeof(buf);     // stricter implementations (Wine) refuse REG_EXPAND_SZ without RRF_NOEXPAND
+    if (RegGetValueW(root, sub, val, RRF_RT_REG_SZ | extra, nullptr, buf, &sz) == ERROR_SUCCESS)
+        return buf;
     return {};
 }
 
@@ -281,6 +285,22 @@ static std::vector<std::wstring> RegSubkeys(HKEY root, const wchar_t *sub)
     std::vector<std::wstring> out;
     HKEY k;
     if (RegOpenKeyExW(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) return out;
+    wchar_t name[512];
+    for (DWORD i = 0;; i++)
+    {
+        DWORD n = 512;
+        if (RegEnumKeyExW(k, i, name, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        out.push_back(name);
+    }
+    RegCloseKey(k);
+    return out;
+}
+
+static std::vector<std::wstring> RegSubkeysView(HKEY root, const wchar_t *sub, REGSAM view)
+{
+    std::vector<std::wstring> out;
+    HKEY k;
+    if (RegOpenKeyExW(root, sub, 0, KEY_READ | view, &k) != ERROR_SUCCESS) return out;
     wchar_t name[512];
     for (DWORD i = 0;; i++)
     {
@@ -1455,6 +1475,118 @@ static std::string VdfValue(const std::string &text, const std::string &key)
     return out;
 }
 
+// Steam's local app info cache (appcache\appinfo.vdf, binary KeyValues): for each app it lists,
+// whether "common/onlyvrsupport" is set. Formats 27-29 (29 keeps key names in a string table).
+static std::map<std::string, bool> SteamVrOnly(const std::wstring &steam)
+{
+    std::map<std::string, bool> out;
+    std::ifstream f(fs::path(Join(steam, L"appcache\\appinfo.vdf")), std::ios::binary);
+    if (!f) return out;
+    std::vector<unsigned char> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto u32 = [&](size_t p) { uint32_t v = 0; if (p + 4 <= d.size()) memcpy(&v, &d[p], 4); return v; };
+    if (d.size() < 16) return out;
+    const uint32_t magic = u32(0);
+    if (magic != 0x07564427 && magic != 0x07564428 && magic != 0x07564429) return out;
+    const bool v29 = magic == 0x07564429;
+    std::vector<std::string> strs;
+    size_t p = 8;
+    if (v29)
+    {
+        uint64_t off = 0;
+        memcpy(&off, &d[8], 8);
+        p = 16;
+        if (off + 4 > d.size()) return out;
+        size_t q = (size_t)off;
+        const uint32_t n = u32(q);
+        q += 4;
+        for (uint32_t i = 0; i < n && q < d.size(); i++)
+        {
+            size_t e = q;
+            while (e < d.size() && d[e]) e++;
+            strs.emplace_back((const char *)&d[q], e - q);
+            q = e + 1;
+        }
+    }
+    const size_t head = 4 + 4 + 8 + 20 + 4 + (magic == 0x07564427 ? 0 : 20);   // state, updated, token, sha1, change, binary sha1
+    while (p + 8 <= d.size())
+    {
+        const uint32_t appid = u32(p), size = u32(p + 4);
+        if (appid == 0) break;
+        const size_t end = p + 8 + (size_t)size;
+        if (end > d.size()) break;
+        size_t q = p + 8 + head;
+        bool vr = false, ok = true;
+        std::vector<std::string> path;
+        auto key = [&](std::string &k) {
+            if (v29)
+            {
+                if (q + 4 > end) return false;
+                const uint32_t i = u32(q);
+                q += 4;
+                if (i >= strs.size()) return false;
+                k = strs[i];
+                return true;
+            }
+            size_t e = q;
+            while (e < end && d[e]) e++;
+            if (e >= end) return false;
+            k.assign((const char *)&d[q], e - q);
+            q = e + 1;
+            return true;
+        };
+        while (ok && q < end)
+        {
+            const unsigned char t = d[q++];
+            if (t == 8 || t == 11)
+            {
+                if (path.empty()) break;
+                path.pop_back();
+                continue;
+            }
+            std::string k;
+            if (!key(k)) { ok = false; break; }
+            const bool want = path.size() >= 1 && LowerA(path.back()) == "common" && LowerA(k) == "onlyvrsupport";
+            switch (t)
+            {
+            case 0: path.push_back(k); break;
+            case 1:
+            {
+                size_t e = q;
+                while (e < end && d[e]) e++;
+                if (e >= end) { ok = false; break; }
+                if (want) vr = std::string((const char *)&d[q], e - q) == "1";
+                q = e + 1;
+                break;
+            }
+            case 2: case 3: case 4: case 6:
+                if (want) vr = u32(q) == 1;
+                q += 4;
+                break;
+            case 7: case 10: q += 8; break;
+            case 5:
+                while (q + 1 < end && (d[q] || d[q + 1])) q += 2;
+                q += 2;
+                break;
+            default: ok = false; break;
+            }
+        }
+        out[std::to_string(appid)] = vr;
+        p = end;
+    }
+    return out;
+}
+
+// A title with "VR" as a word of its own (Skyrim VR, Fallout 4 VR): the fallback where Steam's cache
+// doesn't say (other stores, folders).
+static bool VrName(const std::string &name)
+{
+    for (size_t i = 0; i + 1 < name.size(); i++)
+        if (name[i] == 'V' && name[i + 1] == 'R' && (i == 0 || !isalnum((unsigned char)name[i - 1])) &&
+            (i + 2 == name.size() || !isalnum((unsigned char)name[i + 2])))
+            return true;
+    return false;
+}
+
 static void FindSteam(std::vector<Game> &out, std::set<std::wstring> &seen)
 {
     std::wstring steam = RegString(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath");
@@ -1469,6 +1601,7 @@ static void FindSteam(std::vector<Game> &out, std::set<std::wstring> &seen)
         std::string v = VdfValue(rest, "path");
         if (!v.empty()) libs.push_back(W(v));
     }
+    const std::map<std::string, bool> vrOnly = SteamVrOnly(steam);
     std::set<std::wstring> libSeen;
     for (auto &lib : libs)
     {
@@ -1494,6 +1627,8 @@ static void FindSteam(std::vector<Game> &out, std::set<std::wstring> &seen)
                     std::wstring f = fd.cFileName;   // appmanifest_<id>.acf
                     g->appid = U8(f.substr(12, f.size() - 16));
                 }
+                auto it = vrOnly.find(g->appid);
+                g->vrOnly = it != vrOnly.end() ? it->second : VrName(g->name);
             }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
@@ -1533,7 +1668,7 @@ static void FindEpic(std::vector<Game> &out, std::set<std::wstring> &seen)
         std::string name = JsonString(j, "DisplayName"), loc = JsonString(j, "InstallLocation");
         if (j.find("\"bIsIncompleteInstall\": true") != std::string::npos) continue;
         if (LowerA(JsonString(j, "AppCategories")).find("engines") != std::string::npos) continue;
-        AddGame(out, seen, name, "Epic", W(loc));
+        if (Game *g = AddGame(out, seen, name, "Epic", W(loc))) g->vrOnly = VrName(g->name);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
@@ -1547,7 +1682,7 @@ static void FindGog(std::vector<Game> &out, std::set<std::wstring> &seen)
         std::wstring name = RegString(HKEY_LOCAL_MACHINE, k.c_str(), L"gameName");
         std::wstring path = RegString(HKEY_LOCAL_MACHINE, k.c_str(), L"path");
         if (RegString(HKEY_LOCAL_MACHINE, k.c_str(), L"dependsOn").size()) continue;   // DLC
-        AddGame(out, seen, U8(name), "GOG", path);
+        if (Game *g = AddGame(out, seen, U8(name), "GOG", path)) g->vrOnly = VrName(g->name);
     }
 }
 
@@ -1568,10 +1703,32 @@ static void FindXbox(std::vector<Game> &out, std::set<std::wstring> &seen)
             std::wstring n = fd.cFileName;
             if (n == L"." || n == L".." || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || Lower(n) == L"gamesave") continue;
             std::wstring c = Join(Join(xb, n), L"Content");
-            AddGame(out, seen, U8(n), "Xbox", DirExists(c) ? c : Join(xb, n));
+            if (Game *g = AddGame(out, seen, U8(n), "Xbox", DirExists(c) ? c : Join(xb, n))) g->vrOnly = VrName(g->name);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
+}
+
+// Battle.net games register an uninstaller entry pointing at Blizzard's uninstaller (Activision's games too).
+static void FindBattleNet(std::vector<Game> &out, std::set<std::wstring> &seen, int *count = nullptr)
+{
+    const wchar_t *base = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+    for (HKEY root : { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER })
+        for (REGSAM view : { (REGSAM)KEY_WOW64_32KEY, (REGSAM)KEY_WOW64_64KEY })
+            for (auto &id : RegSubkeysView(root, base, view))
+            {
+                const std::wstring k = std::wstring(base) + L"\\" + id;
+                const DWORD flag = view == KEY_WOW64_32KEY ? RRF_SUBKEY_WOW6432KEY : RRF_SUBKEY_WOW6464KEY;
+                const std::wstring un = Lower(RegString(root, k.c_str(), L"UninstallString", flag));
+                if (un.find(L"blizzard uninstaller") == std::wstring::npos && un.find(L"battle.net\\agent") == std::wstring::npos) continue;
+                const std::wstring name = RegString(root, k.c_str(), L"DisplayName", flag);
+                if (Lower(name) == L"battle.net") continue;
+                std::wstring loc = RegString(root, k.c_str(), L"InstallLocation", flag);
+                while (!loc.empty() && (loc.back() == L'"' || loc.back() == L' ')) loc.pop_back();
+                if (!loc.empty() && loc.front() == L'"') loc.erase(0, 1);
+                if (count) { if (DirExists(loc) && seen.insert(Lower(loc)).second) (*count)++; continue; }
+                if (Game *g = AddGame(out, seen, U8(name), "Battle.net", loc)) g->vrOnly = VrName(g->name);
+            }
 }
 
 static bool DirHasExe(const std::wstring &dir)
@@ -1588,7 +1745,11 @@ static bool DirHasExe(const std::wstring &dir)
 static void FindInFolder(const std::wstring &folder, std::vector<Game> &out, std::set<std::wstring> &seen)
 {
     if (!DirExists(folder)) return;
-    if (DirHasExe(folder)) { AddGame(out, seen, U8(NameOf(folder)), "Folder", folder); return; }
+    if (DirHasExe(folder))
+    {
+        if (Game *g = AddGame(out, seen, U8(NameOf(folder)), "Folder", folder)) g->vrOnly = VrName(g->name);
+        return;
+    }
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(Join(folder, L"*").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -1598,7 +1759,7 @@ static void FindInFolder(const std::wstring &folder, std::vector<Game> &out, std
         if (n == L"." || n == L".." || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         std::wstring l = Lower(n);
         if (l == L"steamapps" || l == L"$recycle.bin" || l == L"system volume information") continue;
-        AddGame(out, seen, U8(n), "Folder", Join(folder, n));
+        if (Game *g = AddGame(out, seen, U8(n), "Folder", Join(folder, n))) g->vrOnly = VrName(g->name);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
@@ -1608,6 +1769,7 @@ ScanOptions LoadScanOptions()
     ScanOptions o;
     auto get = [](const wchar_t *k) { return GetPrivateProfileIntW(L"Libraries", k, 1, SettingsPath().c_str()) != 0; };
     o.steam = get(L"Steam"); o.epic = get(L"Epic"); o.gog = get(L"GOG"); o.xbox = get(L"Xbox");
+    o.bnet = get(L"BattleNet"); o.skipVr = get(L"SkipVR");
     o.folders = LoadFolders();
     return o;
 }
@@ -1616,6 +1778,7 @@ void SaveScanOptions(const ScanOptions &o)
 {
     auto put = [](const wchar_t *k, bool v) { WritePrivateProfileStringW(L"Libraries", k, v ? L"1" : L"0", SettingsPath().c_str()); };
     put(L"Steam", o.steam); put(L"Epic", o.epic); put(L"GOG", o.gog); put(L"Xbox", o.xbox);
+    put(L"BattleNet", o.bnet); put(L"SkipVR", o.skipVr);
     SaveFolders(o.folders);
 }
 
@@ -1660,10 +1823,18 @@ LibraryInfo FindLibraries()
         li.xbox = !drives.empty();
         li.xboxText = drives.empty() ? "no XboxGames folder found" : "XboxGames on " + drives;
     }
+    {
+        std::vector<Game> none;
+        std::set<std::wstring> seen;
+        int n = 0;
+        FindBattleNet(none, seen, &n);
+        li.bnet = n > 0;
+        li.bnetText = n ? std::to_string(n) + " game" + (n > 1 ? "s" : "") + " installed" : "no installed games found";
+    }
     return li;
 }
 
-std::vector<Game> FindGames(const ScanOptions &opt, const std::function<void(const std::string &)> &progress)
+std::vector<Game> FindGames(const ScanOptions &opt, const std::function<void(const std::string &)> &progress, int *vrSkipped)
 {
     std::vector<Game> out;
     out.reserve(4096);   // AddGame hands out pointers into the vector
@@ -1673,7 +1844,14 @@ std::vector<Game> FindGames(const ScanOptions &opt, const std::function<void(con
     if (opt.epic) FindEpic(out, seen);
     if (opt.gog) FindGog(out, seen);
     if (opt.xbox) FindXbox(out, seen);
+    if (opt.bnet) FindBattleNet(out, seen);
     for (auto &f : opt.folders) FindInFolder(f, out, seen);
+    if (opt.skipVr)
+    {
+        const size_t before = out.size();
+        out.erase(std::remove_if(out.begin(), out.end(), [](const Game &g) { return g.vrOnly; }), out.end());
+        if (vrSkipped) *vrSkipped = (int)(before - out.size());
+    }
     int i = 0;
     for (auto &g : out)
     {
