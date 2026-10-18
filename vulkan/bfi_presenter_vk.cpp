@@ -1236,6 +1236,9 @@ static void DestroyPresenterRes(DeviceData *d, PresenterRes &R)
 
 // ---------------------------------------------------------------- presenter thread
 static double g_lastRebuildT = -1.0e9;      // presentation recovery: when the game was last asked to rebuild
+static double g_lastAutoRebuildT = -1.0e9;  // ... automatically
+static double g_rebuildGap = 20.0;          // automatic rebuilds at least this far apart (doubles while they don't help)
+static int    g_rebuildMisses = 0;          // automatic rebuilds in a row after which presentation slowed again within a minute
 static void PresenterThread(Swapchain *sc)
 {
     DeviceData *d = sc->d;
@@ -1921,7 +1924,8 @@ static void PresenterThread(Swapchain *sc)
         if ((tFence - tAcq) > 0.002 || (tAcq - tVb) > 0.002) slowCount++;
         {
             const bool kNow = KeyCombo('O');
-            if (kNow && !kRebuild) { rebuildReq = true; LOGI("BFI Presenter: Ctrl+Shift+O -- rebuilding the swap chain"); }
+            // (held keys aren't taken again by the new swap chain's presenter right after a rebuild)
+            if (kNow && !kRebuild && t - g_lastRebuildT > 1.0) { rebuildReq = true; LOGI("BFI Presenter: Ctrl+Shift+O -- rebuilding the swap chain"); }
             kRebuild = kNow;
         }
         if (t - slowSecT >= 1.0)
@@ -1939,15 +1943,34 @@ static void PresenterThread(Swapchain *sc)
                 goodRun = bad ? 0 : goodRun + 1;
                 if (goodRun == 10) { LOGI("BFI Presenter: presentation steady for 10 s after the rebuild"); afterRebuild = false; }
             }
-            if (s.vkAutoRecover && slowRun >= 3 && !rebuildReq)
+            // A rebuild that didn't help (slow again within a minute: the game keeps the GPU busy, not
+            // the desktop compositor) makes the next one wait twice as long; after 3 in a row automatic
+            // recovery stops for the session (Indiana Jones with heavy settings: a rebuild every 20-30 s).
+            if (g_rebuildMisses > 0 && g_rebuildMisses < 3 && t - g_lastAutoRebuildT > 180.0) { g_rebuildMisses = 0; g_rebuildGap = 20.0; }
+            if (s.vkAutoRecover && slowRun >= 3 && !rebuildReq && g_rebuildMisses < 3)
             {
-                if (t - g_lastRebuildT >= 20.0)
+                if (t - g_lastRebuildT >= g_rebuildGap)
                 {
-                    rebuildReq = true;
-                    LOGI("BFI Presenter: automatic recovery -- rebuilding the swap chain");
+                    if (t - g_lastAutoRebuildT < g_rebuildGap + 60.0)
+                    {
+                        g_rebuildMisses++;
+                        g_rebuildGap = g_rebuildGap * 2.0 > 160.0 ? 160.0 : g_rebuildGap * 2.0;
+                    }
+                    if (g_rebuildMisses >= 3)
+                        LOGI("BFI Presenter: automatic recovery stopped for this session -- 3 rebuilds in a row didn't help. The game "
+                             "probably keeps the GPU busy: lower its settings, or start Steam / the game as administrator for a "
+                             "realtime presenter queue. Ctrl+Shift+O still rebuilds by hand.");
+                    else
+                    {
+                        rebuildReq = true;
+                        g_lastAutoRebuildT = t;
+                        LOGI("BFI Presenter: automatic recovery -- rebuilding the swap chain%s",
+                             g_rebuildMisses ? " (the last one didn't help for long: the next waits longer)" : "");
+                    }
                 }
                 else if (slowRun == 3)
-                    LOGI("BFI Presenter: automatic recovery -- waiting: the last rebuild was %.0f s ago (20 s apart)", t - g_lastRebuildT);
+                    LOGI("BFI Presenter: automatic recovery -- waiting: the last rebuild was %.0f s ago (%.0f s apart)", t - g_lastRebuildT,
+                         g_rebuildGap);
             }
             slowCount = 0;
         }
