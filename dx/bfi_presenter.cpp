@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.11-rfx2"
+#define BFI_ADDON_VERSION "1.0.11-rfx3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -1952,6 +1952,30 @@ static IUnknown *ReflexOwnDevice();
 // DLL is loaded and it has set the game's frame latency to 2 (DLSS-G does when it
 // takes over presenting, Control: Resonant). The automatic frame cap stays at
 // Refresh then: holding DLSS-G's presents back broke its pacing (Onimusha).
+static std::atomic<double> g_fgPresentT{0.0};   // last time a frame-generation DLL was seen presenting
+// Every 30th game present: is a frame-generation DLL on the call stack? DLSS-G presents its
+// real and generated frames from its own thread (sl.dlss_g / nvngx_dlssg); without frame
+// generation the game's own thread presents. The DLL being loaded alone said nothing: God of
+// War loads DLSS-G and sets a frame latency of 2 with frame generation off.
+static void FgCheckCaller()
+{
+    static std::atomic<unsigned> n{0};
+    if ((n.fetch_add(1) % 30) != 0) return;
+    static const char *k[] = { "nvngx_dlssg.dll", "sl.dlss_g.dll", "dlssg_to_fsr3_amd_is_better.dll",
+                               "ffx_frameinterpolation_x64.dll", "libxess_fg.dll", "amd_fidelityfx_dx12.dll" };
+    HMODULE mods[6] = {};
+    bool any = false;
+    for (int i = 0; i < 6; i++) { mods[i] = GetModuleHandleA(k[i]); any = any || mods[i]; }
+    if (!any) return;
+    void *frames[16];
+    const USHORT got = RtlCaptureStackBackTrace(1, 16, frames, nullptr);
+    for (USHORT f = 0; f < got; f++)
+    {
+        HMODULE m = nullptr;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)frames[f], &m)) continue;
+        for (HMODULE x : mods) if (x && m == x) { g_fgPresentT.store(Now()); return; }
+    }
+}
 static bool FgModuleLoaded()
 {
     static const char *k[] = { "nvngx_dlssg.dll", "sl.dlss_g.dll", "dlssg_to_fsr3_amd_is_better.dll",
@@ -2899,11 +2923,11 @@ static DWORD WINAPI PresenterThread(void *)
 
                 // Automatic frame cap (see autoCapDown).
                 const double hzA = modeHz > 0.0 ? modeHz : peakHz;
-                const bool fg = FgModuleLoaded() && g_maxLatency.load() >= 2;
+                const bool fg = Now() - g_fgPresentT.load() < 2.0;
                 if (fg != fgWas)
                 {
                     fgWas = fg;
-                    LOGI("BFI Presenter: frame generation %s", fg ? "active (its DLL is loaded and the game's frame latency is 2)" : "no longer active");
+                    LOGI("BFI Presenter: frame generation %s", fg ? "active (its DLL presents the frames)" : "no longer active");
                 }
                 const double fpsA = g_status.gameFps;
                 if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0)
@@ -3488,6 +3512,7 @@ static HRESULT SubmitGameFrame()
     const DWORD tid = GetCurrentThreadId();
     const double enter = Now();
     ReflexPresentStart(g_frameId + 1);
+    FgCheckCaller();
     GameStage(ST_G_SLOT);
     EnterCriticalSection(&g_submitLock);
     g_gtEnter = enter;
@@ -5355,6 +5380,7 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
 {
     const double enter = Now();
     ReflexPresentStart(g_frameId + 1);
+    FgCheckCaller();
     EnterCriticalSection(&g_submitLock);
     g_gtEnter = enter;
     g_gtSerial = Now();
