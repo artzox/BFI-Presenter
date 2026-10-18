@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.12"
+#define BFI_ADDON_VERSION "1.0.13"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2212,6 +2212,11 @@ static DWORD WINAPI PresenterThread(void *)
     int    capDownSecs = 0, capUpSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
     double capSwitchT = -100.0, capUpT = -100.0, probeWait = 30.0, stayMin = 10.0;
     bool   fgWas = false;
+    bool   capByReflex = false;   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
+    int    fgVotes = 0;           // seconds in a row the counts said the frame-generation state changed
+    double fpsPrevSec = -1.0;
+    double phaseUntil = 0.0, phaseNextT = 0.0;   // Reflex limit phase nudge (see the per-second block)
+    int    phaseNudges = 0;     // last second's presents (goes with the rendered count taken then)
     ReflexSecond rsLast;           // last second's Reflex reports (frames == 0: the game doesn't use Reflex)
     double rsLastT = -100.0;
     // Release -> lit flash of the frames shown this second (timing log, Reflex tests).
@@ -2270,7 +2275,8 @@ static DWORD WINAPI PresenterThread(void *)
         // own BFI flicker (Twelve Minutes, Vulkan layer).
         if (!s.enabled) s.frames = 1;
         userCap = s.gameCap;
-        if (s.autoCap && userCap == 1 && autoCapDown && s.frames >= 2) s.gameCap = 4;   // one game frame per strobe cycle
+        // one game frame per strobe cycle (games with Reflex: Reflex's frame limit does it instead, see below)
+        if (s.autoCap && userCap == 1 && autoCapDown && !capByReflex && s.frames >= 2) s.gameCap = 4;
         // Release the game's frame-latency slot when the frame is handed
         // over (not when the strobe takes it) in Lowest latency, and also
         // whenever a Half/Quarter cap already paces the game to the strobe:
@@ -2916,6 +2922,9 @@ static DWORD WINAPI PresenterThread(void *)
                             LOGI("BFI Presenter: automatic frames ahead: 1 (headroom: %.1f ms spare per frame)", capWaitMs);
                         }
                     }
+                    // (Forcing 1 frame ahead under Reflex's limit was tried: ~21 ms instead of ~30 ms release
+                    // -> flash, but DLSS-G then dropped to 52-55 presented a second at times; at 2 it held
+                    // 60 of 60. Automatic frames ahead decides, as before.)
                     g_maxAhead.store(autoAhead);
                 }
                 else g_maxAhead.store(s.maxAhead);
@@ -2927,18 +2936,43 @@ static DWORD WINAPI PresenterThread(void *)
                 // well above the rendered frames. Without them, an FSR / XeSS frame-generation DLL
                 // presenting. DLSS-G's DLL is on the present path in God of War with it off, so its
                 // presence alone doesn't count.
-                bool fg;
+                // Compared over the same second: the rendered count was taken at the end of the last
+                // second, so it goes with last second's presents. Comparing it with this second's made
+                // the state flip every second once the Reflex limit changed the present rate (God of
+                // War Ragnarok: limit on, off, on... and heavy stutter). A change also needs 3 seconds
+                // in a row (on) or 5 (off).
+                bool fg = fgWas;
                 if (Now() - g_rfxRenderedT.load() < 3.0 && g_rfxRenderedFps.load() > 1.0)
-                    fg = g_status.gameFps > 1.5 * g_rfxRenderedFps.load();
+                {
+                    if (fpsPrevSec > 0.0 && !hitchPaused)
+                    {
+                        const double ratio = fpsPrevSec / g_rfxRenderedFps.load();
+                        const bool says = fgWas ? ratio > 1.25 : ratio > 1.5;
+                        fgVotes = says != fgWas ? fgVotes + 1 : 0;
+                        if (fgVotes >= (fgWas ? 5 : 3)) { fg = says; fgVotes = 0; }
+                    }
+                }
                 else
+                {
                     fg = Now() - g_fgPresentT.load() < 2.0 && !g_fgCallerDlss.load();
+                    fgVotes = 0;
+                }
+                fpsPrevSec = g_status.gameFps;
                 if (fg != fgWas)
                 {
                     fgWas = fg;
-                    LOGI("BFI Presenter: frame generation %s", fg ? "active" : "not active");
+                    LOGI("BFI Presenter: frame generation %s (%.0f presented, %.0f rendered a second)", fg ? "active" : "not active",
+                         fpsPrevSec, g_rfxRenderedFps.load());
                 }
                 const double fpsA = g_status.gameFps;
-                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg)
+                // Games with Reflex (every DLSS frame-generation game): the cap steps down with Reflex's
+                // frame limit, with frame generation or without. The driver paces the game (and DLSS-G),
+                // which is quicker than holding the game at Present: God of War Ragnarok with frame
+                // generation switching itself off had ~57 ms release -> flash with the presenter's cap.
+                // Other games: the presenter's own cap, never while frame generation is active.
+                const bool rfxUse = t - rsLastT < 3.0 && rsLast.frames > 0;
+                if (!autoCapDown) capByReflex = rfxUse;
+                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg))
                 {
                     const double refMs = 1000.0 / hzA;
                     if (capProbe)
@@ -2965,7 +2999,7 @@ static DWORD WINAPI PresenterThread(void *)
                     }
                     else if (!autoCapDown)
                     {
-                        capDownSecs = (!hitchPaused && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;
+                        capDownSecs = (!hitchPaused && fgVotes == 0 && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;   // not while frame generation may be starting
                         if (capDownSecs >= 3 && t - capSwitchT > 3.0)
                         {
                             // Down again soon after going back up: the game is close to the limit, so the
@@ -2973,11 +3007,12 @@ static DWORD WINAPI PresenterThread(void *)
                             if (t - capUpT < 30.0) stayMin = stayMin * 2.0 > 120.0 ? 120.0 : stayMin * 2.0;
                             else stayMin = 10.0;
                             autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t;
-                            LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps) -- the game held "
-                                 "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames, fpsA, hzA);
+                            LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
+                                 "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames,
+                                 capByReflex ? "Reflex frame limit" : "the presenter's cap", fpsA, hzA);
                         }
                     }
-                    else if (t - rsLastT < 3.0 && rsLast.frames > 0 && rsLast.gpuActiveMs > 0.0)
+                    else if (!fg && t - rsLastT < 3.0 && rsLast.frames > 0 && rsLast.gpuActiveMs > 0.0)
                     {
                         // Reflex reports: back up when the game's GPU and CPU work per frame fit well
                         // within one refresh.
@@ -2992,15 +3027,19 @@ static DWORD WINAPI PresenterThread(void *)
                                  "simulation %.1f, submit %.1f), within a refresh", needMs, rsLast.gpuActiveMs, rsLast.simMs, rsLast.submitMs);
                         }
                     }
-                    else if (t - capSwitchT >= probeWait && !hitchPaused)
+                    // With frame generation, a try means 3 s without the limit, and DLSS-G re-pacing twice:
+                    // a visible stutter each time (God of War Ragnarok, every 30-120 s). Frame generation that
+                    // could fill the refresh rate is rare, so try only every 5 minutes then.
+                    else if (t - capSwitchT >= (fg && capByReflex ? 300.0 : probeWait) && !hitchPaused)
                     {
-                        // No Reflex reports: try Refresh for a few seconds.
+                        // No Reflex reports (or frame generation, whose reports are for rendered frames):
+                        // try Refresh for a few seconds.
                         autoCapDown = false; capProbe = true; probeSecs = probeGood = 0; capSwitchT = t; capUpT = t;
                     }
                 }
                 else
                 {
-                    if (autoCapDown && fg) LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation active)");
+                    if (autoCapDown && fg) LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation active, no Reflex)");
                     autoCapDown = capProbe = false; capDownSecs = capUpSecs = 0;
                 }
                 g_status.autoCapDown = autoCapDown ? 1 : 0;
@@ -3019,8 +3058,22 @@ static DWORD WINAPI PresenterThread(void *)
                 // Frame generation at the Refresh cap: Reflex's frame limit at one presented frame
                 // per strobe cycle (e.g. 16,667 us at 120 Hz with 2 frames per cycle).
                 const double hzL = modeHz > 0.0 ? modeHz : peakHz;
-                const int limitUs = (s.autoCap && userCap == 1 && s.enabled && s.frames >= 2 && stNow.fgActive && hzL > 0.0)
-                                        ? (int)(1e6 * s.frames / hzL + 0.5) : 0;
+                int limitUs = (s.autoCap && userCap == 1 && s.enabled && s.frames >= 2 && stNow.autoCapDown && capByReflex && hzL > 0.0)
+                                  ? (int)(1e6 * s.frames / hzL + 0.5) : 0;
+                // Phase: the limiter paces the game on its own clock, so its frames can settle right at
+                // the moment the presenter picks a frame for the lit refresh, where a little jitter
+                // repeats one frame and skips the next, again and again (God of War Ragnarok: 10-18
+                // pairs a second for a whole minute, against none in another run). Then the limit is
+                // shortened by 0.15 ms for one second, which moves the frames ~9 ms earlier against
+                // the strobe, and checked again 3 s later.
+                if (limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
+                {
+                    phaseUntil = t + 1.0; phaseNextT = t + 4.0;
+                    if (++phaseNudges <= 5)
+                        LOGI("BFI Presenter: Reflex frame limit: game frames arrive at the lit refresh's pick (%d repeated, %d skipped "
+                             "last second) -- moving them earlier", stNow.frameRepeats, stNow.frameSkips);
+                }
+                if (limitUs > 0 && t < phaseUntil) limitUs -= 150;
                 ReflexTick(limitUs, rs);
                 rsLast = rs; rsLastT = t;
                 EnterCriticalSection(&g_cfgLock);
@@ -4287,7 +4340,8 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
             g_rfxApplied = want;
             g_rfxAppliedValid = limitUs > 0;
             ReleaseSRWLockExclusive(&g_rfxLock);
-            if (!same || r != 0)
+            const bool onOff = !appliedValid || (applied.minIntervalUs == 0) != (want.minIntervalUs == 0) || limitUs == 0;
+            if ((!same && onOff) || r != 0)
                 LOGI("BFI Presenter: Reflex frame limit %s (%d)", limitUs > 0 ? "on: one presented frame per strobe cycle" :
                      "off: the game's own setting", r);
         }
@@ -7119,17 +7173,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames), so every flash shows the\n"
                                                           "next frame instead of frames dropped unevenly (judder). Back to Refresh rate when the game's\n"
                                                           "frames fit a refresh again (its Reflex reports, or a short try every 30 to 120 s).\n"
-                                                          "With frame generation: stays at Refresh rate and sets Reflex's frame limit to one presented\n"
-                                                          "frame per strobe cycle (DLSS frame generation; the game must use Reflex).");
+                                                          "In games with NVIDIA Reflex (every DLSS frame-generation game) it uses Reflex's own frame limit\n"
+                                                          "for this, which also paces frame generation. Frame generation without Reflex: stays at Refresh.");
             if (s.autoCap)
             {
                 ImGui::SameLine();
                 if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
-                else if (st.fgActive)
-                {
-                    if (st.rfxLimitUs > 0) ImGui::TextDisabled("(frame generation: Reflex frame limit %.1f ms)", st.rfxLimitUs / 1000.0);
-                    else ImGui::TextDisabled("(frame generation: Refresh rate, no Reflex in this game)");
-                }
+                else if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: Reflex frame limit %.1f ms, one frame per strobe cycle)", st.rfxLimitUs / 1000.0);
+                else if (st.fgActive && !st.rfxGameUses) ImGui::TextDisabled("(frame generation without Reflex: Refresh rate)");
                 else ImGui::TextDisabled("%s", st.autoCapProbe ? "(trying Refresh rate)" :
                                                st.autoCapDown ? "(in use: one game frame per strobe cycle)" : "(in use: Refresh rate)");
             }
