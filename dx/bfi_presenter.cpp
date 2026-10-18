@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.12"
+#define BFI_ADDON_VERSION "1.0.13-fg1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2212,6 +2212,8 @@ static DWORD WINAPI PresenterThread(void *)
     int    capDownSecs = 0, capUpSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
     double capSwitchT = -100.0, capUpT = -100.0, probeWait = 30.0, stayMin = 10.0;
     bool   fgWas = false;
+    int    fgVotes = 0;           // seconds in a row the counts said the frame-generation state changed
+    double fpsPrevSec = -1.0;     // last second's presents (goes with the rendered count taken then)
     ReflexSecond rsLast;           // last second's Reflex reports (frames == 0: the game doesn't use Reflex)
     double rsLastT = -100.0;
     // Release -> lit flash of the frames shown this second (timing log, Reflex tests).
@@ -2927,15 +2929,33 @@ static DWORD WINAPI PresenterThread(void *)
                 // well above the rendered frames. Without them, an FSR / XeSS frame-generation DLL
                 // presenting. DLSS-G's DLL is on the present path in God of War with it off, so its
                 // presence alone doesn't count.
-                bool fg;
+                // Compared over the same second: the rendered count was taken at the end of the last
+                // second, so it goes with last second's presents. Comparing it with this second's made
+                // the state flip every second once the Reflex limit changed the present rate (God of
+                // War Ragnarok: limit on, off, on... and heavy stutter). A change also needs 3 seconds
+                // in a row (on) or 5 (off).
+                bool fg = fgWas;
                 if (Now() - g_rfxRenderedT.load() < 3.0 && g_rfxRenderedFps.load() > 1.0)
-                    fg = g_status.gameFps > 1.5 * g_rfxRenderedFps.load();
+                {
+                    if (fpsPrevSec > 0.0 && !hitchPaused)
+                    {
+                        const double ratio = fpsPrevSec / g_rfxRenderedFps.load();
+                        const bool says = fgWas ? ratio > 1.25 : ratio > 1.5;
+                        fgVotes = says != fgWas ? fgVotes + 1 : 0;
+                        if (fgVotes >= (fgWas ? 5 : 3)) { fg = says; fgVotes = 0; }
+                    }
+                }
                 else
+                {
                     fg = Now() - g_fgPresentT.load() < 2.0 && !g_fgCallerDlss.load();
+                    fgVotes = 0;
+                }
+                fpsPrevSec = g_status.gameFps;
                 if (fg != fgWas)
                 {
                     fgWas = fg;
-                    LOGI("BFI Presenter: frame generation %s", fg ? "active" : "not active");
+                    LOGI("BFI Presenter: frame generation %s (%.0f presented, %.0f rendered a second)", fg ? "active" : "not active",
+                         fpsPrevSec, g_rfxRenderedFps.load());
                 }
                 const double fpsA = g_status.gameFps;
                 if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg)
@@ -2965,7 +2985,7 @@ static DWORD WINAPI PresenterThread(void *)
                     }
                     else if (!autoCapDown)
                     {
-                        capDownSecs = (!hitchPaused && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;
+                        capDownSecs = (!hitchPaused && fgVotes == 0 && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;   // not while frame generation may be starting
                         if (capDownSecs >= 3 && t - capSwitchT > 3.0)
                         {
                             // Down again soon after going back up: the game is close to the limit, so the
