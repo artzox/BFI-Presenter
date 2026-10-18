@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-99 of 101 tested games and emulators run with BFI: the 50 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; five with the engine's own stutter) and 49 more listed after it. Two are partial.
+99 of 101 tested games and emulators run with BFI: the 50 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; four with the engine's own stutter) and 49 more listed after it. Two are partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -32,7 +32,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Riven (2023) | Working | Not tested | v0.13 | A steady 60 fps for smooth motion |
 | Onimusha | Working | Works (2×, 3×); Refresh cap | v0.27 | Standard setup |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
-| Returnal | Working without FG | Menu freezes, flickering UI | v0.27 | FG off |
+| Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
 | Pragmata | Working without FG | DLSS FG throttled to \~30 fps (Reflex) | v0.35 | FG off |
 | Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps |
 | Control | Working | Works (2×, 3×, 4× with the [Control-FG](https://github.com/Frooglemcdoo/Control-FG) mod, also with DLSS 5); Refresh cap | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54 |
@@ -52,7 +52,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | shadPS4 | Working (Vulkan) | — | VK 0.7 | Vulkan layer; BFIPresenter.ini next to the emulator's .exe |
 | Blasphemous | Working (DX11) | NVIDIA Smooth Motion must be off | v1.0.3 | Smooth Motion off in the NVIDIA app (with it on, the game closed and relaunched itself) |
 | Guacamelee! 2 | Working (DX11) | Not tested | v1.0.3 | Standard setup; works with Special K (crashed at start before v1.0.3) |
-| Jusant | Working, engine stutter | Not tested | v1.0.3 | Runs; Unreal's frame pipeline delivers finished frames with a varying delay (10–33 ms), so some judder remains at any setting. Queue one refresh ahead removes the flashes |
+| Jusant | Working; recommended with FG | Works (DLSS FG 2×): removes the engine's judder; Refresh cap + Automatic frame cap | v1.0.3 (FG: v1.0.13) | Game frame cap Refresh rate + Automatic frame cap + Frame pacing Lowest latency. With RenoDX, use the UE Extended mod (see notes) |
 | Moons of Madness | Working (DX11) | Not tested | v1.0.3 | BFI shader recommended: with the presenter the engine stutters (Refresh + Smooth); the shader at the game's locked 120 fps doesn't. If you use the presenter: Half refresh + Lowest latency |
 | Ori and the Blind Forest: Definitive Edition | Working (DX11, 32-bit), engine stutter | Not tested | v1.0.3 | `BFIPresenter.addon32`; Half refresh + Lowest latency (a fast game: Smooth adds latency). At Refresh the game's own 60 Hz simulation stutters, with the presenter or the BFI shader |
 | Celeste | Working (DX11 through FNA) | — | v1.0.5 | Steam beta "opengl" (the FNA build) + launch option `--graphics D3D11`, ReShade as `dxgi.dll`; game locked at 60 fps: Half refresh |
@@ -173,7 +173,8 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### Returnal
 
-- FG off: frame generation caused menu freezes and flickering UI elements.
+- FG off: frame generation caused menu freezes and flickering UI elements, and with v1.0.13 bright highlights flicker under BFI (the lit refresh mixes real and generated frames unevenly).
+- Any Reflex frame limit collapses the game to 7–8 fps, including the game's own 16,666 µs limit, which it switches on and off by itself. From v1.0.14 the automatic frame cap notices the collapse, takes the limit out (the game's own too) for the rest of the session and caps with the presenter instead: a steady 60 fps without FG. Without a Reflex limit nothing paces DLSS-G here, which is another reason to keep FG off.
 - Remaining flashes (about 5 per minute) coincide with the game's own GPU hitches of 100–276 ms. Buffer reuse (v0.27) removed the presenter's own GPU stalls.
 - A realtime GPU queue needs Steam itself run as administrator (v0.81); not yet measured in this game.
 
@@ -304,7 +305,9 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### Jusant
 
-- Unreal Engine game. Unreal's frame pipeline hands finished frames over with a varying delay (10–33 ms), so a fixed 120 Hz strobe shows some judder at any setting; this is the engine, not the presenter. Queue one refresh ahead removes the flashes.
+- **Recommended with frame generation (v1.0.13+): DLSS FG 2×, Game frame cap Refresh rate, Automatic frame cap on, Frame pacing Lowest latency.** The automatic frame cap steps down to one presented frame per strobe cycle with Reflex's frame limit, and the presenter shows 60 even frames a second from 30 rendered, about 20–30 ms from release to flash.
+- Without frame generation: Unreal's frame pipeline hands finished frames over with a varying delay (10–33 ms), so a fixed 120 Hz strobe shows some judder at any setting; this is the engine, not the presenter. Queue one refresh ahead removes the flashes.
+- With RenoDX, use the UE Extended RenoDX mod. The older RenoDX Unreal Engine mod (0.2025.622) removed the GPU device a few minutes in (DXGI_ERROR_INVALID_CALL, each time right after it hooked a new render target) and hung the GPU at start-up on ReShade 6.8.0; with UE Extended the game no longer crashes.
 
 ### Kena: Bridge of Spirits
 
