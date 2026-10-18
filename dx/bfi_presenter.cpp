@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.13-fg3"
+#define BFI_ADDON_VERSION "1.0.13-fg4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2920,10 +2920,10 @@ static DWORD WINAPI PresenterThread(void *)
                             LOGI("BFI Presenter: automatic frames ahead: 1 (headroom: %.1f ms spare per frame)", capWaitMs);
                         }
                     }
-                    // While Reflex's frame limit paces the game, a second frame ahead only adds a refresh
-                    // of latency (God of War Ragnarok with frame generation: ~30 ms release -> flash at
-                    // 2, ~21.5 ms at 1).
-                    g_maxAhead.store(rsLast.limitUs > 0 && t - rsLastT < 3.0 ? 1 : autoAhead);
+                    // (Forcing 1 frame ahead under Reflex's limit was tried: ~21 ms instead of ~30 ms release
+                    // -> flash, but DLSS-G then dropped to 52-55 presented a second at times; at 2 it held
+                    // 60 of 60. Automatic frames ahead decides, as before.)
+                    g_maxAhead.store(autoAhead);
                 }
                 else g_maxAhead.store(s.maxAhead);
                 g_status.aheadInUse = g_maxAhead.load();
