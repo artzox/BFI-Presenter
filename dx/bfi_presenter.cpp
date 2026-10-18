@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.13-fg4"
+#define BFI_ADDON_VERSION "1.0.13-fg5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2214,7 +2214,9 @@ static DWORD WINAPI PresenterThread(void *)
     bool   fgWas = false;
     bool   capByReflex = false;   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
     int    fgVotes = 0;           // seconds in a row the counts said the frame-generation state changed
-    double fpsPrevSec = -1.0;     // last second's presents (goes with the rendered count taken then)
+    double fpsPrevSec = -1.0;
+    double phaseUntil = 0.0, phaseNextT = 0.0;   // Reflex limit phase nudge (see the per-second block)
+    int    phaseNudges = 0;     // last second's presents (goes with the rendered count taken then)
     ReflexSecond rsLast;           // last second's Reflex reports (frames == 0: the game doesn't use Reflex)
     double rsLastT = -100.0;
     // Release -> lit flash of the frames shown this second (timing log, Reflex tests).
@@ -3056,8 +3058,22 @@ static DWORD WINAPI PresenterThread(void *)
                 // Frame generation at the Refresh cap: Reflex's frame limit at one presented frame
                 // per strobe cycle (e.g. 16,667 us at 120 Hz with 2 frames per cycle).
                 const double hzL = modeHz > 0.0 ? modeHz : peakHz;
-                const int limitUs = (s.autoCap && userCap == 1 && s.enabled && s.frames >= 2 && stNow.autoCapDown && capByReflex && hzL > 0.0)
-                                        ? (int)(1e6 * s.frames / hzL + 0.5) : 0;
+                int limitUs = (s.autoCap && userCap == 1 && s.enabled && s.frames >= 2 && stNow.autoCapDown && capByReflex && hzL > 0.0)
+                                  ? (int)(1e6 * s.frames / hzL + 0.5) : 0;
+                // Phase: the limiter paces the game on its own clock, so its frames can settle right at
+                // the moment the presenter picks a frame for the lit refresh, where a little jitter
+                // repeats one frame and skips the next, again and again (God of War Ragnarok: 10-18
+                // pairs a second for a whole minute, against none in another run). Then the limit is
+                // shortened by 0.15 ms for one second, which moves the frames ~9 ms earlier against
+                // the strobe, and checked again 3 s later.
+                if (limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
+                {
+                    phaseUntil = t + 1.0; phaseNextT = t + 4.0;
+                    if (++phaseNudges <= 5)
+                        LOGI("BFI Presenter: Reflex frame limit: game frames arrive at the lit refresh's pick (%d repeated, %d skipped "
+                             "last second) -- moving them earlier", stNow.frameRepeats, stNow.frameSkips);
+                }
+                if (limitUs > 0 && t < phaseUntil) limitUs -= 150;
                 ReflexTick(limitUs, rs);
                 rsLast = rs; rsLastT = t;
                 EnterCriticalSection(&g_cfgLock);
@@ -4324,7 +4340,8 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
             g_rfxApplied = want;
             g_rfxAppliedValid = limitUs > 0;
             ReleaseSRWLockExclusive(&g_rfxLock);
-            if (!same || r != 0)
+            const bool onOff = !appliedValid || (applied.minIntervalUs == 0) != (want.minIntervalUs == 0) || limitUs == 0;
+            if ((!same && onOff) || r != 0)
                 LOGI("BFI Presenter: Reflex frame limit %s (%d)", limitUs > 0 ? "on: one presented frame per strobe cycle" :
                      "off: the game's own setting", r);
         }
