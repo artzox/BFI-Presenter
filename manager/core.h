@@ -44,6 +44,8 @@ struct Game {
     std::string  name, store;    // store: Steam, Epic, GOG, Xbox, Battle.net, Folder
     std::string  appid;          // Steam app id, if any
     bool         vrOnly = false; // found while scanning: plays only in a VR headset
+    bool         online = false; // Steam lists it as multiplayer / online (PvP, co-op, MMO)
+    std::string  antiCheat;      // anti-cheat found in the game's folder ("Easy Anti-Cheat", "BattlEye", ...)
     std::wstring root;           // install folder
     std::vector<std::wstring> exes;   // candidates, best first
     std::wstring exe;            // chosen (best or the user's override)
@@ -112,7 +114,13 @@ struct ScanOptions {
 };
 ScanOptions LoadScanOptions();
 void SaveScanOptions(const ScanOptions &o);
-struct LibraryInfo { bool steam = false, epic = false, gog = false, xbox = false, bnet = false; std::string steamText, epicText, gogText, xboxText, bnetText; };
+struct LibraryInfo {
+    bool steam = false, epic = false, gog = false, xbox = false, bnet = false;
+    std::string steamText, epicText, gogText, xboxText, bnetText;
+    std::vector<std::string> steamLibs;          // every Steam library folder (the first is Steam's own)
+};
+// Online or anti-cheat: ReShade with add-ons in such a game can count as cheating (a ban is possible).
+inline bool OnlineRisk(const Game &g) { return g.online || !g.antiCheat.empty(); }
 LibraryInfo FindLibraries();                    // which stores are installed (quick)
 std::vector<Game> FindGames(const ScanOptions &opt,
                             const std::function<void(const std::string &)> &progress = nullptr,

@@ -173,6 +173,11 @@ struct App {
     // install question (NVIDIA settings)
     std::vector<std::wstring> instPending;
     bool openInstall = false;
+    // online / anti-cheat warning before installing
+    std::vector<std::wstring> riskAll;     // the games the action was for
+    int riskKind = 0;                      // 0 BFI Presenter, 1 ReShade
+    std::string riskVer;                   // ReShade version
+    bool openRisk = false;
 
     void SetMsg(const std::string &m, bool err) { msg = m; msgErr = err; needAdmin = false; }
 };
@@ -644,6 +649,18 @@ static void DrawTop(HWND hwnd)
     }
     Tooltip("Use an extracted release or a test build from a folder instead of GitHub.");
     ImGui::EndDisabled();
+    {
+        const char *kf = "Support on Ko-fi";
+        const float w = ImGui::CalcTextSize(kf).x + ImGui::GetStyle().FramePadding.x * 2;
+        const float x = ImGui::GetWindowContentRegionMax().x - w;
+        ImGui::SameLine(x > ImGui::GetCursorPosX() ? x : 0.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.50f, 0.78f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.58f, 0.88f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.42f, 0.68f, 1));
+        if (ImGui::Button(kf)) ShellExecuteW(nullptr, L"open", L"https://ko-fi.com/artzox", nullptr, nullptr, SW_SHOWNORMAL);
+        ImGui::PopStyleColor(3);
+        Tooltip("BFI Presenter is free. If it helps you, you can support its development on Ko-fi (ko-fi.com/artzox).");
+    }
 
     // Vulkan layer
     ImGui::AlignTextToFramePadding();
@@ -1015,7 +1032,95 @@ static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsy
              });
 }
 
+static std::string RiskWhy(const Game &g)
+{
+    if (!g.antiCheat.empty()) return g.antiCheat == "anti-cheat" ? "anti-cheat in its folder" : g.antiCheat;
+    return g.online ? "multiplayer on Steam" : "";
+}
+
+// Games played online or with anti-cheat that the action would put ReShade (or the add-on) into for the first time.
+static std::vector<const Game *> RiskyNew(const std::vector<std::wstring> &roots, int kind)
+{
+    std::vector<const Game *> out;
+    for (auto &r : roots)
+        for (auto &g : g_app.games)
+            if (g.root == r && OnlineRisk(g) && (kind == 1 ? !g.reshade : (g.addonPath.empty() && g.shaderPath.empty())))
+                out.push_back(&g);
+    return out;
+}
+
+static void RequestInstallNow(const std::vector<Game *> &list);
 static void RequestInstall(const std::vector<Game *> &list)
+{
+    if (list.empty()) return;
+    std::vector<std::wstring> roots;
+    for (auto *g : list) roots.push_back(g->root);
+    if (!RiskyNew(roots, 0).empty()) { g_app.riskAll = roots; g_app.riskKind = 0; g_app.openRisk = true; return; }
+    RequestInstallNow(list);
+}
+
+static void RequestReShade(const std::string &ver, const std::vector<std::wstring> &roots)
+{
+    if (!RiskyNew(roots, 1).empty()) { g_app.riskAll = roots; g_app.riskKind = 1; g_app.riskVer = ver; g_app.openRisk = true; return; }
+    StartReShade(ver, roots);
+}
+
+static void DrawRiskQuestion()
+{
+    static bool open = false;
+    if (g_app.openRisk) { g_app.openRisk = false; ImGui::OpenPopup("Online games"); open = true; }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 36, 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Online games", &open, ImGuiWindowFlags_NoSavedSettings)) return;
+    const std::vector<const Game *> risky = RiskyNew(g_app.riskAll, g_app.riskKind);
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextColored(kOrange, "%s", risky.size() == 1 ? "This game is played online or uses anti-cheat:" :
+                                                         "These games are played online or use anti-cheat:");
+    ImGui::PopTextWrapPos();
+    int shown = 0;
+    for (auto *g : risky)
+    {
+        if (++shown > 12) { ImGui::TextColored(kGrey, "  ... and %d more", (int)risky.size() - 12); break; }
+        ImGui::Text("  %s", g->name.c_str());
+        ImGui::SameLine();
+        ImGui::TextColored(kGrey, "(%s)", RiskWhy(*g).c_str());
+    }
+    ImGui::Spacing();
+    ImGui::TextWrapped("BFI Presenter installs ReShade with add-on support (a DLL next to the game's exe) and its own add-on. "
+                       "Anti-cheat systems can treat that as cheating, and playing online with it can get your account banned. "
+                       "Install at your own discretion: it is safest in single-player or offline games.");
+    ImGui::Separator();
+    auto go = [](std::vector<std::wstring> roots) {
+        if (roots.empty()) return;
+        if (g_app.riskKind == 1) { StartReShade(g_app.riskVer, roots); return; }
+        std::vector<Game *> list;
+        for (auto &r : roots) for (auto &g : g_app.games) if (g.root == r) list.push_back(&g);
+        RequestInstallNow(list);
+    };
+    if (ImGui::Button("Install anyway")) { ImGui::CloseCurrentPopup(); go(g_app.riskAll); }
+    const bool others = risky.size() < g_app.riskAll.size();
+    if (others)
+    {
+        ImGui::SameLine();
+        if (ImGui::Button("Leave these out"))
+        {
+            std::vector<std::wstring> rest;
+            for (auto &r : g_app.riskAll)
+            {
+                bool bad = false;
+                for (auto *g : risky) if (g->root == r) bad = true;
+                if (!bad) rest.push_back(r);
+            }
+            ImGui::CloseCurrentPopup();
+            go(rest);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+static void RequestInstallNow(const std::vector<Game *> &list)
 {
     if (list.empty()) return;
     bool ask = g_app.nvOk && LoadSetting(L"NvAskOnInstall", L"1") == L"1";
@@ -1153,7 +1258,7 @@ static void DrawBatch()
         ImGui::SameLine();
         snprintf(lbl, 64, "Install ReShade (%d)", (int)need.size());
         ImGui::BeginDisabled(need.empty() || g_app.busy || g_app.rsVersion.empty());
-        if (ImGui::Button(lbl)) StartReShade(g_app.rsVersion, need);
+        if (ImGui::Button(lbl)) RequestReShade(g_app.rsVersion, need);
         ImGui::EndDisabled();
         Tooltip("Installs the chosen ReShade version in the ticked games that don't have ReShade yet.");
         ImGui::SameLine();
@@ -1345,6 +1450,9 @@ static void DrawDetail(HWND)
     ImGui::TextColored(kGrey, "(%s)", g.store.c_str());
     ImGui::SameLine();
     if (ImGui::SmallButton("Open folder")) OpenInExplorer(g.exe.empty() ? g.root : g.exe, !g.exe.empty());
+    if (OnlineRisk(g))
+        WarnWrapped("Online game (%s): ReShade with add-ons can count as cheating here, and playing online with it can get "
+                    "your account banned. Install at your own discretion.", RiskWhy(g).c_str());
     ImGui::Spacing();
     DrawActions(g);
     ImGui::Separator();
@@ -1438,7 +1546,7 @@ static void DrawDetail(HWND)
         std::string b = g.reshade ? (same ? "Reinstall ReShade" : "Change to " + g_app.rsVersion) : "Install ReShade";
         b += "##reshade";
         ImGui::BeginDisabled(g_app.busy || g_app.rsVersion.empty());
-        if (ImGui::Button(b.c_str())) StartReShade(g_app.rsVersion, { g.root });
+        if (ImGui::Button(b.c_str())) RequestReShade(g_app.rsVersion, { g.root });
         ImGui::EndDisabled();
         Tooltip(g.reshade ? "Replaces the ReShade DLL with the chosen version, keeping its name. The old one is backed up (Undo last change)."
                           : "Downloads ReShade with add-on support from reshade.me and puts it next to the game's exe "
@@ -1508,15 +1616,22 @@ static void DrawLibraries(HWND hwnd)
     ImGui::TextWrapped("Choose where to look for games, then Scan. The list is kept, so this is needed only once and when "
                        "you install games somewhere new.");
     ImGui::Spacing();
-    auto lib = [](const char *name, bool *on, bool found, const std::string &text) {
+    auto lib = [](const char *name, bool *on, bool found, const std::string &text, const std::vector<std::string> *paths = nullptr) {
         ImGui::BeginDisabled(!found);
         if (!found) *on = false;
         ImGui::Checkbox(name, on);
         ImGui::EndDisabled();
         ImGui::SameLine(ImGui::GetFontSize() * 9);
         ImGui::TextColored(found ? kGrey : ImVec4(0.45f, 0.45f, 0.48f, 1), "%s", text.c_str());
+        if (paths && paths->size() > 1 && ImGui::IsItemHovered())
+        {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted("Libraries:");
+            for (auto &p : *paths) ImGui::Text("  %s", p.c_str());
+            ImGui::EndTooltip();
+        }
     };
-    lib("Steam", &o.steam, li.steam, li.steamText);
+    lib("Steam", &o.steam, li.steam, li.steamText, &li.steamLibs);
     lib("Epic Games", &o.epic, li.epic, li.epicText);
     lib("GOG", &o.gog, li.gog, li.gogText);
     lib("Xbox", &o.xbox, li.xbox, li.xboxText);
@@ -1605,6 +1720,7 @@ static void DrawFrame(HWND hwnd)
     ImGui::EndChild();
     DrawLibraries(hwnd);
     DrawInstallQuestion();
+    DrawRiskQuestion();
     DrawJob();
     ImGui::End();
 }

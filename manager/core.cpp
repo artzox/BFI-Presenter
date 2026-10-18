@@ -1300,6 +1300,9 @@ static void DetectShader(Game &g)
     g.shaderOn = PresetHasShader(g.presetPath);
 }
 
+static bool SteamOnline(const std::string &appid);
+static std::string FindAntiCheat(const std::wstring &root, const std::wstring &exeDir);
+
 void Detect(Game &g)
 {
     g.notes.clear();
@@ -1321,6 +1324,8 @@ void Detect(Game &g)
     g.apis = (g.pcgwKnown && g.pcgwApis) ? g.pcgwApis : g.exeApis;
     g.tested = TestedFor(g.name);
     std::wstring dir = DirOf(g.exe);
+    g.online = g.store == "Steam" && !g.appid.empty() && SteamOnline(g.appid);
+    g.antiCheat = FindAntiCheat(g.root, dir);
 
     for (auto n : kReShadeNames)
     {
@@ -1479,10 +1484,19 @@ static std::string VdfValue(const std::string &text, const std::string &key)
 }
 
 // Steam's local app info cache (appcache\appinfo.vdf, binary KeyValues): for each app it lists,
-// whether "common/onlyvrsupport" is set. Formats 27-29 (29 keeps key names in a string table).
-static std::map<std::string, bool> SteamVrOnly(const std::wstring &steam)
+// whether "common/onlyvrsupport" is set, and whether "common/category" has a multiplayer or online
+// category. Formats 27-29 (29 keeps key names in a string table).
+struct SteamFlags { bool vr = false, online = false; };
+static bool OnlineCategory(const std::string &k)
 {
-    std::map<std::string, bool> out;
+    // Multi-player, MMO, Cross-Platform Multiplayer, Online PvP, Online Co-op, PvP
+    static const char *ids[] = { "category_1", "category_20", "category_27", "category_36", "category_38", "category_49" };
+    for (const char *id : ids) if (k == id) return true;
+    return false;
+}
+static std::map<std::string, SteamFlags> SteamAppFlags(const std::wstring &steam)
+{
+    std::map<std::string, SteamFlags> out;
     std::ifstream f(fs::path(Join(steam, L"appcache\\appinfo.vdf")), std::ios::binary);
     if (!f) return out;
     std::vector<unsigned char> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -1518,7 +1532,7 @@ static std::map<std::string, bool> SteamVrOnly(const std::wstring &steam)
         const size_t end = p + 8 + (size_t)size;
         if (end > d.size()) break;
         size_t q = p + 8 + head;
-        bool vr = false, ok = true;
+        bool vr = false, online = false, ok = true;
         std::vector<std::string> path;
         auto key = [&](std::string &k) {
             if (v29)
@@ -1549,6 +1563,8 @@ static std::map<std::string, bool> SteamVrOnly(const std::wstring &steam)
             std::string k;
             if (!key(k)) { ok = false; break; }
             const bool want = path.size() >= 1 && LowerA(path.back()) == "common" && LowerA(k) == "onlyvrsupport";
+            const bool cat = path.size() >= 2 && LowerA(path.back()) == "category" && LowerA(path[path.size() - 2]) == "common" &&
+                             OnlineCategory(LowerA(k));
             switch (t)
             {
             case 0: path.push_back(k); break;
@@ -1557,12 +1573,15 @@ static std::map<std::string, bool> SteamVrOnly(const std::wstring &steam)
                 size_t e = q;
                 while (e < end && d[e]) e++;
                 if (e >= end) { ok = false; break; }
-                if (want) vr = std::string((const char *)&d[q], e - q) == "1";
+                const bool one = std::string((const char *)&d[q], e - q) == "1";
+                if (want) vr = one;
+                if (cat && one) online = true;
                 q = e + 1;
                 break;
             }
             case 2: case 3: case 4: case 6:
                 if (want) vr = u32(q) == 1;
+                if (cat && u32(q) == 1) online = true;
                 q += 4;
                 break;
             case 7: case 10: q += 8; break;
@@ -1573,10 +1592,62 @@ static std::map<std::string, bool> SteamVrOnly(const std::wstring &steam)
             default: ok = false; break;
             }
         }
-        out[std::to_string(appid)] = vr;
+        out[std::to_string(appid)] = { vr, online };
         p = end;
     }
     return out;
+}
+
+static std::wstring SteamDir()
+{
+    std::wstring steam = RegString(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath");
+    if (steam.empty()) steam = RegString(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Valve\\Steam", L"InstallPath");
+    for (auto &c : steam) if (c == L'/') c = L'\\';
+    return steam;
+}
+
+// Online flag for a Steam game, from appinfo.vdf (read once per run; Detect runs on worker threads).
+static bool SteamOnline(const std::string &appid)
+{
+    static std::mutex m;
+    static bool loaded = false;
+    static std::map<std::string, SteamFlags> flags;
+    std::lock_guard<std::mutex> l(m);
+    if (!loaded)
+    {
+        loaded = true;
+        const std::wstring steam = SteamDir();
+        if (!steam.empty()) flags = SteamAppFlags(steam);
+    }
+    auto it = flags.find(appid);
+    return it != flags.end() && it->second.online;
+}
+
+// Anti-cheat in the game's folder or next to its exe (Easy Anti-Cheat, BattlEye and others).
+static std::string FindAntiCheat(const std::wstring &root, const std::wstring &exeDir)
+{
+    std::string found;
+    auto look = [&](const std::wstring &dir) {
+        if (dir.empty() || !found.empty()) return;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(Join(dir, L"*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do
+        {
+            const std::string n = LowerA(U8(fd.cFileName));
+            if (n.find("easyanticheat") != std::string::npos || n == "start_protected_game.exe" || n.find("eac_launcher") == 0)
+                found = "Easy Anti-Cheat";
+            else if (n.find("battleye") != std::string::npos || n.find("beservice") == 0)
+                found = "BattlEye";
+            else if (n.find("anticheat") != std::string::npos || n.find("anti-cheat") != std::string::npos)
+                found = "anti-cheat";
+        } while (found.empty() && FindNextFileW(h, &fd));
+        FindClose(h);
+    };
+    look(root);
+    if (Lower(exeDir) != Lower(root)) look(exeDir);
+    if (found.empty() && !exeDir.empty()) look(DirOf(exeDir));
+    return found;
 }
 
 // A title with "VR" as a word of its own (Skyrim VR, Fallout 4 VR): the fallback where Steam's cache
@@ -1604,7 +1675,7 @@ static void FindSteam(std::vector<Game> &out, std::set<std::wstring> &seen)
         std::string v = VdfValue(rest, "path");
         if (!v.empty()) libs.push_back(W(v));
     }
-    const std::map<std::string, bool> vrOnly = SteamVrOnly(steam);
+    const std::map<std::string, SteamFlags> vrOnly = SteamAppFlags(steam);
     std::set<std::wstring> libSeen;
     for (auto &lib : libs)
     {
@@ -1631,7 +1702,7 @@ static void FindSteam(std::vector<Game> &out, std::set<std::wstring> &seen)
                     g->appid = U8(f.substr(12, f.size() - 16));
                 }
                 auto it = vrOnly.find(g->appid);
-                g->vrOnly = it != vrOnly.end() ? it->second : VrName(g->name);
+                g->vrOnly = it != vrOnly.end() ? it->second.vr : VrName(g->name);
             }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
@@ -1795,7 +1866,16 @@ LibraryInfo FindLibraries()
     {
         std::string vdf = ReadText(Join(steam, L"steamapps\\libraryfolders.vdf"));
         int libs = 0;
-        for (size_t p = 0; (p = LowerA(vdf).find("\"path\"", p)) != std::string::npos; p += 6) libs++;
+        std::set<std::string> libSeen;
+        li.steamLibs.push_back(U8(steam));
+        libSeen.insert(LowerA(U8(steam)));
+        for (size_t p = 0; (p = LowerA(vdf).find("\"path\"", p)) != std::string::npos; p += 6)
+        {
+            libs++;
+            std::string v = VdfValue(vdf.substr(p), "path");
+            for (auto &ch : v) if (ch == '/') ch = '\\';
+            if (!v.empty() && libSeen.insert(LowerA(v)).second) li.steamLibs.push_back(v);
+        }
         li.steam = true;
         li.steamText = U8(steam) + (libs > 1 ? " and " + std::to_string(libs - 1) + " more librar" + (libs > 2 ? "ies" : "y") : "");
     }

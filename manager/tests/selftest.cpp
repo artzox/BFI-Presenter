@@ -47,12 +47,22 @@ int wmain(int argc, wchar_t **argv)
         CHECK(fl && fl->store == "Steam" && fl->appid == "10", "Steam: library from the registry and libraryfolders.vdf");
         CHECK(!ho && vr2 == 1, "Steam: onlyvrsupport in appinfo.vdf left out (%d)", vr2);
         CHECK(sv != nullptr, "Steam: \"VR\" in the title but not VR-only in appinfo.vdf kept");
+        CHECK(fl && fl->online && sv && !sv->online, "Steam: Online PvP category in appinfo.vdf marks the game online, single-player not");
         CHECK(d4 && d4->store == "Battle.net" && !Find(st, "Battle.net"), "Battle.net: game from its uninstall entry, not the launcher");
         s2.skipVr = false;
         st = FindGames(s2);
         CHECK(Find(st, "Headset Only") != nullptr, "VR-only game listed with the option off");
     }
     for (auto &g : all) Dump(g);
+    {
+        Game *ar = Find(all, "ArenaGame"), *wf0 = Find(all, "Wreckfest");
+        CHECK(ar && ar->antiCheat == "Easy Anti-Cheat" && OnlineRisk(*ar), "ArenaGame: Easy Anti-Cheat in its folder found");
+        CHECK(wf0 && wf0->antiCheat.empty() && !OnlineRisk(*wf0), "Wreckfest (folder): no anti-cheat, no online warning");
+    }
+    {
+        LibraryInfo li = FindLibraries();
+        CHECK(li.steam && !li.steamLibs.empty(), "Steam libraries listed (%zu)", li.steamLibs.size());
+    }
 
     Game *wf = Find(all, "Wreckfest"), *aw = Find(all, "Alan Wake"), *op = Find(all, "OptiGame"), *rd = Find(all, "Red Dead Redemption 2"),
          *h2 = Find(all, "Heretic II"), *nr = Find(all, "NoReShade"), *ue = Find(all, "UEGame");

@@ -1,5 +1,5 @@
 # Writes a minimal Steam appinfo.vdf (format 29: key names in a string table) for the manager's self-test.
-# Usage: appinfo.py <out> <appid>:<onlyvr 0|1> ...
+# Usage: appinfo.py <out> <appid>:<onlyvr 0|1>[:<multiplayer 0|1>] ...
 import struct, sys
 strings = []
 def idx(s):
@@ -11,9 +11,11 @@ def ival(k, v): return b'\x02' + idx(k) + struct.pack('<i', v)
 END = b'\x08'
 body = b''
 for a in sys.argv[2:]:
-    appid, vr = a.split(':')
+    f = a.split(':')
+    appid, vr, mp = f[0], f[1], (f[2] if len(f) > 2 else '0')
     kv = node('appinfo') + ival('appid', int(appid)) + node('common') + sval('name', 'App ' + appid)
     if vr == '1': kv += sval('openvrsupport', '1') + sval('onlyvrsupport', '1')
+    kv += node('category') + sval('category_2', '1') + (sval('category_36', '1') if mp == '1' else b'') + END
     kv += sval('type', 'Game') + END + node('extended') + sval('developer', 'x') + END + END + END
     head = struct.pack('<IIQ', 2, 1700000000, 0) + b'\0' * 20 + struct.pack('<I', 1) + b'\0' * 20
     entry = head + kv
