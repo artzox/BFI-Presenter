@@ -65,9 +65,9 @@ Both read the same `BFIPresenter.ini` with the same keys, so one ini works for e
 **Recommended settings:**
 
 - **Method Variable MPRT, Gain 1.0** for full brightness (Gain 0.5, the default, keeps the lit refresh as the game drew it, at half the average brightness). In HDR, set `AblGuardBudgetNits` to the panel's full-white brightness (250 for the Sony A95L).
-- Game holds 120 fps: Refresh cap + Lowest latency.
-- Game holds 60 or more but not 120: Half refresh + Smooth (just-in-time release on, the default).
-- **With frame generation** (DLSS FG, FSR FG, Lossless Scaling): always the **Refresh** cap, never Half refresh, which throws away half the generated frames. Lossless Scaling worked with its VSync set to 1/2.
+- Game holds 120 fps: Refresh cap + Lowest latency (the defaults).
+- Game holds 60 or more but not 120: leave the Refresh cap and the automatic frame cap on (it steps down to one frame per strobe cycle by itself), or pick Half refresh.
+- **With frame generation** (DLSS FG, FSR FG, Lossless Scaling): always the **Refresh** cap, never Half refresh, which throws away half the generated frames. In NVIDIA Reflex games the automatic frame cap sets Reflex's frame limit to one presented frame per strobe cycle. Lossless Scaling worked with its VSync set to 1/2.
 - **The formula:** strobe rate = refresh rate ÷ frames per cycle, and the game needs at least that many fps for a new image on every flash (with frame generation, count the final fps, generated frames included). E.g. 120 Hz ÷ 2 = 60 fps, 240 Hz ÷ 2 = 120 fps.
 
 More in the [DX reference](dx/README.md#recommended-setups).

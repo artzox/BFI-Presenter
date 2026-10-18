@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.11-rfx5"
+#define BFI_ADDON_VERSION "1.0.12"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -114,7 +114,7 @@ struct Settings
                               // 4 = one game frame per strobe cycle (refresh / Frames), 5 = refresh / CapDivisor
     int   capDivisor = 3;    // cap 5: release the game every this many refreshes (1-8)
     int   ownQueue = 1;       // present on the add-on's own queue (read when a swap chain is set up)
-    int   pacingMode = 0;     // 0 = smooth (every game frame shown once, in order), 1 = lowest latency (newest)
+    int   pacingMode = 1;     // 0 = smooth (every game frame shown once, in order), 1 = lowest latency (newest)
     int   maxAhead = 1;       // game may run this many frames ahead of the GPU (0 = no limit)
     int   smoothCatchUp = 0;  // Smooth: 1 = skip a frame when two have waited for 3 cycles (standing latency)
     int   autoAhead = 1;      // automatic: 1 frame ahead, 2 while the game keeps missing strobe cycles
@@ -122,9 +122,8 @@ struct Settings
     int   queueAhead = 0;     // with vblank pacing: keep this many extra presents queued (0 or 1)
     int   laterRelease = 0;   // Lowest latency + Refresh cap: release the game just in time for the pick
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
-    int   autoCap = 0;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
-    int   reflex = 0;         // NVIDIA Reflex: 0 the game's own, 1 on, 2 on + Boost, 3 on + Boost also in games without it
-    int   reflexLimit = 0;    // Reflex frame limit: 0 off, 1 one frame per strobe cycle, 2 half of that (frame generation 2x)
+    int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
+                              // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
     int   deferRecreated = 1; // recreated swap chains: no BFI until the game resizes (safe)
     int   virtualStats = 1;   // report frame statistics in terms of the game's own frames
@@ -233,7 +232,7 @@ static void LoadSettings(Settings &s)
     if (s.capDivisor < 1) s.capDivisor = 1;
     if (s.capDivisor > 8) s.capDivisor = 8;
     s.ownQueue = IniInt("PresentOnOwnQueue", 1);
-    s.pacingMode = IniInt("FramePacing", 0) ? 1 : 0;
+    s.pacingMode = IniInt("FramePacing", 1) ? 1 : 0;
     s.maxAhead = IniInt("MaxFramesAhead", 1);
     s.autoAhead = IniInt("AutoFramesAhead", 1) ? 1 : 0;
     s.smoothCatchUp = IniInt("SmoothCatchUp", 0) ? 1 : 0;
@@ -241,11 +240,7 @@ static void LoadSettings(Settings &s)
     s.queueAhead = IniInt("QueueAhead", 0) ? 1 : 0;
     s.laterRelease = IniInt("LaterRelease", 0) ? 1 : 0;
     s.capJit = IniInt("CapJustInTime", 1) ? 1 : 0;
-    s.autoCap = IniInt("AutoFrameCap", 0) ? 1 : 0;
-    s.reflex = IniInt("Reflex", 0);
-    if (s.reflex < 0 || s.reflex > 3) s.reflex = 0;
-    s.reflexLimit = IniInt("ReflexFrameLimit", 0);
-    if (s.reflexLimit < 0 || s.reflexLimit > 2) s.reflexLimit = 0;
+    s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
     if (s.laterReleaseMs > 5.0f) s.laterReleaseMs = 5.0f;
@@ -385,8 +380,6 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("LaterRelease", s.laterRelease);
     IniWriteInt("CapJustInTime", s.capJit);
     IniWriteInt("AutoFrameCap", s.autoCap);
-    IniWriteInt("Reflex", s.reflex);
-    IniWriteInt("ReflexFrameLimit", s.reflexLimit);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
     IniWriteInt("GameFrameStatistics", s.virtualStats);
@@ -433,12 +426,10 @@ struct Status
     int    lrMisses = 0;
     int    aheadInUse = 1;
     int    autoCapDown = 0;                     // automatic frame cap: one game frame per strobe cycle in use
-    int    fgActive = 0;                        // frame generation looks active (its DLL + game frame latency 2)
-    int    rfxHook = 0;                         // Reflex: 0 not yet, 1 hooked, -1 not available
-    int    rfxGameUses = 0;                     // the game uses Reflex (its own sleep mode or latency markers)
-    int    rfxForced = 0;                       // Reflex forced by the presenter (game without it)
-    int    rfxGameLL = -1, rfxGameBoost = -1, rfxGameUs = -1;   // the game's own sleep mode (-1 = not seen)
-    int    rfxAppLL = -1, rfxAppBoost = -1, rfxAppUs = -1;      // what the presenter applied (-1 = nothing)
+    int    autoCapProbe = 0;                    // automatic frame cap: trying the Refresh rate again
+    int    fgActive = 0;                        // frame generation looks active (presented well above rendered frames)
+    int    rfxGameUses = 0;                     // the game uses Reflex (latency reports)
+    int    rfxLimitUs = 0;                      // Reflex frame limit applied by the presenter (0 = none)
     double rfxSimGpuMs = -1.0;                  // Reflex report: simulation start -> GPU finished (average)
     double relFlashMs = -1.0;                   // game released -> lit flash showing that frame (average)
     double rawAvg  = -1.0;                      // ABL guard: unclipped lit-refresh average (nits)
@@ -1933,19 +1924,22 @@ static const int     kRel = 64;
 static UINT64        g_relId[kRel] = {};
 static double        g_relT[kRel] = {};
 
-// NVIDIA Reflex (NvAPI), test build: see the Reflex section further down.
+// NVIDIA Reflex (NvAPI): see the Reflex section further down.
 struct ReflexSecond
 {
-    int    frames = 0;           // latency reports this second
+    int    frames = 0;           // latency reports this second (0 = the game doesn't use Reflex)
     double simGpuMs = -1.0;      // simulation start -> GPU finished
     double simPresentMs = -1.0;  // simulation start -> present call finished
     double inputGpuMs = -1.0;    // input sampled -> GPU finished (games that mark input)
     double gpuFrameMs = -1.0;    // GPU frame time
+    double gpuActiveMs = -1.0;   // GPU busy with the frame
+    double simMs = -1.0;         // simulation (CPU) time
+    double submitMs = -1.0;      // render submission (CPU) time
     double queueMs = -1.0;       // time in the OS render queue
+    double renderedFps = -1.0;   // rendered frames a second (frame numbers)
+    int    limitUs = 0;          // Reflex frame limit in effect
 };
-static void ReflexTick(const Settings &s, double modeHz, bool cycleCap, ReflexSecond &out);
-static void ReflexGameReleased(UINT64 lastId);
-static void ReflexPresentStart(UINT64 id);
+static void ReflexTick(int limitUs, ReflexSecond &out);
 static IUnknown *ReflexOwnDevice();
 
 // Frame generation that presents its own frames (DLSS-G, FSR 3 FG, XeSS FG): its
@@ -2210,12 +2204,16 @@ static DWORD WINAPI PresenterThread(void *)
     bool   aheadLocked = false;    // settled at 2 for this swap chain (no more switching)
     // Automatic frame cap: at the Refresh cap, one game frame per strobe cycle
     // while the game can't hold the refresh rate (frames between the strobe rate
-    // and the refresh rate were dropped unevenly: judder), back to Refresh when
-    // its frames fit a refresh again.
-    bool   autoCapDown = false;
-    int    capDownSecs = 0, capUpSecs = 0, userCap = 1;
-    double capSwitchT = -100.0, capUpT = 0.0;
-    bool   fgWas = false, capLocked = false;
+    // and the refresh rate were dropped unevenly: judder). Back to Refresh when
+    // the game's Reflex reports show its frames fit a refresh again, or, without
+    // them, after a short try at Refresh that holds the refresh rate (tries 30 s,
+    // 60 s, then every 120 s while they keep failing).
+    bool   autoCapDown = false, capProbe = false;
+    int    capDownSecs = 0, capUpSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
+    double capSwitchT = -100.0, capUpT = -100.0, probeWait = 30.0, stayMin = 10.0;
+    bool   fgWas = false;
+    ReflexSecond rsLast;           // last second's Reflex reports (frames == 0: the game doesn't use Reflex)
+    double rsLastT = -100.0;
     // Release -> lit flash of the frames shown this second (timing log, Reflex tests).
     bool   pickNew = false;
     double pickRelT = 0.0, relSum = 0.0, relMax = 0.0;
@@ -2326,11 +2324,10 @@ static DWORD WINAPI PresenterThread(void *)
                      lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond);
             rfxf = fopen(path, "w");
             if (rfxf)
-                fprintf(rfxf, "time_s,game_fps,cap_set,cap_period,auto_cap,fg_active,pacing,jit,jit_state,jit_est_ms,ahead,"
-                              "reflex_setting,reflex_limit,game_reflex_seen,game_low_latency,game_boost,game_limit_us,"
-                              "applied_low_latency,applied_boost,applied_limit_us,forced,"
-                              "release_to_flash_ms,release_to_flash_max_ms,frames_shown,"
-                              "rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,rfx_queue_ms,rendered_fps\n");
+                fprintf(rfxf, "time_s,game_fps,cap_set,cap_period,auto_cap,auto_cap_probe,fg_active,pacing,jit,jit_state,jit_est_ms,ahead,"
+                              "reflex_limit_us,release_to_flash_ms,release_to_flash_max_ms,frames_shown,"
+                              "rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,"
+                              "rfx_gpu_active_ms,rfx_sim_ms,rfx_submit_ms,rfx_queue_ms,rendered_fps\n");
         }
         else if (!s.log && logf)
         {
@@ -2941,39 +2938,73 @@ static DWORD WINAPI PresenterThread(void *)
                     LOGI("BFI Presenter: frame generation %s", fg ? "active" : "not active");
                 }
                 const double fpsA = g_status.gameFps;
-                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0)
+                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg)
                 {
-                    if (!autoCapDown)
+                    const double refMs = 1000.0 / hzA;
+                    if (capProbe)
                     {
-                        capDownSecs = (!fg && !hitchPaused && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;
-                        if (capDownSecs >= 3 && t - capSwitchT > 10.0)
+                        // Trying Refresh: the first second still counts frames from the cap.
+                        probeSecs++;
+                        if (probeSecs >= 2 && fpsA >= 0.95 * hzA && !hitchPaused) probeGood++;
+                        if (probeSecs >= 4)
                         {
-                            autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t;
-                            // Down again within a minute of going back up: the game is close to the
-                            // limit -- stay at one frame per cycle, no more switching.
-                            capLocked = capUpT > 0.0 && t - capUpT < 60.0;
-                            LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps) -- the game held "
-                                 "%.0f fps of %.0f, so frames were dropped unevenly%s", hzA / s.frames, fpsA, hzA,
-                                 capLocked ? "; staying there for this session" : "");
+                            capProbe = false; capDownSecs = capUpSecs = 0; capSwitchT = t;
+                            if (probeGood >= 2)
+                            {
+                                probeWait = 30.0;
+                                LOGI("BFI Presenter: automatic frame cap: Refresh rate -- the game holds %.0f fps", fpsA);
+                            }
+                            else
+                            {
+                                autoCapDown = true;
+                                probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
+                                LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
+                                     "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
+                            }
                         }
                     }
-                    else
+                    else if (!autoCapDown)
                     {
-                        // Back up when a whole game frame (release -> finished on the GPU, the
-                        // just-in-time release's 95th percentile) fits well within one refresh.
-                        // The time the game waited in the cap misses GPU work that overlaps.
-                        const double needMs = g_status.lrState >= 2 ? g_status.lrEst + g_status.lrMargin : 1e9;
-                        capUpSecs = (!capLocked && !hitchPaused && needMs < 0.9 * 1000.0 / hzA) ? capUpSecs + 1 : 0;
-                        if (fg || (capUpSecs >= 10 && t - capSwitchT > 10.0))
+                        capDownSecs = (!hitchPaused && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;
+                        if (capDownSecs >= 3 && t - capSwitchT > 3.0)
+                        {
+                            // Down again soon after going back up: the game is close to the limit, so the
+                            // next return waits longer.
+                            if (t - capUpT < 30.0) stayMin = stayMin * 2.0 > 120.0 ? 120.0 : stayMin * 2.0;
+                            else stayMin = 10.0;
+                            autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t;
+                            LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps) -- the game held "
+                                 "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames, fpsA, hzA);
+                        }
+                    }
+                    else if (t - rsLastT < 3.0 && rsLast.frames > 0 && rsLast.gpuActiveMs > 0.0)
+                    {
+                        // Reflex reports: back up when the game's GPU and CPU work per frame fit well
+                        // within one refresh.
+                        double needMs = rsLast.gpuActiveMs;
+                        if (rsLast.simMs > needMs) needMs = rsLast.simMs;
+                        if (rsLast.submitMs > needMs) needMs = rsLast.submitMs;
+                        capUpSecs = (!hitchPaused && needMs < 0.85 * refMs) ? capUpSecs + 1 : 0;
+                        if (capUpSecs >= 10 && t - capSwitchT >= stayMin)
                         {
                             autoCapDown = false; capDownSecs = capUpSecs = 0; capSwitchT = t; capUpT = t;
-                            if (fg) LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation active)");
-                            else LOGI("BFI Presenter: automatic frame cap: Refresh rate -- game frames take %.1f ms, within a refresh", needMs);
+                            LOGI("BFI Presenter: automatic frame cap: Refresh rate -- game frames take %.1f ms (GPU %.1f, "
+                                 "simulation %.1f, submit %.1f), within a refresh", needMs, rsLast.gpuActiveMs, rsLast.simMs, rsLast.submitMs);
                         }
                     }
+                    else if (t - capSwitchT >= probeWait && !hitchPaused)
+                    {
+                        // No Reflex reports: try Refresh for a few seconds.
+                        autoCapDown = false; capProbe = true; probeSecs = probeGood = 0; capSwitchT = t; capUpT = t;
+                    }
                 }
-                else if (autoCapDown) { autoCapDown = false; capDownSecs = capUpSecs = 0; }
+                else
+                {
+                    if (autoCapDown && fg) LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation active)");
+                    autoCapDown = capProbe = false; capDownSecs = capUpSecs = 0;
+                }
                 g_status.autoCapDown = autoCapDown ? 1 : 0;
+                g_status.autoCapProbe = capProbe ? 1 : 0;
                 g_status.fgActive = fg ? 1 : 0;
                 g_status.relFlashMs = relN ? relSum / relN : -1.0;
             }
@@ -2985,18 +3016,25 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 ReflexSecond rs;
                 const int perNow = CapPeriod(s.gameCap, s.frames, s.capDivisor);
-                ReflexTick(s, modeHz, perNow >= 2, rs);
+                // Frame generation at the Refresh cap: Reflex's frame limit at one presented frame
+                // per strobe cycle (e.g. 16,667 us at 120 Hz with 2 frames per cycle).
+                const double hzL = modeHz > 0.0 ? modeHz : peakHz;
+                const int limitUs = (s.autoCap && userCap == 1 && s.enabled && s.frames >= 2 && stNow.fgActive && hzL > 0.0)
+                                        ? (int)(1e6 * s.frames / hzL + 0.5) : 0;
+                ReflexTick(limitUs, rs);
+                rsLast = rs; rsLastT = t;
+                EnterCriticalSection(&g_cfgLock);
+                g_status.rfxGameUses = rs.frames > 0 ? 1 : 0;
+                g_status.rfxLimitUs = rs.limitUs;
+                g_status.rfxSimGpuMs = rs.simGpuMs;
+                LeaveCriticalSection(&g_cfgLock);
                 if (rfxf)
                 {
-                    EnterCriticalSection(&g_cfgLock);
-                    const Status sr = g_status;
-                    LeaveCriticalSection(&g_cfgLock);
-                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f\n",
-                            t, stNow.gameFps, userCap, perNow, stNow.autoCapDown, stNow.fgActive, s.pacingMode, s.capJit,
-                            stNow.lrState, stNow.lrEst, stNow.aheadInUse, s.reflex, s.reflexLimit, sr.rfxGameLL >= 0 ? 1 : 0,
-                            sr.rfxGameLL, sr.rfxGameBoost, sr.rfxGameUs, sr.rfxAppLL, sr.rfxAppBoost, sr.rfxAppUs, sr.rfxForced,
+                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f\n",
+                            t, stNow.gameFps, userCap, perNow, stNow.autoCapDown, stNow.autoCapProbe, stNow.fgActive, s.pacingMode,
+                            s.capJit, stNow.lrState, stNow.lrEst, stNow.aheadInUse, rs.limitUs,
                             relN ? relSum / relN : -1.0, relN ? relMax : -1.0, relN, rs.frames, rs.simGpuMs, rs.simPresentMs,
-                            rs.inputGpuMs, rs.gpuFrameMs, rs.queueMs,
+                            rs.inputGpuMs, rs.gpuFrameMs, rs.gpuActiveMs, rs.simMs, rs.submitMs, rs.queueMs,
                             Now() - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : -1.0);
                     fflush(rfxf);
                 }
@@ -3513,7 +3551,6 @@ static void WriteGameLog()
 // mode), then the release time is noted for the release -> lit flash log.
 static void GameReleased(UINT64 lastId)
 {
-    ReflexGameReleased(lastId);
     const UINT64 next = lastId + 1;
     g_relT[next % kRel] = Now();
     g_relId[next % kRel] = next;
@@ -3523,7 +3560,6 @@ static HRESULT SubmitGameFrame()
 {
     const DWORD tid = GetCurrentThreadId();
     const double enter = Now();
-    ReflexPresentStart(g_frameId + 1);
     FgCheckCaller();
     GameStage(ST_G_SLOT);
     EnterCriticalSection(&g_submitLock);
@@ -4005,17 +4041,23 @@ static void *MakeUnhookedEntry(void *target, char *why, size_t whyLen)
     return tramp;
 }
 
-// ---------------------------------------------------------------- NVIDIA Reflex (NvAPI), test build
-// Watches the game's Reflex sleep mode (NvAPI_D3D_SetSleepMode) and can override it:
-// low latency on, Boost, and a Reflex frame limit of one frame per strobe cycle (the
-// driver then paces the game where it samples input, and with DLSS-G it limits the
-// frames that reach the presenter). Reads the driver's latency reports each second
-// for the timing log. "Also in games without Reflex" calls Reflex's sleep and
-// markers around the game's Present itself, as Special K and ReLimiter do.
+// ---------------------------------------------------------------- NVIDIA Reflex (NvAPI)
+// Two uses, both for the automatic frame cap:
+//  * The driver's latency reports (every game that uses Reflex has them, and every DLSS-G
+//    game uses Reflex): rendered frames a second from the game's own frame numbers (frame
+//    generation presents about twice as many), the game's GPU and CPU time per frame (can it
+//    hold the refresh rate again?), and the latency columns of the timing log.
+//  * With frame generation: Reflex's frame limit at one presented frame per strobe cycle.
+//    The driver then paces DLSS-G itself, so every lit refresh gets the next frame (God of
+//    War Ragnarok: 60 of 60, against 57 at ~76 fps without it). Holding DLSS-G's presents back
+//    with the presenter's own cap instead broke its pacing: only 30 of its 60 frames a second
+//    reached the screen.
+// The game's own sleep mode is watched (an inline hook on NvAPI_D3D_SetSleepMode, set up
+// only while the limit is wanted), so its low-latency and Boost choices are kept, and the
+// limit is sent again every 2 s in case the game or the driver resets it.
 #ifdef _WIN64
 struct NvSleepParams   { uint32_t version; uint8_t lowLatency, boost, pad0[2]; uint32_t minIntervalUs; uint8_t useMarkers, rsvd[31]; };
 struct NvSleepStatus   { uint32_t version; uint8_t lowLatency, rsvd[127]; };
-struct NvLatencyMarker { uint32_t version; uint32_t pad0; uint64_t frameID; uint32_t markerType; uint8_t rsvd[64]; };
 struct NvFrameReport
 {
     uint64_t frameID, inputSample, simStart, simEnd, submitStart, submitEnd, presentStart, presentEnd,
@@ -4024,66 +4066,45 @@ struct NvFrameReport
     uint8_t  rsvd[120];
 };
 struct NvLatencyResult { uint32_t version; uint32_t pad0; NvFrameReport r[64]; uint8_t rsvd[32]; };
-static_assert(sizeof(NvSleepParams) == 44 && sizeof(NvSleepStatus) == 132 && sizeof(NvLatencyMarker) == 88 &&
-              sizeof(NvFrameReport) == 240 && sizeof(NvLatencyResult) == 15400, "NvAPI struct layout");
+static_assert(sizeof(NvSleepParams) == 44 && sizeof(NvSleepStatus) == 132 && sizeof(NvFrameReport) == 240 &&
+              sizeof(NvLatencyResult) == 15400, "NvAPI struct layout");
 #define BFI_NVVER(T) ((uint32_t)sizeof(T) | (1u << 16))
 typedef void *(__cdecl *PFN_NvQI)(unsigned int);
 typedef int   (__cdecl *PFN_NvInit)();
 typedef int   (__cdecl *PFN_NvSetSleepMode)(IUnknown *, NvSleepParams *);
 typedef int   (__cdecl *PFN_NvGetSleepStatus)(IUnknown *, NvSleepStatus *);
-typedef int   (__cdecl *PFN_NvSleep)(IUnknown *);
-typedef int   (__cdecl *PFN_NvMarker)(IUnknown *, NvLatencyMarker *);
 typedef int   (__cdecl *PFN_NvGetLatency)(IUnknown *, NvLatencyResult *);
+static PFN_NvSetSleepMode   g_nvSetSleepMode = nullptr;     // the function itself (until hooked)
 static PFN_NvSetSleepMode   o_NvSetSleepMode = nullptr;     // original (trampoline) once hooked
 static PFN_NvGetSleepStatus g_nvGetSleepStatus = nullptr;
-static PFN_NvSleep          g_nvSleep = nullptr;
-static PFN_NvMarker         g_nvMarker = nullptr;
 static PFN_NvGetLatency     g_nvGetLatency = nullptr;
 static SRWLOCK              g_rfxLock = SRWLOCK_INIT;
 static IUnknown            *g_rfxDev = nullptr;              // device the game passed to SetSleepMode
 static NvSleepParams        g_rfxGame = {}, g_rfxApplied = {};
 static bool                 g_rfxGameSeen = false, g_rfxAppliedValid = false;
-static std::atomic<int>     g_rfxHook{0};                    // 0 not tried, 1 hooked, -1 unavailable
-static std::atomic<bool>    g_rfxForced{false};
-static std::atomic<int>     g_rfxWantMode{0}, g_rfxWantLimitUs{0};
+static int                  g_rfxApi = 0;                    // 0 not tried, 1 available, -1 unavailable
+static int                  g_rfxHooked = 0;                 // 0 not tried, 1 hooked, -1 couldn't
+static std::atomic<int>     g_rfxWantLimitUs{0};             // 0 = no limit from the presenter
 static UINT64               g_rfxLastReport = 0;
-static bool                 g_rfxMarkersSeen = false;
-static double               g_rfxStartT = 0.0;
-
-// What the presenter wants on top of the game's own sleep mode.
-static NvSleepParams ReflexWanted(const NvSleepParams &base)
-{
-    NvSleepParams q = base;
-    q.version = BFI_NVVER(NvSleepParams);
-    const int mode = g_rfxWantMode.load(), us = g_rfxWantLimitUs.load();
-    if (mode >= 1) q.lowLatency = 1;
-    if (mode >= 2) q.boost = 1;
-    if (us > 0) q.minIntervalUs = (uint32_t)us;
-    return q;
-}
-static bool SameSleep(const NvSleepParams &a, const NvSleepParams &b)
-{
-    return a.lowLatency == b.lowLatency && a.boost == b.boost && a.minIntervalUs == b.minIntervalUs;
-}
 
 static int __cdecl hk_NvSetSleepMode(IUnknown *dev, NvSleepParams *p)
 {
     if (!p) return o_NvSetSleepMode(dev, p);
     AcquireSRWLockExclusive(&g_rfxLock);
-    const bool changed = !g_rfxGameSeen || !SameSleep(g_rfxGame, *p);
+    const bool changed = !g_rfxGameSeen || g_rfxGame.lowLatency != p->lowLatency || g_rfxGame.boost != p->boost ||
+                         g_rfxGame.minIntervalUs != p->minIntervalUs;
     g_rfxGame = *p;
     g_rfxGameSeen = true;
     g_rfxDev = dev;
-    const bool override = g_rfxWantMode.load() > 0 || g_rfxWantLimitUs.load() > 0;
-    NvSleepParams q = override ? ReflexWanted(*p) : *p;
-    g_rfxApplied = q;
-    g_rfxAppliedValid = override;
+    const int us = g_rfxWantLimitUs.load();
+    NvSleepParams q = *p;
+    if (us > 0) q.minIntervalUs = (uint32_t)us;
+    if (us > 0) { g_rfxApplied = q; g_rfxAppliedValid = true; }
     ReleaseSRWLockExclusive(&g_rfxLock);
     if (changed)
         LOGI("BFI Presenter: game Reflex: low latency %s%s, frame limit %u us%s", p->lowLatency ? "on" : "off",
-             p->boost ? " + Boost" : "", p->minIntervalUs,
-             override ? " -- the presenter's settings apply on top" : "");
-    return o_NvSetSleepMode(dev, override ? &q : p);
+             p->boost ? " + Boost" : "", p->minIntervalUs, us > 0 ? " -- the presenter's frame limit applies on top" : "");
+    return o_NvSetSleepMode(dev, us > 0 ? &q : p);
 }
 
 // Patches target's first instructions with a jump to hook; returns a callable copy
@@ -4141,203 +4162,140 @@ static void *InlineHook64(void *target, void *hook, char *why, size_t whyLen)
     return tramp;
 }
 
-static void ReflexHook(bool load)
+// NvAPI functions, once nvapi64.dll is in the game (it isn't loaded by the presenter).
+static bool ReflexApi()
 {
-    if (g_rfxHook.load() != 0) return;
+    if (g_rfxApi != 0) return g_rfxApi == 1;
     HMODULE nv = GetModuleHandleA("nvapi64.dll");
-    if (!nv && load) nv = LoadLibraryA("nvapi64.dll");
-    if (!nv) return;                                   // not loaded (yet): tried again each second
+    if (!nv) return false;                                         // tried again each second
     PFN_NvQI qi = (PFN_NvQI)(void *)GetProcAddress(nv, "nvapi_QueryInterface");
-    if (!qi) { g_rfxHook.store(-1); LOGW("BFI Presenter: Reflex: nvapi_QueryInterface not found"); return; }
-    if (PFN_NvInit init = (PFN_NvInit)qi(0x0150E828)) init();
-    void *ssm = qi(0xAC1CA9E0);
-    g_nvGetSleepStatus = (PFN_NvGetSleepStatus)qi(0xAEF96CA1);
-    g_nvSleep          = (PFN_NvSleep)qi(0x852CD1D2);
-    g_nvMarker         = (PFN_NvMarker)qi(0xD9984C05);
-    g_nvGetLatency     = (PFN_NvGetLatency)qi(0x1A587F9C);
-    if (!ssm) { g_rfxHook.store(-1); LOGW("BFI Presenter: Reflex: NvAPI_D3D_SetSleepMode not available (driver?)"); return; }
+    if (qi)
+    {
+        if (PFN_NvInit init = (PFN_NvInit)qi(0x0150E828)) init();
+        g_nvSetSleepMode   = (PFN_NvSetSleepMode)qi(0xAC1CA9E0);
+        g_nvGetSleepStatus = (PFN_NvGetSleepStatus)qi(0xAEF96CA1);
+        g_nvGetLatency     = (PFN_NvGetLatency)qi(0x1A587F9C);
+    }
+    g_rfxApi = (g_nvSetSleepMode && g_nvGetLatency) ? 1 : -1;
+    if (g_rfxApi < 0) LOGW("BFI Presenter: Reflex: NvAPI latency functions not available");
+    return g_rfxApi == 1;
+}
+
+static void ReflexWatch()
+{
+    if (g_rfxHooked != 0 || !g_nvSetSleepMode) return;
     char why[96] = "";
-    void *orig = InlineHook64(ssm, (void *)&hk_NvSetSleepMode, why, sizeof(why));
-    if (!orig)
+    void *orig = InlineHook64((void *)g_nvSetSleepMode, (void *)&hk_NvSetSleepMode, why, sizeof(why));
+    if (orig) { o_NvSetSleepMode = (PFN_NvSetSleepMode)orig; g_rfxHooked = 1; }
+    else
     {
-        o_NvSetSleepMode = (PFN_NvSetSleepMode)ssm;     // can still set it, but won't see the game's calls
-        g_rfxHook.store(1);
-        LOGW("BFI Presenter: Reflex: the game's sleep mode can't be watched (%s) -- the presenter's settings are applied "
-             "once a second instead", why);
-        return;
-    }
-    o_NvSetSleepMode = (PFN_NvSetSleepMode)orig;
-    g_rfxHook.store(1);
-    LOGI("BFI Presenter: Reflex: watching the game's sleep mode (NvAPI)");
-}
-
-static void ReflexPresentStart(UINT64 id)
-{
-    if (!g_rfxForced.load() || !g_nvMarker) return;
-    if (IUnknown *dev = ReflexOwnDevice())
-    {
-        NvLatencyMarker m = {};
-        m.version = BFI_NVVER(NvLatencyMarker);
-        m.frameID = id;
-        m.markerType = 4;                                  // PRESENT_START
-        g_nvMarker(dev, &m);
+        o_NvSetSleepMode = g_nvSetSleepMode;
+        g_rfxHooked = -1;
+        LOGW("BFI Presenter: Reflex: the game's own sleep mode can't be watched (%s); the frame limit is sent every 2 s", why);
     }
 }
 
-static void ReflexGameReleased(UINT64 lastId)
-{
-    if (!g_rfxForced.load()) return;
-    IUnknown *dev = ReflexOwnDevice();
-    if (!dev) return;
-    NvLatencyMarker m = {};
-    m.version = BFI_NVVER(NvLatencyMarker);
-    if (g_nvMarker) { m.frameID = lastId; m.markerType = 5; g_nvMarker(dev, &m); }   // PRESENT_END
-    if (g_nvSleep) g_nvSleep(dev);
-    if (g_nvMarker) { m.frameID = lastId + 1; m.markerType = 0; g_nvMarker(dev, &m); }   // SIMULATION_START
-}
-
-// Once a second, from the presenter thread.
-static void ReflexTick(const Settings &s, double modeHz, bool cycleCap, ReflexSecond &out)
+// Once a second, from the presenter thread. limitUs: the frame limit wanted (0 = none).
+static void ReflexTick(int limitUs, ReflexSecond &out)
 {
     out = ReflexSecond();
-    const double hz = modeHz > 0.0 ? modeHz : 120.0;
-    const int frames = std::max(1, s.enabled ? s.frames : 1);
-    int us = 0;
-    if (s.reflexLimit > 0) us = (int)(1e6 * frames / hz * (s.reflexLimit == 2 ? 2.0 : 1.0) + 0.5);
-    (void)cycleCap;
-    g_rfxWantMode.store(s.reflex);
-    g_rfxWantLimitUs.store(us);
-    // Only touched when asked for, or to log the game's own Reflex in the timing log.
-    if (s.reflex == 0 && s.reflexLimit == 0 && !s.log && !s.autoCap && g_rfxHook.load() == 0) return;
-    ReflexHook(s.reflex == 3);
-    if (g_rfxHook.load() != 1) return;
-    if (g_rfxStartT == 0.0) g_rfxStartT = Now();
-
-    // Latency reports (only games that set Reflex markers, or the forced mode, have them).
+    if (!ReflexApi()) return;
+    g_rfxWantLimitUs.store(limitUs);
+    if (limitUs > 0) ReflexWatch();
     IUnknown *dev = nullptr;
     AcquireSRWLockShared(&g_rfxLock);
     dev = g_rfxDev;
     const bool seen = g_rfxGameSeen;
-    NvSleepParams game = g_rfxGame, applied = g_rfxApplied;
+    const NvSleepParams game = g_rfxGame, applied = g_rfxApplied;
     const bool appliedValid = g_rfxAppliedValid;
     ReleaseSRWLockShared(&g_rfxLock);
     if (!dev) dev = ReflexOwnDevice();
-    if (dev && g_nvGetLatency)
+    if (!dev) return;
+
+    static NvLatencyResult res;
+    memset(&res, 0, sizeof(res));
+    res.version = BFI_NVVER(NvLatencyResult);
+    bool markers = false;
+    if (g_nvGetLatency(dev, &res) == 0)
     {
-        static NvLatencyResult res;
-        memset(&res, 0, sizeof(res));
-        res.version = BFI_NVVER(NvLatencyResult);
-        if (g_nvGetLatency(dev, &res) == 0)
+        double a = 0, b = 0, c = 0, g = 0, q = 0, ga = 0, sim = 0, sub = 0;
+        int n = 0, ni = 0;
+        UINT64 newest = g_rfxLastReport;
+        for (const NvFrameReport &r : res.r)
         {
-            double a = 0, b = 0, c = 0, g = 0, q = 0; int n = 0, ni = 0;
-            UINT64 newest = g_rfxLastReport;
-            for (const NvFrameReport &r : res.r)
-            {
-                if (!r.frameID || r.frameID <= g_rfxLastReport || !r.simStart || r.gpuEnd < r.simStart) continue;
-                if (r.gpuEnd - r.simStart > 1000000) continue;           // not a plausible frame (units?)
-                a += (r.gpuEnd - r.simStart) / 1000.0;
-                b += r.presentEnd >= r.simStart ? (r.presentEnd - r.simStart) / 1000.0 : 0.0;
-                if (r.inputSample && r.gpuEnd >= r.inputSample) { c += (r.gpuEnd - r.inputSample) / 1000.0; ni++; }
-                g += r.gpuFrameUs / 1000.0;
-                q += r.queueEnd >= r.queueStart ? (r.queueEnd - r.queueStart) / 1000.0 : 0.0;
-                n++;
-                if (r.frameID > newest) newest = r.frameID;
-            }
-            // Rendered frames a second, from the game's own frame numbers (frame generation
-            // presents about twice as many).
-            {
-                static UINT64 prevNewest = 0;
-                static double prevT = 0.0;
-                const double tn = Now();
-                if (prevNewest && newest > prevNewest && newest - prevNewest < 2000 && tn - prevT > 0.5 && tn - prevT < 3.0)
-                {
-                    g_rfxRenderedFps.store((double)(newest - prevNewest) / (tn - prevT));
-                    g_rfxRenderedT.store(tn);
-                }
-                prevNewest = newest; prevT = tn;
-            }
-            g_rfxLastReport = newest;
-            if (n)
-            {
-                out.frames = n;
-                out.simGpuMs = a / n; out.simPresentMs = b / n; out.gpuFrameMs = g / n; out.queueMs = q / n;
-                if (ni) out.inputGpuMs = c / ni;
-                if (!g_rfxMarkersSeen && !g_rfxForced.load())
-                {
-                    g_rfxMarkersSeen = true;
-                    LOGI("BFI Presenter: game Reflex: latency markers seen (simulation start -> GPU finished %.1f ms)", out.simGpuMs);
-                }
-            }
+            if (!r.frameID || r.frameID <= g_rfxLastReport || !r.simStart || r.gpuEnd < r.simStart) continue;
+            if (r.gpuEnd - r.simStart > 1000000) continue;                 // not a plausible frame
+            a += (r.gpuEnd - r.simStart) / 1000.0;
+            b += r.presentEnd >= r.simStart ? (r.presentEnd - r.simStart) / 1000.0 : 0.0;
+            if (r.inputSample && r.gpuEnd >= r.inputSample) { c += (r.gpuEnd - r.inputSample) / 1000.0; ni++; }
+            g += r.gpuFrameUs / 1000.0;
+            ga += r.gpuActiveUs / 1000.0;
+            q += r.queueEnd >= r.queueStart ? (r.queueEnd - r.queueStart) / 1000.0 : 0.0;
+            sim += r.simEnd >= r.simStart ? (r.simEnd - r.simStart) / 1000.0 : 0.0;
+            sub += r.submitEnd >= r.submitStart ? (r.submitEnd - r.submitStart) / 1000.0 : 0.0;
+            n++;
+            if (r.frameID > newest) newest = r.frameID;
         }
+        if (n)
+        {
+            markers = true;
+            out.frames = n;
+            out.simGpuMs = a / n; out.simPresentMs = b / n; out.gpuFrameMs = g / n; out.queueMs = q / n;
+            out.gpuActiveMs = ga / n; out.simMs = sim / n; out.submitMs = sub / n;
+            if (ni) out.inputGpuMs = c / ni;
+        }
+        // Rendered frames a second, from the game's own frame numbers.
+        static UINT64 prevNewest = 0;
+        static double prevT = 0.0;
+        const double tn = Now();
+        if (prevNewest && newest > prevNewest && newest - prevNewest < 2000 && tn - prevT > 0.5 && tn - prevT < 3.0)
+        {
+            out.renderedFps = (double)(newest - prevNewest) / (tn - prevT);
+            g_rfxRenderedFps.store(out.renderedFps);
+            g_rfxRenderedT.store(tn);
+        }
+        prevNewest = newest; prevT = tn;
+        g_rfxLastReport = newest;
     }
-    const bool gameUses = seen || g_rfxMarkersSeen;
 
-    // "Also in games without Reflex": after 5 s with neither a sleep mode nor markers from the game.
-    if (s.reflex == 3 && !gameUses && !g_rfxForced.load() && Now() - g_rfxStartT > 5.0 && ReflexOwnDevice() && g_nvSleep)
-    {
-        g_rfxForced.store(true);
-        LOGI("BFI Presenter: Reflex: the game doesn't use it -- the presenter runs Reflex's sleep and markers around its Present");
-    }
-    if (g_rfxForced.load() && s.reflex != 3)
-    {
-        g_rfxForced.store(false);
-        LOGI("BFI Presenter: Reflex: forced mode off");
-    }
-
-    // Apply changes: on top of the game's own mode, or our own in the forced mode.
-    const bool want = s.reflex > 0 || us > 0;
-    if ((gameUses || g_rfxForced.load()) && o_NvSetSleepMode)
+    // The frame limit: on top of the game's own mode (as seen, or as the driver reports it).
+    const bool gameUses = seen || markers;
+    if (gameUses && (limitUs > 0 || appliedValid))
     {
         NvSleepParams base = {};
         if (seen) base = game;
-        else if (g_nvGetSleepStatus && dev)
+        else if (g_nvGetSleepStatus)
         {
             NvSleepStatus st = {};
             st.version = BFI_NVVER(NvSleepStatus);
             if (g_nvGetSleepStatus(dev, &st) == 0) base.lowLatency = st.lowLatency;
+            base.useMarkers = 1;
         }
-        base.useMarkers = 1;
-        NvSleepParams q = want ? ReflexWanted(base) : base;
-        q.version = BFI_NVVER(NvSleepParams);
-        // Turned off again: back to the game's own mode (or plain, if the game's call wasn't seen).
-        // Sent again every 2 s while wanted: the driver or the game can reset it (God of War with
-        // frame generation: the limit stopped holding after a while, with no call from the game seen).
+        base.version = BFI_NVVER(NvSleepParams);
+        NvSleepParams want = base;
+        if (limitUs > 0) want.minIntervalUs = (uint32_t)limitUs;
         static double lastSent = 0.0;
-        const bool refresh = want && Now() - lastSent > 2.0;
-        const bool need = want ? (!appliedValid || !SameSleep(applied, q) || refresh) : appliedValid;
-        if (need && dev)
+        const bool same = appliedValid && applied.minIntervalUs == want.minIntervalUs && applied.lowLatency == want.lowLatency &&
+                          applied.boost == want.boost;
+        const bool need = limitUs > 0 ? (!same || Now() - lastSent > 2.0) : appliedValid;
+        if (need)
         {
-            const bool quiet = appliedValid && SameSleep(applied, q);   // a periodic refresh: not logged
+            PFN_NvSetSleepMode set = o_NvSetSleepMode ? o_NvSetSleepMode : g_nvSetSleepMode;
+            const int r = set(dev, &want);
             lastSent = Now();
-            const int r = o_NvSetSleepMode(dev, &q);
             AcquireSRWLockExclusive(&g_rfxLock);
-            g_rfxApplied = q;
-            g_rfxAppliedValid = want;
+            g_rfxApplied = want;
+            g_rfxAppliedValid = limitUs > 0;
             ReleaseSRWLockExclusive(&g_rfxLock);
-            if (!quiet || r != 0)
-                LOGI("BFI Presenter: Reflex set: low latency %s%s, frame limit %u us (%d)%s", q.lowLatency ? "on" : "off",
-                     q.boost ? " + Boost" : "", q.minIntervalUs, r, want ? "" : " -- the game's own setting restored");
+            if (!same || r != 0)
+                LOGI("BFI Presenter: Reflex frame limit %s (%d)", limitUs > 0 ? "on: one presented frame per strobe cycle" :
+                     "off: the game's own setting", r);
         }
     }
-    EnterCriticalSection(&g_cfgLock);
-    g_status.rfxHook     = g_rfxHook.load();
-    g_status.rfxGameUses = gameUses ? 1 : 0;
-    g_status.rfxForced   = g_rfxForced.load() ? 1 : 0;
-    g_status.rfxGameLL    = seen ? game.lowLatency : -1;
-    g_status.rfxGameBoost = seen ? game.boost : -1;
-    g_status.rfxGameUs    = seen ? (int)game.minIntervalUs : -1;
-    AcquireSRWLockShared(&g_rfxLock);
-    g_status.rfxAppLL    = g_rfxAppliedValid ? g_rfxApplied.lowLatency : -1;
-    g_status.rfxAppBoost = g_rfxAppliedValid ? g_rfxApplied.boost : -1;
-    g_status.rfxAppUs    = g_rfxAppliedValid ? (int)g_rfxApplied.minIntervalUs : -1;
-    ReleaseSRWLockShared(&g_rfxLock);
-    g_status.rfxSimGpuMs = out.simGpuMs;
-    LeaveCriticalSection(&g_cfgLock);
+    out.limitUs = (limitUs > 0 && gameUses) ? limitUs : 0;
 }
 #else
-static void ReflexTick(const Settings &, double, bool, ReflexSecond &out) { out = ReflexSecond(); }
-static void ReflexGameReleased(UINT64) {}
-static void ReflexPresentStart(UINT64) {}
+static void ReflexTick(int, ReflexSecond &out) { out = ReflexSecond(); }
 #endif
 
 // DXGI's own Present and ResizeBuffers1, past any inline hooks, for the calls
@@ -5411,7 +5369,6 @@ template <class GetFrame, class ShowOwn>
 static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
 {
     const double enter = Now();
-    ReflexPresentStart(g_frameId + 1);
     FgCheckCaller();
     EnterCriticalSection(&g_submitLock);
     g_gtEnter = enter;
@@ -7157,38 +7114,24 @@ static void draw_overlay(reshade::api::effect_runtime *)
         }
         {
             bool ac = s.autoCap != 0;
-            if (ImGui::Checkbox("Automatic frame cap (test)", &ac)) s.autoCap = ac ? 1 : 0;
+            if (ImGui::Checkbox("Automatic frame cap", &ac)) s.autoCap = ac ? 1 : 0;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the Refresh rate cap: while the game can't hold the refresh rate, the cap drops to one\n"
-                                                          "game frame per strobe cycle (60 fps at 120 Hz with 2 frames), so every flash shows the next\n"
-                                                          "frame instead of frames dropped unevenly (judder). Back to Refresh rate when the game's frames\n"
-                                                          "fit a refresh again. Never with frame generation active.");
+                                                          "game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames), so every flash shows the\n"
+                                                          "next frame instead of frames dropped unevenly (judder). Back to Refresh rate when the game's\n"
+                                                          "frames fit a refresh again (its Reflex reports, or a short try every 30 to 120 s).\n"
+                                                          "With frame generation: stays at Refresh rate and sets Reflex's frame limit to one presented\n"
+                                                          "frame per strobe cycle (DLSS frame generation; the game must use Reflex).");
             if (s.autoCap)
             {
                 ImGui::SameLine();
                 if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
-                else ImGui::TextDisabled("%s", st.fgActive ? "(Refresh rate: frame generation active)" :
+                else if (st.fgActive)
+                {
+                    if (st.rfxLimitUs > 0) ImGui::TextDisabled("(frame generation: Reflex frame limit %.1f ms)", st.rfxLimitUs / 1000.0);
+                    else ImGui::TextDisabled("(frame generation: Refresh rate, no Reflex in this game)");
+                }
+                else ImGui::TextDisabled("%s", st.autoCapProbe ? "(trying Refresh rate)" :
                                                st.autoCapDown ? "(in use: one game frame per strobe cycle)" : "(in use: Refresh rate)");
-            }
-        }
-        {
-            ImGui::Combo("NVIDIA Reflex (test)", &s.reflex, "The game's own setting\0On\0On + Boost\0On + Boost, also in games without Reflex\0");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Overrides the game's Reflex low-latency mode (NVIDIA GPUs). 'Also in games without Reflex'\n"
-                                                          "runs Reflex's sleep around the game's Present when the game doesn't use it itself.\n"
-                                                          "The timing log writes BFIPresenter_reflex_*.csv with the latency each second.");
-            ImGui::Combo("Reflex frame limit (test)", &s.reflexLimit, "Off\0One frame per strobe cycle\0Half of that (frame generation 2x)\0");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reflex's own frame limiter at the strobe rate (60 fps at 120 Hz with 2 frames): the driver paces\n"
-                                                          "the game where it reads input. With frame generation, try it with the Refresh rate cap; if the\n"
-                                                          "limit counts rendered frames, 'Half of that' gives one presented frame per flash with 2x.");
-            if (st.rfxHook == -1) ImGui::TextDisabled("Reflex: not available (NVIDIA driver's NvAPI not found)");
-            else if (st.rfxHook == 1)
-            {
-                char g[64], a[64];
-                if (st.rfxGameLL >= 0) snprintf(g, sizeof(g), "%s%s, limit %d us", st.rfxGameLL ? "on" : "off", st.rfxGameBoost > 0 ? " + Boost" : "", st.rfxGameUs);
-                else snprintf(g, sizeof(g), "%s", st.rfxGameUses ? "uses it (markers)" : "not used");
-                if (st.rfxAppLL >= 0) snprintf(a, sizeof(a), "%s%s, limit %d us", st.rfxAppLL ? "on" : "off", st.rfxAppBoost > 0 ? " + Boost" : "", st.rfxAppUs);
-                else snprintf(a, sizeof(a), "nothing");
-                ImGui::TextDisabled("Reflex -- game: %s   applied: %s%s", g, a, st.rfxForced ? "   (forced)" : "");
-                if (st.rfxSimGpuMs >= 0.0) ImGui::TextDisabled("Reflex latency: simulation start -> GPU finished %.1f ms", st.rfxSimGpuMs);
             }
             if (st.relFlashMs >= 0.0) ImGui::TextDisabled("Game released -> lit flash: %.1f ms", st.relFlashMs);
         }

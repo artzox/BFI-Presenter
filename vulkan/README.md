@@ -75,7 +75,7 @@ No log at all means the layer isn't active: check that `BFIPresenter.ini` is in 
 
 - **Strobe:** BFI and Variable MPRT; frames per cycle, gain, dark floor, roll-off, sine and invert; rolling scan with phosphor decay or seam softness.
 - **Output:** SDR, scRGB and HDR10 (Auto detection), and SDR games presented as HDR10 with highlight expansion.
-- **Pacing:** Smooth and Lowest latency; game frame cap (Refresh / Half / Quarter); just-in-time release at Half / Quarter; Later release at Refresh; automatic frames ahead; queue one refresh ahead.
+- **Pacing:** Lowest latency (default for new ini files) and Smooth; game frame cap (Refresh / Half / Quarter); automatic frame cap at Refresh (one game frame per strobe cycle while the game can't hold the refresh rate, back after a ~3 s try that holds it, every 30–120 s; not with frame generation); just-in-time release at Half / Quarter; Later release at Refresh; automatic frames ahead; queue one refresh ahead.
 - **Guards:** hitch guard and ABL guard.
 - **Logs:** `BFIPresenterVK.log` and a timing log, `BFIPresenterVK_log_<date>_<time>.csv`, with columns close to the DX log's.
 - **Exclusive fullscreen and recovery:** the presenter's swap chain runs in exclusive fullscreen, and presentation that has slowed down for good is recovered with a swap chain rebuild (see `VulkanExclusiveFullscreen`, `VulkanAutoRecover` below).

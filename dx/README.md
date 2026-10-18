@@ -38,11 +38,12 @@ The [Vulkan layer](../vulkan/README.md) covers Vulkan games and DirectX 9–11 g
 |---|---|---|---|---|
 | Game holds 120 fps | Refresh rate | Lowest latency | — | Lowest latency (~29 ms input to screen on the A95L) |
 | Game holds 120 fps easily (light) | Refresh rate | Lowest latency | Later release on | ~5 ms less (Cuphead: 16.7 → 11.3 ms release to display) |
-| Game runs 60–110 fps | Half refresh | Smooth | Just-in-time (default) | Every frame lit exactly once at an even 60 |
-| Game below 60 fps | Quarter refresh | Smooth | Just-in-time (default) | Even 30 fps; each frame lit twice (double image in motion) |
+| Game runs 60–110 fps | Refresh rate + Automatic frame cap, or Half refresh | Lowest latency | Just-in-time (default) | Every frame lit exactly once at an even 60 |
+| Frame generation | Refresh rate + Automatic frame cap | Lowest latency | — | Reflex frame limit at one presented frame per strobe cycle (God of War Ragnarok: a new frame on 60 of 60 flashes, ~21.5 ms release to flash) |
+| Game below 60 fps | Quarter refresh | Lowest latency | Just-in-time (default) | Even 30 fps; each frame lit twice (double image in motion) |
 | Flashes in a GPU-heavy game | any | any | — | Start the launcher (Steam) as administrator for a realtime presenter queue |
 
-Avoid Smooth at the Refresh cap: it adds a refresh of latency and doesn't make 120 fps motion more even.
+Avoid Smooth at the Refresh cap: it adds a refresh of latency and doesn't make 120 fps motion more even. With frame generation it added a full cycle (God of War Ragnarok: ~38 ms against ~21.5 ms release to flash) for no smoother motion. At Half or Quarter it only helps while just-in-time release keeps hitting its limit.
 
 ## The overlay
 
@@ -97,7 +98,8 @@ Settings apply immediately. **Save to BFIPresenter.ini** keeps them; **Reload in
 | Control | ini key (default) | What it does |
 |---|---|---|
 | Game frame cap | `CapGameToRefresh` (1) | 0 off, 1 Refresh rate, 2 Half refresh (60 fps at 120 Hz, every frame lit once), 3 Quarter refresh (30 fps, every frame lit twice), 4 one game frame per strobe cycle (refresh ÷ Frames: 60 fps at 360 Hz with 6 frames, 90 fps with 4), 5 custom (refresh ÷ `CapDivisor`, 1–8; use a multiple of Frames). Counted against the presenter's refreshes, so it stays in step with the strobe |
-| Frame pacing | `FramePacing` (0) | 0 Smooth: every game frame shown once, in order, one held in reserve. 1 Lowest latency: the newest finished frame (waits up to 3 ms for an expected frame that is about to finish) |
+| Automatic frame cap | `AutoFrameCap` (1) | Refresh cap only. After 3 s below 95% of the refresh rate: one game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames), so frames aren't dropped unevenly. Back to Refresh after 10 s in which the game's Reflex reports (GPU, simulation and submit time per frame) stay under 85% of a refresh; without Reflex, a ~3 s try at Refresh after 30 s, 60 s, then every 120 s, kept if the game holds 95% of the refresh rate. With frame generation (presented frames well above Reflex's rendered frames; FSR / XeSS frame generation by its DLL) it stays at Refresh and sets Reflex's frame limit to one presented frame per strobe cycle, sent again every 2 s; the game's own Reflex setting comes back when frame generation stops |
+| Frame pacing | `FramePacing` (1) | 1 Lowest latency: the newest finished frame (waits up to 3 ms for an expected frame that is about to finish). 0 Smooth: every game frame shown once, in order, one held in reserve. New ini files get 1; existing ones keep their value |
 | Just-in-time release at Half / Quarter cap | `CapJustInTime` (1) | Each frame targets a lit refresh and the game is released at that refresh's vblank minus its measured frame time and the margin. No repeat-then-skip at Half, no 1-then-3-cycle frames at Quarter. At its limit it releases as early as the cap allows |
 | Later release at Refresh cap | `LaterRelease` (0) | Refresh cap + Lowest latency: releases the game just in time for the pick instead of a full refresh earlier, so its input is read later. Helps light games; does nothing while frames take nearly a whole refresh. Not for frame generation |
 | Just-in-time safety margin | `LaterReleaseMarginMs` (1.5) | Added to the measured frame time (95th percentile of the last 128 frames). Widens 1 ms after a second with 2+ misses (up to 3 ms over the base), narrows after 5 clean seconds. The status line shows state, frame time and margin |
@@ -174,7 +176,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 
 - **Below the cap's frame rate, motion is uneven.** The strobe shows 60 lit images a second at 120 Hz; use the cap that the game can hold.
 - **Game hitches and GPU stalls show as flashes.** A stall longer than a refresh holds the current refresh on screen. Realtime queue priority and GPU headroom help.
-- **Frame generation:** set Game frame cap to Refresh rate, not Half refresh (Half throws away half the generated frames). DLSS FG 2×–4× works in most tested games, and Lossless Scaling mostly worked with its VSync at 1/2; in a few, Reflex pacing misreads the presenter and throttles the game (Pragmata). OptiScaler FSR FG worked in Shadow of the Tomb Raider.
+- **Frame generation:** set Game frame cap to Refresh rate, not Half refresh (Half throws away half the generated frames). With the automatic frame cap on, the presenter sets Reflex's frame limit to one presented frame per strobe cycle in Reflex games, so every flash gets the next frame; the overlay shows the limit in use. DLSS FG 2×–4× works in most tested games, and Lossless Scaling mostly worked with its VSync at 1/2; in a few, Reflex pacing misreads the presenter and throttles the game (Pragmata). OptiScaler FSR FG worked in Shadow of the Tomb Raider.
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR).
 - **Exclusive fullscreen in DX11 games** is not supported; use borderless (windowed) fullscreen. The Rogue Prince of Persia hung its presenter when it left exclusive fullscreen.
 - **A presenter that won't stop** (stuck in its present for 5 s while the game resizes or recreates its swap chain): BFI switches off for the rest of the session and the game continues on its own frames. Restart the game to use BFI again.
