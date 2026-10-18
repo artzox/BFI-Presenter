@@ -8,6 +8,7 @@
 #include <shlobj.h>
 #include <winhttp.h>
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -273,6 +274,9 @@ static std::wstring RegString(HKEY root, const wchar_t *sub, const wchar_t *val,
     DWORD sz = sizeof(buf);
     if (RegGetValueW(root, sub, val, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | extra, nullptr, buf, &sz) == ERROR_SUCCESS)
         return buf;
+    sz = sizeof(buf);     // stricter implementations (Wine) refuse REG_EXPAND_SZ without RRF_NOEXPAND
+    if (RegGetValueW(root, sub, val, RRF_RT_REG_SZ | extra, nullptr, buf, &sz) == ERROR_SUCCESS)
+        return buf;
     return {};
 }
 
@@ -281,6 +285,22 @@ static std::vector<std::wstring> RegSubkeys(HKEY root, const wchar_t *sub)
     std::vector<std::wstring> out;
     HKEY k;
     if (RegOpenKeyExW(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) return out;
+    wchar_t name[512];
+    for (DWORD i = 0;; i++)
+    {
+        DWORD n = 512;
+        if (RegEnumKeyExW(k, i, name, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        out.push_back(name);
+    }
+    RegCloseKey(k);
+    return out;
+}
+
+static std::vector<std::wstring> RegSubkeysView(HKEY root, const wchar_t *sub, REGSAM view)
+{
+    std::vector<std::wstring> out;
+    HKEY k;
+    if (RegOpenKeyExW(root, sub, 0, KEY_READ | view, &k) != ERROR_SUCCESS) return out;
     wchar_t name[512];
     for (DWORD i = 0;; i++)
     {
@@ -1280,6 +1300,9 @@ static void DetectShader(Game &g)
     g.shaderOn = PresetHasShader(g.presetPath);
 }
 
+static bool SteamOnline(const std::string &appid);
+static std::string FindAntiCheat(const std::wstring &root, const std::wstring &exeDir);
+
 void Detect(Game &g)
 {
     g.notes.clear();
@@ -1301,6 +1324,8 @@ void Detect(Game &g)
     g.apis = (g.pcgwKnown && g.pcgwApis) ? g.pcgwApis : g.exeApis;
     g.tested = TestedFor(g.name);
     std::wstring dir = DirOf(g.exe);
+    g.online = g.store == "Steam" && !g.appid.empty() && SteamOnline(g.appid);
+    g.antiCheat = FindAntiCheat(g.root, dir);
 
     for (auto n : kReShadeNames)
     {
@@ -1417,6 +1442,9 @@ void Detect(Game &g)
     if (g.apis & ApiGL && !(g.apis & (ApiD3D11 | ApiD3D12 | ApiD3D9)) && !g.dgvoodoo)
         g.notes.push_back("OpenGL needs an NVIDIA GPU. Old OpenGL games may need the NVIDIA profile setting Vulkan/OpenGL present method = Prefer layered on DXGI swapchain.");
     if (g.addonWrongBits) g.notes.push_back("An add-on for the wrong bitness is installed; Install replaces it with the right one.");
+    if (g.route == Route::Vulkan && ExeRunsAsAdmin(g.exe))
+        g.notes.push_back("The game is set to run as administrator: the Vulkan layer only loads there when it is installed for "
+                          "all users (Vulkan layer: All users).");
 }
 
 // ------------------------------------------------------------------ discovery
@@ -1455,6 +1483,184 @@ static std::string VdfValue(const std::string &text, const std::string &key)
     return out;
 }
 
+// Steam's local app info cache (appcache\appinfo.vdf, binary KeyValues): for each app it lists,
+// whether "common/onlyvrsupport" is set, and whether "common/category" has a multiplayer or online
+// category. Formats 27-29 (29 keeps key names in a string table).
+struct SteamFlags { bool vr = false, online = false; };
+static bool OnlineCategory(const std::string &k)
+{
+    // Multi-player, MMO, Cross-Platform Multiplayer, Online PvP, Online Co-op, PvP
+    static const char *ids[] = { "category_1", "category_20", "category_27", "category_36", "category_38", "category_49" };
+    for (const char *id : ids) if (k == id) return true;
+    return false;
+}
+static std::map<std::string, SteamFlags> SteamAppFlags(const std::wstring &steam)
+{
+    std::map<std::string, SteamFlags> out;
+    std::ifstream f(fs::path(Join(steam, L"appcache\\appinfo.vdf")), std::ios::binary);
+    if (!f) return out;
+    std::vector<unsigned char> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto u32 = [&](size_t p) { uint32_t v = 0; if (p + 4 <= d.size()) memcpy(&v, &d[p], 4); return v; };
+    if (d.size() < 16) return out;
+    const uint32_t magic = u32(0);
+    if (magic != 0x07564427 && magic != 0x07564428 && magic != 0x07564429) return out;
+    const bool v29 = magic == 0x07564429;
+    std::vector<std::string> strs;
+    size_t p = 8;
+    if (v29)
+    {
+        uint64_t off = 0;
+        memcpy(&off, &d[8], 8);
+        p = 16;
+        if (off + 4 > d.size()) return out;
+        size_t q = (size_t)off;
+        const uint32_t n = u32(q);
+        q += 4;
+        for (uint32_t i = 0; i < n && q < d.size(); i++)
+        {
+            size_t e = q;
+            while (e < d.size() && d[e]) e++;
+            strs.emplace_back((const char *)&d[q], e - q);
+            q = e + 1;
+        }
+    }
+    const size_t head = 4 + 4 + 8 + 20 + 4 + (magic == 0x07564427 ? 0 : 20);   // state, updated, token, sha1, change, binary sha1
+    while (p + 8 <= d.size())
+    {
+        const uint32_t appid = u32(p), size = u32(p + 4);
+        if (appid == 0) break;
+        const size_t end = p + 8 + (size_t)size;
+        if (end > d.size()) break;
+        size_t q = p + 8 + head;
+        bool vr = false, online = false, ok = true;
+        std::vector<std::string> path;
+        auto key = [&](std::string &k) {
+            if (v29)
+            {
+                if (q + 4 > end) return false;
+                const uint32_t i = u32(q);
+                q += 4;
+                if (i >= strs.size()) return false;
+                k = strs[i];
+                return true;
+            }
+            size_t e = q;
+            while (e < end && d[e]) e++;
+            if (e >= end) return false;
+            k.assign((const char *)&d[q], e - q);
+            q = e + 1;
+            return true;
+        };
+        while (ok && q < end)
+        {
+            const unsigned char t = d[q++];
+            if (t == 8 || t == 11)
+            {
+                if (path.empty()) break;
+                path.pop_back();
+                continue;
+            }
+            std::string k;
+            if (!key(k)) { ok = false; break; }
+            const bool want = path.size() >= 1 && LowerA(path.back()) == "common" && LowerA(k) == "onlyvrsupport";
+            const bool cat = path.size() >= 2 && LowerA(path.back()) == "category" && LowerA(path[path.size() - 2]) == "common" &&
+                             OnlineCategory(LowerA(k));
+            switch (t)
+            {
+            case 0: path.push_back(k); break;
+            case 1:
+            {
+                size_t e = q;
+                while (e < end && d[e]) e++;
+                if (e >= end) { ok = false; break; }
+                const bool one = std::string((const char *)&d[q], e - q) == "1";
+                if (want) vr = one;
+                if (cat && one) online = true;
+                q = e + 1;
+                break;
+            }
+            case 2: case 3: case 4: case 6:
+                if (want) vr = u32(q) == 1;
+                if (cat && u32(q) == 1) online = true;
+                q += 4;
+                break;
+            case 7: case 10: q += 8; break;
+            case 5:
+                while (q + 1 < end && (d[q] || d[q + 1])) q += 2;
+                q += 2;
+                break;
+            default: ok = false; break;
+            }
+        }
+        out[std::to_string(appid)] = { vr, online };
+        p = end;
+    }
+    return out;
+}
+
+static std::wstring SteamDir()
+{
+    std::wstring steam = RegString(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath");
+    if (steam.empty()) steam = RegString(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Valve\\Steam", L"InstallPath");
+    for (auto &c : steam) if (c == L'/') c = L'\\';
+    return steam;
+}
+
+// Online flag for a Steam game, from appinfo.vdf (read once per run; Detect runs on worker threads).
+static bool SteamOnline(const std::string &appid)
+{
+    static std::mutex m;
+    static bool loaded = false;
+    static std::map<std::string, SteamFlags> flags;
+    std::lock_guard<std::mutex> l(m);
+    if (!loaded)
+    {
+        loaded = true;
+        const std::wstring steam = SteamDir();
+        if (!steam.empty()) flags = SteamAppFlags(steam);
+    }
+    auto it = flags.find(appid);
+    return it != flags.end() && it->second.online;
+}
+
+// Anti-cheat in the game's folder or next to its exe (Easy Anti-Cheat, BattlEye and others).
+static std::string FindAntiCheat(const std::wstring &root, const std::wstring &exeDir)
+{
+    std::string found;
+    auto look = [&](const std::wstring &dir) {
+        if (dir.empty() || !found.empty()) return;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(Join(dir, L"*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do
+        {
+            const std::string n = LowerA(U8(fd.cFileName));
+            if (n.find("easyanticheat") != std::string::npos || n == "start_protected_game.exe" || n.find("eac_launcher") == 0)
+                found = "Easy Anti-Cheat";
+            else if (n.find("battleye") != std::string::npos || n.find("beservice") == 0)
+                found = "BattlEye";
+            else if (n.find("anticheat") != std::string::npos || n.find("anti-cheat") != std::string::npos)
+                found = "anti-cheat";
+        } while (found.empty() && FindNextFileW(h, &fd));
+        FindClose(h);
+    };
+    look(root);
+    if (Lower(exeDir) != Lower(root)) look(exeDir);
+    if (found.empty() && !exeDir.empty()) look(DirOf(exeDir));
+    return found;
+}
+
+// A title with "VR" as a word of its own (Skyrim VR, Fallout 4 VR): the fallback where Steam's cache
+// doesn't say (other stores, folders).
+static bool VrName(const std::string &name)
+{
+    for (size_t i = 0; i + 1 < name.size(); i++)
+        if (name[i] == 'V' && name[i + 1] == 'R' && (i == 0 || !isalnum((unsigned char)name[i - 1])) &&
+            (i + 2 == name.size() || !isalnum((unsigned char)name[i + 2])))
+            return true;
+    return false;
+}
+
 static void FindSteam(std::vector<Game> &out, std::set<std::wstring> &seen)
 {
     std::wstring steam = RegString(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath");
@@ -1469,6 +1675,7 @@ static void FindSteam(std::vector<Game> &out, std::set<std::wstring> &seen)
         std::string v = VdfValue(rest, "path");
         if (!v.empty()) libs.push_back(W(v));
     }
+    const std::map<std::string, SteamFlags> vrOnly = SteamAppFlags(steam);
     std::set<std::wstring> libSeen;
     for (auto &lib : libs)
     {
@@ -1494,6 +1701,8 @@ static void FindSteam(std::vector<Game> &out, std::set<std::wstring> &seen)
                     std::wstring f = fd.cFileName;   // appmanifest_<id>.acf
                     g->appid = U8(f.substr(12, f.size() - 16));
                 }
+                auto it = vrOnly.find(g->appid);
+                g->vrOnly = it != vrOnly.end() ? it->second.vr : VrName(g->name);
             }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
@@ -1533,7 +1742,7 @@ static void FindEpic(std::vector<Game> &out, std::set<std::wstring> &seen)
         std::string name = JsonString(j, "DisplayName"), loc = JsonString(j, "InstallLocation");
         if (j.find("\"bIsIncompleteInstall\": true") != std::string::npos) continue;
         if (LowerA(JsonString(j, "AppCategories")).find("engines") != std::string::npos) continue;
-        AddGame(out, seen, name, "Epic", W(loc));
+        if (Game *g = AddGame(out, seen, name, "Epic", W(loc))) g->vrOnly = VrName(g->name);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
@@ -1547,7 +1756,7 @@ static void FindGog(std::vector<Game> &out, std::set<std::wstring> &seen)
         std::wstring name = RegString(HKEY_LOCAL_MACHINE, k.c_str(), L"gameName");
         std::wstring path = RegString(HKEY_LOCAL_MACHINE, k.c_str(), L"path");
         if (RegString(HKEY_LOCAL_MACHINE, k.c_str(), L"dependsOn").size()) continue;   // DLC
-        AddGame(out, seen, U8(name), "GOG", path);
+        if (Game *g = AddGame(out, seen, U8(name), "GOG", path)) g->vrOnly = VrName(g->name);
     }
 }
 
@@ -1568,10 +1777,32 @@ static void FindXbox(std::vector<Game> &out, std::set<std::wstring> &seen)
             std::wstring n = fd.cFileName;
             if (n == L"." || n == L".." || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || Lower(n) == L"gamesave") continue;
             std::wstring c = Join(Join(xb, n), L"Content");
-            AddGame(out, seen, U8(n), "Xbox", DirExists(c) ? c : Join(xb, n));
+            if (Game *g = AddGame(out, seen, U8(n), "Xbox", DirExists(c) ? c : Join(xb, n))) g->vrOnly = VrName(g->name);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
+}
+
+// Battle.net games register an uninstaller entry pointing at Blizzard's uninstaller (Activision's games too).
+static void FindBattleNet(std::vector<Game> &out, std::set<std::wstring> &seen, int *count = nullptr)
+{
+    const wchar_t *base = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+    for (HKEY root : { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER })
+        for (REGSAM view : { (REGSAM)KEY_WOW64_32KEY, (REGSAM)KEY_WOW64_64KEY })
+            for (auto &id : RegSubkeysView(root, base, view))
+            {
+                const std::wstring k = std::wstring(base) + L"\\" + id;
+                const DWORD flag = view == KEY_WOW64_32KEY ? RRF_SUBKEY_WOW6432KEY : RRF_SUBKEY_WOW6464KEY;
+                const std::wstring un = Lower(RegString(root, k.c_str(), L"UninstallString", flag));
+                if (un.find(L"blizzard uninstaller") == std::wstring::npos && un.find(L"battle.net\\agent") == std::wstring::npos) continue;
+                const std::wstring name = RegString(root, k.c_str(), L"DisplayName", flag);
+                if (Lower(name) == L"battle.net") continue;
+                std::wstring loc = RegString(root, k.c_str(), L"InstallLocation", flag);
+                while (!loc.empty() && (loc.back() == L'"' || loc.back() == L' ')) loc.pop_back();
+                if (!loc.empty() && loc.front() == L'"') loc.erase(0, 1);
+                if (count) { if (DirExists(loc) && seen.insert(Lower(loc)).second) (*count)++; continue; }
+                if (Game *g = AddGame(out, seen, U8(name), "Battle.net", loc)) g->vrOnly = VrName(g->name);
+            }
 }
 
 static bool DirHasExe(const std::wstring &dir)
@@ -1588,7 +1819,11 @@ static bool DirHasExe(const std::wstring &dir)
 static void FindInFolder(const std::wstring &folder, std::vector<Game> &out, std::set<std::wstring> &seen)
 {
     if (!DirExists(folder)) return;
-    if (DirHasExe(folder)) { AddGame(out, seen, U8(NameOf(folder)), "Folder", folder); return; }
+    if (DirHasExe(folder))
+    {
+        if (Game *g = AddGame(out, seen, U8(NameOf(folder)), "Folder", folder)) g->vrOnly = VrName(g->name);
+        return;
+    }
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(Join(folder, L"*").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -1598,7 +1833,7 @@ static void FindInFolder(const std::wstring &folder, std::vector<Game> &out, std
         if (n == L"." || n == L".." || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         std::wstring l = Lower(n);
         if (l == L"steamapps" || l == L"$recycle.bin" || l == L"system volume information") continue;
-        AddGame(out, seen, U8(n), "Folder", Join(folder, n));
+        if (Game *g = AddGame(out, seen, U8(n), "Folder", Join(folder, n))) g->vrOnly = VrName(g->name);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
@@ -1608,6 +1843,7 @@ ScanOptions LoadScanOptions()
     ScanOptions o;
     auto get = [](const wchar_t *k) { return GetPrivateProfileIntW(L"Libraries", k, 1, SettingsPath().c_str()) != 0; };
     o.steam = get(L"Steam"); o.epic = get(L"Epic"); o.gog = get(L"GOG"); o.xbox = get(L"Xbox");
+    o.bnet = get(L"BattleNet"); o.skipVr = get(L"SkipVR");
     o.folders = LoadFolders();
     return o;
 }
@@ -1616,6 +1852,7 @@ void SaveScanOptions(const ScanOptions &o)
 {
     auto put = [](const wchar_t *k, bool v) { WritePrivateProfileStringW(L"Libraries", k, v ? L"1" : L"0", SettingsPath().c_str()); };
     put(L"Steam", o.steam); put(L"Epic", o.epic); put(L"GOG", o.gog); put(L"Xbox", o.xbox);
+    put(L"BattleNet", o.bnet); put(L"SkipVR", o.skipVr);
     SaveFolders(o.folders);
 }
 
@@ -1629,7 +1866,16 @@ LibraryInfo FindLibraries()
     {
         std::string vdf = ReadText(Join(steam, L"steamapps\\libraryfolders.vdf"));
         int libs = 0;
-        for (size_t p = 0; (p = LowerA(vdf).find("\"path\"", p)) != std::string::npos; p += 6) libs++;
+        std::set<std::string> libSeen;
+        li.steamLibs.push_back(U8(steam));
+        libSeen.insert(LowerA(U8(steam)));
+        for (size_t p = 0; (p = LowerA(vdf).find("\"path\"", p)) != std::string::npos; p += 6)
+        {
+            libs++;
+            std::string v = VdfValue(vdf.substr(p), "path");
+            for (auto &ch : v) if (ch == '/') ch = '\\';
+            if (!v.empty() && libSeen.insert(LowerA(v)).second) li.steamLibs.push_back(v);
+        }
         li.steam = true;
         li.steamText = U8(steam) + (libs > 1 ? " and " + std::to_string(libs - 1) + " more librar" + (libs > 2 ? "ies" : "y") : "");
     }
@@ -1660,10 +1906,18 @@ LibraryInfo FindLibraries()
         li.xbox = !drives.empty();
         li.xboxText = drives.empty() ? "no XboxGames folder found" : "XboxGames on " + drives;
     }
+    {
+        std::vector<Game> none;
+        std::set<std::wstring> seen;
+        int n = 0;
+        FindBattleNet(none, seen, &n);
+        li.bnet = n > 0;
+        li.bnetText = n ? std::to_string(n) + " game" + (n > 1 ? "s" : "") + " installed" : "no installed games found";
+    }
     return li;
 }
 
-std::vector<Game> FindGames(const ScanOptions &opt, const std::function<void(const std::string &)> &progress)
+std::vector<Game> FindGames(const ScanOptions &opt, const std::function<void(const std::string &)> &progress, int *vrSkipped)
 {
     std::vector<Game> out;
     out.reserve(4096);   // AddGame hands out pointers into the vector
@@ -1673,7 +1927,14 @@ std::vector<Game> FindGames(const ScanOptions &opt, const std::function<void(con
     if (opt.epic) FindEpic(out, seen);
     if (opt.gog) FindGog(out, seen);
     if (opt.xbox) FindXbox(out, seen);
+    if (opt.bnet) FindBattleNet(out, seen);
     for (auto &f : opt.folders) FindInFolder(f, out, seen);
+    if (opt.skipVr)
+    {
+        const size_t before = out.size();
+        out.erase(std::remove_if(out.begin(), out.end(), [](const Game &g) { return g.vrOnly; }), out.end());
+        if (vrSkipped) *vrSkipped = (int)(before - out.size());
+    }
     int i = 0;
     for (auto &g : out)
     {
@@ -1748,28 +2009,83 @@ void DetectAll(std::vector<Game> &games, const std::function<void(const std::str
     SaveCache();
 }
 
+bool IsElevated()
+{
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    TOKEN_ELEVATION e{};
+    DWORD n = 0;
+    const bool ok = GetTokenInformation(tok, TokenElevation, &e, sizeof(e), &n) && e.TokenIsElevated;
+    CloseHandle(tok);
+    return ok;
+}
+
+static bool RegDword(HKEY root, const wchar_t *sub, const wchar_t *val, DWORD &out)
+{
+    DWORD sz = sizeof(out);
+    return RegGetValueW(root, sub, val, RRF_RT_REG_DWORD, nullptr, &out, &sz) == ERROR_SUCCESS;
+}
+
+// Windows' compatibility setting "Run this program as an administrator" for an exe.
+bool ExeRunsAsAdmin(const std::wstring &exe)
+{
+    if (exe.empty()) return false;
+    for (HKEY root : { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE })
+    {
+        const std::wstring v = RegString(root, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers", exe.c_str());
+        if (Lower(v).find(L"runasadmin") != std::wstring::npos) return true;
+    }
+    return false;
+}
+
+// Signs that games on this PC run elevated, where the Vulkan loader ignores per-user layers.
+static std::string ElevatedWhy()
+{
+    DWORD lua = 1;
+    if (RegDword(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", L"EnableLUA", lua) && lua == 0)
+        return "User Account Control is turned off, so programs run as administrator";
+    std::wstring steamExe = RegString(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamExe");
+    for (auto &c : steamExe) if (c == L'/') c = L'\\';
+    if (!steamExe.empty())
+    {
+        // The compatibility key is the exe's path as Windows spells it; try both spellings of the drive letter.
+        std::wstring alt = steamExe;
+        if (!alt.empty()) alt[0] = (wchar_t)(iswlower(alt[0]) ? towupper(alt[0]) : towlower(alt[0]));
+        if (ExeRunsAsAdmin(steamExe) || ExeRunsAsAdmin(alt)) return "Steam is set to run as administrator, so its games do too";
+    }
+    if (IsElevated()) return "the Manager itself runs as administrator, so games may too";
+    return {};
+}
+
 VulkanLayerState DetectVulkanLayer()
 {
     VulkanLayerState s;
-    for (auto &v : RegValueNames(HKEY_CURRENT_USER, L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers"))
-    {
-        std::wstring l = Lower(v);
-        if (l.find(L"vklayer_bfi_presenter.json") != std::wstring::npos && Exists(v))
-        {
-            s.dir = DirOf(v);
-            std::wstring dll = Join(s.dir, L"BFIPresenterVK.dll");
-            s.installed = Exists(dll);
-            if (s.installed) s.version = BfiVersionOf(dll, true);
-        }
-    }
+    // The loader lists machine-wide layers first, then per-user ones; earlier = nearer the game.
+    int idx = 0, ourIdx = -1, reshadeIdx = -1;
     for (HKEY root : { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER })
         for (auto &v : RegValueNames(root, L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers"))
-            if (Lower(v).find(L"reshade") != std::wstring::npos && Exists(v))
+        {
+            idx++;
+            const std::wstring l = Lower(v);
+            if (l.find(L"vklayer_bfi_presenter.json") != std::wstring::npos && Exists(v))
+            {
+                const std::wstring dll = Join(DirOf(v), L"BFIPresenterVK.dll");
+                if (!Exists(dll)) continue;
+                (root == HKEY_LOCAL_MACHINE ? s.machine : s.user) = true;
+                if (ourIdx < 0) ourIdx = idx;
+                if (!s.installed || root == HKEY_CURRENT_USER) { s.dir = DirOf(v); s.version = BfiVersionOf(dll, true); }
+                s.installed = true;
+            }
+            else if (l.find(L"reshade") != std::wstring::npos && Exists(v))
             {
                 s.reshadeLayer = true;
+                if (reshadeIdx < 0) reshadeIdx = idx;
                 std::wstring dll = Join(DirOf(v), L"ReShade64.dll");
                 if (Exists(dll)) s.reshadeVersion = ShortVersion(ReadDllInfo(dll).version);
             }
+        }
+    s.reshadeAfter = ourIdx >= 0 && reshadeIdx > ourIdx;
+    s.elevatedWhy = ElevatedWhy();
     return s;
 }
 
@@ -2111,7 +2427,30 @@ std::string InstallVulkanLayer(const Source &src)
         RegSetValueExW(k, v.c_str(), 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
     }
     RegCloseKey(k);
+    // Running as administrator (User Account Control off, or started that way): register for all
+    // users too, so games run as administrator load it as well.
+    if (IsElevated()) RegisterVulkanLayerMachine(true, dest);
     Log(oldV.empty() ? "install" : "update", "Vulkan layer", Join(dest, L"BFIPresenterVK.dll"), oldV, src.vkVersion);
+    return {};
+}
+
+std::string RegisterVulkanLayerMachine(bool add, const std::wstring &dir)
+{
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kVkKey, 0, nullptr, 0, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, nullptr, &k, nullptr) != ERROR_SUCCESS)
+        return "Couldn't open the all-users Vulkan layer registry key (needs administrator rights).";
+    // Ours removed (any folder), then added again so it is listed last, after ReShade.
+    for (auto &v : RegValueNames(HKEY_LOCAL_MACHINE, kVkKey))
+        if (Lower(v).find(L"vklayer_bfi_presenter") != std::wstring::npos) RegDeleteValueW(k, v.c_str());
+    if (add)
+        for (auto n : { L"VkLayer_BFI_presenter.json", L"VkLayer_BFI_presenter32.json" })
+        {
+            const std::wstring v = Join(dir, n);
+            DWORD zero = 0;
+            RegSetValueExW(k, v.c_str(), 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
+        }
+    RegCloseKey(k);
+    Log(add ? "install" : "remove", "Vulkan layer (all users)", Join(dir, L"BFIPresenterVK.dll"), "", "");
     return {};
 }
 
@@ -2124,6 +2463,7 @@ std::string UninstallVulkanLayer()
             if (Lower(v).find(L"vklayer_bfi_presenter") != std::wstring::npos) RegDeleteValueW(k, v.c_str());
         RegCloseKey(k);
     }
+    if (IsElevated()) RegisterVulkanLayerMachine(false, Join(DataDir(), L"Vulkan"));   // else the caller asks for rights
     Log("remove", "Vulkan layer", Join(DataDir(), L"Vulkan"), DetectVulkanLayer().version, "");
     return {};
 }

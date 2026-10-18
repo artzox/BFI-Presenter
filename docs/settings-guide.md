@@ -124,13 +124,18 @@ Limits how fast the game runs so it stays in step with the flashing.
 - **Custom** (`CapDivisor`): a new game image every N refreshes (1–8). Pick a multiple of Frames per cycle, or some images start on a dark refresh and motion judders; the overlay warns when it doesn't fit.
 - **Off**: no limit (not recommended).
 
-*When to change it:* if the game can hold 120, use Refresh. If it dips below, use Half. With frame generation (DLSS FG, FSR FG, Lossless Scaling) always use Refresh, never Half.
+*When to change it:* leave it at Refresh and let the automatic frame cap (below) step down when the game can't keep up. Pick Half yourself if you'd rather it stays at 60 fps. With frame generation (DLSS FG, FSR FG, Lossless Scaling) always use Refresh, never Half.
 
-**Frame pacing** · `FramePacing` · default: Smooth
-- **Smooth** shows every game image once, in order, even if one arrives a little late: no stutter, but up to one frame more delay.
-- **Lowest latency** always shows the newest image: quickest response, but a late frame can cause a small hitch.
+**Automatic frame cap** · `AutoFrameCap` · default: on\
+Works with the Refresh rate cap. When the game can't hold the refresh rate (e.g. 90 fps at 120 Hz), some images would be shown twice and others skipped, which judders. So BFI Presenter steps down to one game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames per cycle): every flash shows the next image. It goes back to Refresh when the game has headroom again: games with NVIDIA Reflex report how long their frames take; for the others it tries Refresh for about 3 seconds, after 30 s, then 60 s, then every 2 minutes while the game still can't hold it.\
+With frame generation it stays at Refresh, and in games with NVIDIA Reflex (every DLSS frame-generation game) it sets Reflex's own frame limit to one presented frame per strobe cycle (e.g. 60 at 120 Hz), so the driver paces the generated frames and every flash gets the next one.\
+*When to change it:* leave on. Turn off if you'd rather keep 120 fps with some judder when the game dips.
 
-*When to change it:* fast or competitive games: Lowest latency. Slow, cinematic games that dip in frame rate: Smooth.
+**Frame pacing** · `FramePacing` · default: Lowest latency (new ini files)
+- **Lowest latency** always shows the newest image: quickest response.
+- **Smooth** holds one finished image in reserve so every image is shown once, in order, even if one arrives a little late: about one refresh more delay.
+
+*When to change it:* leave on Lowest latency. Smooth only helps at the Half or Quarter cap in games whose frame time varies so much that just-in-time release keeps hitting its limit (the overlay's status line shows it). An ini file from an earlier version keeps its own setting: change it in the overlay and save.
 
 **Smooth: catch up after a hitch** · `SmoothCatchUp` · default: off\
 After a stutter, Smooth mode can skip one frame to get back to the lowest delay. That makes a second small stutter right after the first. Off means it stays one frame behind instead and keeps motion even.\
@@ -257,8 +262,8 @@ If a game crashes, these write a short report of what went wrong (`BFIPresenter_
 | Situation | Settings |
 |---|---|
 | The game holds 120 fps | Frame cap: Refresh rate · Pacing: Lowest latency · Light game: Later release on · Gain 1.0, Variable MPRT |
-| The game can't hold 120 | Frame cap: Half refresh · Pacing: Smooth (or Lowest latency for fast games) · Just-in-time release on |
-| Frame generation | Frame cap: Refresh rate, never Half · Later release off · Final fps (generated frames included) at least refresh ÷ frames per cycle |
+| The game can't hold 120 | Frame cap: Refresh rate with Automatic frame cap on (it steps down to 60 by itself), or Half refresh · Pacing: Lowest latency · Just-in-time release on |
+| Frame generation | Frame cap: Refresh rate, never Half · Automatic frame cap on (sets the Reflex frame limit) · Pacing: Lowest latency · Later release off · Final fps (generated frames included) at least refresh ÷ frames per cycle |
 | Before anything else | G-SYNC / VRR off for the game, VSync on or "app setting" · No frame limiter (RivaTuner, NVIDIA) on the game · CRT shader: set its own decay off |
 
 ---

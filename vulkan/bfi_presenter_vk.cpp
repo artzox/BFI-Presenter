@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.11"
+#define BFI_VERSION "1.0.12"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -259,10 +259,11 @@ struct Settings
     float knee     = 0.75f;
     float peakNits = 1400.0f; // display peak (HDR ceiling)
     int   output   = -1;      // -1 auto, 0 SDR, 1 scRGB, 2 HDR10
+    int   autoCap  = 1;       // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   gameCap  = 1;       // 0 off, 1 refresh rate, 2 half refresh, 3 quarter refresh,
                               // 4 one game frame per strobe cycle (refresh / Frames), 5 refresh / CapDivisor
     int   capDivisor = 3;    // cap 5: release the game every this many refreshes (1-8)
-    int   pacingMode = 0;     // 0 smooth (every game frame once, in order), 1 lowest latency (newest)
+    int   pacingMode = 1;     // 0 smooth (every game frame once, in order), 1 lowest latency (newest)
     int   capJit   = 1;       // Half / Quarter cap: release just in time for the lit refresh
     int   laterRelease = 0;   // Refresh cap + Lowest latency: release just in time for the pick
     float laterReleaseMs = 1.5f; // just-in-time safety margin (widened automatically)
@@ -333,8 +334,9 @@ static void LoadSettings(Settings &s)
     s.gameCap  = KvInt(kv, "CapGameToRefresh", 1);
     if (s.gameCap < 0 || s.gameCap > 5) s.gameCap = 1;
     s.capDivisor = Clamp(KvInt(kv, "CapDivisor", 3), 1, 8);
-    s.pacingMode = KvInt(kv, "FramePacing", 0) ? 1 : 0;
+    s.pacingMode = KvInt(kv, "FramePacing", 1) ? 1 : 0;
     s.capJit = KvInt(kv, "CapJustInTime", 1) ? 1 : 0;
+    s.autoCap = KvInt(kv, "AutoFrameCap", 1) ? 1 : 0;
     s.laterRelease = KvInt(kv, "LaterRelease", 0) ? 1 : 0;
     s.laterReleaseMs = Clamp(KvFloat(kv, "LaterReleaseMarginMs", 1.5f), 0.5f, 5.0f);
     s.maxAhead = Clamp(KvInt(kv, "MaxFramesAhead", 1), 0, 3);
@@ -371,7 +373,7 @@ static void LoadSettings(Settings &s)
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
     I("RollingScan", s.rolling); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
-    I("CapJustInTime", s.capJit); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
+    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
@@ -410,6 +412,9 @@ struct Status
     bool   hitchPaused = false;
     bool   limitSuspect = false;   // something caps the presenter below the display refresh
     int    aheadInUse = 1;
+    int    autoCapDown = 0;                 // automatic frame cap: one game frame per strobe cycle in use
+    int    autoCapProbe = 0;                // automatic frame cap: trying the Refresh rate again
+    int    fgActive = 0;                    // a frame-generation DLL is loaded (the automatic cap stays at Refresh)
     double rawAvg = -1.0, litAvg = -1.0, ceilInUse = 0.0;
     int    sharedQueue = 0;
     int    layerOrder = 0;      // 0 unknown, 1 below ReShade (good), 2 ReShade not above the layer
@@ -644,6 +649,7 @@ struct Swapchain
     std::atomic<bool> winDumpReq{false};   // presentation slowed down: log the windows over the game
     std::atomic<bool> retired{false};
     std::atomic<int>  maxAhead{1};
+    std::atomic<bool> autoCapDown{false};       // automatic frame cap: the game gets one frame per strobe cycle
     std::atomic<long long> capWaitUs{0};
     std::atomic<int>  capWaits{0}, slotWaits{0}, staged{0};
     std::atomic<double> lastPresentT{0.0};
@@ -1230,6 +1236,9 @@ static void DestroyPresenterRes(DeviceData *d, PresenterRes &R)
 
 // ---------------------------------------------------------------- presenter thread
 static double g_lastRebuildT = -1.0e9;      // presentation recovery: when the game was last asked to rebuild
+static double g_lastAutoRebuildT = -1.0e9;  // ... automatically
+static double g_rebuildGap = 20.0;          // automatic rebuilds at least this far apart (doubles while they don't help)
+static int    g_rebuildMisses = 0;          // automatic rebuilds in a row after which presentation slowed again within a minute
 static void PresenterThread(Swapchain *sc)
 {
     DeviceData *d = sc->d;
@@ -1307,6 +1316,12 @@ static void PresenterThread(Swapchain *sc)
     int lateIdx = 0;
     double lastNewFrameT = 0.0, hitchUntil = 0.0;
     bool hitchPaused = false;
+    // Automatic frame cap (as the DX add-on): at the Refresh cap, one game frame per
+    // strobe cycle while the game can't hold the refresh rate. Back to Refresh after a
+    // short try that holds the refresh rate (tries 30 s, 60 s, then every 120 s).
+    int capDownSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
+    double capSwitchT = -100.0, probeWait = 30.0;
+    bool capProbe = false, fgWas = false;
     bool kb = false, km = false, kr = false, krs = false;
     FILE *logf = nullptr;
     double monitorCheckT = Now();
@@ -1349,6 +1364,8 @@ static void PresenterThread(Swapchain *sc)
         // and each shown twice (60 Hz motion), which also made a CRT shader's
         // own BFI flicker (Twelve Minutes).
         if (!s.enabled) s.frames = 1;
+        userCap = s.gameCap;
+        if (s.autoCap && userCap == 1 && sc->autoCapDown.load() && s.frames >= 2) s.gameCap = 4;
 
         // timing log: a new time-stamped file each time it is switched on
         if (s.log && !logf)
@@ -1907,13 +1924,18 @@ static void PresenterThread(Swapchain *sc)
         if ((tFence - tAcq) > 0.002 || (tAcq - tVb) > 0.002) slowCount++;
         {
             const bool kNow = KeyCombo('O');
-            if (kNow && !kRebuild) { rebuildReq = true; LOGI("BFI Presenter: Ctrl+Shift+O -- rebuilding the swap chain"); }
+            // (held keys aren't taken again by the new swap chain's presenter right after a rebuild)
+            if (kNow && !kRebuild && t - g_lastRebuildT > 1.0) { rebuildReq = true; LOGI("BFI Presenter: Ctrl+Shift+O -- rebuilding the swap chain"); }
             kRebuild = kNow;
         }
         if (t - slowSecT >= 1.0)
         {
             slowSecT = t;
-            const bool bad = slowCount >= 8;
+            // Not while the automatic frame cap tries Refresh or has just switched: the game then runs
+            // uncapped for a few seconds and fills the GPU, so images come back late for that reason
+            // (RDR2: 20-30 slow returns a second during each try), which a rebuild can't fix.
+            const bool capping = capProbe || t - capSwitchT < 3.0;
+            const bool bad = slowCount >= 8 && !capping;
             slowRun = bad ? slowRun + 1 : 0;
             if (slowRun == 3)
             {
@@ -1925,15 +1947,34 @@ static void PresenterThread(Swapchain *sc)
                 goodRun = bad ? 0 : goodRun + 1;
                 if (goodRun == 10) { LOGI("BFI Presenter: presentation steady for 10 s after the rebuild"); afterRebuild = false; }
             }
-            if (s.vkAutoRecover && slowRun >= 3 && !rebuildReq)
+            // A rebuild that didn't help (slow again within a minute: the game keeps the GPU busy, not
+            // the desktop compositor) makes the next one wait twice as long; after 3 in a row automatic
+            // recovery stops for the session (Indiana Jones with heavy settings: a rebuild every 20-30 s).
+            if (g_rebuildMisses > 0 && g_rebuildMisses < 3 && t - g_lastAutoRebuildT > 180.0) { g_rebuildMisses = 0; g_rebuildGap = 20.0; }
+            if (s.vkAutoRecover && slowRun >= 3 && !rebuildReq && g_rebuildMisses < 3)
             {
-                if (t - g_lastRebuildT >= 20.0)
+                if (t - g_lastRebuildT >= g_rebuildGap)
                 {
-                    rebuildReq = true;
-                    LOGI("BFI Presenter: automatic recovery -- rebuilding the swap chain");
+                    if (t - g_lastAutoRebuildT < g_rebuildGap + 60.0)
+                    {
+                        g_rebuildMisses++;
+                        g_rebuildGap = g_rebuildGap * 2.0 > 160.0 ? 160.0 : g_rebuildGap * 2.0;
+                    }
+                    if (g_rebuildMisses >= 3)
+                        LOGI("BFI Presenter: automatic recovery stopped for this session -- 3 rebuilds in a row didn't help. The game "
+                             "probably keeps the GPU busy: lower its settings, or start Steam / the game as administrator for a "
+                             "realtime presenter queue. Ctrl+Shift+O still rebuilds by hand.");
+                    else
+                    {
+                        rebuildReq = true;
+                        g_lastAutoRebuildT = t;
+                        LOGI("BFI Presenter: automatic recovery -- rebuilding the swap chain%s",
+                             g_rebuildMisses ? " (the last one didn't help for long: the next waits longer)" : "");
+                    }
                 }
                 else if (slowRun == 3)
-                    LOGI("BFI Presenter: automatic recovery -- waiting: the last rebuild was %.0f s ago (20 s apart)", t - g_lastRebuildT);
+                    LOGI("BFI Presenter: automatic recovery -- waiting: the last rebuild was %.0f s ago (%.0f s apart)", t - g_lastRebuildT,
+                         g_rebuildGap);
             }
             slowCount = 0;
         }
@@ -2026,6 +2067,69 @@ static void PresenterThread(Swapchain *sc)
             }
             else sc->maxAhead.store(s.maxAhead);
             g_status.aheadInUse = sc->maxAhead.load();
+            {
+                const double hzA = vb.modeHz > 0.0 ? vb.modeHz : 0.0;
+                bool fg = false;
+#ifdef _WIN32
+                for (const char *dll : { "nvngx_dlssg.dll", "sl.dlss_g.dll", "ffx_frameinterpolation_x64.dll", "libxess_fg.dll" })
+                    if (GetModuleHandleA(dll)) fg = true;
+#endif
+                if (fg != fgWas)
+                {
+                    fgWas = fg;
+                    if (fg && s.autoCap) LOGI("BFI Presenter: frame generation DLL loaded -- the automatic frame cap stays at Refresh rate");
+                }
+                const double fpsA = g_status.gameFps;
+                bool down = sc->autoCapDown.load();
+                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg)
+                {
+                    if (capProbe)
+                    {
+                        // Trying Refresh: the first second still counts frames from the cap.
+                        probeSecs++;
+                        if (probeSecs >= 2 && fpsA >= 0.95 * hzA && !hitchPaused) probeGood++;
+                        if (probeSecs >= 4)
+                        {
+                            capProbe = false; capDownSecs = 0; capSwitchT = t;
+                            if (probeGood >= 2)
+                            {
+                                probeWait = 30.0;
+                                LOGI("BFI Presenter: automatic frame cap: Refresh rate -- the game holds %.0f fps", fpsA);
+                            }
+                            else
+                            {
+                                down = true;
+                                probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
+                                LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
+                                     "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
+                            }
+                        }
+                    }
+                    else if (!down)
+                    {
+                        capDownSecs = (!hitchPaused && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;
+                        if (capDownSecs >= 3 && t - capSwitchT > 3.0)
+                        {
+                            down = true; capDownSecs = 0; capSwitchT = t;
+                            LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps) -- the game held "
+                                 "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames, fpsA, hzA);
+                        }
+                    }
+                    else if (t - capSwitchT >= probeWait && !hitchPaused)
+                    {
+                        down = false; capProbe = true; probeSecs = probeGood = 0; capSwitchT = t;
+                    }
+                }
+                else
+                {
+                    if (down && fg) LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation)");
+                    down = capProbe = false; capDownSecs = 0;
+                }
+                sc->autoCapDown.store(down);
+                g_status.autoCapDown = down ? 1 : 0;
+                g_status.autoCapProbe = capProbe ? 1 : 0;
+                g_status.fgActive = fg ? 1 : 0;
+            }
             secFrameRepeats = secFrameSkips = secReused = 0;
             secRepU = secSkipU = 0;
             secStart = t; secPresents = 0; secLate = 0; ageSum = 0.0;
@@ -2633,8 +2737,9 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
     {
         std::lock_guard<std::mutex> l(g_cfgLock);
         cap = g_shared.gameCap;
+        if (g_shared.autoCap && cap == 1 && sc->autoCapDown.load() && g_shared.enabled && g_shared.frames >= 2) cap = 4;
         pacingLL = g_shared.pacingMode;
-        capPer = CapPeriod(g_shared.gameCap, g_shared.frames, g_shared.capDivisor);
+        capPer = CapPeriod(cap, g_shared.frames, g_shared.capDivisor);
     }
     // Lowest latency, and Smooth with a frame cap: the game's present counts
     // as done once it is handed over, not when the strobe takes it. Completing
@@ -3992,6 +4097,22 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "more latency) and shows every frame once, in order.\n"
                                                           "On: when two finished frames keep waiting, one is skipped to get back to the lowest\n"
                                                           "latency -- a second stutter shortly after the first.");
+        }
+        {
+            bool ac = s.autoCap != 0;
+            if (ImGui::Checkbox("Automatic frame cap", &ac)) s.autoCap = ac ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the Refresh rate cap: while the game can't hold the refresh rate, the cap drops to one\n"
+                                                          "game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames), so every flash shows the\n"
+                                                          "next frame instead of frames dropped unevenly (judder). Back to Refresh rate after a short\n"
+                                                          "try that holds the refresh rate (every 30 to 120 s). Not with frame generation.");
+            if (s.autoCap)
+            {
+                int down, fgA, probe;
+                { std::lock_guard<std::mutex> l(g_cfgLock); down = g_status.autoCapDown; fgA = g_status.fgActive; probe = g_status.autoCapProbe; }
+                ImGui::SameLine();
+                if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
+                else ImGui::TextDisabled("%s", fgA ? "(Refresh rate: frame generation)" : probe ? "(trying Refresh rate)" : down ? "(in use: one game frame per strobe cycle)" : "(in use: Refresh rate)");
+            }
         }
         bool cj = s.capJit != 0;
         if (ImGui::Checkbox("Just-in-time release at caps below the refresh rate", &cj)) s.capJit = cj ? 1 : 0;

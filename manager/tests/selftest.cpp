@@ -32,11 +32,37 @@ int wmain(int argc, wchar_t **argv)
     if (argc < 3) { printf("usage: selftest <games dir> <release dir>\n"); return 2; }
     std::wstring games = argv[1], rel = argv[2];
     ScanOptions o;
-    o.steam = o.epic = o.gog = o.xbox = false;
+    o.steam = o.epic = o.gog = o.xbox = o.bnet = false;
     o.folders = { games };
-    auto all = FindGames(o);
+    int vrLeft = 0;
+    auto all = FindGames(o, nullptr, &vrLeft);
     printf("found %zu games\n", all.size());
+    CHECK(!Find(all, "Skyrim VR") && vrLeft == 1, "folder game with VR in its title left out (%d)", vrLeft);
+    {
+        ScanOptions s2;
+        s2.epic = s2.gog = s2.xbox = false;
+        int vr2 = 0;
+        auto st = FindGames(s2, nullptr, &vr2);
+        Game *fl = Find(st, "Flat Game"), *ho = Find(st, "Headset Only"), *sv = Find(st, "Sim VR"), *d4 = Find(st, "Diablo IV");
+        CHECK(fl && fl->store == "Steam" && fl->appid == "10", "Steam: library from the registry and libraryfolders.vdf");
+        CHECK(!ho && vr2 == 1, "Steam: onlyvrsupport in appinfo.vdf left out (%d)", vr2);
+        CHECK(sv != nullptr, "Steam: \"VR\" in the title but not VR-only in appinfo.vdf kept");
+        CHECK(fl && fl->online && sv && !sv->online, "Steam: Online PvP category in appinfo.vdf marks the game online, single-player not");
+        CHECK(d4 && d4->store == "Battle.net" && !Find(st, "Battle.net"), "Battle.net: game from its uninstall entry, not the launcher");
+        s2.skipVr = false;
+        st = FindGames(s2);
+        CHECK(Find(st, "Headset Only") != nullptr, "VR-only game listed with the option off");
+    }
     for (auto &g : all) Dump(g);
+    {
+        Game *ar = Find(all, "ArenaGame"), *wf0 = Find(all, "Wreckfest");
+        CHECK(ar && ar->antiCheat == "Easy Anti-Cheat" && OnlineRisk(*ar), "ArenaGame: Easy Anti-Cheat in its folder found");
+        CHECK(wf0 && wf0->antiCheat.empty() && !OnlineRisk(*wf0), "Wreckfest (folder): no anti-cheat, no online warning");
+    }
+    {
+        LibraryInfo li = FindLibraries();
+        CHECK(li.steam && !li.steamLibs.empty(), "Steam libraries listed (%zu)", li.steamLibs.size());
+    }
 
     Game *wf = Find(all, "Wreckfest"), *aw = Find(all, "Alan Wake"), *op = Find(all, "OptiGame"), *rd = Find(all, "Red Dead Redemption 2"),
          *h2 = Find(all, "Heretic II"), *nr = Find(all, "NoReShade"), *ue = Find(all, "UEGame");
@@ -102,6 +128,29 @@ int wmain(int argc, wchar_t **argv)
     e = InstallOrUpdate(*rd, src);
     VulkanLayerState vs = DetectVulkanLayer();
     CHECK(e.empty() && rd->ini && vs.installed && vs.version == src.vkVersion, "RDR2: layer %s installed and ini copied (%s)", vs.version.c_str(), e.c_str());
+    CHECK(vs.user && vs.machine == IsElevated(), "layer for this user%s", IsElevated() ? " and all users (elevated)" : "");
+    if (IsElevated())
+    {
+        // ReShade's layer added after ours (a ReShade reinstall): wrong order, then fixed by registering again.
+        HKEY k;
+        const wchar_t *key = L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers";
+        std::wstring rsJson = rel + L"\\ReShade64_fake.json";
+        { HANDLE f = CreateFileW(rsJson.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr); if (f != INVALID_HANDLE_VALUE) CloseHandle(f); }
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, key, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) == ERROR_SUCCESS)
+        {
+            DWORD zero = 0;
+            RegSetValueExW(k, rsJson.c_str(), 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
+            RegCloseKey(k);
+        }
+        VulkanLayerState w = DetectVulkanLayer();
+        CHECK(w.reshadeLayer && w.reshadeAfter, "ReShade listed after BFI Presenter detected");
+        RegisterVulkanLayerMachine(true, vs.dir);
+        w = DetectVulkanLayer();
+        // Wine lists registry values alphabetically, Windows in the order they were added.
+        const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+        CHECK(w.machine && (wine || !w.reshadeAfter), "registered again: BFI Presenter after ReShade%s", wine ? " (order not checked under Wine)" : "");
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_WRITE, &k) == ERROR_SUCCESS) { RegDeleteValueW(k, rsJson.c_str()); RegCloseKey(k); }
+    }
     e = Remove(*rd, false);
     CHECK(e.empty() && !rd->ini, "RDR2: ini removed");
     UninstallVulkanLayer();

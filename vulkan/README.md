@@ -16,10 +16,11 @@ The same presenter-clocked black frame insertion as the [DX add-on](../dx/README
 1. Unzip anywhere and run **`install_vulkan_layer.bat`**. No admin rights are needed.
    - It copies the layer (64-bit and 32-bit) to `%LOCALAPPDATA%\BFIPresenter\Vulkan`.
    - It registers the layer for your Windows user.
+   - **If games run as administrator on your PC** (User Account Control turned off, or Steam or the game set to run as administrator), run it with right-click → **Run as administrator**: it then registers the layer for all users too. Windows' Vulkan loader ignores per-user layers in programs run as administrator, so without this the layer never loads (no `BFIPresenterVK.log`). The BFI Presenter Manager does the same with its **All users** button and warns when it sees these settings.
    - It lists the Vulkan layers in load order. **ReShade must be listed before BFI Presenter.**
 2. If you install or reinstall ReShade later, run `install_vulkan_layer.bat` again so BFI Presenter is listed after ReShade.
 3. To update, run the new package's `install_vulkan_layer.bat`. Games pick up the new layer on their next start; your `BFIPresenter.ini` files stay as they are.
-4. To remove it, run `uninstall_vulkan_layer.bat`.
+4. To remove it, run `uninstall_vulkan_layer.bat` (as administrator if it was registered for all users).
 
 ## Use in a game
 
@@ -74,7 +75,7 @@ No log at all means the layer isn't active: check that `BFIPresenter.ini` is in 
 
 - **Strobe:** BFI and Variable MPRT; frames per cycle, gain, dark floor, roll-off, sine and invert; rolling scan with phosphor decay or seam softness.
 - **Output:** SDR, scRGB and HDR10 (Auto detection), and SDR games presented as HDR10 with highlight expansion.
-- **Pacing:** Smooth and Lowest latency; game frame cap (Refresh / Half / Quarter); just-in-time release at Half / Quarter; Later release at Refresh; automatic frames ahead; queue one refresh ahead.
+- **Pacing:** Lowest latency (default for new ini files) and Smooth; game frame cap (Refresh / Half / Quarter); automatic frame cap at Refresh (one game frame per strobe cycle while the game can't hold the refresh rate, back after a ~3 s try that holds it, every 30–120 s; not with frame generation); just-in-time release at Half / Quarter; Later release at Refresh; automatic frames ahead; queue one refresh ahead.
 - **Guards:** hitch guard and ABL guard.
 - **Logs:** `BFIPresenterVK.log` and a timing log, `BFIPresenterVK_log_<date>_<time>.csv`, with columns close to the DX log's.
 - **Exclusive fullscreen and recovery:** the presenter's swap chain runs in exclusive fullscreen, and presentation that has slowed down for good is recovered with a swap chain rebuild (see `VulkanExclusiveFullscreen`, `VulkanAutoRecover` below).
@@ -101,7 +102,7 @@ Environment variable `DISABLE_BFI_PRESENTER_VK=1` turns the layer off for anythi
 
 ## Known limits
 
-- **Games run as administrator** don't load per-user Vulkan layers (a Vulkan loader rule), so the layer won't load there.
+- **Games run as administrator** don't load per-user Vulkan layers (a Vulkan loader rule): register the layer for all users (see Install).
 - **Anti-cheat games** may refuse unknown Vulkan layers.
 - **32-bit games through DXVK can't strobe cleanly.** In Twelve Minutes (DX11) and Alan Wake (DX9) the presenter's BFI flickered as if the display showed some refreshes twice, even though its timing log was clean, and the CRT shader's own BFI (decay) flickered the same way without the layer. So the frames don't reach the screen one per refresh through DXVK there; it isn't the layer. HDR10 output also gave a black screen (Alan Wake) or froze the game (Twelve Minutes). For 32-bit Direct3D 11 games use the DX add-on's `BFIPresenter.addon32`; 32-bit Direct3D 9 games have no BFI route for now (CRT-Standalone doesn't run under ReShade's DirectX 9 path either).
 - **GPU-heavy games** can still flash when the GPU is saturated (Indiana Jones). Give the GPU headroom, raise the dark floor slightly, or try `QueueAhead=1`.

@@ -41,8 +41,11 @@ struct Source {
 };
 
 struct Game {
-    std::string  name, store;    // store: Steam, Epic, GOG, Xbox, Folder
+    std::string  name, store;    // store: Steam, Epic, GOG, Xbox, Battle.net, Folder
     std::string  appid;          // Steam app id, if any
+    bool         vrOnly = false; // found while scanning: plays only in a VR headset
+    bool         online = false; // Steam lists it as multiplayer / online (PvP, co-op, MMO)
+    std::string  antiCheat;      // anti-cheat found in the game's folder ("Easy Anti-Cheat", "BattlEye", ...)
     std::wstring root;           // install folder
     std::vector<std::wstring> exes;   // candidates, best first
     std::wstring exe;            // chosen (best or the user's override)
@@ -82,11 +85,15 @@ struct Game {
 };
 
 struct VulkanLayerState {
-    bool installed = false;      // registered for this user and the files exist
+    bool installed = false;      // registered (for this user or all users) and the files exist
+    bool user = false;           // registered for this Windows user (HKCU)
+    bool machine = false;        // registered for all users (HKLM): also loads in games run as administrator
     std::string version;
     std::wstring dir;
     bool reshadeLayer = false;   // ReShade's own Vulkan layer is registered
+    bool reshadeAfter = false;   // ReShade is listed after BFI Presenter (wrong order: its effects run on every refresh)
     std::string reshadeVersion;
+    std::string elevatedWhy;     // why games here likely run as administrator ("" = no sign of it)
 };
 
 // ----- Settings (%LOCALAPPDATA%\BFIPresenter\manager.ini)
@@ -100,13 +107,24 @@ std::wstring LoadExeOverride(const std::wstring &root);
 void SaveExeOverride(const std::wstring &root, const std::wstring &exe);
 
 // ----- Discovery and detection
-struct ScanOptions { bool steam = true, epic = true, gog = true, xbox = true; std::vector<std::wstring> folders; };
+struct ScanOptions {
+    bool steam = true, epic = true, gog = true, xbox = true, bnet = true;
+    bool skipVr = true;          // leave out VR-only games (BFI needs a monitor or TV)
+    std::vector<std::wstring> folders;
+};
 ScanOptions LoadScanOptions();
 void SaveScanOptions(const ScanOptions &o);
-struct LibraryInfo { bool steam = false, epic = false, gog = false, xbox = false; std::string steamText, epicText, gogText, xboxText; };
+struct LibraryInfo {
+    bool steam = false, epic = false, gog = false, xbox = false, bnet = false;
+    std::string steamText, epicText, gogText, xboxText, bnetText;
+    std::vector<std::string> steamLibs;          // every Steam library folder (the first is Steam's own)
+};
+// Online or anti-cheat: ReShade with add-ons in such a game can count as cheating (a ban is possible).
+inline bool OnlineRisk(const Game &g) { return g.online || !g.antiCheat.empty(); }
 LibraryInfo FindLibraries();                    // which stores are installed (quick)
 std::vector<Game> FindGames(const ScanOptions &opt,
-                            const std::function<void(const std::string &)> &progress = nullptr);
+                            const std::function<void(const std::string &)> &progress = nullptr,
+                            int *vrSkipped = nullptr);    // how many VR-only games were left out
 // The game list is kept between runs: saved after each scan, loaded (and re-detected) at start.
 void SaveGameList(const std::vector<Game> &games);
 bool LoadGameList(std::vector<Game> &games);    // false if there is no saved list
@@ -130,6 +148,11 @@ std::string Revert(Game &g);                  // puts back the files the last ac
 bool CanRevert(const Game &g);
 std::string InstallVulkanLayer(const Source &src);
 std::string UninstallVulkanLayer();
+// All-users registration (HKLM). Needs administrator rights: the Manager runs itself elevated
+// with --vk-machine add|remove <dir> for it.
+std::string RegisterVulkanLayerMachine(bool add, const std::wstring &dir);
+bool IsElevated();
+bool ExeRunsAsAdmin(const std::wstring &exe);    // "Run this program as an administrator" set for it
 std::wstring BackupDir();
 std::wstring LogPath();
 

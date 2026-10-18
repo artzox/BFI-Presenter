@@ -5,6 +5,8 @@
 #endif
 #include <windows.h>
 #include <shobjidl.h>
+#include <shellapi.h>
+#include <cstdarg>
 #include <d3d11.h>
 #include <atomic>
 #include <mutex>
@@ -20,7 +22,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.3.3"
+#define MANAGER_VERSION "1.3.4"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -31,6 +33,7 @@ static ID3D11RenderTargetView *g_rtv = nullptr;
 static UINT g_resizeW = 0, g_resizeH = 0;
 static float g_dpiScale = 1.0f;
 static bool g_dpiChanged = false;
+static ULONGLONG g_driveArrived = 0;   // a drive was connected (WM_DEVICECHANGE): rescan shortly after
 
 static void CreateRT()
 {
@@ -113,6 +116,12 @@ static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
+    case WM_DEVICECHANGE:
+        // A drive was connected (an external disk with a Steam library or a games folder): the main
+        // loop rescans a few seconds later, once Windows has mounted it.
+        if (wp == 0x8000 /* DBT_DEVICEARRIVAL */ && lp && ((const DWORD *)lp)[1] == 2 /* DBT_DEVTYP_VOLUME */)
+            g_driveArrived = GetTickCount64();
+        return TRUE;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -134,6 +143,7 @@ struct App {
     std::atomic<bool> busy{ false };
     std::string busyText;              // guarded by lock
     bool scanDone = false;             // guarded by lock
+    int  vrSkipped = 0;                // guarded by lock: VR-only games left out by the last fresh scan
     std::vector<Game> scanned;         // guarded by lock
     std::string scanErr;               // guarded by lock
     bool lastFresh = false;
@@ -163,12 +173,18 @@ struct App {
     // install question (NVIDIA settings)
     std::vector<std::wstring> instPending;
     bool openInstall = false;
+    // online / anti-cheat warning before installing
+    std::vector<std::wstring> riskAll;     // the games the action was for
+    int riskKind = 0;                      // 0 BFI Presenter, 1 ReShade
+    std::string riskVer;                   // ReShade version
+    bool openRisk = false;
 
     void SetMsg(const std::string &m, bool err) { msg = m; msgErr = err; needAdmin = false; }
 };
 
 static App g_app;
 static void RestartAsAdmin();
+static std::string VkMachineElevated(bool add, const std::wstring &dir);
 
 // ------------------------------------------------------------------ batch jobs
 // Installs, updates and removes over many games run a few per frame, so the window keeps drawing (a progress
@@ -328,7 +344,8 @@ static void StartScan(bool fresh)
     std::vector<Game> current = g_app.games;
     g_app.worker = std::thread([opt, fresh, current]() mutable {
         std::vector<Game> games;
-        if (fresh) games = FindGames(opt, SetBusy);
+        int vrSkipped = 0;
+        if (fresh) games = FindGames(opt, SetBusy, &vrSkipped);
         else { games = std::move(current); DetectAll(games, SetBusy); }
         std::string err;
         if (LoadSetting(L"PCGamingWiki", L"1") == L"1")
@@ -350,6 +367,7 @@ static void StartScan(bool fresh)
         g_app.scanned = std::move(games);
         g_app.vk = vk;
         g_app.scanErr = err;
+        g_app.vrSkipped = vrSkipped;
         g_app.scanDone = true;
         g_app.busy = false;
     });
@@ -417,7 +435,9 @@ static void PollWorker()
         g_app.sel = -1;
         for (int i = 0; i < (int)g_app.games.size(); i++)
             if (g_app.games[i].root == selRoot) g_app.sel = i;
+        const int vr = g_app.lastFresh ? g_app.vrSkipped : 0;
         g_app.SetMsg((g_app.lastFresh ? "Found " : "Checked ") + std::to_string(g_app.games.size()) + " games." +
+                     (vr ? " " + std::to_string(vr) + " VR-only game" + (vr > 1 ? "s" : "") + " left out." : "") +
                      (g_app.scanErr.empty() ? "" : " (" + g_app.scanErr + ")"), false);
         g_app.scannedOnce = true;
     }
@@ -568,6 +588,19 @@ static void Tooltip(const char *t)
     }
 }
 
+static std::string CapFirst(std::string t) { if (!t.empty()) t[0] = (char)toupper((unsigned char)t[0]); return t; }
+static void WarnWrapped(const char *fmt, ...)
+{
+    char b[1024];
+    va_list a;
+    va_start(a, fmt);
+    vsnprintf(b, sizeof(b), fmt, a);
+    va_end(a);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.60f, 0.30f, 1));
+    ImGui::TextWrapped("%s", b);
+    ImGui::PopStyleColor();
+}
+
 static void DoAction(const std::string &what, const std::string &err)
 {
     if (err.empty()) g_app.SetMsg(what, false);
@@ -616,6 +649,18 @@ static void DrawTop(HWND hwnd)
     }
     Tooltip("Use an extracted release or a test build from a folder instead of GitHub.");
     ImGui::EndDisabled();
+    {
+        const char *kf = "Support on Ko-fi";
+        const float w = ImGui::CalcTextSize(kf).x + ImGui::GetStyle().FramePadding.x * 2;
+        const float x = ImGui::GetWindowContentRegionMax().x - w;
+        ImGui::SameLine(x > ImGui::GetCursorPosX() ? x : 0.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.50f, 0.78f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.58f, 0.88f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.42f, 0.68f, 1));
+        if (ImGui::Button(kf)) ShellExecuteW(nullptr, L"open", L"https://ko-fi.com/artzox", nullptr, nullptr, SW_SHOWNORMAL);
+        ImGui::PopStyleColor(3);
+        Tooltip("BFI Presenter is free. If it helps you, you can support its development on Ko-fi (ko-fi.com/artzox).");
+    }
 
     // Vulkan layer
     ImGui::AlignTextToFramePadding();
@@ -624,7 +669,8 @@ static void DrawTop(HWND hwnd)
     if (g_app.vk.installed)
     {
         bool old = !g_app.src.vkVersion.empty() && CompareVersions(g_app.vk.version, g_app.src.vkVersion) < 0;
-        ImGui::TextColored(old ? kYellow : kGreen, "Installed v%s%s", g_app.vk.version.c_str(), old ? " (update available)" : "");
+        ImGui::TextColored(old ? kYellow : kGreen, "Installed v%s%s%s", g_app.vk.version.c_str(),
+                           g_app.vk.machine ? " for all users" : " for your user", old ? " (update available)" : "");
     }
     else ImGui::TextColored(kGrey, "Not installed (only needed for Vulkan and DXVK games)");
     ImGui::SameLine();
@@ -633,20 +679,49 @@ static void DrawTop(HWND hwnd)
     ImGui::SameLine();
     ImGui::BeginDisabled(g_app.busy || g_app.src.vkDir.empty());
     if (ImGui::Button(g_app.vk.installed ? "Update layer" : "Install layer"))
-        DoAction("Vulkan layer installed for your Windows user.", InstallVulkanLayer(g_app.src));
+        DoAction(IsElevated() || g_app.vk.machine ? "Vulkan layer installed for all users." : "Vulkan layer installed for your Windows user.",
+                 InstallVulkanLayer(g_app.src));
     ImGui::EndDisabled();
     if (g_app.vk.installed)
     {
         ImGui::SameLine();
-        if (ImGui::Button("Remove layer")) DoAction("Vulkan layer removed.", UninstallVulkanLayer());
+        if (ImGui::Button("Remove layer"))
+        {
+            std::string e = UninstallVulkanLayer();
+            if (e.empty() && g_app.vk.machine && !IsElevated()) e = VkMachineElevated(false, g_app.vk.dir);
+            DoAction("Vulkan layer removed.", e);
+        }
+        ImGui::SameLine();
+        if (!g_app.vk.machine)
+        {
+            if (ImGui::Button("All users"))
+                DoAction("Vulkan layer registered for all users: it also loads in games run as administrator.",
+                         VkMachineElevated(true, g_app.vk.dir));
+            Tooltip("Registers the layer for all users (asks for administrator rights). Needed when games run as administrator "
+                    "-- User Account Control turned off, Steam or the game set to run as administrator: Windows' Vulkan loader "
+                    "then ignores per-user layers, and BFI Presenter doesn't load (no BFIPresenterVK.log).");
+        }
+        else if (g_app.vk.reshadeAfter)
+        {
+            if (ImGui::Button("Fix order"))
+                DoAction("BFI Presenter is listed after ReShade again.", VkMachineElevated(true, g_app.vk.dir));
+            Tooltip("Lists the BFI Presenter layer after ReShade's again (asks for administrator rights).");
+        }
     }
+    if (g_app.vk.installed && g_app.vk.reshadeAfter)
+        WarnWrapped("ReShade's Vulkan layer is listed after BFI Presenter: its effects would run on every strobed refresh. %s",
+                    g_app.vk.machine ? "Use Fix order." : "Use Update layer.");
+    if (g_app.vk.installed && !g_app.vk.machine && !g_app.vk.elevatedWhy.empty())
+        WarnWrapped("%s: per-user Vulkan layers don't load in games run as administrator. Use All users.",
+                    CapFirst(g_app.vk.elevatedWhy).c_str());
 
     ImGui::Separator();
 
     // Toolbar
     ImGui::BeginDisabled(g_app.busy);
     if (ImGui::Button("Rescan")) StartScan(true);
-    Tooltip("Searches the selected libraries again (new or removed games). Games already known are checked again quickly.");
+    Tooltip("Searches the selected libraries again (new or removed games). Games already known are checked again quickly.\n"
+            "Connecting a drive (an external disk with a Steam library) starts a rescan by itself.");
     ImGui::SameLine();
     if (ImGui::Button("Libraries...")) g_app.showLibraries = true;
     Tooltip("Choose which stores to search and add folders with other games.");
@@ -957,7 +1032,95 @@ static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsy
              });
 }
 
+static std::string RiskWhy(const Game &g)
+{
+    if (!g.antiCheat.empty()) return g.antiCheat == "anti-cheat" ? "anti-cheat in its folder" : g.antiCheat;
+    return g.online ? "multiplayer on Steam" : "";
+}
+
+// Games played online or with anti-cheat that the action would put ReShade (or the add-on) into for the first time.
+static std::vector<const Game *> RiskyNew(const std::vector<std::wstring> &roots, int kind)
+{
+    std::vector<const Game *> out;
+    for (auto &r : roots)
+        for (auto &g : g_app.games)
+            if (g.root == r && OnlineRisk(g) && (kind == 1 ? !g.reshade : (g.addonPath.empty() && g.shaderPath.empty())))
+                out.push_back(&g);
+    return out;
+}
+
+static void RequestInstallNow(const std::vector<Game *> &list);
 static void RequestInstall(const std::vector<Game *> &list)
+{
+    if (list.empty()) return;
+    std::vector<std::wstring> roots;
+    for (auto *g : list) roots.push_back(g->root);
+    if (!RiskyNew(roots, 0).empty()) { g_app.riskAll = roots; g_app.riskKind = 0; g_app.openRisk = true; return; }
+    RequestInstallNow(list);
+}
+
+static void RequestReShade(const std::string &ver, const std::vector<std::wstring> &roots)
+{
+    if (!RiskyNew(roots, 1).empty()) { g_app.riskAll = roots; g_app.riskKind = 1; g_app.riskVer = ver; g_app.openRisk = true; return; }
+    StartReShade(ver, roots);
+}
+
+static void DrawRiskQuestion()
+{
+    static bool open = false;
+    if (g_app.openRisk) { g_app.openRisk = false; ImGui::OpenPopup("Online games"); open = true; }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 36, 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Online games", &open, ImGuiWindowFlags_NoSavedSettings)) return;
+    const std::vector<const Game *> risky = RiskyNew(g_app.riskAll, g_app.riskKind);
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextColored(kOrange, "%s", risky.size() == 1 ? "This game is played online or uses anti-cheat:" :
+                                                         "These games are played online or use anti-cheat:");
+    ImGui::PopTextWrapPos();
+    int shown = 0;
+    for (auto *g : risky)
+    {
+        if (++shown > 12) { ImGui::TextColored(kGrey, "  ... and %d more", (int)risky.size() - 12); break; }
+        ImGui::Text("  %s", g->name.c_str());
+        ImGui::SameLine();
+        ImGui::TextColored(kGrey, "(%s)", RiskWhy(*g).c_str());
+    }
+    ImGui::Spacing();
+    ImGui::TextWrapped("BFI Presenter installs ReShade with add-on support (a DLL next to the game's exe) and its own add-on. "
+                       "Anti-cheat systems can treat that as cheating, and playing online with it can get your account banned. "
+                       "Install at your own discretion: it is safest in single-player or offline games.");
+    ImGui::Separator();
+    auto go = [](std::vector<std::wstring> roots) {
+        if (roots.empty()) return;
+        if (g_app.riskKind == 1) { StartReShade(g_app.riskVer, roots); return; }
+        std::vector<Game *> list;
+        for (auto &r : roots) for (auto &g : g_app.games) if (g.root == r) list.push_back(&g);
+        RequestInstallNow(list);
+    };
+    if (ImGui::Button("Install anyway")) { ImGui::CloseCurrentPopup(); go(g_app.riskAll); }
+    const bool others = risky.size() < g_app.riskAll.size();
+    if (others)
+    {
+        ImGui::SameLine();
+        if (ImGui::Button("Leave these out"))
+        {
+            std::vector<std::wstring> rest;
+            for (auto &r : g_app.riskAll)
+            {
+                bool bad = false;
+                for (auto *g : risky) if (g->root == r) bad = true;
+                if (!bad) rest.push_back(r);
+            }
+            ImGui::CloseCurrentPopup();
+            go(rest);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+static void RequestInstallNow(const std::vector<Game *> &list)
 {
     if (list.empty()) return;
     bool ask = g_app.nvOk && LoadSetting(L"NvAskOnInstall", L"1") == L"1";
@@ -1095,7 +1258,7 @@ static void DrawBatch()
         ImGui::SameLine();
         snprintf(lbl, 64, "Install ReShade (%d)", (int)need.size());
         ImGui::BeginDisabled(need.empty() || g_app.busy || g_app.rsVersion.empty());
-        if (ImGui::Button(lbl)) StartReShade(g_app.rsVersion, need);
+        if (ImGui::Button(lbl)) RequestReShade(g_app.rsVersion, need);
         ImGui::EndDisabled();
         Tooltip("Installs the chosen ReShade version in the ticked games that don't have ReShade yet.");
         ImGui::SameLine();
@@ -1287,6 +1450,9 @@ static void DrawDetail(HWND)
     ImGui::TextColored(kGrey, "(%s)", g.store.c_str());
     ImGui::SameLine();
     if (ImGui::SmallButton("Open folder")) OpenInExplorer(g.exe.empty() ? g.root : g.exe, !g.exe.empty());
+    if (OnlineRisk(g))
+        WarnWrapped("Online game (%s): ReShade with add-ons can count as cheating here, and playing online with it can get "
+                    "your account banned. Install at your own discretion.", RiskWhy(g).c_str());
     ImGui::Spacing();
     DrawActions(g);
     ImGui::Separator();
@@ -1380,7 +1546,7 @@ static void DrawDetail(HWND)
         std::string b = g.reshade ? (same ? "Reinstall ReShade" : "Change to " + g_app.rsVersion) : "Install ReShade";
         b += "##reshade";
         ImGui::BeginDisabled(g_app.busy || g_app.rsVersion.empty());
-        if (ImGui::Button(b.c_str())) StartReShade(g_app.rsVersion, { g.root });
+        if (ImGui::Button(b.c_str())) RequestReShade(g_app.rsVersion, { g.root });
         ImGui::EndDisabled();
         Tooltip(g.reshade ? "Replaces the ReShade DLL with the chosen version, keeping its name. The old one is backed up (Undo last change)."
                           : "Downloads ReShade with add-on support from reshade.me and puts it next to the game's exe "
@@ -1450,18 +1616,29 @@ static void DrawLibraries(HWND hwnd)
     ImGui::TextWrapped("Choose where to look for games, then Scan. The list is kept, so this is needed only once and when "
                        "you install games somewhere new.");
     ImGui::Spacing();
-    auto lib = [](const char *name, bool *on, bool found, const std::string &text) {
+    auto lib = [](const char *name, bool *on, bool found, const std::string &text, const std::vector<std::string> *paths = nullptr) {
         ImGui::BeginDisabled(!found);
         if (!found) *on = false;
         ImGui::Checkbox(name, on);
         ImGui::EndDisabled();
         ImGui::SameLine(ImGui::GetFontSize() * 9);
         ImGui::TextColored(found ? kGrey : ImVec4(0.45f, 0.45f, 0.48f, 1), "%s", text.c_str());
+        if (paths && paths->size() > 1 && ImGui::IsItemHovered())
+        {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted("Libraries:");
+            for (auto &p : *paths) ImGui::Text("  %s", p.c_str());
+            ImGui::EndTooltip();
+        }
     };
-    lib("Steam", &o.steam, li.steam, li.steamText);
+    lib("Steam", &o.steam, li.steam, li.steamText, &li.steamLibs);
     lib("Epic Games", &o.epic, li.epic, li.epicText);
     lib("GOG", &o.gog, li.gog, li.gogText);
     lib("Xbox", &o.xbox, li.xbox, li.xboxText);
+    lib("Battle.net", &o.bnet, li.bnet, li.bnetText);
+    ImGui::Checkbox("Leave out VR-only games", &o.skipVr);
+    Tooltip("Games that play only in a VR headset (Steam's own flag; elsewhere a title with \"VR\" in it). BFI Presenter "
+            "strobes a monitor or TV, so it can't help there. Games with an optional VR mode stay in the list.");
     {
         bool pw = LoadSetting(L"PCGamingWiki", L"1") == L"1";
         if (ImGui::Checkbox("Look up each game's graphics APIs on PCGamingWiki", &pw)) SaveSetting(L"PCGamingWiki", pw ? L"1" : L"0");
@@ -1494,7 +1671,7 @@ static void DrawLibraries(HWND hwnd)
     }
     ImGui::Spacing();
     ImGui::Separator();
-    bool any = o.steam || o.epic || o.gog || o.xbox || !o.folders.empty();
+    bool any = o.steam || o.epic || o.gog || o.xbox || o.bnet || !o.folders.empty();
     ImGui::BeginDisabled(!any || g_app.busy);
     if (ImGui::Button("Scan"))
     {
@@ -1543,6 +1720,7 @@ static void DrawFrame(HWND hwnd)
     ImGui::EndChild();
     DrawLibraries(hwnd);
     DrawInstallQuestion();
+    DrawRiskQuestion();
     DrawJob();
     ImGui::End();
 }
@@ -1590,8 +1768,42 @@ static void LoadFonts(float scale)
     }
 }
 
+// Runs the Manager elevated for the all-users Vulkan layer registration (HKLM); "" or the error.
+static std::string VkMachineElevated(bool add, const std::wstring &dir)
+{
+    if (IsElevated()) return RegisterVulkanLayerMachine(add, dir);
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring args = std::wstring(L"--vk-machine ") + (add ? L"add" : L"remove") + L" \"" + dir + L"\"";
+    SHELLEXECUTEINFOW ei = { sizeof(ei) };
+    ei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    ei.lpVerb = L"runas";
+    ei.lpFile = self;
+    ei.lpParameters = args.c_str();
+    ei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&ei) || !ei.hProcess)
+        return GetLastError() == ERROR_CANCELLED ? "Administrator rights weren't granted." : "Couldn't start the Manager as administrator.";
+    WaitForSingleObject(ei.hProcess, 30000);
+    DWORD code = 1;
+    GetExitCodeProcess(ei.hProcess, &code);
+    CloseHandle(ei.hProcess);
+    return code == 0 ? "" : "The all-users registration failed.";
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 {
+    {
+        // Elevated helper: BFIPresenterManager.exe --vk-machine add|remove "<layer folder>"
+        int argc = 0;
+        wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv && argc >= 4 && wcscmp(argv[1], L"--vk-machine") == 0)
+        {
+            const std::string e = RegisterVulkanLayerMachine(wcscmp(argv[2], L"add") == 0, argv[3]);
+            LocalFree(argv);
+            return e.empty() ? 0 : 1;
+        }
+        if (argv) LocalFree(argv);
+    }
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     ImGui_ImplWin32_EnableDpiAwareness();
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, inst, LoadIconW(inst, MAKEINTRESOURCEW(1)), LoadCursor(nullptr, IDC_ARROW),
@@ -1688,6 +1900,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         }
         PollWorker();
         StepJob();
+        // A drive was connected: rescan once it has settled, if a list was made before and nothing else runs.
+        if (g_driveArrived && GetTickCount64() - g_driveArrived > 3000 && !g_app.busy && g_app.scannedOnce && !g_job.active)
+        {
+            g_driveArrived = 0;
+            StartScan(true);
+        }
         // Using a downloaded release (not a folder picked by hand): look for a newer one once per session.
         if (g_app.scannedOnce && !g_app.checkedOnce && !g_app.busy)
         {

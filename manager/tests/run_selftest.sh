@@ -53,6 +53,26 @@ import zipfile,sys
 z=zipfile.ZipFile(sys.argv[1]+'/rs.zip','w',zipfile.ZIP_DEFLATED)
 z.write(sys.argv[1]+'/rs_64.dll','ReShade64.dll'); z.write(sys.argv[1]+'/rs_32.dll','ReShade32.dll'); z.close()" "$B"
 cat "$B/g11_64.exe" "$B/rs.zip" > "$B/rssetup.exe"
+mk "Skyrim VR" g11_64.exe SkyrimVR.exe
+mk ArenaGame g11_64.exe ArenaGame.exe; mkdir -p "$G/ArenaGame/EasyAntiCheat"; cp "$B/g11_64.exe" "$G/ArenaGame/start_protected_game.exe"
+# Steam library (VR-only flag from appinfo.vdf) and Battle.net games, found through the registry
+S="$W/Steam"; mkdir -p "$S/steamapps/common" "$S/appcache"
+for a in "10:Flat Game:FlatGame" "20:Headset Only:HeadsetOnly" "30:Sim VR:SimVR"; do
+  id=${a%%:*}; r=${a#*:}; n=${r%%:*}; d=${r#*:}
+  mkdir -p "$S/steamapps/common/$d"; cp "$B/g11_64.exe" "$S/steamapps/common/$d/$d.exe"
+  printf '"AppState"\n{\n\t"appid"\t\t"%s"\n\t"name"\t\t"%s"\n\t"installdir"\t\t"%s"\n}\n' "$id" "$n" "$d" > "$S/steamapps/appmanifest_$id.acf"
+done
+printf '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n}\n' "$(winepath -w "$S" | sed 's/\\/\\\\/g')" > "$S/steamapps/libraryfolders.vdf"
+python3 $F/appinfo.py "$S/appcache/appinfo.vdf" 10:0:1 20:1 30:0
+mkdir -p "$W/BNet/Diablo IV"; cp "$B/g11_64.exe" "$W/BNet/Diablo IV/Diablo IV.exe"
+U='HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+WINEDEBUG=-all wine reg add 'HKCU\Software\Valve\Steam' /v SteamPath /d "$(winepath -w "$S")" /f >/dev/null
+WINEDEBUG=-all wine reg add "$U\Diablo IV" /v DisplayName /d "Diablo IV" /f >/dev/null
+WINEDEBUG=-all wine reg add "$U\Diablo IV" /v InstallLocation /d "$(winepath -w "$W/BNet/Diablo IV")" /f >/dev/null
+WINEDEBUG=-all wine reg add "$U\Diablo IV" /v UninstallString /d '"C:\ProgramData\Battle.net\Agent\Blizzard Uninstaller.exe" --uid=fenris' /f >/dev/null
+WINEDEBUG=-all wine reg add "$U\Battle.net" /v DisplayName /d "Battle.net" /f >/dev/null
+WINEDEBUG=-all wine reg add "$U\Battle.net" /v InstallLocation /d "$(winepath -w "$W/BNet")" /f >/dev/null
+WINEDEBUG=-all wine reg add "$U\Battle.net" /v UninstallString /d '"C:\ProgramData\Battle.net\Agent\Blizzard Uninstaller.exe" --uid=battle.net' /f >/dev/null
 cp -r "$REL" "$W/release"
 cp ../../shader/BFIPresenter_Shader.fx "$W/release/"
 (cd .. && python3 gen_tested.py >/dev/null)
