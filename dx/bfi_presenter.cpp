@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.11-rfx4"
+#define BFI_ADDON_VERSION "1.0.11-rfx5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -1953,6 +1953,8 @@ static IUnknown *ReflexOwnDevice();
 // takes over presenting, Control: Resonant). The automatic frame cap stays at
 // Refresh then: holding DLSS-G's presents back broke its pacing (Onimusha).
 static std::atomic<double> g_fgPresentT{0.0};   // last time a frame-generation DLL was seen presenting
+static std::atomic<bool>   g_fgCallerDlss{false};  // ... and it was DLSS-G's (also on the stack without frame generation)
+static std::atomic<double> g_rfxRenderedFps{0.0}, g_rfxRenderedT{0.0};   // rendered frames/s from Reflex frame numbers
 // Every 30th game present: is a frame-generation DLL on the call stack? DLSS-G presents its
 // real and generated frames from its own thread (sl.dlss_g / nvngx_dlssg); without frame
 // generation the game's own thread presents. The DLL being loaded alone said nothing: God of
@@ -1973,7 +1975,8 @@ static void FgCheckCaller()
     {
         HMODULE m = nullptr;
         if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)frames[f], &m)) continue;
-        for (HMODULE x : mods) if (x && m == x) { g_fgPresentT.store(Now()); return; }
+        for (int i = 0; i < 6; i++)
+            if (mods[i] && m == mods[i]) { g_fgCallerDlss.store(i < 3); g_fgPresentT.store(Now()); return; }
     }
 }
 static bool FgModuleLoaded()
@@ -2327,7 +2330,7 @@ static DWORD WINAPI PresenterThread(void *)
                               "reflex_setting,reflex_limit,game_reflex_seen,game_low_latency,game_boost,game_limit_us,"
                               "applied_low_latency,applied_boost,applied_limit_us,forced,"
                               "release_to_flash_ms,release_to_flash_max_ms,frames_shown,"
-                              "rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,rfx_queue_ms\n");
+                              "rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,rfx_queue_ms,rendered_fps\n");
         }
         else if (!s.log && logf)
         {
@@ -2923,11 +2926,19 @@ static DWORD WINAPI PresenterThread(void *)
 
                 // Automatic frame cap (see autoCapDown).
                 const double hzA = modeHz > 0.0 ? modeHz : peakHz;
-                const bool fg = Now() - g_fgPresentT.load() < 2.0;
+                // Frame generation: with Reflex frame numbers (every DLSS-G game has them), presents
+                // well above the rendered frames. Without them, an FSR / XeSS frame-generation DLL
+                // presenting. DLSS-G's DLL is on the present path in God of War with it off, so its
+                // presence alone doesn't count.
+                bool fg;
+                if (Now() - g_rfxRenderedT.load() < 3.0 && g_rfxRenderedFps.load() > 1.0)
+                    fg = g_status.gameFps > 1.5 * g_rfxRenderedFps.load();
+                else
+                    fg = Now() - g_fgPresentT.load() < 2.0 && !g_fgCallerDlss.load();
                 if (fg != fgWas)
                 {
                     fgWas = fg;
-                    LOGI("BFI Presenter: frame generation %s", fg ? "active (its DLL presents the frames)" : "no longer active");
+                    LOGI("BFI Presenter: frame generation %s", fg ? "active" : "not active");
                 }
                 const double fpsA = g_status.gameFps;
                 if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0)
@@ -2980,12 +2991,13 @@ static DWORD WINAPI PresenterThread(void *)
                     EnterCriticalSection(&g_cfgLock);
                     const Status sr = g_status;
                     LeaveCriticalSection(&g_cfgLock);
-                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f\n",
                             t, stNow.gameFps, userCap, perNow, stNow.autoCapDown, stNow.fgActive, s.pacingMode, s.capJit,
                             stNow.lrState, stNow.lrEst, stNow.aheadInUse, s.reflex, s.reflexLimit, sr.rfxGameLL >= 0 ? 1 : 0,
                             sr.rfxGameLL, sr.rfxGameBoost, sr.rfxGameUs, sr.rfxAppLL, sr.rfxAppBoost, sr.rfxAppUs, sr.rfxForced,
                             relN ? relSum / relN : -1.0, relN ? relMax : -1.0, relN, rs.frames, rs.simGpuMs, rs.simPresentMs,
-                            rs.inputGpuMs, rs.gpuFrameMs, rs.queueMs);
+                            rs.inputGpuMs, rs.gpuFrameMs, rs.queueMs,
+                            Now() - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : -1.0);
                     fflush(rfxf);
                 }
                 relSum = relMax = 0.0; relN = 0;
@@ -4196,7 +4208,7 @@ static void ReflexTick(const Settings &s, double modeHz, bool cycleCap, ReflexSe
     g_rfxWantMode.store(s.reflex);
     g_rfxWantLimitUs.store(us);
     // Only touched when asked for, or to log the game's own Reflex in the timing log.
-    if (s.reflex == 0 && s.reflexLimit == 0 && !s.log && g_rfxHook.load() == 0) return;
+    if (s.reflex == 0 && s.reflexLimit == 0 && !s.log && !s.autoCap && g_rfxHook.load() == 0) return;
     ReflexHook(s.reflex == 3);
     if (g_rfxHook.load() != 1) return;
     if (g_rfxStartT == 0.0) g_rfxStartT = Now();
@@ -4230,6 +4242,19 @@ static void ReflexTick(const Settings &s, double modeHz, bool cycleCap, ReflexSe
                 q += r.queueEnd >= r.queueStart ? (r.queueEnd - r.queueStart) / 1000.0 : 0.0;
                 n++;
                 if (r.frameID > newest) newest = r.frameID;
+            }
+            // Rendered frames a second, from the game's own frame numbers (frame generation
+            // presents about twice as many).
+            {
+                static UINT64 prevNewest = 0;
+                static double prevT = 0.0;
+                const double tn = Now();
+                if (prevNewest && newest > prevNewest && newest - prevNewest < 2000 && tn - prevT > 0.5 && tn - prevT < 3.0)
+                {
+                    g_rfxRenderedFps.store((double)(newest - prevNewest) / (tn - prevT));
+                    g_rfxRenderedT.store(tn);
+                }
+                prevNewest = newest; prevT = tn;
             }
             g_rfxLastReport = newest;
             if (n)
