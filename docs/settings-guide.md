@@ -128,7 +128,7 @@ Limits how fast the game runs so it stays in step with the flashing.
 
 **Automatic frame cap** · `AutoFrameCap` · default: on\
 Works with the Refresh rate cap. When the game can't hold the refresh rate (e.g. 90 fps at 120 Hz), some images would be shown twice and others skipped, which judders. So BFI Presenter steps down to one game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames per cycle): every flash shows the next image. It goes back to Refresh when the game has headroom again: games with NVIDIA Reflex report how long their frames take; for the others it tries Refresh for about 3 seconds, after 30 s, then 60 s, then every 2 minutes while the game still can't hold it.\
-With frame generation it stays at Refresh, and in games with NVIDIA Reflex (every DLSS frame-generation game) it sets Reflex's own frame limit to one presented frame per strobe cycle (e.g. 60 at 120 Hz), so the driver paces the generated frames and every flash gets the next one.\
+With frame generation it stays at Refresh. In DirectX games with NVIDIA Reflex (every DLSS frame-generation game) it also sets Reflex's own frame limit to one presented frame per strobe cycle (e.g. 60 at 120 Hz), so the driver paces the generated frames and every flash gets the next one. The Vulkan layer has no Reflex limit: there it just stays at Refresh, so aim for a final fps (generated frames included) close to your refresh rate.\
 *When to change it:* leave on. Turn off if you'd rather keep 120 fps with some judder when the game dips.
 
 **Frame pacing** · `FramePacing` · default: Lowest latency (new ini files)
@@ -230,7 +230,7 @@ The presenter's own output runs in exclusive fullscreen; the game's window mode 
 *When to change it:* only if a game misbehaves with it; it applies at the next game start.
 
 **Recover automatically** · `VulkanAutoRecover` · default: on\
-Some things can still put Windows into that slower mode, and it stays there after they're gone: a window briefly covering the game (a launcher's splash screen) or the ReShade menu. When the presenter sees it for 3 seconds, it has the game rebuild its swap chain, which brings the flashes back in step. That's a short pause (in most games a blink; up to a few seconds in heavy ones), at most every 20 seconds. Ctrl+Shift+O does it by hand.\
+Some things can still put Windows into that slower mode, and it stays there after they're gone: a window briefly covering the game (a launcher's splash screen) or the ReShade menu. When the presenter sees it for 3 seconds, it has the game rebuild its swap chain, which brings the flashes back in step. That's a short pause (in most games a blink; up to a few seconds in heavy ones), at most every 20 seconds. If presentation slows again soon after, the game is probably just using the whole GPU, which a rebuild can't fix: the next one waits longer (40, then 80 seconds), and after 3 such rebuilds it stops for the session. Slow moments while the automatic frame cap tries Refresh don't count. Ctrl+Shift+O does it by hand.\
 *Tip:* in Vulkan games, change settings in `BFIPresenter.ini` rather than the ReShade menu while playing where you can; the game picks up the change within a second.
 
 **SDR to HDR**, **SDR white**, **SDR highlights** · `SdrToHdr`, `SdrWhiteNits`, `SdrHighlightNits`, `SdrHighlightKnee` · default: on, 200, 800, 0.65\
@@ -263,7 +263,7 @@ If a game crashes, these write a short report of what went wrong (`BFIPresenter_
 |---|---|
 | The game holds 120 fps | Frame cap: Refresh rate · Pacing: Lowest latency · Light game: Later release on · Gain 1.0, Variable MPRT |
 | The game can't hold 120 | Frame cap: Refresh rate with Automatic frame cap on (it steps down to 60 by itself), or Half refresh · Pacing: Lowest latency · Just-in-time release on |
-| Frame generation | Frame cap: Refresh rate, never Half · Automatic frame cap on (sets the Reflex frame limit) · Pacing: Lowest latency · Later release off · Final fps (generated frames included) at least refresh ÷ frames per cycle |
+| Frame generation | Frame cap: Refresh rate, never Half · Automatic frame cap on (DirectX: sets the Reflex frame limit) · Pacing: Lowest latency · Later release off · Final fps (generated frames included) at least refresh ÷ frames per cycle |
 | Before anything else | G-SYNC / VRR off for the game, VSync on or "app setting" · No frame limiter (RivaTuner, NVIDIA) on the game · CRT shader: set its own decay off |
 
 ---
