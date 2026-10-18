@@ -5,6 +5,8 @@
 #endif
 #include <windows.h>
 #include <shobjidl.h>
+#include <shellapi.h>
+#include <cstdarg>
 #include <d3d11.h>
 #include <atomic>
 #include <mutex>
@@ -177,6 +179,7 @@ struct App {
 
 static App g_app;
 static void RestartAsAdmin();
+static std::string VkMachineElevated(bool add, const std::wstring &dir);
 
 // ------------------------------------------------------------------ batch jobs
 // Installs, updates and removes over many games run a few per frame, so the window keeps drawing (a progress
@@ -580,6 +583,19 @@ static void Tooltip(const char *t)
     }
 }
 
+static std::string CapFirst(std::string t) { if (!t.empty()) t[0] = (char)toupper((unsigned char)t[0]); return t; }
+static void WarnWrapped(const char *fmt, ...)
+{
+    char b[1024];
+    va_list a;
+    va_start(a, fmt);
+    vsnprintf(b, sizeof(b), fmt, a);
+    va_end(a);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.60f, 0.30f, 1));
+    ImGui::TextWrapped("%s", b);
+    ImGui::PopStyleColor();
+}
+
 static void DoAction(const std::string &what, const std::string &err)
 {
     if (err.empty()) g_app.SetMsg(what, false);
@@ -636,7 +652,8 @@ static void DrawTop(HWND hwnd)
     if (g_app.vk.installed)
     {
         bool old = !g_app.src.vkVersion.empty() && CompareVersions(g_app.vk.version, g_app.src.vkVersion) < 0;
-        ImGui::TextColored(old ? kYellow : kGreen, "Installed v%s%s", g_app.vk.version.c_str(), old ? " (update available)" : "");
+        ImGui::TextColored(old ? kYellow : kGreen, "Installed v%s%s%s", g_app.vk.version.c_str(),
+                           g_app.vk.machine ? " for all users" : " for your user", old ? " (update available)" : "");
     }
     else ImGui::TextColored(kGrey, "Not installed (only needed for Vulkan and DXVK games)");
     ImGui::SameLine();
@@ -645,13 +662,41 @@ static void DrawTop(HWND hwnd)
     ImGui::SameLine();
     ImGui::BeginDisabled(g_app.busy || g_app.src.vkDir.empty());
     if (ImGui::Button(g_app.vk.installed ? "Update layer" : "Install layer"))
-        DoAction("Vulkan layer installed for your Windows user.", InstallVulkanLayer(g_app.src));
+        DoAction(IsElevated() || g_app.vk.machine ? "Vulkan layer installed for all users." : "Vulkan layer installed for your Windows user.",
+                 InstallVulkanLayer(g_app.src));
     ImGui::EndDisabled();
     if (g_app.vk.installed)
     {
         ImGui::SameLine();
-        if (ImGui::Button("Remove layer")) DoAction("Vulkan layer removed.", UninstallVulkanLayer());
+        if (ImGui::Button("Remove layer"))
+        {
+            std::string e = UninstallVulkanLayer();
+            if (e.empty() && g_app.vk.machine && !IsElevated()) e = VkMachineElevated(false, g_app.vk.dir);
+            DoAction("Vulkan layer removed.", e);
+        }
+        ImGui::SameLine();
+        if (!g_app.vk.machine)
+        {
+            if (ImGui::Button("All users"))
+                DoAction("Vulkan layer registered for all users: it also loads in games run as administrator.",
+                         VkMachineElevated(true, g_app.vk.dir));
+            Tooltip("Registers the layer for all users (asks for administrator rights). Needed when games run as administrator "
+                    "-- User Account Control turned off, Steam or the game set to run as administrator: Windows' Vulkan loader "
+                    "then ignores per-user layers, and BFI Presenter doesn't load (no BFIPresenterVK.log).");
+        }
+        else if (g_app.vk.reshadeAfter)
+        {
+            if (ImGui::Button("Fix order"))
+                DoAction("BFI Presenter is listed after ReShade again.", VkMachineElevated(true, g_app.vk.dir));
+            Tooltip("Lists the BFI Presenter layer after ReShade's again (asks for administrator rights).");
+        }
     }
+    if (g_app.vk.installed && g_app.vk.reshadeAfter)
+        WarnWrapped("ReShade's Vulkan layer is listed after BFI Presenter: its effects would run on every strobed refresh. %s",
+                    g_app.vk.machine ? "Use Fix order." : "Use Update layer.");
+    if (g_app.vk.installed && !g_app.vk.machine && !g_app.vk.elevatedWhy.empty())
+        WarnWrapped("%s: per-user Vulkan layers don't load in games run as administrator. Use All users.",
+                    CapFirst(g_app.vk.elevatedWhy).c_str());
 
     ImGui::Separator();
 
@@ -1607,8 +1652,42 @@ static void LoadFonts(float scale)
     }
 }
 
+// Runs the Manager elevated for the all-users Vulkan layer registration (HKLM); "" or the error.
+static std::string VkMachineElevated(bool add, const std::wstring &dir)
+{
+    if (IsElevated()) return RegisterVulkanLayerMachine(add, dir);
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring args = std::wstring(L"--vk-machine ") + (add ? L"add" : L"remove") + L" \"" + dir + L"\"";
+    SHELLEXECUTEINFOW ei = { sizeof(ei) };
+    ei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    ei.lpVerb = L"runas";
+    ei.lpFile = self;
+    ei.lpParameters = args.c_str();
+    ei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&ei) || !ei.hProcess)
+        return GetLastError() == ERROR_CANCELLED ? "Administrator rights weren't granted." : "Couldn't start the Manager as administrator.";
+    WaitForSingleObject(ei.hProcess, 30000);
+    DWORD code = 1;
+    GetExitCodeProcess(ei.hProcess, &code);
+    CloseHandle(ei.hProcess);
+    return code == 0 ? "" : "The all-users registration failed.";
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 {
+    {
+        // Elevated helper: BFIPresenterManager.exe --vk-machine add|remove "<layer folder>"
+        int argc = 0;
+        wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv && argc >= 4 && wcscmp(argv[1], L"--vk-machine") == 0)
+        {
+            const std::string e = RegisterVulkanLayerMachine(wcscmp(argv[2], L"add") == 0, argv[3]);
+            LocalFree(argv);
+            return e.empty() ? 0 : 1;
+        }
+        if (argv) LocalFree(argv);
+    }
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     ImGui_ImplWin32_EnableDpiAwareness();
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, inst, LoadIconW(inst, MAKEINTRESOURCEW(1)), LoadCursor(nullptr, IDC_ARROW),

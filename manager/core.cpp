@@ -1437,6 +1437,9 @@ void Detect(Game &g)
     if (g.apis & ApiGL && !(g.apis & (ApiD3D11 | ApiD3D12 | ApiD3D9)) && !g.dgvoodoo)
         g.notes.push_back("OpenGL needs an NVIDIA GPU. Old OpenGL games may need the NVIDIA profile setting Vulkan/OpenGL present method = Prefer layered on DXGI swapchain.");
     if (g.addonWrongBits) g.notes.push_back("An add-on for the wrong bitness is installed; Install replaces it with the right one.");
+    if (g.route == Route::Vulkan && ExeRunsAsAdmin(g.exe))
+        g.notes.push_back("The game is set to run as administrator: the Vulkan layer only loads there when it is installed for "
+                          "all users (Vulkan layer: All users).");
 }
 
 // ------------------------------------------------------------------ discovery
@@ -1926,28 +1929,83 @@ void DetectAll(std::vector<Game> &games, const std::function<void(const std::str
     SaveCache();
 }
 
+bool IsElevated()
+{
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    TOKEN_ELEVATION e{};
+    DWORD n = 0;
+    const bool ok = GetTokenInformation(tok, TokenElevation, &e, sizeof(e), &n) && e.TokenIsElevated;
+    CloseHandle(tok);
+    return ok;
+}
+
+static bool RegDword(HKEY root, const wchar_t *sub, const wchar_t *val, DWORD &out)
+{
+    DWORD sz = sizeof(out);
+    return RegGetValueW(root, sub, val, RRF_RT_REG_DWORD, nullptr, &out, &sz) == ERROR_SUCCESS;
+}
+
+// Windows' compatibility setting "Run this program as an administrator" for an exe.
+bool ExeRunsAsAdmin(const std::wstring &exe)
+{
+    if (exe.empty()) return false;
+    for (HKEY root : { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE })
+    {
+        const std::wstring v = RegString(root, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers", exe.c_str());
+        if (Lower(v).find(L"runasadmin") != std::wstring::npos) return true;
+    }
+    return false;
+}
+
+// Signs that games on this PC run elevated, where the Vulkan loader ignores per-user layers.
+static std::string ElevatedWhy()
+{
+    DWORD lua = 1;
+    if (RegDword(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", L"EnableLUA", lua) && lua == 0)
+        return "User Account Control is turned off, so programs run as administrator";
+    std::wstring steamExe = RegString(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamExe");
+    for (auto &c : steamExe) if (c == L'/') c = L'\\';
+    if (!steamExe.empty())
+    {
+        // The compatibility key is the exe's path as Windows spells it; try both spellings of the drive letter.
+        std::wstring alt = steamExe;
+        if (!alt.empty()) alt[0] = (wchar_t)(iswlower(alt[0]) ? towupper(alt[0]) : towlower(alt[0]));
+        if (ExeRunsAsAdmin(steamExe) || ExeRunsAsAdmin(alt)) return "Steam is set to run as administrator, so its games do too";
+    }
+    if (IsElevated()) return "the Manager itself runs as administrator, so games may too";
+    return {};
+}
+
 VulkanLayerState DetectVulkanLayer()
 {
     VulkanLayerState s;
-    for (auto &v : RegValueNames(HKEY_CURRENT_USER, L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers"))
-    {
-        std::wstring l = Lower(v);
-        if (l.find(L"vklayer_bfi_presenter.json") != std::wstring::npos && Exists(v))
-        {
-            s.dir = DirOf(v);
-            std::wstring dll = Join(s.dir, L"BFIPresenterVK.dll");
-            s.installed = Exists(dll);
-            if (s.installed) s.version = BfiVersionOf(dll, true);
-        }
-    }
+    // The loader lists machine-wide layers first, then per-user ones; earlier = nearer the game.
+    int idx = 0, ourIdx = -1, reshadeIdx = -1;
     for (HKEY root : { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER })
         for (auto &v : RegValueNames(root, L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers"))
-            if (Lower(v).find(L"reshade") != std::wstring::npos && Exists(v))
+        {
+            idx++;
+            const std::wstring l = Lower(v);
+            if (l.find(L"vklayer_bfi_presenter.json") != std::wstring::npos && Exists(v))
+            {
+                const std::wstring dll = Join(DirOf(v), L"BFIPresenterVK.dll");
+                if (!Exists(dll)) continue;
+                (root == HKEY_LOCAL_MACHINE ? s.machine : s.user) = true;
+                if (ourIdx < 0) ourIdx = idx;
+                if (!s.installed || root == HKEY_CURRENT_USER) { s.dir = DirOf(v); s.version = BfiVersionOf(dll, true); }
+                s.installed = true;
+            }
+            else if (l.find(L"reshade") != std::wstring::npos && Exists(v))
             {
                 s.reshadeLayer = true;
+                if (reshadeIdx < 0) reshadeIdx = idx;
                 std::wstring dll = Join(DirOf(v), L"ReShade64.dll");
                 if (Exists(dll)) s.reshadeVersion = ShortVersion(ReadDllInfo(dll).version);
             }
+        }
+    s.reshadeAfter = ourIdx >= 0 && reshadeIdx > ourIdx;
+    s.elevatedWhy = ElevatedWhy();
     return s;
 }
 
@@ -2289,7 +2347,30 @@ std::string InstallVulkanLayer(const Source &src)
         RegSetValueExW(k, v.c_str(), 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
     }
     RegCloseKey(k);
+    // Running as administrator (User Account Control off, or started that way): register for all
+    // users too, so games run as administrator load it as well.
+    if (IsElevated()) RegisterVulkanLayerMachine(true, dest);
     Log(oldV.empty() ? "install" : "update", "Vulkan layer", Join(dest, L"BFIPresenterVK.dll"), oldV, src.vkVersion);
+    return {};
+}
+
+std::string RegisterVulkanLayerMachine(bool add, const std::wstring &dir)
+{
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kVkKey, 0, nullptr, 0, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, nullptr, &k, nullptr) != ERROR_SUCCESS)
+        return "Couldn't open the all-users Vulkan layer registry key (needs administrator rights).";
+    // Ours removed (any folder), then added again so it is listed last, after ReShade.
+    for (auto &v : RegValueNames(HKEY_LOCAL_MACHINE, kVkKey))
+        if (Lower(v).find(L"vklayer_bfi_presenter") != std::wstring::npos) RegDeleteValueW(k, v.c_str());
+    if (add)
+        for (auto n : { L"VkLayer_BFI_presenter.json", L"VkLayer_BFI_presenter32.json" })
+        {
+            const std::wstring v = Join(dir, n);
+            DWORD zero = 0;
+            RegSetValueExW(k, v.c_str(), 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
+        }
+    RegCloseKey(k);
+    Log(add ? "install" : "remove", "Vulkan layer (all users)", Join(dir, L"BFIPresenterVK.dll"), "", "");
     return {};
 }
 
@@ -2302,6 +2383,7 @@ std::string UninstallVulkanLayer()
             if (Lower(v).find(L"vklayer_bfi_presenter") != std::wstring::npos) RegDeleteValueW(k, v.c_str());
         RegCloseKey(k);
     }
+    if (IsElevated()) RegisterVulkanLayerMachine(false, Join(DataDir(), L"Vulkan"));   // else the caller asks for rights
     Log("remove", "Vulkan layer", Join(DataDir(), L"Vulkan"), DetectVulkanLayer().version, "");
     return {};
 }

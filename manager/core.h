@@ -83,11 +83,15 @@ struct Game {
 };
 
 struct VulkanLayerState {
-    bool installed = false;      // registered for this user and the files exist
+    bool installed = false;      // registered (for this user or all users) and the files exist
+    bool user = false;           // registered for this Windows user (HKCU)
+    bool machine = false;        // registered for all users (HKLM): also loads in games run as administrator
     std::string version;
     std::wstring dir;
     bool reshadeLayer = false;   // ReShade's own Vulkan layer is registered
+    bool reshadeAfter = false;   // ReShade is listed after BFI Presenter (wrong order: its effects run on every refresh)
     std::string reshadeVersion;
+    std::string elevatedWhy;     // why games here likely run as administrator ("" = no sign of it)
 };
 
 // ----- Settings (%LOCALAPPDATA%\BFIPresenter\manager.ini)
@@ -136,6 +140,11 @@ std::string Revert(Game &g);                  // puts back the files the last ac
 bool CanRevert(const Game &g);
 std::string InstallVulkanLayer(const Source &src);
 std::string UninstallVulkanLayer();
+// All-users registration (HKLM). Needs administrator rights: the Manager runs itself elevated
+// with --vk-machine add|remove <dir> for it.
+std::string RegisterVulkanLayerMachine(bool add, const std::wstring &dir);
+bool IsElevated();
+bool ExeRunsAsAdmin(const std::wstring &exe);    // "Run this program as an administrator" set for it
 std::wstring BackupDir();
 std::wstring LogPath();
 

@@ -118,6 +118,29 @@ int wmain(int argc, wchar_t **argv)
     e = InstallOrUpdate(*rd, src);
     VulkanLayerState vs = DetectVulkanLayer();
     CHECK(e.empty() && rd->ini && vs.installed && vs.version == src.vkVersion, "RDR2: layer %s installed and ini copied (%s)", vs.version.c_str(), e.c_str());
+    CHECK(vs.user && vs.machine == IsElevated(), "layer for this user%s", IsElevated() ? " and all users (elevated)" : "");
+    if (IsElevated())
+    {
+        // ReShade's layer added after ours (a ReShade reinstall): wrong order, then fixed by registering again.
+        HKEY k;
+        const wchar_t *key = L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers";
+        std::wstring rsJson = rel + L"\\ReShade64_fake.json";
+        { HANDLE f = CreateFileW(rsJson.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr); if (f != INVALID_HANDLE_VALUE) CloseHandle(f); }
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, key, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) == ERROR_SUCCESS)
+        {
+            DWORD zero = 0;
+            RegSetValueExW(k, rsJson.c_str(), 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
+            RegCloseKey(k);
+        }
+        VulkanLayerState w = DetectVulkanLayer();
+        CHECK(w.reshadeLayer && w.reshadeAfter, "ReShade listed after BFI Presenter detected");
+        RegisterVulkanLayerMachine(true, vs.dir);
+        w = DetectVulkanLayer();
+        // Wine lists registry values alphabetically, Windows in the order they were added.
+        const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+        CHECK(w.machine && (wine || !w.reshadeAfter), "registered again: BFI Presenter after ReShade%s", wine ? " (order not checked under Wine)" : "");
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_WRITE, &k) == ERROR_SUCCESS) { RegDeleteValueW(k, rsJson.c_str()); RegCloseKey(k); }
+    }
     e = Remove(*rd, false);
     CHECK(e.empty() && !rd->ini, "RDR2: ini removed");
     UninstallVulkanLayer();
