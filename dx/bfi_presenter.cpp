@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.11-rfx1"
+#define BFI_ADDON_VERSION "1.0.11-rfx2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -4249,7 +4249,8 @@ static void ReflexTick(const Settings &s, double modeHz, bool cycleCap, ReflexSe
         base.useMarkers = 1;
         NvSleepParams q = want ? ReflexWanted(base) : base;
         q.version = BFI_NVVER(NvSleepParams);
-        const bool need = want ? (!appliedValid || !SameSleep(applied, q)) : (appliedValid && seen);
+        // Turned off again: back to the game's own mode (or plain, if the game's call wasn't seen).
+        const bool need = want ? (!appliedValid || !SameSleep(applied, q)) : appliedValid;
         if (need && dev)
         {
             const int r = o_NvSetSleepMode(dev, &q);
@@ -7088,6 +7089,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
             {
                 const double hz = st.refreshHz > 1.0 ? st.refreshHz : 0.0;
                 if (hz > 0.0) ImGui::Text("Cap: %.0f fps (a new game frame every %d refresh%s)", hz / per, per, per == 1 ? "" : "es");
+                if (per >= 2 && st.fgActive)
+                    ImGui::TextColored(kAmber, "Frame generation with a cap below the refresh rate: half its frames never reach the screen\n"
+                                       "(God of War: 30 new images a second at Half) and latency doubles. Use Refresh rate.");
                 if (per >= 2 && per % s.frames != 0)
                     ImGui::TextColored(kAmber, "%d refreshes per game frame doesn't fit %d frames per cycle: some game frames start\n"
                                        "on a dark refresh and motion judders. Use a multiple of %d.", per, s.frames, s.frames);
