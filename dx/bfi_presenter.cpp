@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.13"
+#define BFI_ADDON_VERSION "1.0.14-rt1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2212,7 +2212,10 @@ static DWORD WINAPI PresenterThread(void *)
     int    capDownSecs = 0, capUpSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
     double capSwitchT = -100.0, capUpT = -100.0, probeWait = 30.0, stayMin = 10.0;
     bool   fgWas = false;
-    bool   capByReflex = false;   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
+    bool   capByReflex = false;
+    bool   rfxLimitBad = false;   // the game collapsed under Reflex's limit: not used again this session
+    int    rfxBadSecs = 0;
+    double fpsAtDown = 0.0;       // game fps when the automatic frame cap stepped down   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
     int    fgVotes = 0;           // seconds in a row the counts said the frame-generation state changed
     double fpsPrevSec = -1.0;
     double phaseUntil = 0.0, phaseNextT = 0.0;   // Reflex limit phase nudge (see the per-second block)
@@ -2970,7 +2973,21 @@ static DWORD WINAPI PresenterThread(void *)
                 // which is quicker than holding the game at Present: God of War Ragnarok with frame
                 // generation switching itself off had ~57 ms release -> flash with the presenter's cap.
                 // Other games: the presenter's own cap, never while frame generation is active.
-                const bool rfxUse = t - rsLastT < 3.0 && rsLast.frames > 0;
+                // Safety net: a game whose own Reflex setup makes the limit collapse its frame rate
+                // (Returnal: 60 fps -> 7.5 fps the moment the limit went on) -- the limit is dropped for
+                // the session and the presenter's own cap used instead.
+                if (autoCapDown && capByReflex && !rfxLimitBad && t - capSwitchT >= 1.5 && t - capSwitchT < 6.0 &&
+                    fpsAtDown > 0.8 * hzA / s.frames && fpsA < 0.5 * hzA / s.frames)
+                {
+                    if (++rfxBadSecs >= 2)
+                    {
+                        rfxLimitBad = true; capByReflex = false;
+                        LOGW("BFI Presenter: Reflex frame limit: the game fell to %.0f fps under it (%.0f before) -- not used for the "
+                             "rest of this session; the automatic frame cap uses the presenter's own cap", fpsA, fpsAtDown);
+                    }
+                }
+                else rfxBadSecs = 0;
+                const bool rfxUse = t - rsLastT < 3.0 && rsLast.frames > 0 && !rfxLimitBad;
                 if (!autoCapDown) capByReflex = rfxUse;
                 if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg))
                 {
@@ -3006,7 +3023,7 @@ static DWORD WINAPI PresenterThread(void *)
                             // next return waits longer.
                             if (t - capUpT < 30.0) stayMin = stayMin * 2.0 > 120.0 ? 120.0 : stayMin * 2.0;
                             else stayMin = 10.0;
-                            autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t;
+                            autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames,
                                  capByReflex ? "Reflex frame limit" : "the presenter's cap", fpsA, hzA);
