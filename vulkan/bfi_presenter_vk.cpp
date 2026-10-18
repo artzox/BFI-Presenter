@@ -1931,7 +1931,11 @@ static void PresenterThread(Swapchain *sc)
         if (t - slowSecT >= 1.0)
         {
             slowSecT = t;
-            const bool bad = slowCount >= 8;
+            // Not while the automatic frame cap tries Refresh or has just switched: the game then runs
+            // uncapped for a few seconds and fills the GPU, so images come back late for that reason
+            // (RDR2: 20-30 slow returns a second during each try), which a rebuild can't fix.
+            const bool capping = capProbe || t - capSwitchT < 3.0;
+            const bool bad = slowCount >= 8 && !capping;
             slowRun = bad ? slowRun + 1 : 0;
             if (slowRun == 3)
             {
