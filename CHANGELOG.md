@@ -7,6 +7,13 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.14] — 2026-10-19
+
+- **[DX] Fixed: games that collapse under a Reflex frame limit.** In Returnal the automatic frame cap's Reflex limit dropped the game from 60 to about 7.5 fps, and so did the game's own 16,666 µs limit, which it switches on and off by itself. The presenter now notices the collapse within 2 seconds and, for the rest of the session (also across swap-chain changes): sets no Reflex limit, takes the game's own limit out of its Reflex calls, and caps with its own cap instead. Returnal now holds a steady 60 fps without frame generation. The log says when this happens.
+- **[DX] Frame generation without Reflex reports.** When a game that gave Reflex reports stops giving them while DLSS-G presents, the automatic frame cap counts it as frame generation and stays at Refresh, instead of holding DLSS-G's frames with its own cap.
+- **[Docs]** Tested games: Jusant recommended with DLSS frame generation and the automatic frame cap (it removes the engine's judder; with RenoDX, use the UE Extended mod), Returnal notes. Settings guide and DX README: the collapse fallback.
+- **[Vulkan]** No changes; version number only.
+
 ## [1.0.13] — 2026-10-18
 
 - **[DX] Fixed: with DLSS frame generation the Reflex frame limit switched on and off every second** (1.0.12): the frame-generation check compared one second's presents with the previous second's rendered frames, so the limit undid its own detection, with heavy stutter (God of War Ragnarok). Presents and rendered frames are now compared over the same second, and the state changes only after 3 seconds in a row (on) or 5 (off). The automatic frame cap doesn't step down while that may be changing.
