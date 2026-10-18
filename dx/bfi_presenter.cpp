@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.13-fg2"
+#define BFI_ADDON_VERSION "1.0.13-fg3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3025,7 +3025,10 @@ static DWORD WINAPI PresenterThread(void *)
                                  "simulation %.1f, submit %.1f), within a refresh", needMs, rsLast.gpuActiveMs, rsLast.simMs, rsLast.submitMs);
                         }
                     }
-                    else if (t - capSwitchT >= probeWait && !hitchPaused)
+                    // With frame generation, a try means 3 s without the limit, and DLSS-G re-pacing twice:
+                    // a visible stutter each time (God of War Ragnarok, every 30-120 s). Frame generation that
+                    // could fill the refresh rate is rare, so try only every 5 minutes then.
+                    else if (t - capSwitchT >= (fg && capByReflex ? 300.0 : probeWait) && !hitchPaused)
                     {
                         // No Reflex reports (or frame generation, whose reports are for rendered frames):
                         // try Refresh for a few seconds.
