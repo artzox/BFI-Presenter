@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.11-rfx3"
+#define BFI_ADDON_VERSION "1.0.11-rfx4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -4275,16 +4275,23 @@ static void ReflexTick(const Settings &s, double modeHz, bool cycleCap, ReflexSe
         NvSleepParams q = want ? ReflexWanted(base) : base;
         q.version = BFI_NVVER(NvSleepParams);
         // Turned off again: back to the game's own mode (or plain, if the game's call wasn't seen).
-        const bool need = want ? (!appliedValid || !SameSleep(applied, q)) : appliedValid;
+        // Sent again every 2 s while wanted: the driver or the game can reset it (God of War with
+        // frame generation: the limit stopped holding after a while, with no call from the game seen).
+        static double lastSent = 0.0;
+        const bool refresh = want && Now() - lastSent > 2.0;
+        const bool need = want ? (!appliedValid || !SameSleep(applied, q) || refresh) : appliedValid;
         if (need && dev)
         {
+            const bool quiet = appliedValid && SameSleep(applied, q);   // a periodic refresh: not logged
+            lastSent = Now();
             const int r = o_NvSetSleepMode(dev, &q);
             AcquireSRWLockExclusive(&g_rfxLock);
             g_rfxApplied = q;
             g_rfxAppliedValid = want;
             ReleaseSRWLockExclusive(&g_rfxLock);
-            LOGI("BFI Presenter: Reflex set: low latency %s%s, frame limit %u us (%d)%s", q.lowLatency ? "on" : "off",
-                 q.boost ? " + Boost" : "", q.minIntervalUs, r, want ? "" : " -- the game's own setting restored");
+            if (!quiet || r != 0)
+                LOGI("BFI Presenter: Reflex set: low latency %s%s, frame limit %u us (%d)%s", q.lowLatency ? "on" : "off",
+                     q.boost ? " + Boost" : "", q.minIntervalUs, r, want ? "" : " -- the game's own setting restored");
         }
     }
     EnterCriticalSection(&g_cfgLock);
