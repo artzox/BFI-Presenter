@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.16"
+#define BFI_ADDON_VERSION "1.0.17-w1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -124,6 +124,7 @@ struct Settings
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
+    int   rfxCollapseCheck = 1;   // ReflexCollapseCheck (ini only): 0 keeps our Reflex limit even when the game falls under it
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
     int   deferRecreated = 1; // recreated swap chains: no BFI until the game resizes (safe)
@@ -243,6 +244,7 @@ static void LoadSettings(Settings &s)
     s.capJit = IniInt("CapJustInTime", 1) ? 1 : 0;
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
+    s.rfxCollapseCheck = IniInt("ReflexCollapseCheck", 1) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
     if (s.laterReleaseMs > 5.0f) s.laterReleaseMs = 5.0f;
@@ -3003,7 +3005,10 @@ static DWORD WINAPI PresenterThread(void *)
                 const bool rfxLimitBad = g_rfxLimitBad.load();
                 const bool stallSec = fpsA < 3.0 || hitchPaused;
                 if (stallSec) { rfxChkT = t; rcOnT = t; }
-                if (autoCapDown && capByReflex && !rfxLimitBad && !stallSec && t - rfxChkT >= 1.5 && t - rfxChkT < 6.0 &&
+                if (autoCapDown && capByReflex && !rfxLimitBad && !stallSec && t - rfxChkT < 12.0 && t - rfxChkT >= 0.0)
+                    LOGI("BFI Presenter: [test] %.0f s after the Reflex step-down: %.1f presented, %.1f rendered fps%s", t - rfxChkT, fpsA,
+                         g_rfxRenderedFps.load(), hitchPaused ? " (hitch guard paused)" : "");
+                if (s.rfxCollapseCheck && autoCapDown && capByReflex && !rfxLimitBad && !stallSec && t - rfxChkT >= 1.5 && t - rfxChkT < 6.0 &&
                     fpsAtDown > 0.8 * hzA / s.frames && fpsA < 0.5 * hzA / s.frames)
                 {
                     if (++rfxBadSecs >= 2)
