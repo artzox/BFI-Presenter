@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.13"
+#define BFI_ADDON_VERSION "1.0.15"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -123,6 +123,7 @@ struct Settings
     int   laterRelease = 0;   // Lowest latency + Refresh cap: release the game just in time for the pick
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
+    int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
     int   deferRecreated = 1; // recreated swap chains: no BFI until the game resizes (safe)
@@ -241,6 +242,7 @@ static void LoadSettings(Settings &s)
     s.laterRelease = IniInt("LaterRelease", 0) ? 1 : 0;
     s.capJit = IniInt("CapJustInTime", 1) ? 1 : 0;
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
+    s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
     if (s.laterReleaseMs > 5.0f) s.laterReleaseMs = 5.0f;
@@ -380,6 +382,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("LaterRelease", s.laterRelease);
     IniWriteInt("CapJustInTime", s.capJit);
     IniWriteInt("AutoFrameCap", s.autoCap);
+    IniWriteInt("CapWithReflex", s.capReflex);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
     IniWriteInt("GameFrameStatistics", s.virtualStats);
@@ -1941,6 +1944,11 @@ struct ReflexSecond
 };
 static void ReflexTick(int limitUs, ReflexSecond &out);
 static IUnknown *ReflexOwnDevice();
+// The game collapsed under a Reflex frame limit (Returnal: 60 -> 7.5 fps, ours or its own).
+// For the rest of the process: no limit from the presenter, and the game's own limit is
+// taken out too (kept across swap chain changes, which recreate the presenter's state).
+static std::atomic<bool> g_rfxLimitBad{false};
+static int ReflexGameLimitUs();
 
 // Frame generation that presents its own frames (DLSS-G, FSR 3 FG, XeSS FG): its
 // DLL is loaded and it has set the game's frame latency to 2 (DLSS-G does when it
@@ -2210,14 +2218,22 @@ static DWORD WINAPI PresenterThread(void *)
     // 60 s, then every 120 s while they keep failing).
     bool   autoCapDown = false, capProbe = false;
     int    capDownSecs = 0, capUpSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
+    int    statPer = 1;           // refreshes per game frame of the cap in effect (for the uneven-cycle counts)
     double capSwitchT = -100.0, capUpT = -100.0, probeWait = 30.0, stayMin = 10.0;
     bool   fgWas = false;
-    bool   capByReflex = false;   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
+    bool   capByReflex = false;
+    bool   reflexCap = false;     // the game frame cap applied with Reflex's frame limit (CapWithReflex)
+    double rcOnT = -100.0, fpsAtRc = 0.0;
+    int    rcBadSecs = 0;
+    int    rfxBadSecs = 0, gameLimBadSecs = 0;   // seconds collapsed under our Reflex limit / the game's own
+    double fpsGoodT = -100.0;     // last second the game held at least half the strobe rate
+    double fpsAtDown = 0.0;       // game fps when the automatic frame cap stepped down   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
     int    fgVotes = 0;           // seconds in a row the counts said the frame-generation state changed
     double fpsPrevSec = -1.0;
     double phaseUntil = 0.0, phaseNextT = 0.0;   // Reflex limit phase nudge (see the per-second block)
     int    phaseNudges = 0;     // last second's presents (goes with the rendered count taken then)
     ReflexSecond rsLast;           // last second's Reflex reports (frames == 0: the game doesn't use Reflex)
+    double rsEverT = -1.0;         // last time this swap chain had Reflex reports
     double rsLastT = -100.0;
     // Release -> lit flash of the frames shown this second (timing log, Reflex tests).
     bool   pickNew = false;
@@ -2277,6 +2293,10 @@ static DWORD WINAPI PresenterThread(void *)
         userCap = s.gameCap;
         // one game frame per strobe cycle (games with Reflex: Reflex's frame limit does it instead, see below)
         if (s.autoCap && userCap == 1 && autoCapDown && !capByReflex && s.frames >= 2) s.gameCap = 4;
+        // Cap applied with Reflex's frame limit (see the per-second block): the presenter itself then
+        // takes every frame, like at Refresh, and the driver paces the game.
+        statPer = CapPeriod(s.gameCap, s.frames, s.capDivisor);
+        if (reflexCap && s.capReflex && userCap >= 2 && s.enabled) s.gameCap = 1;
         // Release the game's frame-latency slot when the frame is handed
         // over (not when the strobe takes it) in Lowest latency, and also
         // whenever a Half/Quarter cap already paces the game to the strobe:
@@ -2475,7 +2495,7 @@ static DWORD WINAPI PresenterThread(void *)
         if (cycleStart && lastShownId && pickId >= lastShownId)
         {
             const int step = (int)(pickId - lastShownId);
-            if (CapPeriod(s.gameCap, s.frames, s.capDivisor) > s.frames) { if (step >= 2) secSkipU++; }   // frame lit over several cycles: 0/1 steps are normal
+            if (statPer > s.frames) { if (step >= 2) secSkipU++; }   // frame lit over several cycles: 0/1 steps are normal
             else
             {
                 const int expect = std::max(1, (int)std::floor(llStep + 0.5));
@@ -2954,7 +2974,9 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 else
                 {
-                    fg = Now() - g_fgPresentT.load() < 2.0 && !g_fgCallerDlss.load();
+                    // DLSS-G presenting counts too once the game has stopped giving Reflex reports it gave
+                    // before (Returnal with frame generation on): the presenter's cap would halve its frames.
+                    fg = Now() - g_fgPresentT.load() < 2.0 && (!g_fgCallerDlss.load() || rsEverT > 0.0);
                     fgVotes = 0;
                 }
                 fpsPrevSec = g_status.gameFps;
@@ -2970,7 +2992,72 @@ static DWORD WINAPI PresenterThread(void *)
                 // which is quicker than holding the game at Present: God of War Ragnarok with frame
                 // generation switching itself off had ~57 ms release -> flash with the presenter's cap.
                 // Other games: the presenter's own cap, never while frame generation is active.
-                const bool rfxUse = t - rsLastT < 3.0 && rsLast.frames > 0;
+                // Safety net: a game whose own Reflex setup makes the limit collapse its frame rate
+                // (Returnal: 60 fps -> 7.5 fps the moment the limit went on) -- the limit is dropped for
+                // the session and the presenter's own cap used instead.
+                const bool rfxLimitBad = g_rfxLimitBad.load();
+                if (autoCapDown && capByReflex && !rfxLimitBad && t - capSwitchT >= 1.5 && t - capSwitchT < 6.0 &&
+                    fpsAtDown > 0.8 * hzA / s.frames && fpsA < 0.5 * hzA / s.frames)
+                {
+                    if (++rfxBadSecs >= 2)
+                    {
+                        g_rfxLimitBad.store(true); capByReflex = false;
+                        LOGW("BFI Presenter: Reflex frame limit: the game fell to %.0f fps under it (%.0f before) -- no Reflex frame "
+                             "limit for the rest of this session (the game's own is taken out too); the automatic frame cap uses the "
+                             "presenter's own cap", fpsA, fpsAtDown);
+                    }
+                }
+                else rfxBadSecs = 0;
+                // The same collapse under the game's own Reflex limit (Returnal sets 16,666 us now and then:
+                // 60 fps -> 7.9 the same second, back to 60 when it clears it).
+                if (hzA > 0.0 && fpsA >= 0.5 * hzA / s.frames) fpsGoodT = t;
+                const int gameLimUs = ReflexGameLimitUs();
+                if (!rfxLimitBad && s.enabled && gameLimUs > 0 && !hitchPaused && fpsA > 0.0 && fpsA < 0.2 * hzA / s.frames && t - fpsGoodT < 6.0)
+                {
+                    if (++gameLimBadSecs >= 2)
+                    {
+                        g_rfxLimitBad.store(true); capByReflex = false;
+                        LOGW("BFI Presenter: the game's own Reflex frame limit (%d us): the game fell to %.0f fps under it -- taken out "
+                             "for the rest of this session", gameLimUs, fpsA);
+                    }
+                }
+                else gameLimBadSecs = 0;
+                const bool rfxUse = t - rsLastT < 3.0 && rsLast.frames > 0 && !g_rfxLimitBad.load();
+                // Game frame cap with Reflex's frame limit (CapWithReflex, off by default): in games with
+                // Reflex, a cap below the refresh rate (Half, Quarter, one per strobe cycle, custom) is applied
+                // by the driver where the game starts each frame, instead of holding the game at Present --
+                // what a game's own Reflex fps limit does. For engines that hand frames over irregularly
+                // (The Midnight Walk at Half: 1.7% of flashes off-cadence against 15.6%); elsewhere just-in-
+                // time release is as even with less latency (Silent Hill 2 at Half: 1.3% against 2.2%, 25 ms
+                // against 34 ms release -> flash; Alan Wake 2 at Quarter: 35 ms against 56 ms).
+                {
+                    const bool autoDown = s.autoCap && userCap == 1 && autoCapDown;
+                    const bool want = s.capReflex && userCap >= 2 && s.enabled && rfxUse && hzA > 0.0 && !autoDown;
+                    const int rcPer = CapPeriod(userCap, s.frames, s.capDivisor);
+                    if (want && !reflexCap)
+                    {
+                        rcOnT = t; fpsAtRc = fpsA; rcBadSecs = 0;
+                        LOGI("BFI Presenter: game frame cap with Reflex's frame limit: %.1f fps (%.0f us)", hzA / rcPer, 1e6 * rcPer / hzA);
+                    }
+                    else if (!want && reflexCap && !autoDown)
+                        LOGI("BFI Presenter: game frame cap: the presenter's own cap%s", g_rfxLimitBad.load() ? " (the game collapsed under Reflex's limit)" :
+                             !rfxUse && s.capReflex ? " (no Reflex reports from the game)" : "");
+                    reflexCap = want;
+                    if (reflexCap)
+                    {
+                        const double capFps = hzA / rcPer;
+                        if (t - rcOnT >= 1.5 && t - rcOnT < 6.0 && fpsAtRc > 0.8 * capFps && fpsA < 0.5 * capFps)
+                        {
+                            if (++rcBadSecs >= 2)
+                            {
+                                g_rfxLimitBad.store(true); reflexCap = false;
+                                LOGW("BFI Presenter: Reflex frame limit: the game fell to %.0f fps under it (%.0f before) -- no Reflex frame "
+                                     "limit for the rest of this session; the game frame cap uses the presenter's own cap", fpsA, fpsAtRc);
+                            }
+                        }
+                        else rcBadSecs = 0;
+                    }
+                }
                 if (!autoCapDown) capByReflex = rfxUse;
                 if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg))
                 {
@@ -3006,7 +3093,7 @@ static DWORD WINAPI PresenterThread(void *)
                             // next return waits longer.
                             if (t - capUpT < 30.0) stayMin = stayMin * 2.0 > 120.0 ? 120.0 : stayMin * 2.0;
                             else stayMin = 10.0;
-                            autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t;
+                            autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames,
                                  capByReflex ? "Reflex frame limit" : "the presenter's cap", fpsA, hzA);
@@ -3039,7 +3126,7 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 else
                 {
-                    if (autoCapDown && fg) LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation active, no Reflex)");
+                    if (autoCapDown && fg && s.autoCap && userCap == 1) LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation active, no Reflex)");
                     autoCapDown = capProbe = false; capDownSecs = capUpSecs = 0;
                 }
                 g_status.autoCapDown = autoCapDown ? 1 : 0;
@@ -3060,6 +3147,8 @@ static DWORD WINAPI PresenterThread(void *)
                 const double hzL = modeHz > 0.0 ? modeHz : peakHz;
                 int limitUs = (s.autoCap && userCap == 1 && s.enabled && s.frames >= 2 && stNow.autoCapDown && capByReflex && hzL > 0.0)
                                   ? (int)(1e6 * s.frames / hzL + 0.5) : 0;
+                if (limitUs == 0 && reflexCap && s.capReflex && userCap >= 2 && s.enabled && hzL > 0.0)
+                    limitUs = (int)(1e6 * CapPeriod(userCap, s.frames, s.capDivisor) / hzL + 0.5);
                 // Phase: the limiter paces the game on its own clock, so its frames can settle right at
                 // the moment the presenter picks a frame for the lit refresh, where a little jitter
                 // repeats one frame and skips the next, again and again (God of War Ragnarok: 10-18
@@ -3076,6 +3165,7 @@ static DWORD WINAPI PresenterThread(void *)
                 if (limitUs > 0 && t < phaseUntil) limitUs -= 150;
                 ReflexTick(limitUs, rs);
                 rsLast = rs; rsLastT = t;
+                if (rs.frames > 0) rsEverT = t;
                 EnterCriticalSection(&g_cfgLock);
                 g_status.rfxGameUses = rs.frames > 0 ? 1 : 0;
                 g_status.rfxLimitUs = rs.limitUs;
@@ -4151,13 +4241,16 @@ static int __cdecl hk_NvSetSleepMode(IUnknown *dev, NvSleepParams *p)
     g_rfxDev = dev;
     const int us = g_rfxWantLimitUs.load();
     NvSleepParams q = *p;
+    const bool strip = us <= 0 && g_rfxLimitBad.load() && p->minIntervalUs > 0;
     if (us > 0) q.minIntervalUs = (uint32_t)us;
+    if (strip) q.minIntervalUs = 0;
     if (us > 0) { g_rfxApplied = q; g_rfxAppliedValid = true; }
     ReleaseSRWLockExclusive(&g_rfxLock);
     if (changed)
         LOGI("BFI Presenter: game Reflex: low latency %s%s, frame limit %u us%s", p->lowLatency ? "on" : "off",
-             p->boost ? " + Boost" : "", p->minIntervalUs, us > 0 ? " -- the presenter's frame limit applies on top" : "");
-    return o_NvSetSleepMode(dev, us > 0 ? &q : p);
+             p->boost ? " + Boost" : "", p->minIntervalUs, us > 0 ? " -- the presenter's frame limit applies on top" :
+             strip ? " -- taken out (the game collapsed under it)" : "");
+    return o_NvSetSleepMode(dev, (us > 0 || strip) ? &q : p);
 }
 
 // Patches target's first instructions with a jump to hook; returns a callable copy
@@ -4249,12 +4342,21 @@ static void ReflexWatch()
 }
 
 // Once a second, from the presenter thread. limitUs: the frame limit wanted (0 = none).
+static int ReflexGameLimitUs()
+{
+    AcquireSRWLockShared(&g_rfxLock);
+    const int us = g_rfxGameSeen ? (int)g_rfxGame.minIntervalUs : 0;
+    ReleaseSRWLockShared(&g_rfxLock);
+    return us;
+}
+
 static void ReflexTick(int limitUs, ReflexSecond &out)
 {
     out = ReflexSecond();
     if (!ReflexApi()) return;
+    if (g_rfxLimitBad.load()) limitUs = 0;
     g_rfxWantLimitUs.store(limitUs);
-    if (limitUs > 0) ReflexWatch();
+    if (limitUs > 0 || g_rfxLimitBad.load()) ReflexWatch();
     IUnknown *dev = nullptr;
     AcquireSRWLockShared(&g_rfxLock);
     dev = g_rfxDev;
@@ -4346,9 +4448,25 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
                      "off: the game's own setting", r);
         }
     }
+    // The game's own limit taken out (g_rfxLimitBad): its setting again without the limit, every
+    // 2 s while it has one (the hook strips it from the game's own calls).
+    if (g_rfxLimitBad.load() && limitUs <= 0 && seen && game.minIntervalUs > 0)
+    {
+        static double lastStrip = 0.0;
+        if (Now() - lastStrip > 2.0)
+        {
+            NvSleepParams want = game;
+            want.version = BFI_NVVER(NvSleepParams);
+            want.minIntervalUs = 0;
+            PFN_NvSetSleepMode set = o_NvSetSleepMode ? o_NvSetSleepMode : g_nvSetSleepMode;
+            set(dev, &want);
+            lastStrip = Now();
+        }
+    }
     out.limitUs = (limitUs > 0 && gameUses) ? limitUs : 0;
 }
 #else
+static int ReflexGameLimitUs() { return 0; }
 static void ReflexTick(int, ReflexSecond &out) { out = ReflexSecond(); }
 #endif
 
@@ -7158,7 +7276,25 @@ static void draw_overlay(reshade::api::effect_runtime *)
             {
                 const double hz = st.refreshHz > 1.0 ? st.refreshHz : 0.0;
                 if (hz > 0.0) ImGui::Text("Cap: %.0f fps (a new game frame every %d refresh%s)", hz / per, per, per == 1 ? "" : "es");
-                if (per >= 2 && st.fgActive)
+                if (per >= 2)
+                {
+                    bool cr = s.capReflex != 0;
+                    if (ImGui::Checkbox("Apply the cap with Reflex's frame limit (irregular frame delivery only)", &cr)) s.capReflex = cr ? 1 : 0;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Half / Quarter cap in games with NVIDIA Reflex: the cap is applied by Reflex's own frame limit,\n"
+                                                                  "like a game's own Reflex fps limit, instead of the presenter releasing the game just in time.\n"
+                                                                  "Only for games whose frames still arrive irregularly at Half or Quarter -- just-in-time release\n"
+                                                                  "keeps switching itself off and motion stutters (The Midnight Walk: 1.7%% of flashes off-cadence\n"
+                                                                  "with it, 15.6%% without).\n"
+                                                                  "Adds latency compared with just-in-time release (about 10-20 ms: Silent Hill 2 34 ms against\n"
+                                                                  "25 ms) and is no smoother where just-in-time release works. Off by default.");
+                    if (s.capReflex)
+                    {
+                        ImGui::SameLine();
+                        if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: %.1f ms)", st.rfxLimitUs / 1000.0);
+                        else ImGui::TextDisabled("(not in use: no Reflex in this game)");
+                    }
+                }
+                if (per >= 2 && st.fgActive && st.rfxLimitUs <= 0)
                     ImGui::TextColored(kAmber, "Frame generation with a cap below the refresh rate: half its frames never reach the screen\n"
                                        "(God of War: 30 new images a second at Half) and latency doubles. Use Refresh rate.");
                 if (per >= 2 && per % s.frames != 0)

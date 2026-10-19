@@ -128,7 +128,7 @@ Limits how fast the game runs so it stays in step with the flashing.
 
 **Automatic frame cap** · `AutoFrameCap` · default: on\
 Works with the Refresh rate cap. When the game can't hold the refresh rate (e.g. 90 fps at 120 Hz), some images would be shown twice and others skipped, which judders. So BFI Presenter steps down to one game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames per cycle): every flash shows the next image. It goes back to Refresh when the game has headroom again: games with NVIDIA Reflex report how long their frames take; for the others it tries Refresh for about 3 seconds, after 30 s, then 60 s, then every 2 minutes while the game still can't hold it.\
-In DirectX games with NVIDIA Reflex (every DLSS frame-generation game) it steps down with Reflex's own frame limit instead, one presented frame per strobe cycle (e.g. 60 at 120 Hz), with frame generation or without: the driver paces the game and its generated frames, and every flash gets the next one. With frame generation it then tries Refresh only every 5 minutes. Without Reflex, frame generation keeps it at Refresh. The Vulkan layer has no Reflex limit: there frame generation keeps it at Refresh, so aim for a final fps (generated frames included) close to your refresh rate.\
+In DirectX games with NVIDIA Reflex (every DLSS frame-generation game) it steps down with Reflex's own frame limit instead, one presented frame per strobe cycle (e.g. 60 at 120 Hz), with frame generation or without: the driver paces the game and its generated frames, and every flash gets the next one. With frame generation it then tries Refresh only every 5 minutes. A few games collapse under any Reflex frame limit, their own included (Returnal: 60 fps down to about 7): then the presenter stops using the limit for the rest of the session, takes the game's own out too, and caps with its own cap. Without Reflex, frame generation keeps it at Refresh. The Vulkan layer has no Reflex limit: there frame generation keeps it at Refresh, so aim for a final fps (generated frames included) close to your refresh rate.\
 *When to change it:* leave on. Turn off if you'd rather keep 120 fps with some judder when the game dips.
 
 **Frame pacing** · `FramePacing` · default: Lowest latency (new ini files)
@@ -144,6 +144,11 @@ After a stutter, Smooth mode can skip one frame to get back to the lowest delay.
 **Just-in-time release** · `CapJustInTime` · default: on\
 With any cap below the refresh rate (Half, Quarter, one frame per strobe cycle, Custom), BFI Presenter learns how long the game takes to draw a frame and tells it to start at exactly the right moment, so each frame finishes just before its flash. Even motion, no waiting around.\
 *When to change it:* leave on.
+
+**Apply the cap with Reflex's frame limit** · `CapWithReflex` · default: off · DirectX games with NVIDIA Reflex\
+With Half, Quarter or another cap below the refresh rate, the cap is applied by Reflex's own frame limit (what a game's own Reflex fps limit does) instead of just-in-time release. A few engines hand their frames over so irregularly that just-in-time release keeps switching itself off and motion stutters even at a steady 60 fps; Reflex then paces the game evenly where it starts each frame (The Midnight Walk at Half: 1.7% of flashes off-cadence with it, 15.6% without).\
+It costs latency: about 10–20 ms more than just-in-time release (Silent Hill 2 at Half: 34 ms against 25 ms from release to flash; Alan Wake 2 at Quarter: 56 ms against 35 ms), and in games where just-in-time release works it is no smoother. Games without Reflex keep the presenter's cap; the overlay shows whether the limit is in use.\
+*When to change it:* leave off. Turn on only for a game that still stutters at Half or Quarter while the overlay shows just-in-time release switching off, and compare.
 
 **Later release** and **margin** · `LaterRelease`, `LaterReleaseMarginMs` · default: off, 1.5 ms\
 The same trick for the Refresh cap with Lowest latency: the game starts each frame as late as safely possible, which cuts up to about 5 ms of input delay in light games. The margin is the safety gap it keeps (it grows by itself if frames start arriving late).\
@@ -263,6 +268,7 @@ If a game crashes, these write a short report of what went wrong (`BFIPresenter_
 |---|---|
 | The game holds 120 fps | Frame cap: Refresh rate · Pacing: Lowest latency · Light game: Later release on · Gain 1.0, Variable MPRT |
 | The game can't hold 120 | Frame cap: Refresh rate with Automatic frame cap on (it steps down to 60 by itself), or Half refresh · Pacing: Lowest latency · Just-in-time release on |
+| Stutter at Half or Quarter while the overlay shows just-in-time release switching off (e.g. The Midnight Walk) | DirectX games with Reflex: Apply the cap with Reflex's frame limit on · Pacing: Lowest latency · Costs about 10–20 ms, so compare and keep it off where just-in-time release works |
 | Frame generation | Frame cap: Refresh rate, never Half · Automatic frame cap on (DirectX: sets the Reflex frame limit) · Pacing: Lowest latency · Later release off · Final fps (generated frames included) at least refresh ÷ frames per cycle |
 | Before anything else | G-SYNC / VRR off for the game, VSync on or "app setting" · No frame limiter (RivaTuner, NVIDIA) on the game · CRT shader: set its own decay off |
 
