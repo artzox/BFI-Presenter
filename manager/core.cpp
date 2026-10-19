@@ -1117,36 +1117,69 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
     }
     if (want.empty()) return {};
     std::string err;
-    const size_t batch = 25;
-    for (size_t i = 0; i < want.size(); i += batch)
-    {
-        if (progress) progress("Looking up graphics APIs on PCGamingWiki (" + std::to_string(i) + "/" + std::to_string(want.size()) + ")");
-        std::string where;
-        for (size_t k = i; k < std::min(want.size(), i + batch); k++)
+    // One query per batch of games, at most 25 and at most ~3,000 characters of encoded conditions: names
+    // (non-Steam games, each with its edition variants) make long URLs, and a URL that is too long failed the
+    // whole lookup, so every game after it showed "?" for its APIs.
+    auto cond = [](const Game &g) {
+        std::string w;
+        if (!g.appid.empty()) return "Infobox_game.Steam_AppID HOLDS \"" + g.appid + "\"";
+        for (const std::string &v : PcgwNames(g.name))
         {
-            Game &g = *want[k];
-            if (!where.empty()) where += " OR ";
-            if (!g.appid.empty()) where += "Infobox_game.Steam_AppID HOLDS \"" + g.appid + "\"";
-            else
-                for (const std::string &v : PcgwNames(g.name))
-                {
-                    std::string n;
-                    for (char c : v) { if (c == '"' || c == '\\') n += '\\'; n += c; }
-                    if (where.size() >= 4 && where.compare(where.size() - 4, 4, " OR ") != 0) where += " OR ";
-                    where += "Infobox_game._pageName=\"" + n + "\"";
-                }
+            std::string n;
+            for (char c : v) { if (c == '"' || c == '\\') n += '\\'; n += c; }
+            if (!w.empty()) w += " OR ";
+            w += "Infobox_game._pageName=\"" + n + "\"";
         }
+        return w;
+    };
+    std::vector<std::pair<size_t, size_t>> batches;   // [first, end) into want
+    for (size_t a = 0; a < want.size();)
+    {
+        size_t b = a, len = 0;
+        while (b < want.size() && b - a < 25)
+        {
+            const size_t l = UrlEncode(cond(*want[b])).size() + 8;
+            if (b > a && len + l > 3000) break;
+            len += l; b++;
+        }
+        batches.push_back({ a, b });
+        a = b;
+    }
+    size_t done = 0, failedInRow = 0, failed = 0;
+    for (auto [i, iEnd] : batches)
+    {
+        if (progress) progress("Looking up graphics APIs on PCGamingWiki (" + std::to_string(done) + "/" + std::to_string(want.size()) + ")");
+        done = iEnd;
+        std::string where;
+        for (size_t k = i; k < iEnd; k++) { if (!where.empty()) where += " OR "; where += cond(*want[k]); }
         std::string url = "https://www.pcgamingwiki.com/w/api.php?action=cargoquery&format=json&limit=500"
                           "&tables=Infobox_game,API&join_on=Infobox_game._pageName%3DAPI._pageName"
                           "&fields=Infobox_game._pageName%3DPage,Infobox_game.Steam_AppID%3DAppid,"
                           "API.Direct3D_versions%3DD3D,API.Vulkan_versions%3DVK,API.OpenGL_versions%3DGL"
                           "&where=" + UrlEncode(where);
+        // An error page or a rate-limit answer has no "cargoquery" list: don't record those games as "not on the
+        // wiki" for a week because of it. One retry after a pause, then the batch is skipped (looked up again on
+        // the next scan) and the others go on; two failed batches in a row stop the lookup (offline, or the wiki
+        // is refusing us).
         std::string body, e;
-        if (!HttpGet(W(url), body, e)) { err = "PCGamingWiki: " + e; break; }
-        // An error page or a rate-limit answer has no "cargoquery" list: don't record every game as "not on the
-        // wiki" for a week because of it.
-        if (body.find("\"cargoquery\"") == std::string::npos) { err = "PCGamingWiki: unexpected answer (try Look up again later)"; break; }
-        if (i + batch < want.size()) Sleep(500);   // be gentle with the wiki between batches
+        bool ok = false;
+        for (int attempt = 0; attempt < 2 && !ok; attempt++)
+        {
+            if (attempt) Sleep(3000);
+            body.clear(); e.clear();
+            ok = HttpGet(W(url), body, e);
+            if (ok && body.find("\"cargoquery\"") == std::string::npos) { ok = false; e = "unexpected answer"; }
+        }
+        if (!ok)
+        {
+            failed += iEnd - i;
+            err = "PCGamingWiki: " + e + " -- " + std::to_string(failed) + " games not looked up; they're tried again on the next scan";
+            if (++failedInRow >= 2) { failed = want.size() - i; err = "PCGamingWiki: " + e + " -- " + std::to_string(failed) +
+                                      " games not looked up; they're tried again on the next scan"; break; }
+            continue;
+        }
+        failedInRow = 0;
+        if (iEnd < want.size()) Sleep(500);   // be gentle with the wiki between batches
         std::lock_guard<std::mutex> l(g_pcgwLock);
         std::set<std::string> hit;
         std::map<std::string, int> hitScore;   // several pages can list the same Steam AppID (mods, remasters): best name wins
@@ -1159,7 +1192,7 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
             en.when = now;
             en.found = true;
             PcgwParseRow(JsonString(obj, "D3D"), JsonString(obj, "VK"), JsonString(obj, "GL"), en.apis, en.text);
-            for (size_t k = i; k < std::min(want.size(), i + batch); k++)
+            for (size_t k = i; k < iEnd; k++)
             {
                 Game &g = *want[k];
                 bool match = false;
@@ -1180,8 +1213,9 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
                 g_pcgw[key] = e2; hit.insert(key); hitScore[key] = score;
             }
         }
-        for (size_t k = i; k < std::min(want.size(), i + batch); k++)
+        for (size_t k = i; k < iEnd; k++)
             if (!hit.count(PcgwKey(*want[k]))) { PcgwEntry en; en.when = now; g_pcgw[PcgwKey(*want[k])] = en; }
+        PcgwSave();   // after every batch: a closed Manager or a later failure keeps what was found so far
     }
     {
         std::lock_guard<std::mutex> l(g_pcgwLock);
@@ -1422,7 +1456,11 @@ void Detect(Game &g)
                               "the game folder. Use an FNA build if the game has one (Celeste: Steam beta \"opengl\").");
     }
     if (g.bits == 0) g.notes.push_back("Couldn't read the executable's header; pick the game's .exe below.");
-    if (!g.apis) g.notes.push_back("The graphics API wasn't recognised from the executable; the route below is a guess.");
+    if (!g.apis)
+        g.notes.push_back(std::string("The graphics API wasn't recognised: ") +
+                          (g.pcgwKnown ? "PCGamingWiki's page lists none" : "PCGamingWiki didn't find this game (or wasn't reached; Scan tries again)") +
+                          ", and the executable doesn't show it (a launcher, or an API loaded at run time). The route below is a guess; "
+                          "pick the game's own .exe below if this one is a launcher.");
     if (g.pcgwKnown && g.pcgwApis && g.exeApis && !(g.pcgwApis & g.exeApis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL | ApiVulkan)))
         g.notes.push_back("PCGamingWiki lists " + ApiText(g.pcgwApis) + "; the executable looked like " + ApiText(g.exeApis) +
                           ". The route follows PCGamingWiki.");
@@ -2475,9 +2513,11 @@ static bool HttpGet(const std::wstring &url, std::string &body, std::string &err
 {
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
-    wchar_t host[256]{}, path[4096]{};
+    wchar_t host[256]{};
+    std::vector<wchar_t> pathBuf(url.size() + 1);   // the path with its query (PCGamingWiki's can be long)
+    wchar_t *path = pathBuf.data();
     uc.lpszHostName = host; uc.dwHostNameLength = 256;
-    uc.lpszUrlPath = path; uc.dwUrlPathLength = 4096;
+    uc.lpszUrlPath = path; uc.dwUrlPathLength = (DWORD)pathBuf.size();
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) { err = "Bad URL"; return false; }
     HINTERNET s = WinHttpOpen(L"BFIPresenterManager", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, nullptr, nullptr, 0);
     if (!s) s = WinHttpOpen(L"BFIPresenterManager", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
@@ -2530,7 +2570,13 @@ RemoteRelease ParseRelease(const std::string &body)
         std::string u = JsonString(body.substr(p), "browser_download_url");
         std::string l = LowerA(u);
         if (l.size() < 4 || l.compare(l.size() - 4, 4, ".zip") != 0) continue;
-        if (l.find("bfipresenter-dx") != std::string::npos) rr.dxUrl = u;
+        if (l.find("bfipresentermanager") != std::string::npos)
+        {
+            rr.mgrUrl = u;
+            const size_t v = l.rfind("-v");
+            if (v != std::string::npos) rr.mgrVersion = u.substr(v + 2, u.size() - 4 - (v + 2));
+        }
+        else if (l.find("bfipresenter-dx") != std::string::npos) rr.dxUrl = u;
         else if (l.find("vulkan") != std::string::npos) rr.vkUrl = u;
     }
     rr.ok = !rr.tag.empty() && (!rr.dxUrl.empty() || !rr.vkUrl.empty());
@@ -2598,6 +2644,73 @@ std::string DownloadRelease(const RemoteRelease &r, Source &out, const std::func
     out = SourceFromFolder(dir);
     out.label = "GitHub " + r.tag;
     return out.ok() ? std::string() : "The downloaded release has no BFI Presenter files.";
+}
+
+static std::wstring FindFileBelow(const std::wstring &dir, const wchar_t *name, int depth)
+{
+    std::wstring f = Join(dir, name);
+    if (Exists(f)) return f;
+    if (depth <= 0) return {};
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(Join(dir, L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    std::wstring found;
+    do
+    {
+        std::wstring n = fd.cFileName;
+        if (n == L"." || n == L".." || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        found = FindFileBelow(Join(dir, n), name, depth - 1);
+    } while (found.empty() && FindNextFileW(h, &fd));
+    FindClose(h);
+    return found;
+}
+
+static std::wstring SelfExe()
+{
+    wchar_t p[MAX_PATH * 2]{};
+    GetModuleFileNameW(nullptr, p, MAX_PATH * 2);
+    return p;
+}
+
+void CleanupOldManagerExe()
+{
+    std::wstring old = SelfExe() + L".old";
+    if (Exists(old)) DeleteFileW(old.c_str());   // fails harmlessly while the old process is still closing
+}
+
+std::string UpdateManagerExe(const RemoteRelease &r, const std::function<void(const std::string &)> &progress)
+{
+    if (r.mgrUrl.empty()) return "The latest release has no Manager zip.";
+    std::wstring dir = Join(DataDir(), L"manager");
+    CreateDirectoryW(dir.c_str(), nullptr);
+    dir = Join(dir, W(r.mgrVersion.empty() ? r.tag : r.mgrVersion));
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::string name = r.mgrUrl.substr(r.mgrUrl.find_last_of('/') + 1), body, err;
+    if (progress) progress("Downloading " + name);
+    if (!HttpGet(W(r.mgrUrl), body, err, [&](size_t got, size_t total) {
+            if (progress && total) progress("Downloading " + name + " (" + std::to_string(got * 100 / total) + " %)");
+        }))
+        return "Download of " + name + " failed: " + err;
+    std::wstring zip = Join(dir, W(name));
+    std::ofstream(fs::path(zip), std::ios::binary).write(body.data(), (std::streamsize)body.size());
+    if (progress) progress("Unpacking " + name);
+    std::string e = Extract(zip, dir);
+    if (!e.empty()) return e;
+    std::wstring neu = FindFileBelow(dir, L"BFIPresenterManager.exe", 2);
+    if (neu.empty()) return "The Manager zip has no BFIPresenterManager.exe.";
+    // A running exe can't be overwritten, but it can be renamed: the new one takes its name and place.
+    const std::wstring self = SelfExe(), old = self + L".old";
+    DeleteFileW(old.c_str());
+    if (!MoveFileExW(self.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING))
+        return "Couldn't replace the Manager in its folder (error " + std::to_string(GetLastError()) +
+               "; a protected folder?). The new version is in " + U8(DirOf(neu)) + ".";
+    if (!CopyFileW(neu.c_str(), self.c_str(), FALSE))
+    {
+        const DWORD ce = GetLastError();
+        MoveFileExW(old.c_str(), self.c_str(), MOVEFILE_REPLACE_EXISTING);
+        return "Couldn't copy the new Manager (error " + std::to_string(ce) + "). The new version is in " + U8(DirOf(neu)) + ".";
+    }
+    return {};
 }
 
 Source CachedRelease()

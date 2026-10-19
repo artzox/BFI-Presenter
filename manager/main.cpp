@@ -22,7 +22,7 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.3.4"
+#define MANAGER_VERSION "1.3.5"
 
 // ------------------------------------------------------------------ D3D11 window plumbing
 
@@ -150,6 +150,10 @@ struct App {
     bool releaseDone = false;          // guarded by lock
     Source fetched;                    // guarded by lock
     std::string remoteTag, remoteErr;  // guarded by lock
+    RemoteRelease remote;              // guarded by lock: the last release seen on GitHub (for the Manager update)
+    bool mgrDone = false;              // guarded by lock: a Manager update finished
+    std::string mgrErr;                // guarded by lock
+    bool restart = false;              // start the updated Manager and quit
 
     // UI
     char search[128] = {};
@@ -390,18 +394,19 @@ static void StartReShade(const std::string &ver, const std::vector<std::wstring>
     });
 }
 
-static void StartFetch()
+// getRelease false: only look (a folder picked by hand stays in use; a new Manager is still offered).
+static void StartFetch(bool getRelease = true)
 {
     if (g_app.busy) return;
     JoinWorker();
     g_app.busy = true;
     { std::lock_guard<std::mutex> l(g_app.lock); g_app.busyText = "Checking GitHub for the latest release..."; }
     std::string have = g_app.src.dxVersion;
-    g_app.worker = std::thread([have] {
+    g_app.worker = std::thread([have, getRelease] {
         RemoteRelease rr = FetchLatestRelease();
         Source s;
-        std::string err = rr.error;
-        if (rr.ok)
+        std::string err = getRelease ? rr.error : std::string();
+        if (rr.ok && getRelease)
         {
             std::string tagV = rr.tag;
             // "v1.0.4", "v.1.0.4", "1.0.4": skip everything before the first digit
@@ -418,8 +423,36 @@ static void StartFetch()
         std::lock_guard<std::mutex> l(g_app.lock);
         g_app.fetched = s;
         g_app.remoteTag = rr.tag;
+        g_app.remote = rr;
         g_app.remoteErr = err;
         g_app.releaseDone = true;
+        g_app.busy = false;
+    });
+}
+
+static bool ManagerUpdateAvailable()
+{
+    std::lock_guard<std::mutex> l(g_app.lock);
+    return !g_app.remote.mgrUrl.empty() && !g_app.remote.mgrVersion.empty() &&
+           CompareVersions(g_app.remote.mgrVersion, MANAGER_VERSION) > 0;
+}
+
+static void StartManagerUpdate()
+{
+    if (g_app.busy) return;
+    JoinWorker();
+    g_app.busy = true;
+    RemoteRelease rr;
+    {
+        std::lock_guard<std::mutex> l(g_app.lock);
+        rr = g_app.remote;
+        g_app.busyText = "Updating the Manager to " + rr.mgrVersion + "...";
+    }
+    g_app.worker = std::thread([rr] {
+        std::string e = UpdateManagerExe(rr, SetBusy);
+        std::lock_guard<std::mutex> l(g_app.lock);
+        g_app.mgrErr = e;
+        g_app.mgrDone = true;
         g_app.busy = false;
     });
 }
@@ -459,6 +492,12 @@ static void PollWorker()
                      });
         }
         g_app.rsPending.clear();
+    }
+    if (g_app.mgrDone)
+    {
+        g_app.mgrDone = false;
+        if (!g_app.mgrErr.empty()) g_app.SetMsg(g_app.mgrErr, true);
+        else g_app.restart = true;
     }
     if (g_app.releaseDone)
     {
@@ -648,6 +687,19 @@ static void DrawTop(HWND hwnd)
         }
     }
     Tooltip("Use an extracted release or a test build from a folder instead of GitHub.");
+    if (ManagerUpdateAvailable())
+    {
+        std::string v;
+        { std::lock_guard<std::mutex> l(g_app.lock); v = g_app.remote.mgrVersion; }
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.65f, 0.36f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.16f, 0.45f, 0.24f, 1));
+        if (ImGui::Button(("Update Manager to " + v).c_str())) StartManagerUpdate();
+        ImGui::PopStyleColor(3);
+        Tooltip("Downloads the new Manager from GitHub, puts it in place of this one and restarts it. "
+                "Your game list and settings are kept.");
+    }
     ImGui::EndDisabled();
     {
         const char *kf = "Support on Ko-fi";
@@ -1493,8 +1545,9 @@ static void DrawDetail(HWND)
             Detect(g);
         }
         Tooltip("BFI shader: the strobe as a ReShade effect, clocked by the game's own frames. Only for games that hold a "
-                "rock-steady frame rate equal to the refresh rate and whose engine stutters with the presenter "
-                "(Moons of Madness). Everywhere else the DX add-on is better: with the shader a late frame flashes.");
+                "rock-steady frame rate equal to the refresh rate and whose engine stutters with the presenter, "
+                "or that reach it only with NVIDIA Smooth Motion, which the presenter can't use (Blasphemous). Everywhere else the DX add-on is better: "
+                "with the shader a late frame flashes.");
         ImGui::SameLine();
         ImGui::TextColored(kAccent, "%s", RouteText(g.route));
     }
@@ -1642,10 +1695,12 @@ static void DrawLibraries(HWND hwnd)
     {
         bool pw = LoadSetting(L"PCGamingWiki", L"1") == L"1";
         if (ImGui::Checkbox("Look up each game's graphics APIs on PCGamingWiki", &pw)) SaveSetting(L"PCGamingWiki", pw ? L"1" : L"0");
-        bool ask = LoadSetting(L"NvAskOnInstall", L"1") == L"1";
-        if (ImGui::Checkbox("Ask about G-SYNC and Vertical Sync when installing", &ask)) SaveSetting(L"NvAskOnInstall", ask ? L"1" : L"0");
         Tooltip("Asks pcgamingwiki.com which APIs a game supports (Steam games by app id, others by name). More reliable than "
                 "reading the executable, for example for games that load Vulkan or Direct3D 12 at run time. Results are cached.");
+        bool ask = LoadSetting(L"NvAskOnInstall", L"1") == L"1";
+        if (ImGui::Checkbox("Ask about G-SYNC and Vertical Sync when installing", &ask)) SaveSetting(L"NvAskOnInstall", ask ? L"1" : L"0");
+        Tooltip("Before each install, asks whether to set the game's NVIDIA profile to G-SYNC off and Vertical Sync on. "
+                "Off: the last choices are used without asking.");
     }
     ImGui::Spacing();
     ImGui::Separator();
@@ -1863,6 +1918,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     ImGui_ImplDX11_Init(g_dev, g_ctx);
 
     // initial state
+    CleanupOldManagerExe();
     g_app.opt = LoadScanOptions();
     std::wstring srcDir = LoadSetting(L"Source", L"");
     if (!srcDir.empty()) g_app.src = SourceFromFolder(srcDir);
@@ -1899,6 +1955,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
             ImGui_ImplDX11_InvalidateDeviceObjects();
         }
         PollWorker();
+        if (g_app.restart && !g_job.active)
+        {
+            wchar_t self[MAX_PATH * 2]{};
+            GetModuleFileNameW(nullptr, self, MAX_PATH * 2);
+            ShellExecuteW(nullptr, L"open", self, nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        }
         StepJob();
         // A drive was connected: rescan once it has settled, if a list was made before and nothing else runs.
         if (g_driveArrived && GetTickCount64() - g_driveArrived > 3000 && !g_app.busy && g_app.scannedOnce && !g_job.active)
@@ -1910,7 +1973,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         if (g_app.scannedOnce && !g_app.checkedOnce && !g_app.busy)
         {
             g_app.checkedOnce = true;
-            if (LoadSetting(L"Source", L"").empty() && LoadSetting(L"AutoCheck", L"1") == L"1") StartFetch();
+            if (LoadSetting(L"AutoCheck", L"1") == L"1") StartFetch(LoadSetting(L"Source", L"").empty());   // also offers a new Manager
         }
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();

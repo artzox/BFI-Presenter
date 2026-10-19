@@ -50,10 +50,10 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Hades II | Working | Not tested | v0.78 | GPU headroom for 120 fps (4K yes, 5K DSR no) |
 | Indiana Jones and the Great Circle | Partial (Vulkan) | Flashes persist with FG | VK 0.8.2 | Vulkan layer; GPU at its limit causes 10–20 flashes a minute |
 | shadPS4 | Working (Vulkan) | — | VK 0.7 | Vulkan layer; BFIPresenter.ini next to the emulator's .exe |
-| Blasphemous | Working (DX11) | NVIDIA Smooth Motion must be off | v1.0.3 | Smooth Motion off in the NVIDIA app (with it on, the game closed and relaunched itself) |
+| Blasphemous | Working (DX11) | NVIDIA Smooth Motion must be off with the presenter; works with the BFI shader | v1.0.3 | Locked at 60 fps: Refresh rate + Lowest latency; Smooth Motion off in the NVIDIA app (with it on, the game closed and relaunched itself). Or the BFI shader at 120 Hz with Smooth Motion on |
 | Guacamelee! 2 | Working (DX11) | Not tested | v1.0.3 | Standard setup; works with Special K (crashed at start before v1.0.3) |
 | Jusant | Working; recommended with FG | Works (DLSS FG 2×): removes the engine's judder; Refresh cap + Automatic frame cap | v1.0.3 (FG: v1.0.13) | Game frame cap Refresh rate + Automatic frame cap + Frame pacing Lowest latency. With RenoDX, use the UE Extended mod (see notes) |
-| Moons of Madness | Working (DX11) | Not tested | v1.0.3 | BFI shader recommended: with the presenter the engine stutters (Refresh + Smooth); the shader at the game's locked 120 fps doesn't. If you use the presenter: Half refresh + Lowest latency |
+| Moons of Madness | Working (DX11) | Not tested | v1.0.3 | Half refresh + Lowest latency (the engine stutters at Refresh + Smooth); the BFI shader at the game's locked 120 fps also works |
 | Ori and the Blind Forest: Definitive Edition | Working (DX11, 32-bit), engine stutter | Not tested | v1.0.3 | `BFIPresenter.addon32`; Half refresh + Lowest latency (a fast game: Smooth adds latency). At Refresh the game's own 60 Hz simulation stutters, with the presenter or the BFI shader |
 | Celeste | Working (DX11 through FNA) | — | v1.0.5 | Steam beta "opengl" (the FNA build) + launch option `--graphics D3D11`, ReShade as `dxgi.dll`; game locked at 60 fps: Half refresh |
 | Wreckfest | Working (DX11) | Not tested | v1.0.3 | `DX11GamePresent=1` in `BFIPresenter.ini`: without it the game slowed to 5 fps within a minute |
@@ -385,7 +385,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 The shader runs the presenter's strobe inside ReShade, one game frame per sub-frame, so the game's own VSync does the pacing. **Use it only when the game holds a rock-steady 120 fps and its engine stutters with the presenter.** Otherwise the presenter is better: with the shader every late game frame shows a lit or a dark frame twice (a flash), which the shader's hitch guard can only soften.
 
-- **Recommended:** Moons of Madness. The presenter's pacing makes the engine stutter; the shader doesn't. It flickers a little, no more than CRT-Standalone's decay did.
+- **Works:** Blasphemous at 120 Hz with NVIDIA Smooth Motion (the game is locked at 60 fps; the presenter can't be used with Smooth Motion, and plays it at Refresh + Lowest latency without it). Moons of Madness at its locked 120 fps (it flickers a little, no more than CRT-Standalone's decay did), though the presenter at Half refresh + Lowest latency is now recommended there.
 - **Likely fine, not yet tested with the shader** (CRT-Standalone's decay ran cleanly in them, and they hold 120 fps): Hades, Hades II, FAR: Lone Sails, Layers of Fear 2, Cocoon, Cuphead, Guacamelee! 2, Hollow Knight, Prodeus, Tony Hawk's Pro Skater 1 + 2, Jotun. The presenter works in all of them too.
 - **Not recommended:** Stray and Sifu: CRT-Standalone's decay flashed a lot there; use the presenter.
 - **Doesn't help:** Ori and the Blind Forest: Definitive Edition: the stutter at 120 comes from the game's own 60 Hz simulation. Use the presenter at Half refresh + Lowest latency.
