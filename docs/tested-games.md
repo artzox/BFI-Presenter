@@ -14,7 +14,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 - **Recommended presenter settings (v0.82):** PresenterBuffers 3, Wait for vblank on, Queue one refresh ahead off, Automatic frames ahead on.
   - Game holds 120 fps: Game frame cap Refresh rate + Frame pacing Lowest latency. Light games: add Later release (Cuphead: \~5 ms less latency).
   - Game can't hold 120: Game frame cap Half refresh + Frame pacing Smooth, with Just-in-time release on (the default). Some games are smoother with Lowest latency instead (Soul Reaver).
-  - **With frame generation (DLSS FG, FSR FG, Lossless Scaling): Game frame cap Refresh rate, not Half refresh.** FG doubles (or triples) the game's output, so let the presenter take every generated frame; Half refresh throws half of them away.
+  - **With frame generation (DLSS FG, FSR FG, Lossless Scaling): Game frame cap Refresh rate, not Half refresh.** FG doubles (or triples) the game's output, so let the presenter take every generated frame; Half refresh throws half of them away. Exception: when frame generation only reaches about the strobe rate (e.g. 60 at 120 Hz: 2× at about 30 rendered fps, 3× at about 20), use Half refresh + Smooth: it shows every generated frame evenly and was quicker than Reflex's limit at Refresh (Alan Wake 2 with 3×, Pragmata, Until Dawn).
 - **DirectX 11 games: borderless or windowed, not exclusive fullscreen.** The DX11 path presents through its own window over the game (Mirror's Edge Catalyst crashed on exit in exclusive fullscreen).
 - **Realtime GPU priority (DirectX):** start Steam (or the game's launcher) as administrator for the session. The presenter queue then runs at global realtime priority, which removed the \~30 ms stalls behind God of War Ragnarök's flashes. The overlay's Status section shows the queue priority.
 - **Vulkan games:** install the Vulkan layer once with `install_vulkan_layer.bat` and put `BFIPresenter.ini` next to the game's .exe. The layer loads only when the game runs without administrator rights.
@@ -22,18 +22,18 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-99 of 101 tested games and emulators run with BFI: the 50 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; four with the engine's own stutter) and 49 more listed after it. Two are partial.
+99 of 101 tested games and emulators run with BFI: the 50 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; three with the engine's own stutter) and 49 more listed after it. Two are partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
 | Shadow of the Tomb Raider | Working | Works (OptiScaler FSR 3.1 FG) | v0.2 | Standard setup |
-| Alan Wake 2 | Working | Works (2×, 3×); Refresh cap | v0.19 | Standard setup |
+| Alan Wake 2 | Working | Works (2×, 3×); 3× at \~20 fps: Half refresh + Smooth | v0.19 | Standard setup |
 | God of War Ragnarök | Working | Runs, but judders below 60 output fps | v0.24 | Standard setup; RTSS limiter off |
 | Riven (2023) | Working | Not tested | v0.13 | A steady 60 fps for smooth motion |
 | Onimusha | Working | Works (2×, 3×); Refresh cap | v0.27 | Standard setup |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
-| Pragmata | Working without FG | DLSS FG runs uncapped at \~70 fps on 120 Hz (no way to cap it to 60) | v1.0.15 | FG off |
+| Pragmata | Working | Works at Half refresh + Smooth (\~30 rendered, 60 presented); the automatic cap can't hold Refresh | v1.0.16 | Half refresh + Smooth with FG; change resolution once to start BFI |
 | Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps |
 | Control | Working | Works (2×, 3×, 4× with the [Control-FG](https://github.com/Frooglemcdoo/Control-FG) mod, also with DLSS 5); Refresh cap | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54 |
 | Marvel's Spider-Man 2 | Partial | Unstable even without the presenter | v0.35 | VRAM-limited at 4K; resolution toggle to start BFI |
@@ -70,7 +70,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Red Dead Redemption 2 | Working (Vulkan) | Not tested | — | Vulkan renderer; Vulkan layer, `BFIPresenter.ini` next to `RDR2.exe` |
 | DOOM Eternal | Working (Vulkan) | Not tested | v1.0.3 | Vulkan layer without ReShade (the game didn't start with ReShade); `BFIPresenter.ini` next to `DOOMEternalx64vk.exe`; settings in the ini + hotkeys |
 | PT-PC | Working (Vulkan) | — | v1.0.5 | Vulkan layer; ReShade only through its Vulkan layer (manager: Turn on), never as `dxgi.dll` and no DX add-on in the folder (crashed). With ray tracing on: Half refresh + Lowest latency + Just-in-time release |
-| Kena: Bridge of Spirits | Working, engine stutter | Not tested | v1.0.3 | Standard setup; the stutter is the engine's own |
+| Kena: Bridge of Spirits | Working | Not tested | v1.0.3 | Refresh rate + automatic frame cap (v1.0.16) |
 | Need for Speed: Porsche Unleashed | Working (OpenGL, 32-bit), engine stutter; not recommended | — | v1.0.3 | `BFIPresenter.addon32`; in the unofficial patch's OGL3 mode: NVIDIA profile Vulkan/OpenGL present method = Prefer layered on DXGI swapchain |
 | Legacy of Kain: Soul Reaver 1 & 2 Remastered | Working (OpenGL) | — | v1.0.3 | With DLSS 5: Half refresh + Lowest latency. Without: Refresh + Lowest latency + Later release (Smooth stutters more) |
 | Heretic II | Working (OpenGL, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32` |
@@ -117,7 +117,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | RiME | Standard setup |
 | Shadow Man Remastered | Standard setup |
 | Silent Hill 2 (2024) | Works with DLSS 5 and FG 2× (Refresh cap) |
-| South of Midnight | HDR: `AblGuardBudgetNits=250` (the sky flashed at 300) |
+| South of Midnight | Half refresh + Lowest latency, or Refresh + automatic frame cap (it can't hold 120; even 60 either way, Smooth repeated \~1.3%); HDR: `AblGuardBudgetNits=250` (the sky flashed at 300) |
 | Split Fiction | Standard setup |
 | Spyro Reignited Trilogy | Standard setup |
 | Stray | Standard setup |
@@ -131,7 +131,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Tony Hawk's Pro Skater 1 + 2 | Standard setup |
 | Trine 5 | Standard setup |
 | Unto The End | Standard setup |
-| Until Dawn (2024) | Works with DLSS 5 and FG (Refresh cap) |
+| Until Dawn (2024) | Works with DLSS 5 and FG: Refresh cap, or Half refresh at \~30 rendered fps (60 of 60 flashes, \~30 ms more latency) |
 | Untitled Goose Game | Standard setup |
 | Wreckfest 2 | Standard setup |
 
@@ -144,6 +144,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### Alan Wake 2
 
 - No issues found. The game calls exclusive fullscreen and changes HDR format several times at start-up; the presenter handles both.
+- **With 3× frame generation at about 20 rendered fps (60 presented): Half refresh + Smooth (v1.0.16).** A new frame on 60 of 60 flashes (0.5% repeated) at about 99 ms from input to flash. Reflex's limit (Refresh with the automatic frame cap, or Half with *Apply the cap with Reflex's frame limit*) repeated about 7% of flashes at about 130 ms; Half + Lowest latency repeated or skipped about a third.
 
 ### God of War Ragnarök
 
@@ -182,8 +183,11 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 - Uses REFramework (loads as `dinput8.dll`); its harmless memory-probe exceptions appear at the top of `BFIPresenter_crash.txt`.
 - Steam's overlay hooks on Present and ResizeBuffers1 hung and crashed the game until v0.34, which calls DXGI directly past them.
-- DLSS Frame Generation drops to about 15 base fps (shown as 30) with the presenter, because Reflex pacing misreads the presenter's presents.
-- Since v1.0.14, frame generation runs at about 35 rendered and 70 presented fps, but nothing can cap it to 60 on a 120 Hz display: the game collapses under any Reflex frame limit (e.g. 50 → 8 fps), so the presenter drops the limit for the session; the in-game limit is inactive with FG; and NVIDIA's Max Frame Rate also limits the presenter's own presents and breaks the strobe. Play without FG, or try XeSS or FSR FG through OptiScaler (OptiScaler limited the frame rate in a v1.0.15 test).
+- **BFI starts only after the game rebuilds its swap chain:** change the resolution once in the game's settings (and back) to start it.
+- **Recommended with frame generation (v1.0.16): Half refresh + Frame pacing Smooth.** With DLSS FG at about 30 rendered fps, every flash showed the next generated frame (60 of 60 a second), at about 108 ms from the game's input to the flash.
+- Refresh rate + Smooth is the next best: also 60 of 60, but frame generation delivers about 65 a second, so about 5 a second are dropped (small skips), at about 117 ms. Refresh + Lowest latency repeated a frame on about 40% of flashes.
+- The automatic frame cap can't hold Refresh with frame generation: the game collapses under any Reflex frame limit (e.g. 50 → 8 fps), so the presenter drops the limit for the session and frame generation runs uncapped at about 65–70 fps. The in-game limit is inactive with FG, and NVIDIA's Max Frame Rate also limits the presenter's own presents and breaks the strobe, so pick Half refresh yourself.
+- Before v1.0.14, DLSS Frame Generation dropped to about 15 base fps (shown as 30) with the presenter, because Reflex pacing misread the presenter's presents. OptiScaler limited the frame rate in a v1.0.15 test.
 
 ### Control
 
@@ -329,7 +333,8 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### Kena: Bridge of Spirits
 
-- Works with the standard setup; the remaining stutter is the engine's own and shows without the presenter too.
+- **Recommended (v1.0.16): Game frame cap Refresh rate with the automatic frame cap on** (the defaults): it runs smoothly.
+- Earlier versions left a stutter that looked like the engine's own; with the automatic frame cap it no longer shows.
 
 ### Replaced
 
@@ -389,7 +394,7 @@ The shader runs the presenter's strobe inside ReShade, one game frame per sub-fr
 ## Known issues across games
 
 - **Below 60 fps, motion judders.** The strobe shows 60 lit images per second; a game at 45 fps repeats frames. Clarity is unaffected.
-- **Frame generation:** use the Refresh rate cap, not Half refresh. DLSS FG (2×–4×) works in Alan Wake 2, Onimusha, Control (Control-FG mod), Silent Hill 2, Directive 8020 and Until Dawn; OptiScaler FSR FG in Shadow of the Tomb Raider. Lossless Scaling frame generation mostly worked with its VSync set to 1/2. In a few games Reflex pacing misreads the presenter's own presents and throttles the game (Pragmata, likely Returnal).
+- **Frame generation:** use the Refresh rate cap, not Half refresh, unless frame generation only reaches about 60 fps: then Half refresh + Smooth shows every generated frame (Alan Wake 2 with 3×, Pragmata, Until Dawn). DLSS FG (2×–4×) works in Alan Wake 2, Onimusha, Control (Control-FG mod), Silent Hill 2, Directive 8020 and Until Dawn; OptiScaler FSR FG in Shadow of the Tomb Raider. Lossless Scaling frame generation mostly worked with its VSync set to 1/2. A few games collapse under any Reflex frame limit (Pragmata, Returnal); the presenter then drops the limit for the session.
 - **Game hitches show as single flashes:** when the whole GPU stalls for 100 ms or more, no refresh can be presented on time. With the GPU at its limit, shorter stalls of one to four refreshes flash too (God of War Ragnarök, Indiana Jones). GPU headroom helps everywhere; in DirectX, a realtime presenter queue (launcher run as administrator) removed them.
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR). Games already at the limit can collapse in performance.
 - **Overlays:** in DirectX games the RTSS OSD and the Steam overlay don't draw on the strobed frames by default (their hooks are bypassed for the presenter's own presents since v0.34). `ShowOverlays=1` (v1.0.9) sends the presents through them again in 64-bit DirectX games (not 32-bit or OpenGL games); turn it off if a game crashes. Vulkan games show them anyway. Any RTSS or driver frame limiter must stay off.

@@ -124,7 +124,7 @@ Limits how fast the game runs so it stays in step with the flashing.
 - **Custom** (`CapDivisor`): a new game image every N refreshes (1–8). Pick a multiple of Frames per cycle, or some images start on a dark refresh and motion judders; the overlay warns when it doesn't fit.
 - **Off**: no limit (not recommended).
 
-*When to change it:* leave it at Refresh and let the automatic frame cap (below) step down when the game can't keep up. Pick Half yourself if you'd rather it stays at 60 fps. With frame generation (DLSS FG, FSR FG, Lossless Scaling) always use Refresh, never Half.
+*When to change it:* leave it at Refresh and let the automatic frame cap (below) step down when the game can't keep up. Pick Half yourself if you'd rather it stays at 60 fps. With frame generation (DLSS FG, FSR FG, Lossless Scaling) use Refresh, unless its output is only about the strobe rate (e.g. 60 at 120 Hz: 2× at about 30 rendered fps, 3× at about 20): then Half refresh + Smooth shows every generated frame and was smoother and quicker than Refresh (Alan Wake 2 with 3×, Pragmata, Until Dawn).
 
 **Automatic frame cap** · `AutoFrameCap` · default: on\
 Works with the Refresh rate cap. When the game can't hold the refresh rate (e.g. 90 fps at 120 Hz), some images would be shown twice and others skipped, which judders. So BFI Presenter steps down to one game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames per cycle): every flash shows the next image. It goes back to Refresh when the game has headroom again: games with NVIDIA Reflex report how long their frames take; for the others it tries Refresh for about 3 seconds, after 30 s, then 60 s, then every 2 minutes while the game still can't hold it.\
@@ -269,7 +269,8 @@ If a game crashes, these write a short report of what went wrong (`BFIPresenter_
 | The game holds 120 fps | Frame cap: Refresh rate · Pacing: Lowest latency · Light game: Later release on · Gain 1.0, Variable MPRT |
 | The game can't hold 120 | Frame cap: Refresh rate with Automatic frame cap on (it steps down to 60 by itself), or Half refresh · Pacing: Lowest latency · Just-in-time release on |
 | Stutter at Half or Quarter while the overlay shows just-in-time release switching off (e.g. The Midnight Walk) | DirectX games with Reflex: Apply the cap with Reflex's frame limit on · Pacing: Lowest latency · Costs about 10–20 ms, so compare and keep it off where just-in-time release works |
-| Frame generation | Frame cap: Refresh rate, never Half · Automatic frame cap on (DirectX: sets the Reflex frame limit) · Pacing: Lowest latency · Later release off · Final fps (generated frames included) at least refresh ÷ frames per cycle |
+| Frame generation, output about the strobe rate (e.g. 3× at 20 fps, 2× at 30) | Frame cap: Half refresh · Pacing: Smooth (Alan Wake 2 with 3×: 60 of 60 flashes, \~99 ms from input to flash against \~130 ms with Reflex's limit at Refresh) |
+| Frame generation, output well above the strobe rate | Frame cap: Refresh rate · Automatic frame cap on (DirectX: sets the Reflex frame limit) · Pacing: Lowest latency · Later release off · Final fps (generated frames included) at least refresh ÷ frames per cycle |
 | Before anything else | G-SYNC / VRR off for the game, VSync on or "app setting" · No frame limiter (RivaTuner, NVIDIA) on the game · CRT shader: set its own decay off |
 
 ---

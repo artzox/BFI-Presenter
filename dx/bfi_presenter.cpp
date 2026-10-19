@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.15"
+#define BFI_ADDON_VERSION "1.0.16"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2224,6 +2224,7 @@ static DWORD WINAPI PresenterThread(void *)
     bool   capByReflex = false;
     bool   reflexCap = false;     // the game frame cap applied with Reflex's frame limit (CapWithReflex)
     double rcOnT = -100.0, fpsAtRc = 0.0;
+    double rfxChkT = -100.0;      // start of the collapse check after a step-down with Reflex's limit (moved on by stalls)
     int    rcBadSecs = 0;
     int    rfxBadSecs = 0, gameLimBadSecs = 0;   // seconds collapsed under our Reflex limit / the game's own
     double fpsGoodT = -100.0;     // last second the game held at least half the strobe rate
@@ -2995,8 +2996,14 @@ static DWORD WINAPI PresenterThread(void *)
                 // Safety net: a game whose own Reflex setup makes the limit collapse its frame rate
                 // (Returnal: 60 fps -> 7.5 fps the moment the limit went on) -- the limit is dropped for
                 // the session and the presenter's own cap used instead.
+                // A stall is not a collapse: Until Dawn's startup load (1-12 fps, the hitch guard paused from
+                // 50 ms after the step-down, the window not responding) set it off. A collapsed game keeps
+                // drawing steadily with the hitch guard running (Returnal ~7 fps, Pragmata ~8), so a second
+                // with the hitch guard paused or below 3 fps restarts the check instead of counting.
                 const bool rfxLimitBad = g_rfxLimitBad.load();
-                if (autoCapDown && capByReflex && !rfxLimitBad && t - capSwitchT >= 1.5 && t - capSwitchT < 6.0 &&
+                const bool stallSec = fpsA < 3.0 || hitchPaused;
+                if (stallSec) { rfxChkT = t; rcOnT = t; }
+                if (autoCapDown && capByReflex && !rfxLimitBad && !stallSec && t - rfxChkT >= 1.5 && t - rfxChkT < 6.0 &&
                     fpsAtDown > 0.8 * hzA / s.frames && fpsA < 0.5 * hzA / s.frames)
                 {
                     if (++rfxBadSecs >= 2)
@@ -3046,7 +3053,7 @@ static DWORD WINAPI PresenterThread(void *)
                     if (reflexCap)
                     {
                         const double capFps = hzA / rcPer;
-                        if (t - rcOnT >= 1.5 && t - rcOnT < 6.0 && fpsAtRc > 0.8 * capFps && fpsA < 0.5 * capFps)
+                        if (!stallSec && t - rcOnT >= 1.5 && t - rcOnT < 6.0 && fpsAtRc > 0.8 * capFps && fpsA < 0.5 * capFps)
                         {
                             if (++rcBadSecs >= 2)
                             {
@@ -3093,7 +3100,7 @@ static DWORD WINAPI PresenterThread(void *)
                             // next return waits longer.
                             if (t - capUpT < 30.0) stayMin = stayMin * 2.0 > 120.0 ? 120.0 : stayMin * 2.0;
                             else stayMin = 10.0;
-                            autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; fpsAtDown = fpsA;
+                            autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames,
                                  capByReflex ? "Reflex frame limit" : "the presenter's cap", fpsA, hzA);
