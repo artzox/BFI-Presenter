@@ -2996,11 +2996,12 @@ static DWORD WINAPI PresenterThread(void *)
                 // Safety net: a game whose own Reflex setup makes the limit collapse its frame rate
                 // (Returnal: 60 fps -> 7.5 fps the moment the limit went on) -- the limit is dropped for
                 // the session and the presenter's own cap used instead.
-                // A stall (a loading screen: Until Dawn at 1 fps with the window not responding) is not a
-                // collapse -- a collapsed game still draws (Returnal ~7 fps, Pragmata ~8): a second below
-                // 3 fps restarts the check instead of counting.
+                // A stall is not a collapse: Until Dawn's startup load (1-12 fps, the hitch guard paused from
+                // 50 ms after the step-down, the window not responding) set it off. A collapsed game keeps
+                // drawing steadily with the hitch guard running (Returnal ~7 fps, Pragmata ~8), so a second
+                // with the hitch guard paused or below 3 fps restarts the check instead of counting.
                 const bool rfxLimitBad = g_rfxLimitBad.load();
-                const bool stallSec = fpsA < 3.0;
+                const bool stallSec = fpsA < 3.0 || hitchPaused;
                 if (stallSec) { rfxChkT = t; rcOnT = t; }
                 if (autoCapDown && capByReflex && !rfxLimitBad && !stallSec && t - rfxChkT >= 1.5 && t - rfxChkT < 6.0 &&
                     fpsAtDown > 0.8 * hzA / s.frames && fpsA < 0.5 * hzA / s.frames)
