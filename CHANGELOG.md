@@ -7,6 +7,13 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.16] — 2026-10-19
+
+- **[DX] Fixed: a loading screen could switch off the Reflex frame limit for the whole session.** The collapse safety net from 1.0.14 counted a loading stall right after the automatic frame cap stepped down as a collapse (Until Dawn's startup load: 1–12 fps, with the hitch guard paused and the window not responding), so frame generation then ran uncapped at about 65 fps. Seconds below 3 fps or with the hitch guard paused now restart the check instead of counting. Real collapses keep drawing steadily with the hitch guard running and are still caught (Returnal about 7 fps, Pragmata about 8). Until Dawn with frame generation now holds 60 at the Refresh cap.
+- **[Docs] Frame generation at Half refresh.** When frame generation's output is only about the strobe rate (e.g. 60 at 120 Hz: 3× at about 20 rendered fps, 2× at about 30), Half refresh + Smooth shows every generated frame and was both smoother and quicker than Reflex's limit at Refresh: Alan Wake 2 with 3×, 60 of 60 flashes at about 99 ms from input to flash against about 7% repeated at about 130 ms. README, settings guide, DX README and tested games.
+- **[Docs]** Tested games: Pragmata works with frame generation at Half refresh + Smooth (change the resolution once to start BFI); Until Dawn at Half as an alternative; Kena runs smoothly at Refresh with the automatic frame cap; South of Midnight and Alan Wake 2 recommended settings.
+- **[Vulkan]** No changes; version number only.
+
 ## [1.0.15] — 2026-10-19
 
 - **[DX] New: Apply the cap with Reflex's frame limit** (`CapWithReflex`, **off by default**; checkbox under Game frame cap). With Half, Quarter or another cap below the refresh rate, in games with NVIDIA Reflex, the cap is applied by Reflex's own frame limit, like a game's own Reflex fps limit, instead of just-in-time release. **Only for games whose frames arrive irregularly at Half or Quarter**, where just-in-time release keeps switching itself off and motion stutters: The Midnight Walk at Half, 1.7% of flashes off-cadence with it against 15.6% without, with no in-game limit needed. **It adds latency compared with just-in-time release**, about 10–20 ms, and is no smoother in games where just-in-time release works: Silent Hill 2 at Half, 2.2% against 1.3% off-cadence and 34 ms against 25 ms release to flash; Alan Wake 2 at Quarter, 56 ms against 35 ms. Games without Reflex keep the presenter's cap; a game that collapses under the limit falls back to it for the session.
