@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.14"
+#define BFI_ADDON_VERSION "1.0.15-t1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -123,6 +123,7 @@ struct Settings
     int   laterRelease = 0;   // Lowest latency + Refresh cap: release the game just in time for the pick
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
+    int   capReflex = 1;      // caps below the refresh rate: Reflex's frame limit in games that use Reflex
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
     int   deferRecreated = 1; // recreated swap chains: no BFI until the game resizes (safe)
@@ -241,6 +242,7 @@ static void LoadSettings(Settings &s)
     s.laterRelease = IniInt("LaterRelease", 0) ? 1 : 0;
     s.capJit = IniInt("CapJustInTime", 1) ? 1 : 0;
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
+    s.capReflex = IniInt("CapWithReflex", 1) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
     if (s.laterReleaseMs > 5.0f) s.laterReleaseMs = 5.0f;
@@ -380,6 +382,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("LaterRelease", s.laterRelease);
     IniWriteInt("CapJustInTime", s.capJit);
     IniWriteInt("AutoFrameCap", s.autoCap);
+    IniWriteInt("CapWithReflex", s.capReflex);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
     IniWriteInt("GameFrameStatistics", s.virtualStats);
@@ -2215,9 +2218,16 @@ static DWORD WINAPI PresenterThread(void *)
     // 60 s, then every 120 s while they keep failing).
     bool   autoCapDown = false, capProbe = false;
     int    capDownSecs = 0, capUpSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
+    int    statPer = 1;           // refreshes per game frame of the cap in effect (for the uneven-cycle counts)
     double capSwitchT = -100.0, capUpT = -100.0, probeWait = 30.0, stayMin = 10.0;
     bool   fgWas = false;
     bool   capByReflex = false;
+    bool   reflexCap = false;     // a cap below the refresh rate applied with Reflex's frame limit (CapWithReflex)
+    double rcOnT = -100.0, fpsAtRc = 0.0;
+    int    rcBadSecs = 0;
+    bool   downUneven = false;    // the automatic cap stepped down because the game was uneven at Refresh
+    int    unevenSecs = 0;
+    double unevenWait = 60.0;     // first try at Refresh after an uneven step-down
     int    rfxBadSecs = 0, gameLimBadSecs = 0;   // seconds collapsed under our Reflex limit / the game's own
     double fpsGoodT = -100.0;     // last second the game held at least half the strobe rate
     double fpsAtDown = 0.0;       // game fps when the automatic frame cap stepped down   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
@@ -2286,6 +2296,10 @@ static DWORD WINAPI PresenterThread(void *)
         userCap = s.gameCap;
         // one game frame per strobe cycle (games with Reflex: Reflex's frame limit does it instead, see below)
         if (s.autoCap && userCap == 1 && autoCapDown && !capByReflex && s.frames >= 2) s.gameCap = 4;
+        // Cap below the refresh rate with Reflex's frame limit (see the per-second block): the
+        // presenter itself then takes every frame, like at Refresh, and the driver paces the game.
+        statPer = CapPeriod(s.gameCap, s.frames, s.capDivisor);
+        if (reflexCap && s.capReflex && userCap >= 2 && s.enabled) s.gameCap = 1;
         // Release the game's frame-latency slot when the frame is handed
         // over (not when the strobe takes it) in Lowest latency, and also
         // whenever a Half/Quarter cap already paces the game to the strobe:
@@ -2484,7 +2498,7 @@ static DWORD WINAPI PresenterThread(void *)
         if (cycleStart && lastShownId && pickId >= lastShownId)
         {
             const int step = (int)(pickId - lastShownId);
-            if (CapPeriod(s.gameCap, s.frames, s.capDivisor) > s.frames) { if (step >= 2) secSkipU++; }   // frame lit over several cycles: 0/1 steps are normal
+            if (statPer > s.frames) { if (step >= 2) secSkipU++; }   // frame lit over several cycles: 0/1 steps are normal
             else
             {
                 const int expect = std::max(1, (int)std::floor(llStep + 0.5));
@@ -3012,6 +3026,40 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 else gameLimBadSecs = 0;
                 const bool rfxUse = t - rsLastT < 3.0 && rsLast.frames > 0 && !g_rfxLimitBad.load();
+                // Caps below the refresh rate (Half, Quarter, one per strobe cycle, custom) in games with
+                // Reflex: Reflex's frame limit at the cap's rate instead of holding the game at Present.
+                // It paces the game where it starts a frame, which keeps frames even where the engine
+                // hands them over unevenly (The Midnight Walk: 1-2% of flashes off-cadence with a 60 fps
+                // Reflex limit, against ~11% with the presenter's Half cap), and with frame generation it
+                // paces the generated frames too.
+                {
+                    const bool want = s.capReflex && userCap >= 2 && s.enabled && rfxUse && hzA > 0.0;
+                    if (want && !reflexCap)
+                    {
+                        rcOnT = t; fpsAtRc = fpsA; rcBadSecs = 0;
+                        LOGI("BFI Presenter: game frame cap with Reflex's frame limit: %.1f fps (%.0f us)",
+                             hzA / CapPeriod(userCap, s.frames, s.capDivisor), 1e6 * CapPeriod(userCap, s.frames, s.capDivisor) / hzA);
+                    }
+                    else if (!want && reflexCap)
+                        LOGI("BFI Presenter: game frame cap: the presenter's own cap%s", g_rfxLimitBad.load() ? " (the game collapsed under Reflex's limit)" :
+                             !rfxUse && userCap >= 2 && s.capReflex ? " (no Reflex reports from the game)" : "");
+                    reflexCap = want;
+                    // Same safety net as the automatic cap: a game that collapses under the limit.
+                    if (reflexCap)
+                    {
+                        const double capFps = hzA / CapPeriod(userCap, s.frames, s.capDivisor);
+                        if (t - rcOnT >= 1.5 && t - rcOnT < 6.0 && fpsAtRc > 0.8 * capFps && fpsA < 0.5 * capFps)
+                        {
+                            if (++rcBadSecs >= 2)
+                            {
+                                g_rfxLimitBad.store(true); reflexCap = false;
+                                LOGW("BFI Presenter: Reflex frame limit: the game fell to %.0f fps under it (%.0f before) -- no Reflex frame "
+                                     "limit for the rest of this session; the game frame cap uses the presenter's own cap", fpsA, fpsAtRc);
+                            }
+                        }
+                        else rcBadSecs = 0;
+                    }
+                }
                 if (!autoCapDown) capByReflex = rfxUse;
                 if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg))
                 {
@@ -3020,28 +3068,42 @@ static DWORD WINAPI PresenterThread(void *)
                     {
                         // Trying Refresh: the first second still counts frames from the cap.
                         probeSecs++;
-                        if (probeSecs >= 2 && fpsA >= 0.95 * hzA && !hitchPaused) probeGood++;
+                        if (probeSecs >= 2 && fpsA >= 0.95 * hzA && !hitchPaused && (!downUneven || g_status.unevenRep + g_status.unevenSkip < 4)) probeGood++;
                         if (probeSecs >= 4)
                         {
                             capProbe = false; capDownSecs = capUpSecs = 0; capSwitchT = t;
                             if (probeGood >= 2)
                             {
                                 probeWait = 30.0;
+                                if (downUneven) { downUneven = false; unevenWait = 60.0; }
                                 LOGI("BFI Presenter: automatic frame cap: Refresh rate -- the game holds %.0f fps", fpsA);
                             }
                             else
                             {
                                 autoCapDown = true;
-                                probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
+                                if (downUneven) unevenWait = unevenWait * 2.0 > 600.0 ? 600.0 : unevenWait * 2.0;
+                                else probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
-                                     "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
+                                     "at Refresh%s); next try in %.0f s", fpsA, hzA, downUneven ? ", uneven" : "", downUneven ? unevenWait : probeWait);
                             }
                         }
                     }
                     else if (!autoCapDown)
                     {
                         capDownSecs = (!hitchPaused && fgVotes == 0 && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;   // not while frame generation may be starting
-                        if (capDownSecs >= 3 && t - capSwitchT > 3.0)
+                        // Uneven at the refresh rate: the game holds it, but hands its frames over at uneven
+                        // times, so the lit refreshes repeat one and skip the next (The Midnight Walk at a full
+                        // 120 fps: about half the flashes). 8 or more uneven cycles a second for 5 s.
+                        const int unevenNow = g_status.unevenRep + g_status.unevenSkip;
+                        unevenSecs = (!hitchPaused && fgVotes == 0 && !fg && fpsA >= 0.95 * hzA && unevenNow >= 8 && t - capSwitchT > 3.0) ? unevenSecs + 1 : 0;
+                        if (unevenSecs >= 5)
+                        {
+                            autoCapDown = true; downUneven = true; capDownSecs = capUpSecs = unevenSecs = 0; capSwitchT = t; fpsAtDown = fpsA;
+                            LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game holds %.0f fps "
+                                 "but %d of %d strobe cycles last second were uneven; next try at Refresh in %.0f s", hzA / s.frames,
+                                 capByReflex ? "Reflex frame limit" : "the presenter's cap", fpsA, unevenNow, (int)(hzA / s.frames + 0.5), unevenWait);
+                        }
+                        else if (capDownSecs >= 3 && t - capSwitchT > 3.0)
                         {
                             // Down again soon after going back up: the game is close to the limit, so the
                             // next return waits longer.
@@ -3053,7 +3115,7 @@ static DWORD WINAPI PresenterThread(void *)
                                  capByReflex ? "Reflex frame limit" : "the presenter's cap", fpsA, hzA);
                         }
                     }
-                    else if (!fg && t - rsLastT < 3.0 && rsLast.frames > 0 && rsLast.gpuActiveMs > 0.0)
+                    else if (!fg && !downUneven && t - rsLastT < 3.0 && rsLast.frames > 0 && rsLast.gpuActiveMs > 0.0)
                     {
                         // Reflex reports: back up when the game's GPU and CPU work per frame fit well
                         // within one refresh.
@@ -3071,7 +3133,7 @@ static DWORD WINAPI PresenterThread(void *)
                     // With frame generation, a try means 3 s without the limit, and DLSS-G re-pacing twice:
                     // a visible stutter each time (God of War Ragnarok, every 30-120 s). Frame generation that
                     // could fill the refresh rate is rare, so try only every 5 minutes then.
-                    else if (t - capSwitchT >= (fg && capByReflex ? 300.0 : probeWait) && !hitchPaused)
+                    else if (t - capSwitchT >= (fg && capByReflex ? 300.0 : downUneven ? unevenWait : probeWait) && !hitchPaused)
                     {
                         // No Reflex reports (or frame generation, whose reports are for rendered frames):
                         // try Refresh for a few seconds.
@@ -3080,8 +3142,8 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 else
                 {
-                    if (autoCapDown && fg) LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation active, no Reflex)");
-                    autoCapDown = capProbe = false; capDownSecs = capUpSecs = 0;
+                    if (autoCapDown && fg && s.autoCap && userCap == 1) LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation active, no Reflex)");
+                    autoCapDown = capProbe = downUneven = false; capDownSecs = capUpSecs = unevenSecs = 0;
                 }
                 g_status.autoCapDown = autoCapDown ? 1 : 0;
                 g_status.autoCapProbe = capProbe ? 1 : 0;
@@ -3101,6 +3163,8 @@ static DWORD WINAPI PresenterThread(void *)
                 const double hzL = modeHz > 0.0 ? modeHz : peakHz;
                 int limitUs = (s.autoCap && userCap == 1 && s.enabled && s.frames >= 2 && stNow.autoCapDown && capByReflex && hzL > 0.0)
                                   ? (int)(1e6 * s.frames / hzL + 0.5) : 0;
+                if (reflexCap && s.capReflex && userCap >= 2 && s.enabled && hzL > 0.0)
+                    limitUs = (int)(1e6 * CapPeriod(userCap, s.frames, s.capDivisor) / hzL + 0.5);
                 // Phase: the limiter paces the game on its own clock, so its frames can settle right at
                 // the moment the presenter picks a frame for the lit refresh, where a little jitter
                 // repeats one frame and skips the next, again and again (God of War Ragnarok: 10-18
@@ -7228,7 +7292,23 @@ static void draw_overlay(reshade::api::effect_runtime *)
             {
                 const double hz = st.refreshHz > 1.0 ? st.refreshHz : 0.0;
                 if (hz > 0.0) ImGui::Text("Cap: %.0f fps (a new game frame every %d refresh%s)", hz / per, per, per == 1 ? "" : "es");
-                if (per >= 2 && st.fgActive)
+                if (per >= 2)
+                {
+                    bool cr = s.capReflex != 0;
+                    if (ImGui::Checkbox("Use Reflex's frame limit for this cap", &cr)) s.capReflex = cr ? 1 : 0;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("In games with NVIDIA Reflex, the cap is applied by Reflex's own frame limit: the driver\n"
+                                                                  "paces the game where it starts each frame, instead of the presenter holding it at Present.\n"
+                                                                  "Frames come out more even (The Midnight Walk: 1-2%% off-cadence flashes against ~11%%),\n"
+                                                                  "and frame generation is paced too. Games without Reflex keep the presenter's cap.\n"
+                                                                  "Just-in-time release doesn't apply while Reflex caps the game.");
+                    if (s.capReflex)
+                    {
+                        ImGui::SameLine();
+                        if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: %.1f ms)", st.rfxLimitUs / 1000.0);
+                        else ImGui::TextDisabled("(not in use: no Reflex in this game)");
+                    }
+                }
+                if (per >= 2 && st.fgActive && st.rfxLimitUs <= 0)
                     ImGui::TextColored(kAmber, "Frame generation with a cap below the refresh rate: half its frames never reach the screen\n"
                                        "(God of War: 30 new images a second at Half) and latency doubles. Use Refresh rate.");
                 if (per >= 2 && per % s.frames != 0)
