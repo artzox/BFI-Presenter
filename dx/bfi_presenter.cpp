@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.15-t1"
+#define BFI_ADDON_VERSION "1.0.15-t2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2228,6 +2228,9 @@ static DWORD WINAPI PresenterThread(void *)
     bool   downUneven = false;    // the automatic cap stepped down because the game was uneven at Refresh
     int    unevenSecs = 0;
     double unevenWait = 60.0;     // first try at Refresh after an uneven step-down
+    bool   upByReports = false;   // the last return to Refresh came from the Reflex reports
+    int    reportMisses = 0;      // ... and the game fell below the refresh rate again within 30 s
+    bool   reportsUnreliable = false;   // after 2 such misses: back to Refresh only by a try that holds it evenly
     int    rfxBadSecs = 0, gameLimBadSecs = 0;   // seconds collapsed under our Reflex limit / the game's own
     double fpsGoodT = -100.0;     // last second the game held at least half the strobe rate
     double fpsAtDown = 0.0;       // game fps when the automatic frame cap stepped down   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
@@ -3068,23 +3071,24 @@ static DWORD WINAPI PresenterThread(void *)
                     {
                         // Trying Refresh: the first second still counts frames from the cap.
                         probeSecs++;
-                        if (probeSecs >= 2 && fpsA >= 0.95 * hzA && !hitchPaused && (!downUneven || g_status.unevenRep + g_status.unevenSkip < 4)) probeGood++;
+                        if (probeSecs >= 2 && fpsA >= 0.95 * hzA && !hitchPaused && (!(downUneven || reportsUnreliable) || g_status.unevenRep + g_status.unevenSkip < 4)) probeGood++;
                         if (probeSecs >= 4)
                         {
                             capProbe = false; capDownSecs = capUpSecs = 0; capSwitchT = t;
                             if (probeGood >= 2)
                             {
                                 probeWait = 30.0;
-                                if (downUneven) { downUneven = false; unevenWait = 60.0; }
+                                if (downUneven || reportsUnreliable) unevenWait = 60.0;
+                                downUneven = false; upByReports = false;
                                 LOGI("BFI Presenter: automatic frame cap: Refresh rate -- the game holds %.0f fps", fpsA);
                             }
                             else
                             {
                                 autoCapDown = true;
-                                if (downUneven) unevenWait = unevenWait * 2.0 > 600.0 ? 600.0 : unevenWait * 2.0;
+                                if (downUneven || reportsUnreliable) unevenWait = unevenWait * 2.0 > 600.0 ? 600.0 : unevenWait * 2.0;
                                 else probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
-                                     "at Refresh%s); next try in %.0f s", fpsA, hzA, downUneven ? ", uneven" : "", downUneven ? unevenWait : probeWait);
+                                     "at Refresh%s); next try in %.0f s", fpsA, hzA, downUneven ? ", uneven" : "", (downUneven || reportsUnreliable) ? unevenWait : probeWait);
                             }
                         }
                     }
@@ -3109,13 +3113,24 @@ static DWORD WINAPI PresenterThread(void *)
                             // next return waits longer.
                             if (t - capUpT < 30.0) stayMin = stayMin * 2.0 > 120.0 ? 120.0 : stayMin * 2.0;
                             else stayMin = 10.0;
+                            // The Reflex reports said the frames fit a refresh, but the game didn't hold it (The
+                            // Midnight Walk: GPU 6.5 ms, yet 92-98 fps at Refresh, so the cap went up and down
+                            // every minute, a stutter each time). Twice: only a try at Refresh decides from now on.
+                            if (upByReports && t - capUpT < 30.0 && !reportsUnreliable && ++reportMisses >= 2)
+                            {
+                                reportsUnreliable = true;
+                                LOGI("BFI Presenter: automatic frame cap: the game twice fell below the refresh rate soon after its Reflex "
+                                     "reports showed headroom -- from now on it goes back to Refresh only after a try that holds it (first in %.0f s)",
+                                     unevenWait);
+                            }
+                            upByReports = false;
                             autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames,
                                  capByReflex ? "Reflex frame limit" : "the presenter's cap", fpsA, hzA);
                         }
                     }
-                    else if (!fg && !downUneven && t - rsLastT < 3.0 && rsLast.frames > 0 && rsLast.gpuActiveMs > 0.0)
+                    else if (!fg && !downUneven && !reportsUnreliable && t - rsLastT < 3.0 && rsLast.frames > 0 && rsLast.gpuActiveMs > 0.0)
                     {
                         // Reflex reports: back up when the game's GPU and CPU work per frame fit well
                         // within one refresh.
@@ -3125,7 +3140,7 @@ static DWORD WINAPI PresenterThread(void *)
                         capUpSecs = (!hitchPaused && needMs < 0.85 * refMs) ? capUpSecs + 1 : 0;
                         if (capUpSecs >= 10 && t - capSwitchT >= stayMin)
                         {
-                            autoCapDown = false; capDownSecs = capUpSecs = 0; capSwitchT = t; capUpT = t;
+                            autoCapDown = false; capDownSecs = capUpSecs = 0; capSwitchT = t; capUpT = t; upByReports = true;
                             LOGI("BFI Presenter: automatic frame cap: Refresh rate -- game frames take %.1f ms (GPU %.1f, "
                                  "simulation %.1f, submit %.1f), within a refresh", needMs, rsLast.gpuActiveMs, rsLast.simMs, rsLast.submitMs);
                         }
@@ -3133,7 +3148,7 @@ static DWORD WINAPI PresenterThread(void *)
                     // With frame generation, a try means 3 s without the limit, and DLSS-G re-pacing twice:
                     // a visible stutter each time (God of War Ragnarok, every 30-120 s). Frame generation that
                     // could fill the refresh rate is rare, so try only every 5 minutes then.
-                    else if (t - capSwitchT >= (fg && capByReflex ? 300.0 : downUneven ? unevenWait : probeWait) && !hitchPaused)
+                    else if (t - capSwitchT >= (fg && capByReflex ? 300.0 : (downUneven || reportsUnreliable) ? unevenWait : probeWait) && !hitchPaused)
                     {
                         // No Reflex reports (or frame generation, whose reports are for rendered frames):
                         // try Refresh for a few seconds.
