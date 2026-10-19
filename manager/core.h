@@ -157,12 +157,16 @@ std::wstring BackupDir();
 std::wstring LogPath();
 
 // ----- GitHub releases
-struct RemoteRelease { std::string tag, dxUrl, vkUrl, notesUrl; bool ok = false; std::string error; };
+struct RemoteRelease { std::string tag, dxUrl, vkUrl, notesUrl, mgrUrl, mgrVersion; bool ok = false; std::string error; };
 RemoteRelease FetchLatestRelease();
 RemoteRelease ParseRelease(const std::string &json);           // blocking (call from a worker thread)
 std::string DownloadRelease(const RemoteRelease &r, Source &out,
                             const std::function<void(const std::string &)> &progress);
 Source CachedRelease();                        // newest release already downloaded, if any
+// Downloads the Manager zip of r and puts its exe in place of the running one (which is renamed to .old).
+// "" = done: start the new exe and quit.
+std::string UpdateManagerExe(const RemoteRelease &r, const std::function<void(const std::string &)> &progress);
+void CleanupOldManagerExe();                   // removes the .old exe left by an update
 
 // ----- ReShade (the add-on build from reshade.me)
 std::string FetchReShadeVersions(std::vector<std::string> &out);     // newest first, from GitHub tags

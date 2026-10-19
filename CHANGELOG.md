@@ -7,6 +7,13 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Manager 1.3.5] — 2026-10-19 (with the 1.0.16 release)
+
+- **[Manager] Update button.** When the latest GitHub release carries a newer Manager, **Update Manager to …** appears next to **Check GitHub** (checked once after the first scan of each start, also when a folder is picked as the source). It downloads the new exe, swaps it in for the running one and restarts; the game list, settings and backups are kept. Needs the Manager in a folder you can write to.
+- **[Manager] Fixed: "?" for many games' APIs after a large scan.** PCGamingWiki was asked about 25 games per query; for games without a Steam app id (looked up by name, with their edition variants) the query URL grew past the Manager's 4,096-character limit, the lookup stopped there, and every game after it fell back to its executable, often "?". Queries are now kept short, a failed one is retried once and then skipped (two in a row stop the lookup), and the cache is saved after each one, so the next scan continues where it stopped instead of asking again for every game. The detail pane says why an API is "?".
+- **[Manager] Fixed: the PCGamingWiki tooltip appeared on "Ask about G-SYNC and Vertical Sync when installing"** (under Libraries...). Each option has its own tooltip now.
+- **[Docs]** Tested games: Moons of Madness now recommended with the presenter at Half refresh + Lowest latency (the BFI shader still works); Blasphemous at Refresh + Lowest latency (locked at 60 fps), or with the BFI shader at 120 Hz with NVIDIA Smooth Motion.
+
 ## [1.0.16] — 2026-10-19
 
 - **[DX] Fixed: a loading screen could switch off the Reflex frame limit for the whole session.** The collapse safety net from 1.0.14 counted a loading stall right after the automatic frame cap stepped down as a collapse (Until Dawn's startup load: 1–12 fps, with the hitch guard paused and the window not responding), so frame generation then ran uncapped at about 65 fps. Seconds below 3 fps or with the hitch guard paused now restart the check instead of counting. Real collapses keep drawing steadily with the hitch guard running and are still caught (Returnal about 7 fps, Pragmata about 8). Until Dawn with frame generation now holds 60 at the Refresh cap.
