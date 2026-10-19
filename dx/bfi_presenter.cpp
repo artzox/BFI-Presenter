@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.15-m1"
+#define BFI_ADDON_VERSION "1.0.15"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3024,13 +3024,15 @@ static DWORD WINAPI PresenterThread(void *)
                 else gameLimBadSecs = 0;
                 const bool rfxUse = t - rsLastT < 3.0 && rsLast.frames > 0 && !g_rfxLimitBad.load();
                 // Game frame cap with Reflex's frame limit (CapWithReflex, off by default): in games with
-                // Reflex, the cap (Refresh, Half, Quarter, one per strobe cycle, custom) is applied by the
-                // driver where the game starts each frame, instead of holding the game at Present -- what a
-                // game's own Reflex fps limit does (The Midnight Walk's 60 fps option). The automatic frame
-                // cap's own step-down, when it is active, takes precedence.
+                // Reflex, a cap below the refresh rate (Half, Quarter, one per strobe cycle, custom) is applied
+                // by the driver where the game starts each frame, instead of holding the game at Present --
+                // what a game's own Reflex fps limit does. For engines that hand frames over irregularly
+                // (The Midnight Walk at Half: 1.7% of flashes off-cadence against 15.6%); elsewhere just-in-
+                // time release is as even with less latency (Silent Hill 2 at Half: 1.3% against 2.2%, 25 ms
+                // against 34 ms release -> flash; Alan Wake 2 at Quarter: 35 ms against 56 ms).
                 {
                     const bool autoDown = s.autoCap && userCap == 1 && autoCapDown;
-                    const bool want = s.capReflex && userCap >= 1 && s.enabled && rfxUse && hzA > 0.0 && !autoDown;
+                    const bool want = s.capReflex && userCap >= 2 && s.enabled && rfxUse && hzA > 0.0 && !autoDown;
                     const int rcPer = CapPeriod(userCap, s.frames, s.capDivisor);
                     if (want && !reflexCap)
                     {
@@ -3145,7 +3147,7 @@ static DWORD WINAPI PresenterThread(void *)
                 const double hzL = modeHz > 0.0 ? modeHz : peakHz;
                 int limitUs = (s.autoCap && userCap == 1 && s.enabled && s.frames >= 2 && stNow.autoCapDown && capByReflex && hzL > 0.0)
                                   ? (int)(1e6 * s.frames / hzL + 0.5) : 0;
-                if (limitUs == 0 && reflexCap && s.capReflex && userCap >= 1 && s.enabled && hzL > 0.0)
+                if (limitUs == 0 && reflexCap && s.capReflex && userCap >= 2 && s.enabled && hzL > 0.0)
                     limitUs = (int)(1e6 * CapPeriod(userCap, s.frames, s.capDivisor) / hzL + 0.5);
                 // Phase: the limiter paces the game on its own clock, so its frames can settle right at
                 // the moment the presenter picks a frame for the lit refresh, where a little jitter
@@ -7274,14 +7276,17 @@ static void draw_overlay(reshade::api::effect_runtime *)
             {
                 const double hz = st.refreshHz > 1.0 ? st.refreshHz : 0.0;
                 if (hz > 0.0) ImGui::Text("Cap: %.0f fps (a new game frame every %d refresh%s)", hz / per, per, per == 1 ? "" : "es");
+                if (per >= 2)
                 {
                     bool cr = s.capReflex != 0;
-                    if (ImGui::Checkbox("Apply the cap with Reflex's frame limit", &cr)) s.capReflex = cr ? 1 : 0;
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("In games with NVIDIA Reflex, the cap is applied by Reflex's own frame limit, like the game's own\n"
-                                                                  "Reflex fps limit: the driver paces the game where it starts each frame, instead of the\n"
-                                                                  "presenter holding it at Present. Can be steadier in engines that hand frames over unevenly,\n"
-                                                                  "and paces frame generation too. Games without Reflex keep the presenter's cap.\n"
-                                                                  "Just-in-time release doesn't apply while Reflex caps the game. Off by default.");
+                    if (ImGui::Checkbox("Apply the cap with Reflex's frame limit (irregular frame delivery only)", &cr)) s.capReflex = cr ? 1 : 0;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Half / Quarter cap in games with NVIDIA Reflex: the cap is applied by Reflex's own frame limit,\n"
+                                                                  "like a game's own Reflex fps limit, instead of the presenter releasing the game just in time.\n"
+                                                                  "Only for games whose frames still arrive irregularly at Half or Quarter -- just-in-time release\n"
+                                                                  "keeps switching itself off and motion stutters (The Midnight Walk: 1.7%% of flashes off-cadence\n"
+                                                                  "with it, 15.6%% without).\n"
+                                                                  "Adds latency compared with just-in-time release (about 10-20 ms: Silent Hill 2 34 ms against\n"
+                                                                  "25 ms) and is no smoother where just-in-time release works. Off by default.");
                     if (s.capReflex)
                     {
                         ImGui::SameLine();

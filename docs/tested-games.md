@@ -44,7 +44,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Grip | Working | Not tested | v0.65 | Standard setup (didn't load in v0.64) |
 | Prince of Persia: The Lost Crown | Working | Not tested | v0.64 | Standard setup (was held at 60 fps before v0.64) |
 | ABZU | Working | Not tested | v0.66 | Standard setup |
-| The Midnight Walk | Working | Not tested | v0.70 | In-game 60 fps limit + Refresh cap + Automatic frame cap + Lowest latency; DLSS needs `Engine.ini` lines (see notes) |
+| The Midnight Walk | Working | Not tested | v0.70 | Half refresh + Apply the cap with Reflex's frame limit (v1.0.15) + Lowest latency; DLSS needs `Engine.ini` lines (see notes) |
 | Cuphead | Working | Not tested | v0.73 | Later release on: \~5 ms less latency at 120 fps |
 | Obduction | Working | Not tested | v0.77 | Half refresh + just-in-time release; Lowest latency + Refresh is smoothest at 120 |
 | Hades II | Working | Not tested | v0.78 | GPU headroom for 120 fps (4K yes, 5K DSR no) |
@@ -247,7 +247,8 @@ Also tested and working with the standard setup above. Their notes weren't recor
   ```
 
   `r.AntiAliasingMethod` defaults to 2 (TAA), which is why the upscalers do nothing.
-- **Recommended (v1.0.14):** the game's own 60 fps limit (it sets Reflex's frame limit), frame generation off, DLSS Balanced; presenter Game frame cap Refresh rate, Automatic frame cap on, Frame pacing Lowest latency, automatic frames ahead. A new frame on about 98% of flashes, ~36 ms release to flash. Uncapped, the engine hands over frames unevenly even at a full 120 fps (about half the flashes repeat or skip), and heavier DLSS modes (Quality, DLAA) vary more from frame to frame, so repeat/skip pairs come back.
+- **Recommended (v1.0.15): Half refresh + Apply the cap with Reflex's frame limit + Frame pacing Lowest latency**, no in-game limit, frame generation off, DLSS Balanced. 1.7% of flashes off-cadence against 15.6% with the presenter's own Half cap (the engine hands frames over too irregularly for just-in-time release), ~35 ms release to flash. The engine's frame delivery is the reason: in most games leave the option off.
+- **Alternative (v1.0.14):** the game's own 60 fps limit (it sets Reflex's frame limit), frame generation off, DLSS Balanced; presenter Game frame cap Refresh rate, Automatic frame cap on, Frame pacing Lowest latency, automatic frames ahead. A new frame on about 98% of flashes, ~36 ms release to flash. Uncapped, the engine hands over frames unevenly even at a full 120 fps (about half the flashes repeat or skip), and heavier DLSS modes (Quality, DLAA) vary more from frame to frame, so repeat/skip pairs come back.
 - Smooth with the v1.0.3 default (`SmoothCatchUp=0`) shows every frame once at 60: no repeats or skips, against about one of each a second with catch-up on.
 - Camera-rotation judder that remains in every mode is the game's own. Half refresh + Lowest latency is the best combination; v0.69 releases the game in time for the lit refresh (frames \~5 ms old when shown).
 
