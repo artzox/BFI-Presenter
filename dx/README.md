@@ -40,6 +40,7 @@ The [Vulkan layer](../vulkan/README.md) covers Vulkan games and DirectX 9–11 g
 | Game holds 120 fps easily (light) | Refresh rate | Lowest latency | Later release on | ~5 ms less (Cuphead: 16.7 → 11.3 ms release to display) |
 | Game runs 60–110 fps | Refresh rate + Automatic frame cap, or Half refresh | Lowest latency | Just-in-time (default) | Every frame lit exactly once at an even 60 |
 | Frame generation | Refresh rate + Automatic frame cap | Lowest latency | — | Reflex frame limit at one presented frame per strobe cycle (God of War Ragnarok: a new frame on 60 of 60 flashes, ~21.5 ms release to flash) |
+| Stutter at Half / Quarter with irregular frame delivery (e.g. The Midnight Walk) | Half or Quarter + Apply the cap with Reflex's frame limit | Lowest latency | Reflex frame limit | Reflex games only; about 10–20 ms more than just-in-time release, so leave it off elsewhere |
 | Game below 60 fps | Quarter refresh | Lowest latency | Just-in-time (default) | Even 30 fps; each frame lit twice (double image in motion) |
 | Flashes in a GPU-heavy game | any | any | — | Start the launcher (Steam) as administrator for a realtime presenter queue |
 

@@ -22,7 +22,7 @@ Software strobing usually runs on the game's frame clock, so any late frame leav
 
 - **Strobe:** Variable MPRT (the default) or classic BFI with hue-preserving highlight roll-off (Ctrl+Shift+M switches); frames per cycle, gain, dark-frame floor, sine and inverted cycles; rolling scan with phosphor fade or a soft seam.
 - **HDR:** SDR, scRGB and HDR10 output with a display-peak ceiling and the ABL guard.
-- **Pacing:** game frame cap at Refresh / Half / Quarter, Smooth or Lowest-latency pacing, just-in-time release so each frame finishes right before its lit refresh, automatic frames ahead, hitch guard.
+- **Pacing:** game frame cap at Refresh / Half / Quarter, Smooth or Lowest-latency pacing, just-in-time release so each frame finishes right before its lit refresh (or, as an opt-in for Reflex games with irregular frame delivery, Reflex's frame limit), automatic frames ahead, hitch guard.
 - **APIs:** Direct3D 12, 11 and 9 and OpenGL through a ReShade add-on; Vulkan (and DXVK) through a Vulkan layer. Works with frame generation (DLSS FG, FSR FG, Lossless Scaling) at the Refresh cap.
 - **Settings** live in the ReShade overlay and in one `BFIPresenter.ini` per game.
 
