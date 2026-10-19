@@ -33,7 +33,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Onimusha | Working | Works (2×, 3×); Refresh cap | v0.27 | Standard setup |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
-| Pragmata | Working without FG | DLSS FG throttled to \~30 fps (Reflex) | v0.35 | FG off |
+| Pragmata | Working without FG | DLSS FG runs uncapped at \~70 fps on 120 Hz (no way to cap it to 60) | v1.0.15 | FG off |
 | Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps |
 | Control | Working | Works (2×, 3×, 4× with the [Control-FG](https://github.com/Frooglemcdoo/Control-FG) mod, also with DLSS 5); Refresh cap | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54 |
 | Marvel's Spider-Man 2 | Partial | Unstable even without the presenter | v0.35 | VRAM-limited at 4K; resolution toggle to start BFI |
@@ -182,7 +182,8 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 - Uses REFramework (loads as `dinput8.dll`); its harmless memory-probe exceptions appear at the top of `BFIPresenter_crash.txt`.
 - Steam's overlay hooks on Present and ResizeBuffers1 hung and crashed the game until v0.34, which calls DXGI directly past them.
-- DLSS Frame Generation drops to about 15 base fps (shown as 30) with the presenter, because Reflex pacing misreads the presenter's presents. Play without FG, or try XeSS or FSR FG through OptiScaler.
+- DLSS Frame Generation drops to about 15 base fps (shown as 30) with the presenter, because Reflex pacing misreads the presenter's presents.
+- Since v1.0.14, frame generation runs at about 35 rendered and 70 presented fps, but nothing can cap it to 60 on a 120 Hz display: the game collapses under any Reflex frame limit (e.g. 50 → 8 fps), so the presenter drops the limit for the session; the in-game limit is inactive with FG; and NVIDIA's Max Frame Rate also limits the presenter's own presents and breaks the strobe. Play without FG, or try XeSS or FSR FG through OptiScaler (OptiScaler limited the frame rate in a v1.0.15 test).
 
 ### Control
 
