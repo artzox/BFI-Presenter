@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.15-t2"
+#define BFI_ADDON_VERSION "1.0.15-t3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2252,6 +2252,14 @@ static DWORD WINAPI PresenterThread(void *)
     int  queuedNow = -1;
     int lastShown = -1;
     double lastT = Now(), secStart = Now(), ageSum = 0.0;
+    // Reflex frame limit phase lock: the age of the frame each lit refresh shows, and the display's
+    // measured refresh period (the A95L: 119.959 Hz, so a 16,667 us limit ran 5.4 us a frame fast and
+    // the game's frames drifted through the lit refresh's pick every ~50 s: a burst of repeat/skip pairs).
+    float  litAges[256]; int litAgeN = 0;
+    double minLitAge = 1e9; int lockPer = 0;   // lowest age seen at a lit refresh under this limit
+    UINT64 anchorSync = 0; LONGLONG anchorQpc = 0; double measPeriod = 0.0, qpcFreq = 0.0;
+    double lockTrimUs = 0.0;
+    { LARGE_INTEGER f; QueryPerformanceFrequency(&f); qpcFreq = (double)f.QuadPart; }
     int secPresents = 0, secLate = 0;
     // Hitch guard: while the presenter misses refreshes (GPU saturated by
     // loading) or the game stops delivering frames, every refresh is shown
@@ -2776,6 +2784,7 @@ static DWORD WINAPI PresenterThread(void *)
         }
         secPresents++;
         ageSum += (t - pickTime) * 1000.0;
+        if (cycleStart && litAgeN < 256) litAges[litAgeN++] = (float)((t - pickTime) * 1000.0);
         if (t - lastT > 1.5 / (modeHz > 0.0 ? modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
         {
             secLate++;
@@ -2802,6 +2811,19 @@ static DWORD WINAPI PresenterThread(void *)
             DXGI_FRAME_STATISTICS st = {};
             const bool sok = SUCCEEDED(ScStats(&st));
             int rep = 0;
+            // The display's refresh period, from its own refresh count and timestamps over a long span.
+            if (sok && st.SyncRefreshCount > 0 && st.SyncQPCTime.QuadPart > 0 && qpcFreq > 0.0)
+            {
+                if (!anchorSync || st.SyncRefreshCount <= anchorSync || st.SyncQPCTime.QuadPart <= anchorQpc)
+                { anchorSync = st.SyncRefreshCount; anchorQpc = st.SyncQPCTime.QuadPart; }
+                else if (st.SyncRefreshCount - anchorSync >= 600)
+                {
+                    const double per = (double)(st.SyncQPCTime.QuadPart - anchorQpc) / qpcFreq / (double)(st.SyncRefreshCount - anchorSync);
+                    const double ref = modeHz > 0.0 ? 1.0 / modeHz : per;
+                    if (fabs(per - ref) < 0.005 * ref) measPeriod = per;
+                    else { anchorSync = st.SyncRefreshCount; anchorQpc = st.SyncQPCTime.QuadPart; measPeriod = 0.0; }
+                }
+            }
             const double rate = secPresents / (t - secStart);
             if (!vsyncOverridden)
             {
@@ -3176,10 +3198,31 @@ static DWORD WINAPI PresenterThread(void *)
                 // Frame generation at the Refresh cap: Reflex's frame limit at one presented frame
                 // per strobe cycle (e.g. 16,667 us at 120 Hz with 2 frames per cycle).
                 const double hzL = modeHz > 0.0 ? modeHz : peakHz;
-                int limitUs = (s.autoCap && userCap == 1 && s.enabled && s.frames >= 2 && stNow.autoCapDown && capByReflex && hzL > 0.0)
-                                  ? (int)(1e6 * s.frames / hzL + 0.5) : 0;
-                if (reflexCap && s.capReflex && userCap >= 2 && s.enabled && hzL > 0.0)
-                    limitUs = (int)(1e6 * CapPeriod(userCap, s.frames, s.capDivisor) / hzL + 0.5);
+                const double perL = measPeriod > 0.0 ? measPeriod : (hzL > 0.0 ? 1.0 / hzL : 0.0);   // measured refresh period
+                int limPer = 0;   // refreshes per limited frame
+                if (s.autoCap && userCap == 1 && s.enabled && s.frames >= 2 && stNow.autoCapDown && capByReflex && perL > 0.0) limPer = s.frames;
+                if (reflexCap && s.capReflex && userCap >= 2 && s.enabled && perL > 0.0) limPer = CapPeriod(userCap, s.frames, s.capDivisor);
+                // Phase lock: keep the lit refreshes' frames half a limit interval away from the point where
+                // they'd arrive right at the pick. That point is the lowest age a frame can have when shown
+                // (a frame finished just in time; the lowest age seen under this limit: ~6 ms in The Midnight
+                // Walk, where the bursts of repeat/skip pairs happened as the median age passed ~20 ms). The
+                // median age is steered to that floor + half the interval by lengthening (age too high:
+                // frames finish too early) or shortening the limit by up to 30 us a frame (~1.8 ms a second
+                // at 60 fps).
+                if (limPer != lockPer) { lockPer = limPer; minLitAge = 1e9; lockTrimUs = 0.0; }
+                if (limPer > 0 && litAgeN >= 20 && !hitchPaused)
+                {
+                    std::sort(litAges, litAges + litAgeN);
+                    const double med = litAges[litAgeN / 2];
+                    if (litAges[0] > 0.5 && litAges[0] < minLitAge) minLitAge = litAges[0];
+                    const double target = minLitAge + 0.5 * limPer * perL * 1000.0;
+                    const double err = med - target;                                     // ms
+                    const double want = err * 3.0;                                       // us a frame
+                    lockTrimUs = 0.7 * lockTrimUs + 0.3 * (want > 30.0 ? 30.0 : want < -30.0 ? -30.0 : want);
+                }
+                else if (limPer == 0) lockTrimUs = 0.0;
+                litAgeN = 0;
+                int limitUs = limPer > 0 ? (int)(1e6 * limPer * perL + lockTrimUs + 0.5) : 0;
                 // Phase: the limiter paces the game on its own clock, so its frames can settle right at
                 // the moment the presenter picks a frame for the lit refresh, where a little jitter
                 // repeats one frame and skips the next, again and again (God of War Ragnarok: 10-18
