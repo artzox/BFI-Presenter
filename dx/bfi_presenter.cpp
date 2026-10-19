@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.15-t4"
+#define BFI_ADDON_VERSION "1.0.15-t3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2259,7 +2259,6 @@ static DWORD WINAPI PresenterThread(void *)
     double minLitAge = 1e9; int lockPer = 0;   // lowest age seen at a lit refresh under this limit
     UINT64 anchorSync = 0; LONGLONG anchorQpc = 0; double measPeriod = 0.0, qpcFreq = 0.0;
     double lockTrimUs = 0.0;
-    bool   lockActive = false;      // the phase lock is steering the limit (the old one-second nudge then stays off)
     { LARGE_INTEGER f; QueryPerformanceFrequency(&f); qpcFreq = (double)f.QuadPart; }
     int secPresents = 0, secLate = 0;
     // Hitch guard: while the presenter misses refreshes (GPU saturated by
@@ -2821,12 +2820,7 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     const double per = (double)(st.SyncQPCTime.QuadPart - anchorQpc) / qpcFreq / (double)(st.SyncRefreshCount - anchorSync);
                     const double ref = modeHz > 0.0 ? 1.0 / modeHz : per;
-                    if (fabs(per - ref) < 0.005 * ref)
-                    {
-                        if (measPeriod <= 0.0 && st.SyncRefreshCount - anchorSync >= 1200)
-                            LOGI("BFI Presenter: display refresh measured: %.4f Hz (%.2f us a refresh)", 1.0 / per, per * 1e6);
-                        if (st.SyncRefreshCount - anchorSync >= 1200) measPeriod = per;
-                    }
+                    if (fabs(per - ref) < 0.005 * ref) measPeriod = per;
                     else { anchorSync = st.SyncRefreshCount; anchorQpc = st.SyncQPCTime.QuadPart; measPeriod = 0.0; }
                 }
             }
@@ -3222,22 +3216,11 @@ static DWORD WINAPI PresenterThread(void *)
                     const double med = litAges[litAgeN / 2];
                     if (litAges[0] > 0.5 && litAges[0] < minLitAge) minLitAge = litAges[0];
                     const double target = minLitAge + 0.5 * limPer * perL * 1000.0;
-                    // Error on the circle of one limit interval: the shorter way round to the target.
-                    const double cyc = limPer * perL * 1000.0;
-                    double err = med - target;                                           // ms
-                    while (err > 0.5 * cyc) err -= cyc;
-                    while (err < -0.5 * cyc) err += cyc;
-                    // Close to the target: gentle (3 us a frame per ms, at most 30). Far from it, e.g. after
-                    // the game's own hitch moved its frames ~9 ms at once (The Midnight Walk: right onto the
-                    // pick, then 15 s of repeat/skip pairs while the old 30 us limit walked them back): up to
-                    // 120 us a frame, ~7 ms a second at 60 fps, so it's back within 2 s.
-                    const double fa = fabs(err);
-                    double want = fa > 3.0 ? err * 12.0 : err * 3.0;
-                    const double lim = fa > 3.0 ? 120.0 : 30.0;
-                    lockTrimUs = want > lim ? lim : want < -lim ? -lim : want;
-                    lockActive = true;
+                    const double err = med - target;                                     // ms
+                    const double want = err * 3.0;                                       // us a frame
+                    lockTrimUs = 0.7 * lockTrimUs + 0.3 * (want > 30.0 ? 30.0 : want < -30.0 ? -30.0 : want);
                 }
-                else if (limPer == 0) { lockTrimUs = 0.0; lockActive = false; }
+                else if (limPer == 0) lockTrimUs = 0.0;
                 litAgeN = 0;
                 int limitUs = limPer > 0 ? (int)(1e6 * limPer * perL + lockTrimUs + 0.5) : 0;
                 // Phase: the limiter paces the game on its own clock, so its frames can settle right at
@@ -3246,7 +3229,7 @@ static DWORD WINAPI PresenterThread(void *)
                 // pairs a second for a whole minute, against none in another run). Then the limit is
                 // shortened by 0.15 ms for one second, which moves the frames ~9 ms earlier against
                 // the strobe, and checked again 3 s later.
-                if (limitUs > 0 && rsLast.limitUs > 0 && !lockActive && !hitchPaused && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
+                if (limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
                 {
                     phaseUntil = t + 1.0; phaseNextT = t + 4.0;
                     if (++phaseNudges <= 5)
