@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-99 of 101 tested games and emulators run with BFI: the 50 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; three with the engine's own stutter) and 49 more listed after it. Two are partial.
+101 of 102 tested games and emulators run with BFI: the 52 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; three with the engine's own stutter) and 49 more listed after it. One is partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -32,15 +32,16 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Riven (2023) | Working | Not tested | v0.13 | A steady 60 fps for smooth motion |
 | Onimusha | Working | Works (2×, 3×); Refresh cap | v0.27 | Standard setup |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
+| Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency (Refresh + automatic frame cap also works) |
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
 | Pragmata | Working | Works at Half refresh + Smooth (\~30 rendered, 60 presented); the automatic cap can't hold Refresh | v1.0.16 | Half refresh + Smooth with FG; change resolution once to start BFI |
 | Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps |
 | Control | Working | Works (2×, 3×, 4× with the [Control-FG](https://github.com/Frooglemcdoo/Control-FG) mod, also with DLSS 5); Refresh cap | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54 |
-| Marvel's Spider-Man 2 | Partial | Unstable even without the presenter | v0.35 | VRAM-limited at 4K; resolution toggle to start BFI |
+| Marvel's Spider-Man 2 | Working without FG | Must be off (unstable even without the presenter) | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency or Smooth, or Refresh + Lowest latency |
 | Sifu | Working (DX11) | Not tested | — | Borderless window |
 | God of War (2018) | Working (DX11) | Not tested | v0.60 | Borderless window |
 | No Rest for the Wicked | Working | Not tested | v0.61 | Standard setup (froze on a resize after loading before v0.61) |
-| Mirror's Edge Catalyst | Working (DX11) | Not tested | v0.65 | Borderless window, not exclusive fullscreen |
+| Mirror's Edge Catalyst | Working (DX11) | Not tested | v0.65 | Borderless window, not exclusive fullscreen; lower Gain and ABL guard budget (bright scenes trigger the TV's ABL) |
 | Grip | Working | Not tested | v0.65 | Standard setup (didn't load in v0.64) |
 | Prince of Persia: The Lost Crown | Working | Not tested | v0.64 | Standard setup (was held at 60 fps before v0.64) |
 | ABZU | Working | Not tested | v0.66 | Standard setup |
@@ -172,6 +173,13 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - Reflex off measured slightly better: 52 vs 49 fps and 3.5 ms less delay to screen.
 - Runs at about 50 fps, so expect judder unless settings reach 60.
 
+### Ratchet & Clank: Rift Apart
+
+- **Set the game to exclusive fullscreen.** In borderless/windowed mode it fell to 15–23 fps as soon as BFI started (the game's render submit took 40–60 ms a frame), with occasional stretches at 60 after a load.
+- **Frame generation off.**
+- **BFI starts only after the game resizes its swap chain:** change the resolution once in the game's settings (and back).
+- Recommended (v1.0.16): Half refresh + Lowest latency, slightly steadier; Refresh rate + Lowest latency with the automatic frame cap on (the defaults) works well too.
+
 ### Returnal
 
 - FG off: frame generation caused menu freezes and flickering UI elements, and with v1.0.13 bright highlights flicker under BFI (the lit refresh mixes real and generated frames unevenly).
@@ -202,10 +210,11 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### Marvel's Spider-Man 2
 
-- BFI starts only after a resolution toggle: the game recreates its swap chain without resizing it.
-- The game runs at the limit of 16 GB VRAM at 4K with ReShade. When BFI starts (about 0.3 GB extra), performance can collapse to 5–6 fps.
-- Toggling frame generation with ReShade alone already recreates the swap chain twice and destabilises the game. One GPU hang occurred in the game's DirectStorage GPU decompression.
-- Not recommended with the presenter at 4K until the lean-memory option exists.
+- **Set the game to exclusive fullscreen** (as in Ratchet & Clank: Rift Apart, the same engine). In borderless mode BFI was hard to start and performance collapsed once it did (5–6 fps), which earlier looked like video memory running out.
+- **BFI starts only after the game resizes its swap chain:** change the resolution once in the game's settings (and back).
+- **Frame generation off.** Toggling it with ReShade alone already recreates the swap chain twice and destabilises the game; one GPU hang occurred in the game's DirectStorage GPU decompression.
+- **Ray tracing only if you can afford it:** without frame generation it is very heavy, even on an RTX 5080.
+- Recommended (v1.0.16), by the frame rate the game holds: below 120, Half refresh + Lowest latency (or Smooth); close to 120, Refresh rate + Lowest latency with the automatic frame cap.
 
 ### Sifu
 
@@ -222,6 +231,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### Mirror's Edge Catalyst
 
 - DirectX 11. Crashed on exit in exclusive fullscreen; works in a borderless window.
+- **Lower Gain vs blur and a lower ABL guard budget** (`AblGuardBudgetNits`) than usual. The game's large, very bright areas (white rooftops and sky) push the lit refresh high enough to trigger the TV's own ABL, which shows as flicker; a lower Gain and a lower budget keep the strobe below that point.
 
 ### Grip
 
