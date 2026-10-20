@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.17-g1"
+#define BFI_ADDON_VERSION "1.0.17-g2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -1413,8 +1413,12 @@ float3 Strobe(float3 lin, uint j, float litGain)
     {
         if (method == 0)
         {
-            float g = GradualGain(j, litGain, dfloor, 1e6);
-            return ((flags & 1) != 0) ? Rolloff(lin, g, ceilLin, knee) : lin * g;
+            // Roll the highlights off once, for the whole lit image, then share that light out: rolling off
+            // each refresh's share separately compresses less as the light splits, and highlights pulsed
+            // brighter with every drift step.
+            float3 full = ((flags & 1) != 0) ? Rolloff(lin, litGain, ceilLin, knee) : lin * litGain;
+            float3 base = lin * dfloor;
+            return base + (full - base) * Overlap(phase, 1.0, float(j), float(frames));
         }
         float mg = max(max(lin.r, lin.g), lin.b);
         float Sg = (mg > 1e-6) ? max(ceilLin / mg, 1.0) : 1e6;
