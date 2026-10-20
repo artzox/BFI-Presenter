@@ -41,7 +41,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Sifu | Working (DX11) | Not tested | — | Borderless window |
 | God of War (2018) | Working (DX11) | Not tested | v0.60 | Borderless window |
 | No Rest for the Wicked | Working | Not tested | v0.61 | Standard setup (froze on a resize after loading before v0.61) |
-| Mirror's Edge Catalyst | Working (DX11) | Not tested | v0.65 | Borderless window, not exclusive fullscreen |
+| Mirror's Edge Catalyst | Working (DX11) | Not tested | v0.65 | Borderless window, not exclusive fullscreen; lower Gain and ABL guard budget (bright scenes trigger the TV's ABL) |
 | Grip | Working | Not tested | v0.65 | Standard setup (didn't load in v0.64) |
 | Prince of Persia: The Lost Crown | Working | Not tested | v0.64 | Standard setup (was held at 60 fps before v0.64) |
 | ABZU | Working | Not tested | v0.66 | Standard setup |
@@ -231,6 +231,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### Mirror's Edge Catalyst
 
 - DirectX 11. Crashed on exit in exclusive fullscreen; works in a borderless window.
+- **Lower Gain vs blur and a lower ABL guard budget** (`AblGuardBudgetNits`) than usual. The game's large, very bright areas (white rooftops and sky) push the lit refresh high enough to trigger the TV's own ABL, which shows as flicker; a lower Gain and a lower budget keep the strobe below that point.
 
 ### Grip
 
