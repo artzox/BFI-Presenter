@@ -132,7 +132,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 struct Rect { LONG x, y, w, h; };
 static void Fill(D3D12_CPU_DESCRIPTOR_HANDLE rtv, const float c[4], std::vector<D3D12_RECT> &rs)
 {
-    if (!rs.empty()) g_list->ClearRenderTargetView(rtv, c, (UINT)rs.size(), rs.data());
+    // A few rectangles per call: some layers on the present path (overlays, capture tools) handle
+    // long rectangle lists badly, and the patterns with many tiles crashed there.
+    for (size_t i = 0; i < rs.size(); i += 8)
+        g_list->ClearRenderTargetView(rtv, c, (UINT)((rs.size() - i) < 8 ? (rs.size() - i) : 8), rs.data() + i);
     rs.clear();
 }
 static void Add(std::vector<D3D12_RECT> &rs, LONG x, LONG y, LONG w, LONG h)
