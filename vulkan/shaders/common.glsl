@@ -16,6 +16,7 @@ layout(push_constant) uniform C
     float seam;       // rolling scan (flags & 8): blended zone between bands, fraction of the screen height
     float decay;      // rolling scan: phosphor decay time in sub-frames (0 = hard bands + seam)
     float soften;     // 0..1: blend toward the steady average picture (LCD phase swap fade)
+    float phase;      // LCD gradual saver: start of the lit window within the first sub-frame, 0..1
 } pc;
 layout(set = 0, binding = 0) uniform sampler2D src;
 

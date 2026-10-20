@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.17-g2"
+#define BFI_ADDON_VERSION "1.0.17-g3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -105,7 +105,7 @@ struct Settings
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
-    int   lcdGradual = 0;    // LCD saver mode: 0 Sudden (fade, shift, fade back), 1 Gradual (the lit window drifts slowly)
+    int   lcdGradual = 0;    // LCD saver mode: 0 Immediate (fade, shift, fade back), 1 Gradual (the lit window drifts slowly)
     int   lcdGradSec = 120;  // Gradual: seconds for the lit window to drift through the whole cycle (20-900)
     float rollSeam = 0.0f;    // blended zone between bands, fraction of the screen height
     float rollDecay = 0.2f;   // rolling scan phosphor decay, in sub-frames (0 = off: hard bands + seam)
@@ -156,7 +156,7 @@ static char     g_dredPath[MAX_PATH] = {};
 static CRITICAL_SECTION g_cfgLock;             // guards g_shared and g_status
 static Settings g_shared;                      // edited by overlay / hotkeys, read per refresh
 // LCD saver in Gradual mode: even cycles only (odd ones alternate by themselves), plain strobe only
-// (sine, inverted and rolling-scan cycles keep the Sudden swap).
+// (sine, inverted and rolling-scan cycles keep the Immediate swap).
 static bool GradualSaverOn(const Settings &s)
 {
     return s.lcdSwap && s.lcdGradual && s.enabled && (s.frames % 2) == 0 && !s.sine && !s.invert && !s.rolling;
@@ -7292,22 +7292,22 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (s.lcdSwap)
         {
             ImGui::Indent(16.0f);
-            const char *modes[] = { "Sudden: fade, shift, fade back", "Gradual: the lit window drifts slowly" };
+            const char *modes[] = { "Immediate: fade, shift, fade back", "Gradual: the lit window drifts slowly" };
             int md = s.lcdGradual ? 1 : 0;
-            ImGui::SetNextItemWidth(260.0f);
+            ImGui::SetNextItemWidth(ImGui::CalcTextSize(modes[1]).x + ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.0f);
             if (ImGui::Combo("Mode", &md, modes, 2)) s.lcdGradual = md;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Sudden: every N seconds the strobe fades to a steady picture, shifts by one refresh and\n"
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Immediate: every N seconds the strobe fades to a steady picture, shifts by one refresh and\n"
                                                           "fades back. Best at 2 frames per cycle (e.g. 120 Hz).\n"
                                                           "Gradual: the lit window drifts later by a tiny fraction of a refresh every refresh, so it\n"
                                                           "visits every refresh of the cycle once per period, with no fade. Meant for 4 or more\n"
                                                           "frames per cycle (e.g. 240 Hz and up); at 2 frames the drift softens motion for a while\n"
-                                                          "in each turn. Plain strobe only: with Sine BFI, Invert cycle or Rolling scan, Sudden is used.\n"
+                                                          "in each turn. Plain strobe only: with Sine BFI, Invert cycle or Rolling scan, Immediate is used.\n"
                                                           "Design after the Blur Busters CRT beam simulator's LCD Saver.");
             if (s.lcdGradual)
             {
                 ImGui::SliderInt("Seconds per full drift", &s.lcdGradSec, 20, 900);
-                if (s.sine || s.invert || s.rolling) ImGui::TextDisabled("Sine BFI / Invert cycle / Rolling scan on: Sudden is used.");
-                else if (s.frames == 2) ImGui::TextDisabled("2 frames per cycle: Sudden is recommended (the drift softens motion for a while).");
+                if (s.sine || s.invert || s.rolling) ImGui::TextDisabled("Sine BFI / Invert cycle / Rolling scan on: Immediate is used.");
+                else if (s.frames == 2) ImGui::TextDisabled("2 frames per cycle: Immediate is recommended (the drift softens motion for a while).");
             }
             else ImGui::SliderInt("Seconds between phase swaps", &s.lcdSwapSec, 1, 300);
             if (s.frames % 2) ImGui::TextDisabled("Odd frames per cycle: the lit refresh already alternates, nothing to do.");
