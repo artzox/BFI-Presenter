@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.17-g3"
+#define BFI_VERSION "1.0.17-g4"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -3962,6 +3962,17 @@ const char *DESCRIPTION = "Presenter-clocked black frame insertion for Vulkan ga
 
 static const char *kOutputNames = "Auto\0SDR (sRGB)\0HDR scRGB\0HDR10 (PQ)\0";
 
+// Width of a text in the overlay font. ReShade is built with MSVC, which returns ImVec2 (it has
+// constructors) through a hidden pointer; MinGW expects it in registers, so a plain
+// ImGui::CalcTextSize call through ReShade's function table crashes. Call it the MSVC way.
+static float OverlayTextWidth(const char *text)
+{
+    typedef ImVec2 *(*CalcTextSizeMsvc)(ImVec2 *, const char *, const char *, bool, float);
+    ImVec2 r(0.0f, 0.0f);
+    reinterpret_cast<CalcTextSizeMsvc>(imgui_function_table_instance()->CalcTextSize)(&r, text, nullptr, false, -1.0f);
+    return r.x;
+}
+
 static void draw_overlay(reshade::api::effect_runtime *)
 {
     Status st;
@@ -4038,7 +4049,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::Indent(16.0f);
             const char *modes[] = { "Immediate: fade, shift, fade back", "Gradual: the lit window drifts slowly" };
             int md = s.lcdGradual ? 1 : 0;
-            ImGui::SetNextItemWidth(ImGui::CalcTextSize(modes[1]).x + ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.0f);
+            ImGui::SetNextItemWidth(OverlayTextWidth(modes[1]) + ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.0f);
             if (ImGui::Combo("Mode", &md, modes, 2)) s.lcdGradual = md;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Immediate: every N seconds the strobe fades to a steady picture, shifts by one refresh and\n"
                                                           "fades back. Best at 2 frames per cycle (e.g. 120 Hz).\n"
