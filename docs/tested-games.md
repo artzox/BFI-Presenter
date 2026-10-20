@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-99 of 101 tested games and emulators run with BFI: the 50 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; three with the engine's own stutter) and 49 more listed after it. Two are partial.
+100 of 102 tested games and emulators run with BFI: the 51 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; three with the engine's own stutter) and 49 more listed after it. Two are partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -32,6 +32,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Riven (2023) | Working | Not tested | v0.13 | A steady 60 fps for smooth motion |
 | Onimusha | Working | Works (2×, 3×); Refresh cap | v0.27 | Standard setup |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
+| Ratchet & Clank: Rift Apart | Working without FG | Not working: the game drops to \~20 fps | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Refresh + Lowest latency + automatic frame cap |
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
 | Pragmata | Working | Works at Half refresh + Smooth (\~30 rendered, 60 presented); the automatic cap can't hold Refresh | v1.0.16 | Half refresh + Smooth with FG; change resolution once to start BFI |
 | Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps |
@@ -171,6 +172,13 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - With Force on, a growing present queue made the driver throttle the game; Queue one refresh ahead (v0.19) fixed it.
 - Reflex off measured slightly better: 52 vs 49 fps and 3.5 ms less delay to screen.
 - Runs at about 50 fps, so expect judder unless settings reach 60.
+
+### Ratchet & Clank: Rift Apart
+
+- **Set the game to exclusive fullscreen.** In borderless/windowed mode it fell to 15–23 fps as soon as BFI started (the game's render submit took 40–60 ms a frame), with occasional stretches at 60 after a load.
+- **Frame generation off.**
+- **BFI starts only after the game resizes its swap chain:** change the resolution once in the game's settings (and back).
+- Recommended (v1.0.16): Refresh rate + Lowest latency with the automatic frame cap on (the defaults).
 
 ### Returnal
 
