@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>BFI Presenter Log Analyzer</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=Martian+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a bench instrument — drop zone on top, then one panel per capture session
+   (settings strip, timeline, per-mode table, findings), then a cross-session comparison. */
+:root{
+  --bg:#f3f5f7; --panel:#ffffff; --ink:#12161c; --ink-2:#4b5563; --ink-3:#7a8494;
+  --line:#dde2e8; --tint:#eef1f5; --tint-2:#e3e8ee;
+  --accent:#2f5bd3; --accent-ink:#ffffff;
+  --good:#0f7b45; --good-bg:#e3f4ea; --warn:#9a6200; --warn-bg:#fbf0d9; --bad:#b42323; --bad-bg:#fbe4e4;
+  --s1:#2a78d6; --s2:#eb6834;
+  --f-body:"Hanken Grotesk",ui-sans-serif,system-ui,"Segoe UI",sans-serif;
+  --f-mono:"Martian Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0f1216; --panel:#171b21; --ink:#e9edf2; --ink-2:#aab3bf; --ink-3:#7e8896;
+  --line:#2a313a; --tint:#1d232b; --tint-2:#252c35;
+  --accent:#7b9cff; --accent-ink:#0f1216;
+  --good:#5fd197; --good-bg:#16302a; --warn:#f0b54a; --warn-bg:#33291a; --bad:#ff7d7d; --bad-bg:#3a1d20;
+  --s1:#3987e5; --s2:#d95926; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0f1216; --panel:#171b21; --ink:#e9edf2; --ink-2:#aab3bf; --ink-3:#7e8896;
+  --line:#2a313a; --tint:#1d232b; --tint-2:#252c35;
+  --accent:#7b9cff; --accent-ink:#0f1216;
+  --good:#5fd197; --good-bg:#16302a; --warn:#f0b54a; --warn-bg:#33291a; --bad:#ff7d7d; --bad-bg:#3a1d20;
+  --s1:#3987e5; --s2:#d95926; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:15px;line-height:1.5;margin:0}
+.wrap{max-width:1180px;margin:0 auto;padding-block:28px 64px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));display:flex;flex-direction:column;gap:22px}
+h1{font-size:26px;font-weight:700;letter-spacing:-.01em;margin:0;text-wrap:balance}
+h2{font-size:19px;font-weight:700;margin:0;text-wrap:balance}
+h3{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3);margin:0}
+p{margin:0}
+.lede{color:var(--ink-2);max-width:68ch}
+.mono,code{font-family:var(--f-mono);font-size:.82em}
+.head{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:end;justify-content:space-between}
+.drop{border:1.5px dashed var(--line);background:var(--panel);border-radius:10px;padding:22px;display:flex;flex-wrap:wrap;gap:14px 20px;align-items:center;justify-content:space-between;transition:border-color .15s,background .15s}
+.drop.over{border-color:var(--accent);background:var(--tint)}
+.drop .txt{display:flex;flex-direction:column;gap:4px;min-width:0}
+.drop .txt strong{font-size:16px}
+.drop .txt span{color:var(--ink-2);font-size:13.5px}
+.btns{display:flex;gap:8px;flex-wrap:wrap}
+button,.btn{font:inherit;font-size:14px;font-weight:600;border-radius:7px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 14px;cursor:pointer}
+button.primary,.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+button:hover{border-color:var(--accent)}
+button:focus-visible,.btn:focus-visible,input:focus-visible+label{outline:2px solid var(--accent);outline-offset:2px}
+input[type=file]{position:absolute;width:1px;height:1px;opacity:0}
+.files{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font-family:var(--f-mono);font-size:11.5px;background:var(--tint);border:1px solid var(--line);border-radius:999px;padding:2px 9px;color:var(--ink-2);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.note{font-size:13px;color:var(--ink-3)}
+.example{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;background:var(--warn-bg);color:var(--warn);border-radius:4px;padding:2px 7px}
+.session{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:18px;min-width:0}
+.s-head{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px 16px;align-items:baseline}
+.s-head .sub{color:var(--ink-2);font-size:13.5px}
+.facts{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:13px;color:var(--ink-2)}
+.facts b{color:var(--ink);font-weight:600}
+.verdict{display:flex;flex-direction:column;gap:8px;border-radius:9px;background:var(--tint);padding:14px 16px}
+.verdict .best{font-size:16px;font-weight:600}
+.verdict .best em{font-style:normal;color:var(--accent)}
+ul.find{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:7px}
+ul.find li{display:grid;grid-template-columns:auto 1fr;gap:10px;align-items:start;font-size:14px}
+.tag{font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;border-radius:4px;padding:2px 6px;margin-top:2px;white-space:nowrap}
+.tag.good{background:var(--good-bg);color:var(--good)} .tag.warn{background:var(--warn-bg);color:var(--warn)} .tag.bad{background:var(--bad-bg);color:var(--bad)} .tag.info{background:var(--tint-2);color:var(--ink-2)}
+.tablebox{overflow-x:auto;border:1px solid var(--line);border-radius:9px}
+table{border-collapse:collapse;width:100%;font-size:13px;min-width:860px}
+th,td{padding:8px 10px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap;font-variant-numeric:tabular-nums}
+th{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-3);background:var(--tint);position:sticky;top:0}
+th:first-child,td:first-child{text-align:left;white-space:normal;min-width:220px}
+td.num{font-family:var(--f-mono);font-size:12px}
+tr:last-child td{border-bottom:0}
+tr.best td{background:color-mix(in srgb,var(--accent) 9%,transparent)}
+.pill{display:inline-block;font-size:11px;font-weight:700;border-radius:999px;padding:1px 8px}
+.pill.good{background:var(--good-bg);color:var(--good)} .pill.warn{background:var(--warn-bg);color:var(--warn)} .pill.bad{background:var(--bad-bg);color:var(--bad)}
+.mode{font-weight:600}
+.mode small{display:block;font-weight:400;color:var(--ink-3);font-size:12px}
+.chart{position:relative}
+.chart svg{display:block;width:100%;height:auto}
+.legend{display:flex;gap:16px;font-size:12.5px;color:var(--ink-2);flex-wrap:wrap}
+.legend i{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:6px}
+.tip{position:absolute;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:7px 10px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.12);white-space:nowrap;z-index:2}
+.tip b{font-weight:600}
+.events{font-size:13px;color:var(--ink-2);display:flex;flex-direction:column;gap:3px;max-height:220px;overflow:auto;border:1px solid var(--line);border-radius:9px;padding:10px 12px}
+.events div{display:grid;grid-template-columns:5.5em 1fr;gap:10px}
+.events span:first-child{font-family:var(--f-mono);font-size:11.5px;color:var(--ink-3)}
+details summary{cursor:pointer;font-weight:600;font-size:14px}
+details[open] summary{margin-bottom:8px}
+.cmp{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:14px;min-width:0}
+.empty{color:var(--ink-3);font-size:14px}
+footer{color:var(--ink-3);font-size:12.5px;max-width:80ch}
+@media (max-width:560px){h1{font-size:22px}.session,.cmp{padding:14px}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head><body>
+
+<div class="wrap">
+  <header class="head">
+    <div style="display:flex;flex-direction:column;gap:6px;min-width:0">
+      <h1>BFI Presenter Log Analyzer</h1>
+      <p class="lede">Drop the timing logs from a session (<code>BFIPresenter_log_…csv</code>, <code>_reflex_…csv</code>, <code>_game_…csv</code>) together with <code>ReShade.log</code>. Each setting you tried becomes a row: how evenly new frames hit the flashes, the latency, and what to try next. Files are read in this browser only and never uploaded.</p>
+    </div>
+  </header>
+
+  <section class="drop" id="drop" aria-label="Add log files">
+    <div class="txt">
+      <strong>Drop log files here</strong>
+      <span>Several sessions at once are fine: they are grouped by their date and time stamp and compared at the end.</span>
+      <div class="files" id="fileChips"></div>
+    </div>
+    <div class="btns">
+      <input type="file" id="pick" multiple accept=".csv,.log,.txt">
+      <label for="pick" class="btn primary" tabindex="0" id="pickLbl">Choose files</label>
+      <button id="example" type="button">Show example</button>
+      <button id="copy" type="button">Copy summary</button>
+      <button id="clear" type="button">Clear</button>
+    </div>
+  </section>
+
+  <div id="out" style="display:flex;flex-direction:column;gap:22px"></div>
+
+  <footer>
+    How it reads the logs: a flash is a lit refresh. At the cap in use the presenter expects a set number of new game frames per flash (one at Half, two at Refresh with 2 frames per cycle). <b>Repeated</b> counts flashes that showed the previous frame again, <b>skipped</b> counts flashes where a frame was dropped. Seconds below 3 fps (loading) and hitch-guard pauses are left out. Input to flash is the game's Reflex time from input to present plus the presenter's release-to-flash time, so it needs a Reflex game. Rows under 8 seconds are shown but not ranked.
+  </footer>
+</div>
+
+<script>
+"use strict";
+const $=s=>document.querySelector(s);
+const CAP_NAMES={0:"Cap off",1:"Refresh rate",2:"Half refresh",3:"Quarter refresh",4:"One frame per strobe cycle",5:"Custom cap"};
+const PACING={0:"Smooth",1:"Lowest latency"};
+let FILES=[]; // {name,text}
+
+// ---------- parsing ----------
+function parseCSV(text){
+  const lines=text.split(/\r?\n/).filter(l=>l.length);
+  if(!lines.length) return {cols:[],rows:[]};
+  const cols=lines[0].split(",");
+  const rows=new Array(lines.length-1);
+  for(let i=1;i<lines.length;i++){
+    const p=lines[i].split(","); const r={};
+    for(let j=0;j<cols.length;j++) r[cols[j]]=+p[j];
+    rows[i-1]=r;
+  }
+  return {cols,rows};
+}
+function stampOf(name){const m=name.match(/(\d{8})_(\d{6})/);return m?m[1]+"_"+m[2]:null}
+function stampSec(st){if(!st)return null;const t=st.split("_")[1];return (+t.slice(0,2))*3600+(+t.slice(2,4))*60+(+t.slice(4,6))}
+function kindOf(name,text){
+  const n=name.toLowerCase();
+  if(/_reflex_\d{8}_\d{6}/.test(n)) return "reflex";
+  if(/_game_\d{8}_\d{6}/.test(n)) return "game";
+  if(/bfipresenter_log_\d{8}_\d{6}/.test(n)) return "log";
+  if(n.endsWith(".log")||/reshade/.test(n)) return "rslog";
+  const h=text.slice(0,200);
+  if(h.startsWith("time_s,game_fps")) return "reflex";
+  if(h.startsWith("time_ms,frame_id,outside_ms")) return "game";
+  if(h.startsWith("time_ms,present,slot")) return "log";
+  if(/\| INFO  \|/.test(h)) return "rslog";
+  return null;
+}
+function parseRsLog(text){
+  const ev=[]; let exe=null, version=null;
+  for(const line of text.split(/\r?\n/)){
+    const m=line.match(/^(\d\d):(\d\d):(\d\d):(\d{3}) \[\s*\d+\] \| (\w+)\s*\| (.*)$/); if(!m) continue;
+    const sec=(+m[1])*3600+(+m[2])*60+(+m[3])+(+m[4])/1000, msg=m[6];
+    if(!exe){const e=msg.match(/into '([^']+)'/); if(e) exe=e[1].split(/[\\/]/).pop();}
+    if(msg.includes("BFI Presenter")){
+      const t=msg.replace(/^\[BFI Presenter\] /,"").replace(/^BFI Presenter: /,"");
+      const v=t.match(/^v(\S+) loaded/); if(v) version=v[1];
+      ev.push({sec,level:m[5],text:t});
+    }
+  }
+  return {ev,exe,version};
+}
+function pct(a,q){if(!a.length)return NaN;const s=[...a].sort((x,y)=>x-y);return s[Math.min(s.length-1,Math.floor(q*s.length))]}
+function mean(a){return a.length?a.reduce((x,y)=>x+y,0)/a.length:NaN}
+function capPeriod(cap,frames){return cap==1?1:cap==2?2:cap==3?4:cap==4?frames:0}
+
+// ---------- session assembly ----------
+function buildSessions(files){
+  const csv=[], logs=[];
+  for(const f of files){
+    const k=kindOf(f.name,f.text); if(!k) continue;
+    if(k==="rslog"){logs.push({name:f.name,...parseRsLog(f.text)});continue;}
+    const p=parseCSV(f.text); if(!p.rows.length) continue;
+    const tcol=k==="reflex"?"time_s":"time_ms", mul=k==="reflex"?1000:1;
+    const t0=p.rows[0][tcol]*mul, t1=p.rows[p.rows.length-1][tcol]*mul;
+    csv.push({kind:k,name:f.name,stamp:stampOf(f.name),rows:p.rows,t0,t1});
+  }
+  // anchors: log files, else reflex files
+  const anchors=csv.filter(c=>c.kind==="log"); const used=new Set(anchors);
+  for(const c of csv) if(c.kind==="reflex" && !anchors.some(a=>overlap(a,c)>0)) {anchors.push(c);used.add(c);}
+  for(const c of csv) if(c.kind==="game" && !anchors.some(a=>overlap(a,c)>0)) {anchors.push(c);used.add(c);}
+  const sessions=anchors.map(a=>({stamp:a.stamp,t0:a.t0,t1:a.t1,log:a.kind==="log"?a:null,reflex:a.kind==="reflex"?a:null,game:a.kind==="game"?a:null,rs:null}));
+  for(const c of csv){ if(used.has(c)) continue;
+    let best=null,bo=0; for(const s of sessions){const o=overlap(s,c); if(o>bo){bo=o;best=s;}}
+    if(best && !best[c.kind]) {best[c.kind]=c; best.t0=Math.min(best.t0,c.t0); best.t1=Math.max(best.t1,c.t1);}
+  }
+  for(const s of sessions){ s.stamp = s.stamp || (s.reflex&&s.reflex.stamp) || (s.game&&s.game.stamp); }
+  // ReShade.log: the one that started this session's timing log, else the one whose events cover its wall time
+  for(const s of sessions){
+    const st=s.stamp;
+    let rs=logs.find(l=>l.ev.some(e=>st && e.text.includes("timing log started") && e.text.includes(st)));
+    if(!rs && st){const w=stampSec(st); rs=logs.find(l=>l.ev.length && l.ev[0].sec<=w+5 && l.ev[l.ev.length-1].sec>=w-5);}
+    s.rs=rs||null;
+  }
+  sessions.sort((a,b)=>(a.stamp||"").localeCompare(b.stamp||""));
+  return sessions;
+}
+function overlap(a,b){return Math.max(0,Math.min(a.t1,b.t1)-Math.max(a.t0,b.t0))}
+
+// ---------- analysis ----------
+function analyse(s){
+  const out={stamp:s.stamp,segments:[],timeline:[],events:[],findings:[],facts:{}};
+  const L=s.log?s.log.rows:null, R=s.reflex?s.reflex.rows:null, G=s.game?s.game.rows:null;
+  // display refresh from present intervals
+  let hz=NaN, frames=2;
+  if(L){const iv=L.map(r=>r.interval_ms).filter(v=>v>2&&v<50); const med=pct(iv,.5); hz=1000/med; frames=pct(L.map(r=>r.frames),.5)||2;}
+  else if(R){hz=120;}
+  hz = Math.round(hz/10)*10 >= 100 ? (Math.abs(hz-Math.round(hz))<1.5?Math.round(hz):hz) : hz;
+  out.facts.hz=hz; out.facts.frames=frames;
+  const strobe=hz/frames;
+  // per-second rows -> mode keys
+  const secRows=[];
+  if(R){
+    for(const r of R){
+      const rl=r.reflex_limit_us>0;
+      // With Reflex's frame limit the driver sets the game's rate: count cadence against that period.
+      let per=r.cap_period>0?r.cap_period:capPeriod(r.cap_set,frames);
+      if(rl && hz>0) per=Math.max(1,Math.round(r.reflex_limit_us*hz/1e6));
+      const key=[r.cap_set,per,r.pacing,r.fg_active?1:0,rl?1:0].join("|");
+      secRows.push({t:r.time_s,key,r,per,rl});
+    }
+  }
+  // lit-refresh cadence from the per-present log
+  const litStats={}; // key -> {n,rep,skip,unevenRuns...}
+  function keyAt(tms){
+    if(!secRows.length) return null;
+    let lo=0,hi=secRows.length-1; const ts=tms/1000;
+    while(lo<hi){const mid=(lo+hi)>>1; if(secRows[mid].t<ts) lo=mid+1; else hi=mid;}
+    return secRows[lo];
+  }
+  if(L){
+    const lit=L.filter(r=>r.slot===0);
+    const runs={}; // for E<1
+    for(let i=1;i<lit.length;i++){
+      const a=lit[i-1], b=lit[i]; if(a.hitch_paused||b.hitch_paused) continue;
+      const dt=b.time_ms-a.time_ms; if(dt>2.5*frames*1000/hz) continue;
+      const sr=keyAt(b.time_ms);
+      let key, per;
+      if(sr){ if(sr.r.game_fps<3) continue; key=sr.key; per=sr.per; }
+      else { per=capPeriod(a.cap,a.frames); key=[a.cap,per,a.pacing,-1,-1].join("|"); }
+      const st=litStats[key]||(litStats[key]={n:0,rep:0,skip:0,off:0,per,frames:a.frames,secs:0,runFrames:0,runOff:0,run:0,last:null});
+      st.n++; st.secs+=dt/1000;
+      const d=b.frame_id-a.frame_id;
+      const E=per>0?a.frames/per:0;
+      if(E>=1){ const e=Math.round(E); if(d!==e) st.off++; if(d===0) st.rep++; else if(d>e) st.skip++; }
+      else if(E>0){ // several flashes per game frame expected
+        const K=Math.round(1/E);
+        if(d===0) st.run++; else { if(st.last!==null){ st.runFrames++; const len=st.run+1; if(len!==K){ st.runOff++; st.off++; if(len>K) st.rep++; else st.skip++; } } st.run=0; st.last=b.frame_id; }
+      } else { if(d===0){ st.rep++; st.off++; } }
+    }
+    for(const k in litStats){const st=litStats[k]; if(st.runFrames){ st.n=st.runFrames; }}
+  }
+  // build segments (aggregated by key)
+  const segs={};
+  const pushSeg=(key)=>segs[key]||(segs[key]={key,secs:0,stall:0,rows:[]});
+  if(secRows.length){
+    for(const sr of secRows){ const sg=pushSeg(sr.key); if(sr.r.game_fps<3){sg.stall++;continue;} sg.secs++; sg.rows.push(sr.r); }
+  } else if(L){
+    for(const k in litStats){ const sg=pushSeg(k); sg.secs=Math.round(litStats[k].secs); }
+  }
+  for(const key in segs){
+    const sg=segs[key]; const [cap,per,pac,fg,rl]=key.split("|").map(Number);
+    const rows=sg.rows;
+    const m=(c,f=v=>v>=0)=>mean(rows.map(r=>r[c]).filter(f));
+    const presented=rows.length?m("game_fps"):NaN;
+    const rendered=rows.length?m("rendered_fps",v=>v>0):NaN;
+    const shown=rows.length?m("frames_shown"):NaN;
+    const ideal = per>0 ? (per<=frames ? strobe : hz/per) : strobe;
+    const r2f=rows.length?m("release_to_flash_ms",v=>v>0):NaN;
+    const s2p=rows.length?m("rfx_sim_to_present_ms",v=>v>0):NaN;
+    const submit=rows.length?m("rfx_submit_ms",v=>v>=0&&v<1000):NaN;
+    const gpu=rows.length?m("rfx_gpu_active_ms",v=>v>=0&&v<1000):NaN;
+    const autoCap = rows.length? rows.some(r=>r.auto_cap===1):false;
+    const jitLimit = rows.length? rows.filter(r=>r.jit_state===3).length/rows.length : 0;
+    const ls=litStats[key];
+    const rep = ls&&ls.n? ls.rep/ls.n*100 : NaN, skip= ls&&ls.n? ls.skip/ls.n*100 : NaN;
+    const uneven = ls&&ls.n? ls.off/ls.n*100 : (isNaN(shown)?NaN:Math.max(0,(1-shown/ideal)*100));
+    sg.m={cap,per,pac,fg,rl,presented,rendered,shown,ideal,r2f,s2p,i2f:(s2p>0&&r2f>0)?s2p+r2f:NaN,submit,gpu,autoCap,jitLimit,rep,skip,uneven,target:per>0?hz/per:hz};
+    sg.label=modeLabel(sg.m,hz,frames);
+    out.segments.push(sg);
+  }
+  out.segments.sort((a,b)=>b.secs-a.secs);
+  const ranked=out.segments.filter(s=>s.secs>=8 && !isNaN(s.m.uneven));
+  ranked.sort((a,b)=>{const d=a.m.uneven-b.m.uneven; if(Math.abs(d)>1) return d; const la=isNaN(a.m.i2f)?a.m.r2f:a.m.i2f, lb=isNaN(b.m.i2f)?b.m.r2f:b.m.i2f; return (la||1e9)-(lb||1e9);});
+  out.best=ranked[0]||null;
+  // timeline
+  if(R){ const t0=R[0].time_s; out.timeline=secRows.map(sr=>({x:sr.t-t0,fps:sr.r.game_fps,shown:sr.r.frames_shown,key:sr.key})); }
+  // game-side frame times
+  if(G){ const o=G.map(r=>r.outside_ms).filter(v=>v>0&&v<2000), t=G.map(r=>r.total_ms).filter(v=>v>=0);
+    out.facts.game={p50:pct(o,.5),p90:pct(o,.9),p99:pct(o,.99),pres:mean(t),presP99:pct(t,.99)}; }
+  // ReShade.log events in this session's window
+  if(s.rs){
+    out.facts.exe=s.rs.exe; out.facts.version=s.rs.version;
+    const w=stampSec(s.stamp); const dur=(s.t1-s.t0)/1000;
+    const inWin=e=> w==null || (e.sec>=w-120 && e.sec<=w+dur+5);
+    const keep=/automatic frame cap|frame generation (active|not active)|Reflex frame limit|fell to|hitch guard: BFI paused|just-in-time release (off|at its limit)|WATCHDOG|swap chain recreated|waiting for the game's first resize|BFI starts|not elevated|frame limiter|presents\/s|collapsed|game frame cap with Reflex/;
+    for(const e of s.rs.ev) if(inWin(e) && keep.test(e.text)) out.events.push(e);
+    out.allEv=s.rs.ev;
+  }
+  findings(out,hz,frames);
+  return out;
+}
+function modeLabel(m,hz,frames){
+  let name=CAP_NAMES[m.cap]||("Cap "+m.cap);
+  const parts=[];
+  if(m.cap===1 && m.per>1) parts.push((m.rl?"Reflex limit":"auto cap")+" → "+Math.round(hz/m.per)+" fps");
+  else if(m.rl) parts.push("Reflex frame limit");
+  return {main:name+(m.pac in PACING?" + "+PACING[m.pac]:""), sub:[(m.fg===1?"frame generation on":m.fg===0?"frame generation off":null),...parts].filter(Boolean).join(" · ")};
+}
+function f0(v){return isNaN(v)?"–":Math.round(v).toString()}
+function f1(v){return isNaN(v)?"–":v.toFixed(1)}
+function fp(v){return isNaN(v)?"–":(v<0.05?"0":v<10?v.toFixed(1):Math.round(v))+"%"}
+function grade(u){return isNaN(u)?null:u<1?["good","Even"]:u<4?["warn","Minor"]:["bad","Judder"]}
+
+function findings(out,hz,frames){
+  const F=out.findings, add=(lvl,t)=>F.push({lvl,t});
+  const ev=out.allEv||[];
+  if(out.best){const b=out.best, lat=isNaN(b.m.i2f)?(isNaN(b.m.r2f)?"":` at about ${f0(b.m.r2f)} ms from release to flash`):` at about ${f0(b.m.i2f)} ms from input to flash`;
+    out.bestText=`${b.label.main}${b.label.sub?" ("+b.label.sub+")":""}: ${fp(b.m.uneven)} of flashes off-cadence${lat}.`;}
+  for(const s of out.segments){ const m=s.m, nm=s.label.main+(s.label.sub?` (${s.label.sub})`:"");
+    if(s.secs<5) continue;
+    if(m.per>0 && !isNaN(m.presented) && m.presented<0.93*m.target && !(m.fg===1&&m.cap===1&&!m.rl))
+      add("warn",`${nm}: the game ran ${f0(m.presented)} fps against the cap's ${f0(m.target)}, so frames miss their flash. ${m.cap===1?"Turn on the automatic frame cap or use Half refresh.":"A lower cap or lighter game settings even it out."}`);
+    if(m.fg===1 && m.cap===1 && !m.rl && m.presented>0.55*hz && m.presented<0.93*hz)
+      add("bad",`${nm}: frame generation ran uncapped at ${f0(m.presented)} fps, between the strobe rate and the refresh rate, which judders. No Reflex limit was in use${ev.some(e=>/fell to/.test(e.text))?" (the game collapsed under it earlier)":""}. If ${f0(m.rendered)} rendered fps × the frame-generation factor lands near ${f0(hz/frames)}, try Half refresh + Smooth.`);
+    if(m.fg===1 && m.cap===2 && m.pac===1 && m.uneven>5)
+      add("warn",`${nm}: frame generation's output is uneven without Smooth (${fp(m.uneven)} off-cadence). Try Half refresh + Smooth.`);
+    if(m.submit>30 && m.gpu>0 && m.gpu<0.75*(1000/Math.max(1,m.presented||1)))
+      add("bad",`${nm}: the game's render submit took ${f0(m.submit)} ms a frame while the GPU was busy only ${f0(m.gpu)} ms. That points at the game's own render thread stalling: try exclusive fullscreen (Insomniac games), lower texture settings (video memory), or fewer loaded ReShade effects.`);
+    if(m.jitLimit>0.5 && m.cap>=2 && m.pac===1 && m.uneven>=1)
+      add("info",`${nm}: just-in-time release was at its limit most of the time (game frames take nearly the whole cap interval). Smooth can even it out, at about a refresh more latency.`);
+  }
+  const has=re=>ev.find(e=>re.test(e.text));
+  const col=ev.filter(e=>/fell to \d+ fps under it/.test(e.text));
+  if(col.length) add("warn",`The game collapsed under a Reflex frame limit (${col[0].text.match(/fell to \d+ fps \(\d+ before\)/)?.[0]||"fell under it"}), so the presenter stopped using it for the session. With frame generation the presenter then can't cap at Refresh.`);
+  if(has(/not elevated/)) add("info","The game isn't running as administrator, so the presenter queue has high rather than realtime priority. Starting the launcher (e.g. Steam) as administrator helps GPU-heavy games.");
+  if(has(/frame limiter is acting|held to \d+ presents/)) add("bad","Something limits the presenter's own presents (RivaTuner or NVIDIA's Max Frame Rate). Turn every external frame limiter off for this game.");
+  const hp=ev.filter(e=>/hitch guard: BFI paused/.test(e.text)).length;
+  if(hp>=10) add("info",`The hitch guard paused BFI ${hp} times (stalls, loading or missed refreshes). Many pauses in play point at a GPU or video memory at its limit.`);
+  if(has(/waiting for the game's first resize|swap chain recreated by the game/) && !has(/BFI starts/)) add("warn","BFI never started: the game didn't resize its swap chain. Change the resolution (or display mode) once in the game's settings.");
+  if(out.facts.game && out.facts.game.presP99>3) add("warn",`Time inside the presenter's Present reached ${f1(out.facts.game.presP99)} ms (99th percentile). Normally it is well under 1 ms.`);
+  if(!out.segments.length) add("info","No per-second data in these files. Add the matching _reflex_ or _log_ CSV.");
+  if(!F.length && out.best) add("good","Nothing stands out: the presenter kept its cadence in every setting tried.");
+}
+
+// ---------- rendering ----------
+function el(tag,attrs,html){const e=document.createElement(tag); if(attrs) for(const k in attrs) e.setAttribute(k,attrs[k]); if(html!=null) e.innerHTML=html; return e;}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+function segRow(sg,isBest,extraFirst){
+  const m=sg.m, g=grade(m.uneven);
+  return `<tr class="${isBest?"best":""}"><td><div class="mode">${extraFirst?`<span class="note">${esc(extraFirst)}</span><br>`:""}${esc(sg.label.main)}${isBest?' <span class="pill good">best</span>':""}<small>${esc(sg.label.sub||" ")}</small></div></td>
+  <td class="num">${sg.secs}s${sg.stall?`<br><span class="note">+${sg.stall}s loading</span>`:""}</td>
+  <td class="num">${f0(m.presented)}</td><td class="num">${f0(m.rendered)}</td>
+  <td class="num">${isNaN(m.shown)?"–":f1(m.shown)+" / "+f0(m.ideal)}</td>
+  <td class="num">${fp(m.rep)}</td><td class="num">${fp(m.skip)}</td>
+  <td>${g?`<span class="pill ${g[0]}">${g[1]} ${fp(m.uneven)}</span>`:"–"}</td>
+  <td class="num">${f0(m.r2f)}</td><td class="num">${f0(m.i2f)}</td>
+  <td class="num">${f0(m.submit)} / ${f0(m.gpu)}</td></tr>`;
+}
+const THEAD=`<thead><tr><th>Mode</th><th>Time</th><th>Presented fps</th><th>Rendered fps</th><th>New frames / s (of ideal)</th><th>Repeated</th><th>Skipped</th><th>Cadence</th><th>Release → flash ms</th><th>Input → flash ms</th><th>Submit / GPU ms</th></tr></thead>`;
+
+function chart(tl,segments){
+  if(!tl.length) return "";
+  const W=1000,H=220,ml=40,mr=12,mt=26,mb=26, x1=tl[tl.length-1].x||1;
+  const ymax=Math.max(60,...tl.map(d=>Math.max(d.fps,d.shown)));
+  const yTop=Math.ceil(ymax/30)*30;
+  const X=x=>ml+(W-ml-mr)*x/x1, Y=y=>mt+(H-mt-mb)*(1-Math.min(y,yTop)/yTop);
+  let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Presented fps and new frames shown per second over the session">`;
+  // mode bands
+  let start=0;
+  for(let i=1;i<=tl.length;i++){
+    if(i===tl.length || tl[i].key!==tl[start].key){
+      const seg=segments.find(sg=>sg.key===tl[start].key); const xa=X(tl[start].x), xb=X(i<tl.length?tl[i].x:x1);
+      s+=`<rect x="${xa}" y="${mt}" width="${Math.max(0,xb-xa)}" height="${H-mt-mb}" fill="var(--tint)" opacity="${(start/1)%2?0.55:1}"/>`;
+      if(xb-xa>70 && seg) s+=`<text x="${xa+4}" y="${mt-8}" font-size="11" fill="var(--ink-3)" font-family="var(--f-body)">${esc(seg.label.main.replace(" refresh","").replace("Lowest latency","LL"))}${seg.m.fg===1?" · FG":""}</text>`;
+      s+=`<line x1="${xa}" x2="${xa}" y1="${mt}" y2="${H-mb}" stroke="var(--line)"/>`;
+      start=i;
+    }
+  }
+  for(let v=0;v<=yTop;v+=30){s+=`<line x1="${ml}" x2="${W-mr}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--line)" stroke-width="${v?0.6:1}"/><text x="${ml-6}" y="${Y(v)+4}" font-size="11" text-anchor="end" fill="var(--ink-3)" font-family="var(--f-mono)">${v}</text>`;}
+  const step=x1>600?120:x1>240?60:30;
+  for(let t=0;t<=x1;t+=step) s+=`<text x="${X(t)}" y="${H-8}" font-size="11" text-anchor="middle" fill="var(--ink-3)" font-family="var(--f-mono)">${t}s</text>`;
+  const path=k=>tl.map((d,i)=>(i?"L":"M")+X(d.x).toFixed(1)+","+Y(d[k]).toFixed(1)).join("");
+  s+=`<path d="${path("fps")}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>`;
+  s+=`<path d="${path("shown")}" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>`;
+  s+=`<line class="cross" x1="0" x2="0" y1="${mt}" y2="${H-mb}" stroke="var(--ink-3)" stroke-dasharray="3 3" visibility="hidden"/>`;
+  s+=`<rect class="hit" x="${ml}" y="${mt}" width="${W-ml-mr}" height="${H-mt-mb}" fill="transparent"/></svg>`;
+  return s;
+}
+function wireChart(box,tl,segments){
+  const svg=box.querySelector("svg"); if(!svg) return;
+  const tip=el("div",{class:"tip",hidden:""}); box.appendChild(tip);
+  const cross=svg.querySelector(".cross"); const W=1000,ml=40,mr=12, x1=tl[tl.length-1].x||1;
+  const move=ev=>{const r=svg.getBoundingClientRect(); const px=(ev.clientX-r.left)/r.width*W; const x=(px-ml)/(W-ml-mr)*x1;
+    let i=0,bd=1e9; tl.forEach((d,j)=>{const dd=Math.abs(d.x-x); if(dd<bd){bd=dd;i=j;}}); const d=tl[i];
+    const seg=segments.find(sg=>sg.key===d.key);
+    const cx=ml+(W-ml-mr)*d.x/x1; cross.setAttribute("x1",cx); cross.setAttribute("x2",cx); cross.setAttribute("visibility","visible");
+    tip.innerHTML=`<b>${Math.round(d.x)} s</b> · ${esc(seg?seg.label.main:"")}<br>Presented ${f0(d.fps)} fps · new frames shown ${f0(d.shown)}/s`;
+    tip.hidden=false; const bx=box.getBoundingClientRect(); let left=ev.clientX-bx.left+12; if(left+tip.offsetWidth>bx.width) left=ev.clientX-bx.left-tip.offsetWidth-12; tip.style.left=Math.max(0,left)+"px"; tip.style.top="8px";};
+  svg.addEventListener("pointermove",move); svg.addEventListener("pointerleave",()=>{tip.hidden=true;cross.setAttribute("visibility","hidden");});
+}
+
+let LAST=[];
+function render(results,isExample){
+  LAST=results; const out=$("#out"); out.innerHTML="";
+  if(!results.length){out.innerHTML=`<p class="empty">No timing logs recognised yet. Drop the CSV files from the game's folder (turn on the timing log in the overlay first).</p>`;return;}
+  results.forEach((r,idx)=>{
+    const sec=el("section",{class:"session"});
+    const name=r.facts.exe||"Session";
+    const when=r.stamp?r.stamp.replace(/^(\d{4})(\d\d)(\d\d)_(\d\d)(\d\d)(\d\d)$/,"$1-$2-$3 $4:$5:$6"):"";
+    sec.innerHTML=`<div class="s-head"><h2>${isExample?'<span class="example">Example</span> ':""}${esc(name)}</h2><span class="sub">${esc(when)}${r.facts.version?" · v"+esc(r.facts.version):""}</span></div>
+    <div class="facts"><span>Display <b>${isNaN(r.facts.hz)?"–":f0(r.facts.hz)+" Hz"}</b></span><span>Frames per cycle <b>${r.facts.frames}</b></span><span>Strobe <b>${f0(r.facts.hz/r.facts.frames)} Hz</b></span>${r.facts.game?`<span>Game frame time <b>${f1(r.facts.game.p50)}</b> ms median, <b>${f1(r.facts.game.p99)}</b> ms p99</span><span>Presenter time per frame <b>${f1(r.facts.game.pres)}</b> ms</span>`:""}</div>
+    <div class="verdict"><h3>Verdict</h3><div class="best">${r.best?`Best here: <em>${esc(r.bestText)}</em>`:"Not enough data to rank the settings (each needs 8 seconds or more)."}</div>
+      <ul class="find">${r.findings.map(f=>`<li><span class="tag ${f.lvl}">${{good:"OK",warn:"Check",bad:"Problem",info:"Note"}[f.lvl]}</span><span>${esc(f.t)}</span></li>`).join("")}</ul></div>
+    ${r.timeline.length?`<div class="chart"><div class="legend"><span><i style="background:var(--s1)"></i>Presented fps</span><span><i style="background:var(--s2)"></i>New frames shown per second</span><span class="note">Shaded bands: the setting in use</span></div>${chart(r.timeline,r.segments)}</div>`:""}
+    <div class="tablebox"><table>${THEAD}<tbody>${r.segments.filter(sg=>sg.secs>=3).map(sg=>segRow(sg,r.best===sg)).join("")}</tbody></table></div>${r.segments.some(sg=>sg.secs<3)?`<p class="note">${r.segments.filter(sg=>sg.secs<3).length} settings used for under 3 seconds (switching between modes) are left out.</p>`:""}
+    ${r.events.length?`<details><summary>Presenter events (${r.events.length})</summary><div class="events">${r.events.map(e=>`<div><span>${secToClock(e.sec)}</span><span>${esc(e.text)}</span></div>`).join("")}</div></details>`:""}`;
+    out.appendChild(sec);
+    const c=sec.querySelector(".chart"); if(c) wireChart(c,r.timeline,r.segments);
+  });
+  if(results.length>1){
+    const all=[]; results.forEach(r=>r.segments.forEach(sg=>{ if(sg.secs>=8) all.push({r,sg}); }));
+    all.sort((a,b)=>{const d=a.sg.m.uneven-b.sg.m.uneven; if(Math.abs(d)>1) return d; return (a.sg.m.i2f||a.sg.m.r2f||1e9)-(b.sg.m.i2f||b.sg.m.r2f||1e9);});
+    const cmp=el("section",{class:"cmp"});
+    cmp.innerHTML=`<h2>All sessions compared</h2><p class="note">Every setting with 8 seconds or more, most even first; ties within 1 point go to the lower latency.</p><div class="tablebox"><table>${THEAD}<tbody>${all.map((o,i)=>segRow(o.sg,i===0,(o.r.facts.exe||"")+" "+(o.r.stamp?o.r.stamp.slice(9,11)+":"+o.r.stamp.slice(11,13):""))).join("")}</tbody></table></div>`;
+    out.appendChild(cmp);
+  }
+}
+function secToClock(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=Math.floor(s%60);return [h,m,x].map(v=>String(v).padStart(2,"0")).join(":")}
+
+function summaryText(){
+  if(!LAST.length) return "";
+  let t="";
+  for(const r of LAST){
+    t+=`## ${r.facts.exe||"Session"} ${r.stamp||""}${r.facts.version?" (v"+r.facts.version+")":""}\n`;
+    if(r.bestText) t+=`Best: ${r.bestText}\n`;
+    t+=`\n| Mode | Time | Presented | Rendered | New frames/s | Repeated | Skipped | Off-cadence | Release→flash | Input→flash |\n|---|---|---|---|---|---|---|---|---|---|\n`;
+    for(const sg of r.segments){if(sg.secs<3) continue; const m=sg.m; t+=`| ${sg.label.main}${sg.label.sub?" ("+sg.label.sub+")":""} | ${sg.secs}s | ${f0(m.presented)} | ${f0(m.rendered)} | ${isNaN(m.shown)?"–":f1(m.shown)+"/"+f0(m.ideal)} | ${fp(m.rep)} | ${fp(m.skip)} | ${fp(m.uneven)} | ${f0(m.r2f)} | ${f0(m.i2f)} |\n`;}
+    for(const f of r.findings) t+=`- ${f.t}\n`;
+    t+="\n";
+  }
+  return t;
+}
+
+// ---------- input ----------
+async function addFiles(list){
+  for(const f of list){ const text=await f.text(); FILES=FILES.filter(x=>x.name!==f.name); FILES.push({name:f.name,text}); }
+  run();
+}
+function run(){
+  const chips=$("#fileChips"); chips.innerHTML=FILES.map(f=>`<span class="chip" title="${esc(f.name)}">${esc(f.name)}</span>`).join("");
+  const sessions=buildSessions(FILES);
+  render(sessions.map(analyse),false);
+}
+const drop=$("#drop");
+["dragenter","dragover"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add("over");}));
+["dragleave","drop"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove("over");}));
+drop.addEventListener("drop",ev=>{ if(ev.dataTransfer.files.length) addFiles([...ev.dataTransfer.files]); });
+document.addEventListener("dragover",ev=>ev.preventDefault()); document.addEventListener("drop",ev=>{ev.preventDefault(); if(ev.dataTransfer.files.length) addFiles([...ev.dataTransfer.files]);});
+$("#pick").addEventListener("change",ev=>addFiles([...ev.target.files]));
+$("#pickLbl").addEventListener("keydown",ev=>{if(ev.key==="Enter"||ev.key===" "){ev.preventDefault();$("#pick").click();}});
+$("#clear").addEventListener("click",()=>{FILES=[];$("#fileChips").innerHTML="";render([],false);});
+$("#example").addEventListener("click",()=>{FILES=[];$("#fileChips").innerHTML="";showExample();});
+$("#copy").addEventListener("click",async ev=>{const t=summaryText(); if(!t) return; const b=ev.currentTarget; try{await navigator.clipboard.writeText(t); b.textContent="Copied";}catch(e){ const ta=document.createElement("textarea"); ta.value=t; document.body.appendChild(ta); ta.select(); try{document.execCommand("copy"); b.textContent="Copied";}catch(_){b.textContent="Select and copy below";} ta.remove(); } setTimeout(()=>b.textContent="Copy summary",1600);});
+
+// ---------- example data (synthetic, shown on load) ----------
+function showExample(){
+  // A made-up 120 Hz session: 60 s at Refresh with frame generation uncapped, then 60 s at Half + Smooth.
+  let seed=7; const rnd=()=>((seed=(seed*16807)%2147483647)/2147483647);
+  const hz=120, refresh=1000/hz, R=["time_s,game_fps,cap_set,cap_period,auto_cap,auto_cap_probe,fg_active,pacing,jit,jit_state,jit_est_ms,ahead,reflex_limit_us,release_to_flash_ms,release_to_flash_max_ms,frames_shown,rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,rfx_gpu_active_ms,rfx_sim_ms,rfx_submit_ms,rfx_queue_ms,rendered_fps"];
+  const Lh="time_ms,present,slot,frame_id,frame_age_ms,interval_ms,present_count,sync_refresh_count,bfi,method,frames,gain,floor,rolloff,pacing,cap,ahead,vblank,queue_ahead,queued,wait_vblank_ms,wait_gpu_ms,submit_ms,present_ms,hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup";
+  const L=[Lh]; let t=100000, fid=1, acc=0, present=0;
+  for(let sec=0;sec<120;sec++){
+    const half=sec>=60, fps=half?60:73+rnd()*4;
+    for(let k=0;k<hz;k++){
+      present++; t+=refresh+(rnd()-.5)*.2; const slot=present%2===0?1:0;
+      if(slot===0){ if(half){ fid+= (rnd()<0.004?0:1); } else { acc+=fps/60; const n=Math.floor(acc); acc-=n; fid+=n; } }
+      L.push([t.toFixed(3),present,slot,fid,20,refresh.toFixed(3),present,present,1,1,2,1,0,1,half?0:1,half?2:1,1,1,0,-1,7,0,0.1,0.1,0,1400,80,80,0,0,0,1.5,0].join(","));
+    }
+    const ts=(100+sec+1).toFixed(3);
+    R.push([ts,f1(fps),half?2:1,half?2:1,0,0,1,half?0:1,1,2,6,2,0,(half?41:22).toFixed(2),45,half?60:Math.round(57+rnd()*3),30,96,half?66.5:24,-1,33,30,4,8,58,half?30:37].join(","));
+  }
+  const files=[{name:"BFIPresenter_log_20261020_120000.csv",text:L.join("\n")},{name:"BFIPresenter_reflex_20261020_120000.csv",text:R.join("\n")}];
+  const res=buildSessions(files).map(analyse); res.forEach(r=>{r.facts.exe="Example game.exe";});
+  render(res,true);
+}
+showExample();
+</script>
+</body></html>
