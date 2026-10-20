@@ -32,7 +32,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Riven (2023) | Working | Not tested | v0.13 | A steady 60 fps for smooth motion |
 | Onimusha | Working | Works (2×, 3×); Refresh cap | v0.27 | Standard setup |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
-| Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Refresh + Lowest latency + automatic frame cap |
+| Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency (Refresh + automatic frame cap also works) |
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
 | Pragmata | Working | Works at Half refresh + Smooth (\~30 rendered, 60 presented); the automatic cap can't hold Refresh | v1.0.16 | Half refresh + Smooth with FG; change resolution once to start BFI |
 | Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps |
@@ -178,7 +178,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - **Set the game to exclusive fullscreen.** In borderless/windowed mode it fell to 15–23 fps as soon as BFI started (the game's render submit took 40–60 ms a frame), with occasional stretches at 60 after a load.
 - **Frame generation off.**
 - **BFI starts only after the game resizes its swap chain:** change the resolution once in the game's settings (and back).
-- Recommended (v1.0.16): Refresh rate + Lowest latency with the automatic frame cap on (the defaults).
+- Recommended (v1.0.16): Half refresh + Lowest latency, slightly steadier; Refresh rate + Lowest latency with the automatic frame cap on (the defaults) works well too.
 
 ### Returnal
 
