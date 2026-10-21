@@ -124,7 +124,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Stray | Standard setup |
 | The Callisto Protocol | Standard setup |
 | The Dark Pictures Anthology: Directive 8020 | Works with DLSS 5 and FG 2× (Refresh cap) |
-| The Elder Scrolls IV: Oblivion Remastered | Works with DLSS 5 |
+| The Elder Scrolls IV: Oblivion Remastered | Works with DLSS 5 and FG 2×: Half refresh + Smooth + Apply the cap with Reflex's frame limit (see the notes below) |
 | The Last of Us Part I | Works with DLSS 5. Needs `TypedBackBufferDesc=1` (the default; it crashed without it) |
 | The Vanishing of Ethan Carter Redux | Standard setup |
 | The Witcher 3: Wild Hunt (patch 4.04, DirectX 12) | Works with DLSS 5 |
@@ -196,6 +196,10 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - Refresh rate + Smooth is the next best: also 60 of 60, but frame generation delivers about 65 a second, so about 5 a second are dropped (small skips), at about 117 ms. Refresh + Lowest latency repeated a frame on about 40% of flashes.
 - The automatic frame cap can't hold Refresh with frame generation: the game collapses under any Reflex frame limit (e.g. 50 → 8 fps), so the presenter drops the limit for the session and frame generation runs uncapped at about 65–70 fps. The in-game limit is inactive with FG, and NVIDIA's Max Frame Rate also limits the presenter's own presents and breaks the strobe, so pick Half refresh yourself.
 - Before v1.0.14, DLSS Frame Generation dropped to about 15 base fps (shown as 30) with the presenter, because Reflex pacing misread the presenter's presents. OptiScaler limited the frame rate in a v1.0.15 test.
+
+### The Elder Scrolls IV: Oblivion Remastered
+
+- **Recommended with frame generation 2× (v1.0.17): Half refresh + Frame pacing Smooth + Apply the cap with Reflex's frame limit**, especially with DLSS 5. Just-in-time release is at its limit most of the time here: the game's frames take nearly the whole cap interval, so there is no room left to release them later, and Reflex's own frame limit paces them more evenly.
 
 ### Control
 
