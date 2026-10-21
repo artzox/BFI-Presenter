@@ -22,8 +22,6 @@
 
 using namespace bfi;
 
-#define MANAGER_VERSION "1.3.5"
-
 // ------------------------------------------------------------------ D3D11 window plumbing
 
 static ID3D11Device *g_dev = nullptr;
@@ -1695,8 +1693,9 @@ static void DrawLibraries(HWND hwnd)
     {
         bool pw = LoadSetting(L"PCGamingWiki", L"1") == L"1";
         if (ImGui::Checkbox("Look up each game's graphics APIs on PCGamingWiki", &pw)) SaveSetting(L"PCGamingWiki", pw ? L"1" : L"0");
-        Tooltip("Asks pcgamingwiki.com which APIs a game supports (Steam games by app id, others by name). More reliable than "
-                "reading the executable, for example for games that load Vulkan or Direct3D 12 at run time. Results are cached.");
+        Tooltip("Reads each game's page on pcgamingwiki.com for the APIs it supports (found by name; Steam games are checked "
+                "against their app id). More reliable than reading the executable, for example for games that load Vulkan or "
+                "Direct3D 12 at run time. Results are cached for a month; the first scan of a large library takes a few minutes.");
         bool ask = LoadSetting(L"NvAskOnInstall", L"1") == L"1";
         if (ImGui::Checkbox("Ask about G-SYNC and Vertical Sync when installing", &ask)) SaveSetting(L"NvAskOnInstall", ask ? L"1" : L"0");
         Tooltip("Before each install, asks whether to set the game's NVIDIA profile to G-SYNC off and Vertical Sync on. "
