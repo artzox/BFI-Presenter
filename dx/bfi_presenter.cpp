@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.18-r1"
+#define BFI_ADDON_VERSION "1.0.18-r2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3060,7 +3060,7 @@ static DWORD WINAPI PresenterThread(void *)
                 // War Ragnarok: limit on, off, on... and heavy stutter). A change also needs 3 seconds
                 // in a row (on) or 5 (off).
                 bool fg = fgWas;
-                if (Now() - g_rfxRenderedT.load() < 3.0 && g_rfxRenderedFps.load() > 1.0)
+                if (!ReflexInjected() && Now() - g_rfxRenderedT.load() < 3.0 && g_rfxRenderedFps.load() > 1.0)
                 {
                     if (fpsPrevSec > 0.0 && !hitchPaused)
                     {
@@ -3267,10 +3267,14 @@ static DWORD WINAPI PresenterThread(void *)
                              "last second) -- moving them earlier", stNow.frameRepeats, stNow.frameSkips);
                 }
                 if (limitUs > 0 && t < phaseUntil) limitUs -= 150;
-                ReflexSetInjectWant(s.injectReflex && s.capReflex && userCap >= 2 && s.enabled);
+                ReflexSetInjectWant(s.injectReflex && s.capReflex && userCap >= 2 && s.enabled && !fgWas);
                 ReflexTick(limitUs, rs);
                 rsLast = rs; rsLastT = t;
-                if (rs.frames > 0) rsEverT = t;
+                // Only the game's own Reflex reports count here: the ones the presenter makes when it adds Reflex
+                // (InjectReflex) must not later read as "the game stopped its Reflex reports", which the frame-
+                // generation check below takes as DLSS-G on (Shadow of the Tomb Raider: stuck "frame generation
+                // active" after the added Reflex was turned off, the cap dropped and the strobe flickered).
+                if (rs.frames > 0 && !ReflexInjected()) rsEverT = t;
                 EnterCriticalSection(&g_cfgLock);
                 g_status.rfxGameUses = rs.frames > 0 ? 1 : 0;
                 g_status.rfxLimitUs = rs.limitUs;
@@ -4551,6 +4555,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
             NvSleepParams off = {}; off.version = BFI_NVVER(NvSleepParams);
             (o_NvSetSleepMode ? o_NvSetSleepMode : g_nvSetSleepMode)(dev, &off);
             AcquireSRWLockExclusive(&g_rfxLock); g_rfxAppliedValid = false; ReleaseSRWLockExclusive(&g_rfxLock);
+            g_rfxRenderedFps.store(0.0); g_rfxRenderedT.store(0.0); g_rfxLastReport = 0;
             LOGI("BFI Presenter: Reflex: added Reflex off");
         }
         if (want && !inj && !seen)
