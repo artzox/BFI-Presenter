@@ -124,7 +124,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Stray | Standard setup |
 | The Callisto Protocol | Standard setup |
 | The Dark Pictures Anthology: Directive 8020 | Works with DLSS 5 and FG 2× (Refresh cap) |
-| The Elder Scrolls IV: Oblivion Remastered | Works with DLSS 5 and FG 2×: Half refresh + Smooth + Apply the cap with Reflex's frame limit (see the notes below) |
+| The Elder Scrolls IV: Oblivion Remastered | Works with DLSS 5; frame generation off (artifacts). 2 frames per cycle at Half refresh + Smooth + Apply the cap with Reflex's frame limit (see the notes below) |
 | The Last of Us Part I | Works with DLSS 5. Needs `TypedBackBufferDesc=1` (the default; it crashed without it) |
 | The Vanishing of Ethan Carter Redux | Standard setup |
 | The Witcher 3: Wild Hunt (patch 4.04, DirectX 12) | Works with DLSS 5 |
@@ -199,7 +199,8 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### The Elder Scrolls IV: Oblivion Remastered
 
-- **Recommended with frame generation 2× (v1.0.17): Half refresh + Frame pacing Smooth + Apply the cap with Reflex's frame limit**, especially with DLSS 5. Just-in-time release is at its limit most of the time here: the game's frames take nearly the whole cap interval, so there is no room left to release them later, and Reflex's own frame limit paces them more evenly.
+- **Frame generation off.** It is very buggy in this game and shows a lot of artifacts.
+- **Recommended (v1.0.17): 2 frames per cycle with Half refresh + Frame pacing Smooth + Apply the cap with Reflex's frame limit**, especially with DLSS 5. Just-in-time release is at its limit most of the time here: the game's frames take nearly the whole cap interval, so there is no room left to release them later, and Reflex's own frame limit paces them more evenly.
 
 ### Control
 
