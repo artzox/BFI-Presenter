@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.18-r2"
+#define BFI_ADDON_VERSION "1.0.18-r3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -128,7 +128,6 @@ struct Settings
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
-    int   injectReflex = 0;   // with capReflex: Reflex added to games that don't use it (sleep + markers at the game's Present)
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
     int   deferRecreated = 1; // recreated swap chains: no BFI until the game resizes (safe)
@@ -260,7 +259,6 @@ static void LoadSettings(Settings &s)
     s.capJit = IniInt("CapJustInTime", 1) ? 1 : 0;
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
-    s.injectReflex = IniInt("InjectReflex", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
     if (s.laterReleaseMs > 5.0f) s.laterReleaseMs = 5.0f;
@@ -405,7 +403,6 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("CapJustInTime", s.capJit);
     IniWriteInt("AutoFrameCap", s.autoCap);
     IniWriteInt("CapWithReflex", s.capReflex);
-    IniWriteInt("InjectReflex", s.injectReflex);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
     IniWriteInt("GameFrameStatistics", s.virtualStats);
@@ -2004,10 +2001,6 @@ struct ReflexSecond
     int    limitUs = 0;          // Reflex frame limit in effect
 };
 static void ReflexTick(int limitUs, ReflexSecond &out);
-static void ReflexInjectBefore();
-static void ReflexInjectAfter();
-static void ReflexSetInjectWant(bool on);
-static bool ReflexInjected();
 static IUnknown *ReflexOwnDevice();
 // The game collapsed under a Reflex frame limit (Returnal: 60 -> 7.5 fps, ours or its own).
 // For the rest of the process: no limit from the presenter, and the game's own limit is
@@ -3060,7 +3053,7 @@ static DWORD WINAPI PresenterThread(void *)
                 // War Ragnarok: limit on, off, on... and heavy stutter). A change also needs 3 seconds
                 // in a row (on) or 5 (off).
                 bool fg = fgWas;
-                if (!ReflexInjected() && Now() - g_rfxRenderedT.load() < 3.0 && g_rfxRenderedFps.load() > 1.0)
+                if (Now() - g_rfxRenderedT.load() < 3.0 && g_rfxRenderedFps.load() > 1.0)
                 {
                     if (fpsPrevSec > 0.0 && !hitchPaused)
                     {
@@ -3267,14 +3260,9 @@ static DWORD WINAPI PresenterThread(void *)
                              "last second) -- moving them earlier", stNow.frameRepeats, stNow.frameSkips);
                 }
                 if (limitUs > 0 && t < phaseUntil) limitUs -= 150;
-                ReflexSetInjectWant(s.injectReflex && s.capReflex && userCap >= 2 && s.enabled && !fgWas);
                 ReflexTick(limitUs, rs);
                 rsLast = rs; rsLastT = t;
-                // Only the game's own Reflex reports count here: the ones the presenter makes when it adds Reflex
-                // (InjectReflex) must not later read as "the game stopped its Reflex reports", which the frame-
-                // generation check below takes as DLSS-G on (Shadow of the Tomb Raider: stuck "frame generation
-                // active" after the added Reflex was turned off, the cap dropped and the strobe flickered).
-                if (rs.frames > 0 && !ReflexInjected()) rsEverT = t;
+                if (rs.frames > 0) rsEverT = t;
                 EnterCriticalSection(&g_cfgLock);
                 g_status.rfxGameUses = rs.frames > 0 ? 1 : 0;
                 g_status.rfxLimitUs = rs.limitUs;
@@ -3942,36 +3930,18 @@ static bool StuckPassThrough(void *sc)
 
 static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT flags)
 {
-    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST))
-    {
-        ReflexInjectBefore();
-        const HRESULT hr = SubmitGameFrame11(sc, sync, flags);
-        ReflexInjectAfter();
-        return hr;
-    }
+    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present(sc, sync, flags); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST)) return o_Present(sc, sync, flags);
-    ReflexInjectBefore();
-    const HRESULT hr = SubmitGameFrame();
-    ReflexInjectAfter();
-    return hr;
+    return SubmitGameFrame();
 }
 
 static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p)
 {
-    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST))
-    {
-        ReflexInjectBefore();
-        const HRESULT hr = SubmitGameFrame11(sc, sync, flags);
-        ReflexInjectAfter();
-        return hr;
-    }
+    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present1(sc, sync, flags, p); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST)) return o_Present1(sc, sync, flags, p);
-    ReflexInjectBefore();
-    const HRESULT hr = SubmitGameFrame();
-    ReflexInjectAfter();
-    return hr;
+    return SubmitGameFrame();
 }
 
 static HRESULT STDMETHODCALLTYPE hk_GetBuffer(IDXGISwapChain *sc, UINT idx, REFIID riid, void **pp)
@@ -4344,17 +4314,6 @@ typedef int   (__cdecl *PFN_NvInit)();
 typedef int   (__cdecl *PFN_NvSetSleepMode)(IUnknown *, NvSleepParams *);
 typedef int   (__cdecl *PFN_NvGetSleepStatus)(IUnknown *, NvSleepStatus *);
 typedef int   (__cdecl *PFN_NvGetLatency)(IUnknown *, NvLatencyResult *);
-// Reflex for games without it (InjectReflex): the presenter calls the game's part itself, at the game's Present.
-struct NvMarkerParams  { uint32_t version; uint32_t pad0; uint64_t frameID; uint32_t markerType; uint8_t rsvd[64]; };
-static_assert(sizeof(NvMarkerParams) == 88, "NvAPI marker layout");
-enum { NvSimStart = 0, NvSimEnd = 1, NvSubmitStart = 2, NvSubmitEnd = 3, NvPresentStart = 4, NvPresentEnd = 5, NvInputSample = 6 };
-typedef int   (__cdecl *PFN_NvSleep)(IUnknown *);
-typedef int   (__cdecl *PFN_NvMarker)(IUnknown *, NvMarkerParams *);
-static PFN_NvSleep          g_nvSleep = nullptr;
-static PFN_NvMarker         g_nvMarker = nullptr;
-static std::atomic<bool>    g_rfxInject{false};              // the presenter is doing the game's Reflex calls
-static std::atomic<bool>    g_rfxInjectWant{false};          // InjectReflex on and the cap wants Reflex's limit
-static uint64_t             g_injFrame = 1;                  // game thread only
 static PFN_NvSetSleepMode   g_nvSetSleepMode = nullptr;     // the function itself (until hooked)
 static PFN_NvSetSleepMode   o_NvSetSleepMode = nullptr;     // original (trampoline) once hooked
 static PFN_NvGetSleepStatus g_nvGetSleepStatus = nullptr;
@@ -4451,8 +4410,6 @@ static bool ReflexApi()
 {
     if (g_rfxApi != 0) return g_rfxApi == 1;
     HMODULE nv = GetModuleHandleA("nvapi64.dll");
-    // A game without Reflex may never load NvAPI: load it for InjectReflex (presenter thread, not the loader lock).
-    if (!nv && g_rfxInjectWant.load()) nv = LoadLibraryA("nvapi64.dll");
     if (!nv) return false;                                         // tried again each second
     PFN_NvQI qi = (PFN_NvQI)(void *)GetProcAddress(nv, "nvapi_QueryInterface");
     if (qi)
@@ -4461,46 +4418,11 @@ static bool ReflexApi()
         g_nvSetSleepMode   = (PFN_NvSetSleepMode)qi(0xAC1CA9E0);
         g_nvGetSleepStatus = (PFN_NvGetSleepStatus)qi(0xAEF96CA1);
         g_nvGetLatency     = (PFN_NvGetLatency)qi(0x1A587F9C);
-        g_nvSleep          = (PFN_NvSleep)qi(0x852CD1D2);
-        g_nvMarker         = (PFN_NvMarker)qi(0xD9984C05);
     }
     g_rfxApi = (g_nvSetSleepMode && g_nvGetLatency) ? 1 : -1;
     if (g_rfxApi < 0) LOGW("BFI Presenter: Reflex: NvAPI latency functions not available");
     return g_rfxApi == 1;
 }
-
-// The game's half of Reflex, done at the game's Present (InjectReflex): present markers around it, then
-// Reflex's sleep (where the driver applies its frame limit and low-latency wait) and the next frame's start.
-// The game samples input and simulates right after Present returns, so that is where its frame begins.
-static void InjMark(IUnknown *d, uint32_t type)
-{
-    NvMarkerParams m = {};
-    m.version = BFI_NVVER(NvMarkerParams);
-    m.frameID = g_injFrame;
-    m.markerType = type;
-    g_nvMarker(d, &m);
-}
-static IUnknown *ReflexOwnDevice();
-static IUnknown *InjDevice() { return (g_rfxInject.load() && g_nvSleep && g_nvMarker) ? ReflexOwnDevice() : nullptr; }
-static void ReflexInjectBefore()
-{
-    if (IUnknown *d = InjDevice()) { InjMark(d, NvSubmitEnd); InjMark(d, NvPresentStart); }
-}
-static void ReflexInjectAfter()
-{
-    IUnknown *d = InjDevice();
-    if (!d) return;
-    InjMark(d, NvPresentEnd);
-    g_nvSleep(d);
-    g_injFrame++;
-    InjMark(d, NvSimStart);
-    InjMark(d, NvInputSample);
-    InjMark(d, NvSimEnd);
-    InjMark(d, NvSubmitStart);
-}
-
-static void ReflexSetInjectWant(bool on) { g_rfxInjectWant.store(on); }
-static bool ReflexInjected() { return g_rfxInject.load(); }
 
 static void ReflexWatch()
 {
@@ -4541,44 +4463,6 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
     ReleaseSRWLockShared(&g_rfxLock);
     if (!dev) dev = ReflexOwnDevice();
     if (!dev) return;
-    // InjectReflex: only in games that don't use Reflex themselves -- 5 s of presents without the game setting
-    // a sleep mode or sending markers. Stops if the game turns out to use it after all.
-    {
-        static double noRfxSince = 0.0;
-        const double tn = Now();
-        const bool want = g_rfxInjectWant.load() && g_nvSleep && g_nvMarker && !g_rfxLimitBad.load();
-        bool inj = g_rfxInject.load();
-        if (seen && inj) { g_rfxInject.store(false); inj = false; LOGI("BFI Presenter: Reflex: the game uses Reflex itself -- no longer added"); }
-        if (!want && inj)
-        {
-            g_rfxInject.store(false); inj = false;
-            NvSleepParams off = {}; off.version = BFI_NVVER(NvSleepParams);
-            (o_NvSetSleepMode ? o_NvSetSleepMode : g_nvSetSleepMode)(dev, &off);
-            AcquireSRWLockExclusive(&g_rfxLock); g_rfxAppliedValid = false; ReleaseSRWLockExclusive(&g_rfxLock);
-            g_rfxRenderedFps.store(0.0); g_rfxRenderedT.store(0.0); g_rfxLastReport = 0;
-            LOGI("BFI Presenter: Reflex: added Reflex off");
-        }
-        if (want && !inj && !seen)
-        {
-            if (noRfxSince <= 0.0) noRfxSince = tn;
-            if (g_rfxLastReport == 0 && tn - noRfxSince >= 5.0)
-            {
-                NvSleepParams on = {};
-                on.version = BFI_NVVER(NvSleepParams);
-                on.lowLatency = 1; on.useMarkers = 1;
-                on.minIntervalUs = limitUs > 0 ? (uint32_t)limitUs : 0;
-                const int r = (o_NvSetSleepMode ? o_NvSetSleepMode : g_nvSetSleepMode)(dev, &on);
-                if (r == 0)
-                {
-                    AcquireSRWLockExclusive(&g_rfxLock); g_rfxApplied = on; g_rfxAppliedValid = limitUs > 0; ReleaseSRWLockExclusive(&g_rfxLock);
-                    g_rfxInject.store(true);
-                    LOGI("BFI Presenter: Reflex: the game has no Reflex of its own -- added by the presenter (low latency, sleep and markers at its Present)");
-                }
-                else { LOGW("BFI Presenter: Reflex: couldn't be added to this game (NvAPI %d)", r); g_rfxLimitBad.store(true); }
-            }
-        }
-        if (!want) noRfxSince = 0.0;
-    }
 
     static NvLatencyResult res;
     memset(&res, 0, sizeof(res));
@@ -4638,7 +4522,6 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
             st.version = BFI_NVVER(NvSleepStatus);
             if (g_nvGetSleepStatus(dev, &st) == 0) base.lowLatency = st.lowLatency;
             base.useMarkers = 1;
-            if (g_rfxInject.load()) base.lowLatency = 1;
         }
         base.version = BFI_NVVER(NvSleepParams);
         NvSleepParams want = base;
@@ -4682,10 +4565,6 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
 #else
 static int ReflexGameLimitUs() { return 0; }
 static void ReflexTick(int, ReflexSecond &out) { out = ReflexSecond(); }
-static void ReflexInjectBefore() {}
-static void ReflexInjectAfter() {}
-static void ReflexSetInjectWant(bool) {}
-static bool ReflexInjected() { return false; }
 #endif
 
 // DXGI's own Present and ResizeBuffers1, past any inline hooks, for the calls
@@ -7553,18 +7432,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                     if (s.capReflex)
                     {
                         ImGui::SameLine();
-                        if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: %.1f ms%s)", st.rfxLimitUs / 1000.0, ReflexInjected() ? ", Reflex added" : "");
-                        else ImGui::TextDisabled(s.injectReflex ? "(not in use yet: adding Reflex to this game)" : "(not in use: no Reflex in this game)");
-                        ImGui::Indent(16.0f);
-                        bool ir = s.injectReflex != 0;
-                        if (ImGui::Checkbox("Add Reflex to games without it (test)", &ir)) s.injectReflex = ir ? 1 : 0;
-                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("NVIDIA, DirectX 11 and 12. For games without Reflex of their own: the presenter turns on\n"
-                                                                      "Reflex for the game and makes the game's Reflex calls itself at its Present (Reflex's\n"
-                                                                      "sleep, where the driver applies the frame limit, and the frame markers), so the cap above\n"
-                                                                      "can use Reflex's frame limit too. Starts after 5 s without Reflex from the game; stops if\n"
-                                                                      "the game turns out to use Reflex. Less precise than a game's own Reflex (the presenter\n"
-                                                                      "doesn't know when the game reads input). Adds latency like the option above. Off by default.");
-                        ImGui::Unindent(16.0f);
+                        if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: %.1f ms)", st.rfxLimitUs / 1000.0);
+                        else ImGui::TextDisabled("(not in use: no Reflex in this game)");
                     }
                 }
                 if (per >= 2 && st.fgActive && st.rfxLimitUs <= 0)
