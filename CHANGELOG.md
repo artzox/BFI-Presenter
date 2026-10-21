@@ -7,6 +7,12 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Manager 1.3.7] — 2026-10-21
+
+- **[Manager] Direct3D 8 games are recognised** (from PCGamingWiki and from a `d3d8.dll` import) and shown as "D3D8" instead of "?". They get the DX add-on route, through Direct3D 9: **Install ReShade** copies ReShade as `d3d9.dll`, and the game's notes say to download the d3d8to9 converter by crosire and put its `d3d8.dll` next to the executable, with a link to [d3d8to9](https://github.com/crosire/d3d8to9) (or to use ReShade's own setup with Direct3D 8 picked, which downloads it). With dgVoodoo installed they stay on its Direct3D 11 route. Executables are read again once for the new check.
+- **[Manager]** Links in a game's notes can be clicked and open in the browser. The labels in the details pane are spaced to the longest one, so "NVIDIA profile" no longer runs into the profile name.
+- **[Manager]** A PCGamingWiki page that lists only APIs BFI Presenter doesn't support (e.g. Direct3D 7) now says so in the game's notes, instead of "PCGamingWiki's page lists none".
+
 ## [Manager 1.3.6] — 2026-10-21
 
 - **[Manager] Fixed: PCGamingWiki lookups stopped working for everyone.** PCGamingWiki no longer answers anonymous Cargo (database) queries ("You don't have permission to run arbitrary Cargo queries"), so every lookup failed, `pcgw_cache3.txt` stayed empty, and games whose executable doesn't show the API (launchers, APIs loaded at run time) kept "?". The Manager now reads the game pages themselves through the standard MediaWiki API, up to 20 pages per request by title with redirects followed, and takes the Direct3D, Vulkan and OpenGL versions from each page's API box. A Steam game must land on a page that lists its app id; if its name doesn't lead there, the wiki's Steam app id redirect finds the page (one request per such game). Results already in the cache are kept. The first scan of a large library takes a few minutes; after that games are looked up again every 30 days (7 when not found).

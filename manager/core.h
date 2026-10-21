@@ -5,8 +5,8 @@
 #include <vector>
 #include <functional>
 
-#define MANAGER_VERSION "1.3.6"
-#define MANAGER_VERSION_W L"1.3.6"
+#define MANAGER_VERSION "1.3.7"
+#define MANAGER_VERSION_W L"1.3.7"
 
 namespace bfi {
 
@@ -15,7 +15,7 @@ std::string  U8(const std::wstring &w);
 std::wstring W(const std::string &s);
 std::wstring Lower(std::wstring s);
 
-enum Api : unsigned { ApiD3D9 = 1, ApiD3D10 = 2, ApiD3D11 = 4, ApiD3D12 = 8, ApiGL = 16, ApiVulkan = 32 };
+enum Api : unsigned { ApiD3D9 = 1, ApiD3D10 = 2, ApiD3D11 = 4, ApiD3D12 = 8, ApiGL = 16, ApiVulkan = 32, ApiD3D8 = 64 };
 std::string ApiText(unsigned apis);
 
 // What BFI Presenter files a game needs.
