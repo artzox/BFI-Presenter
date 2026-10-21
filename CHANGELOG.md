@@ -16,7 +16,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
   - Not tested on a high-refresh LCD yet: reports welcome. If a ghost image appears at 2 frames, lower the hold seconds (one IPS tester still saw one with Immediate swaps every 30 s).
 - **[Docs]** Settings guide (and PDF): the LCD section explains both modes, with a new diagram of the hold–drift–hold and the slow drift. DX reference, example ini and README updated.
 - **[Tools] New: log analyzer and motion test** (`BFIPresenter-Tools-v1.0.17.zip`). The log analyzer is an offline page: drop in a session's timing logs and `ReShade.log` for per-setting cadence, repeats and skips, latency, and the setting that ran most evenly. The motion test (`BFIMotionTest.exe`) is a Direct3D 12 program with moving test patterns that ReShade and the presenter hook like a game, to compare settings on the same picture on any display. Both are in `tools/`.
-- **[Docs]** Tested games: The Elder Scrolls IV: Oblivion Remastered recommended with frame generation 2× at Half refresh + Smooth + Apply the cap with Reflex's frame limit, especially with DLSS 5 (just-in-time release is at its limit there: the game's frames take nearly the whole cap interval).
+- **[Docs]** Tested games: The Elder Scrolls IV: Oblivion Remastered recommended without frame generation (it shows a lot of artifacts in this game), at 2 frames per cycle with Half refresh + Smooth + Apply the cap with Reflex's frame limit, especially with DLSS 5 (just-in-time release is at its limit there: the game's frames take nearly the whole cap interval).
 
 ## [Manager 1.3.5] — 2026-10-19 (with the 1.0.16 release)
 
