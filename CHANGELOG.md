@@ -11,6 +11,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 
 - **[Manager] Direct3D 8 games are recognised** (from PCGamingWiki and from a `d3d8.dll` import) and shown as "D3D8" instead of "?". They get the DX add-on route, through Direct3D 9: **Install ReShade** copies ReShade as `d3d9.dll`, and the game's notes say to download the d3d8to9 converter by crosire and put its `d3d8.dll` next to the executable, with a link to [d3d8to9](https://github.com/crosire/d3d8to9) (or to use ReShade's own setup with Direct3D 8 picked, which downloads it). With dgVoodoo installed they stay on its Direct3D 11 route. Executables are read again once for the new check.
 - **[Manager]** Links in a game's notes can be clicked and open in the browser. The labels in the details pane are spaced to the longest one, so "NVIDIA profile" no longer runs into the profile name.
+- **[Manager] Fixed: Observer: System Redux (and Observer) were missing from the list.** Executables with "server" in the name are skipped as dedicated servers, and "Observer" contains it; every exe of the game was skipped, and a game without an exe isn't listed. Words like Observer and Crash Bandicoot are now exempt.
 - **[Manager]** A PCGamingWiki page that lists only APIs BFI Presenter doesn't support (e.g. Direct3D 7) now says so in the game's notes, instead of "PCGamingWiki's page lists none".
 
 ## [Manager 1.3.6] — 2026-10-21
