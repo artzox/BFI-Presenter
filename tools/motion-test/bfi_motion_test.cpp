@@ -1,5 +1,5 @@
 // BFI Motion Test -- a small Direct3D 12 program that draws moving test patterns, so ReShade and
-// BFI Presenter can be judged on the same picture on every display (like TestUFO, but as a "game"
+// BFI Presenter can be judged on the same picture on every display (inspired by Blur Busters' TestUFO, but as a "game"
 // the presenter hooks). Everything is drawn with ClearRenderTargetView rectangles: no shaders.
 //
 // Motion is computed from the clock, not from the frame count, so a late or repeated frame shows
@@ -34,7 +34,7 @@ static UINT g_w = 1280, g_h = 720;
 static bool g_resize = false, g_fullscreen = false, g_vsync = true, g_paused = false, g_tearing = false;
 static int g_speedIdx = 3, g_pattern = 0, g_rateDiv = 1;
 static const int kSpeeds[] = { 240, 480, 720, 960, 1440, 1920, 2880, 3840 };
-static const char *kPatterns[] = { "Bars and UFO", "Checkerboard", "Thin lines", "Gradient blocks" };
+static const char *kPatterns[] = { "Bars and marker", "Checkerboard", "Thin lines", "Gradient blocks" };
 static RECT g_winRect;
 static double g_pos = 0.0;
 
@@ -171,12 +171,12 @@ static void Draw(UINT bi, double t)
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += bi * g_rtvSize;
     const float bg[4] = { 0.18f, 0.18f, 0.18f, 1 }, white[4] = { 0.92f, 0.92f, 0.92f, 1 }, dark[4] = { 0.04f, 0.04f, 0.04f, 1 },
-                mid[4] = { 0.5f, 0.5f, 0.5f, 1 }, ufo[4] = { 0.95f, 0.75f, 0.2f, 1 }, cyan[4] = { 0.3f, 0.8f, 0.95f, 1 };
+                mid[4] = { 0.5f, 0.5f, 0.5f, 1 }, accent[4] = { 0.95f, 0.75f, 0.2f, 1 }, cyan[4] = { 0.3f, 0.8f, 0.95f, 1 };
     g_list->ClearRenderTargetView(rtv, bg, 0, nullptr);
     std::vector<D3D12_RECT> rs;
     const LONG H = (LONG)g_h, laneH = H / 6;
     const double px = g_pos;
-    // three lanes at full, half and quarter speed (as TestUFO's three UFO rows)
+    // three lanes at full, half and quarter speed
     for (int lane = 0; lane < 3; lane++)
     {
         const double off = px / (1 << lane);
@@ -186,10 +186,11 @@ static void Draw(UINT bi, double t)
         Lane(rs, y0 + laneH / 8, laneH * 3 / 4, off, 160, 40, kind);
         Fill(rtv, kind == 1 ? mid : white, rs);
         if (kind == 0)
-        {   // the "UFO": a body and a dome, one per lane
+        {   // the marker: a tall block with a contrasting core and thin edges, one per lane
             const LONG ux = (LONG)fmod(off, (double)g_w + 200) - 100, uy = y0 + laneH / 2;
-            Add(rs, ux - 60, uy - 12, 120, 24); Fill(rtv, ufo, rs);
-            Add(rs, ux - 24, uy - 30, 48, 18); Fill(rtv, cyan, rs);
+            Add(rs, ux - 36, uy - laneH * 3 / 8, 72, laneH * 3 / 4); Fill(rtv, accent, rs);
+            Add(rs, ux - 12, uy - laneH * 3 / 8, 24, laneH * 3 / 4); Fill(rtv, cyan, rs);
+            Add(rs, ux - 2, uy - laneH * 3 / 8, 4, laneH * 3 / 4); Fill(rtv, dark, rs);
         }
     }
     // frame counter: 10 bits of the frame index -- a repeated frame shows the same pattern twice in a photo
@@ -203,7 +204,7 @@ static void Draw(UINT bi, double t)
     // a sweeping column that moves one step per frame: gaps or doubles show missed or repeated frames
     const LONG cols = 30, cw = ((LONG)g_w - 20 * s) / cols, cx = 14 * s + (LONG)(frameNo % cols) * cw;
     Add(rs, 14 * s, by, cols * cw, s); Fill(rtv, dark, rs);
-    Add(rs, cx, by, cw, s); Fill(rtv, ufo, rs);
+    Add(rs, cx, by, cw, s); Fill(rtv, accent, rs);
     (void)t;
 }
 
