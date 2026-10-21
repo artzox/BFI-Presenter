@@ -7,6 +7,17 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.17] — 2026-10-21
+
+- **[Both] New: Gradual mode for the LCD image-retention protection** (`LcdSaverGradual`, Mode: **Immediate** | **Gradual**; Immediate stays the default). Immediate is the existing fade, shift by one refresh, fade back every `LcdPhaseSwapSeconds`. Gradual instead slides the light slowly from one refresh into the next, with the cycle's light kept constant, so there is no fade, no brightness change and no stutter. The design follows the LCD Saver of the [Blur Busters](https://blurbusters.com) CRT beam simulator by Mark Rejhon and Timothy Lottes (MIT), written from scratch for BFI Presenter.
+  - **At 2 frames per cycle: hold, drift, hold.** Halfway through a slide the light is split 50/50 over both refreshes, which is the same as no BFI for that moment, so the light stays fully on one refresh for `LcdGradualHoldSeconds` (120), slides to the other over `LcdGradualDriftSeconds` (10) and holds again. Motion is sharp about 92% of the time. Hold 0 = drift continuously.
+  - **At 4 frames per cycle and up: continuous drift**, once through the whole cycle every `LcdGradualSeconds` (1000, 20–1200, the Blur Busters default). A 4-frame cycle is still dark half the time mid-slide, so clarity barely changes.
+  - Plain strobe only (BFI and Variable MPRT); with Sine BFI, Invert cycle or Rolling scan the Immediate swap is used. With the BFI method the highlights are rolled off once for the whole lit picture and then shared between the refreshes, so the slide doesn't change them.
+  - Not tested on a high-refresh LCD yet: reports welcome. If a ghost image appears at 2 frames, lower the hold seconds (one IPS tester still saw one with Immediate swaps every 30 s).
+- **[Docs]** Settings guide (and PDF): the LCD section explains both modes, with a new diagram of the hold–drift–hold and the slow drift. DX reference, example ini and README updated.
+- **[Tools] New: log analyzer and motion test** (`BFIPresenter-Tools-v1.0.17.zip`). The log analyzer is an offline page: drop in a session's timing logs and `ReShade.log` for per-setting cadence, repeats and skips, latency, and the setting that ran most evenly. The motion test (`BFIMotionTest.exe`) is a Direct3D 12 program with moving test patterns that ReShade and the presenter hook like a game, to compare settings on the same picture on any display. Both are in `tools/`.
+- **[Docs]** Tested games: The Elder Scrolls IV: Oblivion Remastered recommended with frame generation 2× at Half refresh + Smooth + Apply the cap with Reflex's frame limit, especially with DLSS 5 (just-in-time release is at its limit there: the game's frames take nearly the whole cap interval).
+
 ## [Manager 1.3.5] — 2026-10-19 (with the 1.0.16 release)
 
 - **[Manager] Update button.** When the latest GitHub release carries a newer Manager, **Update Manager to …** appears next to **Check GitHub** (checked once after the first scan of each start, also when a folder is picked as the source). It downloads the new exe, swaps it in for the running one and restarts; the game list, settings and backups are kept. Needs the Manager in a folder you can write to.

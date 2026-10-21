@@ -58,8 +58,39 @@ float MprtScale(uint k, float litGain, float fl, float S)
 }
 
 // One pixel's light in sub-frame j of the cycle.
+// LCD gradual saver (after the Blur Busters CRT simulator's slewing LCD Saver): see the DX add-on.
+float Overlap(float a, float w, float j, float n)
+{
+    float o = max(0.0, min(a + w, j + 1.0) - max(a, j));
+    o += max(0.0, min(a + w, j + 1.0 + n) - max(a, j + n));
+    return o;
+}
+float GradualGain(uint j, float litGain, float fl, float S)
+{
+    float E = litGain - fl;
+    if (E <= 0.0) return fl;
+    float n = float(pc.frames);
+    float h = min(E, max(S - fl, 1e-4));
+    float w = E / h;
+    if (w >= n) { w = n; h = E / n; }
+    return fl + h * Overlap(pc.phase, w, float(j), n);
+}
+
 vec3 Strobe(vec3 lin, uint j, float litGain)
 {
+    if ((pc.flags & 16u) != 0u)
+    {
+        if (pc.method == 0u)
+        {
+            // Roll the highlights off once for the whole lit image, then share that light out.
+            vec3 full = ((pc.flags & 1u) != 0u) ? Rolloff(lin, litGain, pc.ceilLin, pc.knee) : lin * litGain;
+            vec3 base = lin * pc.dfloor;
+            return base + (full - base) * Overlap(pc.phase, 1.0, float(j), float(pc.frames));
+        }
+        float mg = max(max(lin.r, lin.g), lin.b);
+        float Sg = (mg > 1e-6) ? max(pc.ceilLin / mg, 1.0) : 1e6;
+        return lin * GradualGain(j, litGain, pc.dfloor, Sg);
+    }
     if (pc.method == 0u)
     {
         float g = Target(j, litGain, pc.dfloor);

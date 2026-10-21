@@ -80,14 +80,52 @@ Makes each line fade out after the "beam" passes, like the glow of a real CRT, i
 
 ## Your display
 
-**LCD: prevent image retention** · `LcdPhaseSwap`, `LcdPhaseSwapSeconds` · default: off, 5 s\
-**Turn this on if you have an LCD monitor (IPS, VA or TN).** An LCD drives every refresh with the opposite voltage of the one before, so over time it all evens out. With BFI's "lit, dark, lit, dark" every lit picture lands on the same voltage, and after a long session the screen can keep a faint ghost of the image (HUDs, menus). It's usually temporary, but annoying. This option, every few seconds, briefly fades the flashing out to a steady picture (about half a second), shifts it by one refresh where nobody can see it, and fades it back in, so the lit pictures switch to the other voltage and it evens out again. At most you'll notice motion getting a little softer for a moment.\
-*When to change it:* on for every LCD; leave off for OLED, which doesn't work this way. Not needed with an odd number of frames per cycle (3), where the lit refresh alternates anyway.
+**LCD: prevent image retention** · `LcdPhaseSwap` · default: off\
+**Turn this on if you have an LCD monitor (IPS, VA or TN).** An LCD drives every refresh with the opposite voltage of the one before, so over time it all evens out. With BFI's "lit, dark, lit, dark" every lit picture lands on the same voltage, and after a long session the screen can keep a faint ghost of the image (HUDs, menus). It's usually temporary, but annoying. The fix is to move the lit picture to the other refresh from time to time, so the lit pictures get the other voltage for a while and it evens out. There are two ways to do that, picked with **Mode**.\
+*When to change it:* on for every LCD; leave off for OLED, which doesn't work this way. Not needed with an odd number of frames per cycle (3, 5, 7), where the lit refresh alternates anyway.
+
+**Mode** · `LcdSaverGradual` · default: Immediate (0)\
+How the lit picture is moved to the other refresh.
+
+- **Immediate** (0): every few seconds the flashing fades out to a steady picture (about half a second), shifts by one refresh where nobody can see it, and fades back in. Quick and well tested, but each swap shows as a short softening of motion, and some people notice a small stutter.
+- **Gradual** (1): the lit picture slides slowly from one refresh into the next instead of jumping, with no fade and no stutter. How it slides depends on the frames per cycle, below.
+
+*When to change it:* try Gradual if the Immediate swaps bother you. Gradual works with the plain strobe (BFI or Variable MPRT) only; with Sine BFI, Invert cycle or Rolling scan on, Immediate is used.
+
+**Immediate: seconds between swaps** · `LcdPhaseSwapSeconds` · default: 5\
+How long the full strobe runs between two swaps (1–300).\
+*When to change it:* lower it if you still see a ghost. One IPS tester still saw one at 30 s; at 5 s it was gone.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/lcd-phase-swap-dark.png">
   <img src="img/lcd-phase-swap-light.png" alt="Without the LCD option every lit refresh gets the same + voltage; with it the strobe fades to a steady picture, one extra refresh is inserted, and afterwards every lit refresh gets the − voltage." width="760">
 </picture>
+
+**How Gradual moves the light.** Think of each refresh in a cycle as a chair, and the lit picture as a spotlight on one chair. Gradual slides the spotlight to the next chair instead of switching it off and on again. While it slides, part of the light is on one refresh and the rest on the next; the total light in the cycle never changes, so nothing flickers or changes brightness.
+
+The catch is that while the light is split, the picture is lit for longer, and longer means more motion blur. How much depends on how many refreshes the cycle has:
+
+- **2 frames per cycle (e.g. 60 fps at 120 Hz):** halfway through a slide the light is split 50/50 over both refreshes. That's the same as no BFI at all for that moment, so motion clearly softens. So at 2 frames Gradual **holds, drifts, holds**: the light stays fully on one refresh for 2 minutes (sharp, just like with the option off), slides to the other refresh over 10 seconds, and stays there for the next 2 minutes. You're in a slide only about 8% of the time, and noticeably soft for about half of that.
+- **4 or more frames per cycle (e.g. 60 fps at 240 Hz):** halfway through a slide the cycle is still something like 50%, 50%, 0%, 0%, so it's dark half the time and motion stays nearly as clear. Here Gradual slides **continuously and very slowly**: by default once through the whole cycle every 1000 seconds (about 17 minutes), about 4 minutes per refresh. Changes that slow are very hard to see.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/lcd-gradual-dark.png">
+  <img src="img/lcd-gradual-light.png" alt="At 2 frames per cycle the light is held on the first refresh (+ voltage), slides over three cycles (75/25, 50/50, 25/75) to the second refresh and is then held there (− voltage). At 4 frames per cycle snapshots over time show the light sliding slowly from refresh 1 to refresh 2." width="760">
+</picture>
+
+**Gradual at 2 frames: hold seconds** · `LcdGradualHoldSeconds` · default: 120\
+How long the light stays fully on one refresh before it slides to the other (0–600). 0 = no holds: slide continuously, using the seconds per full drift below.\
+*When to change it:* if you see a ghost image, lower it (e.g. 30, or 20 for a very sensitive panel). Each hold puts the lit pictures on one voltage, like the time between Immediate swaps, and one IPS tester saw a ghost with Immediate swaps every 30 s. Shorter holds mean slides come more often.
+
+**Gradual at 2 frames: drift seconds** · `LcdGradualDriftSeconds` · default: 10\
+How long one slide to the other refresh takes (2–60).\
+*When to change it:* longer (20–30) if you notice the slide as a change in clarity; it becomes gentler, but the picture is soft for longer. Shorter gets it over with, but the change becomes easier to see.
+
+**Gradual at 4+ frames: seconds per full drift** · `LcdGradualSeconds` · default: 1000\
+How long the light takes to slide once through every refresh of the cycle (20–1200). Also used at 2 frames when hold seconds is 0.\
+*When to change it:* rarely. 1000 s is the default of the Blur Busters CRT simulator, which this mode follows; 100 s is very cautious and mainly makes the changes easier to see. Ini files from the first test builds may still have 120: set it to 1000.
+
+*Gradual follows the LCD Saver of the [Blur Busters](https://blurbusters.com) CRT beam simulator by Mark Rejhon and Timothy Lottes, written from scratch for BFI Presenter. Testing on high-refresh LCDs is still welcome: tell me what you see.*
 
 **Output** · `Output` · default: auto\
 Whether the game's picture is SDR or HDR (and which HDR format). Auto reads it from the game.\
