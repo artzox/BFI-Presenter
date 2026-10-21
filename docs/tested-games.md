@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-102 of 103 tested games and emulators run with BFI: the 52 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; three with the engine's own stutter) and 50 more listed after it. One is partial.
+102 of 103 tested games and emulators run with BFI: the 52 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; one with the engine's own stutter) and 50 more listed after it. One is partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -72,7 +72,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | DOOM Eternal | Working (Vulkan) | Not tested | v1.0.3 | Vulkan layer without ReShade (the game didn't start with ReShade); `BFIPresenter.ini` next to `DOOMEternalx64vk.exe`; settings in the ini + hotkeys |
 | PT-PC | Working (Vulkan) | — | v1.0.5 | Vulkan layer; ReShade only through its Vulkan layer (manager: Turn on), never as `dxgi.dll` and no DX add-on in the folder (crashed). With ray tracing on: Half refresh + Lowest latency + Just-in-time release |
 | Kena: Bridge of Spirits | Working | Not tested | v1.0.3 | Refresh rate + automatic frame cap (v1.0.16) |
-| Need for Speed: Porsche Unleashed | Working (OpenGL, 32-bit), engine stutter; not recommended | — | v1.0.3 | `BFIPresenter.addon32`; in the unofficial patch's OGL3 mode: NVIDIA profile Vulkan/OpenGL present method = Prefer layered on DXGI swapchain |
+| Need for Speed: Porsche Unleashed | Working (DX11 with the NFS5 Enhanced mod, 32-bit) | — | v1.0.17 | [NFS5 Enhanced](https://github.com/iArtorias/nfs5_enhanced) v1.2.0 (its Direct3D 11 renderer) with 32-bit ReShade and `BFIPresenter.addon32`; Refresh rate + Lowest latency; the CRT-Standalone shader for the full retro look |
 | Legacy of Kain: Soul Reaver 1 & 2 Remastered | Working (OpenGL) | — | v1.0.3 | With DLSS 5: Half refresh + Lowest latency. Without: Refresh + Lowest latency + Later release (Smooth stutters more) |
 | Heretic II | Working (OpenGL, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32` |
 | DOOM 3: BFG Edition | Working (OpenGL, 32-bit) | — | v1.0.4 | `BFIPresenter.addon32`; NVIDIA profile: Vulkan/OpenGL present method = Prefer layered on DXGI swapchain (else about 30 fps) |
@@ -375,7 +375,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### OpenGL games (v1.0.3)
 
 - The add-on takes each finished OpenGL frame after ReShade's effects and shares it with its own Direct3D 11 device through NVIDIA's `WGL_NV_DX_interop2`, so OpenGL needs an NVIDIA GPU. The game's swap interval is set to 0 so its own SwapBuffers doesn't wait for vblank (`OpenGLSwapInterval0=0` turns that off).
-- **Need for Speed: Porsche Unleashed** (32-bit), with the unofficial patch in OGL3 mode: the presenter was blocked (presents of 20–46 ms) until the game's NVIDIA profile had *Vulkan/OpenGL present method* set to *Prefer layered on DXGI swapchain*. The BFI Presenter Manager doesn't set it here, because a dgVoodoo install makes the game look like Direct3D 11 to it: set it in NVIDIA Profile Inspector. Runs after that, but the engine's own stutter remains, so the game isn't recommended.
+- **Need for Speed: Porsche Unleashed** (32-bit): **recommended with the [NFS5 Enhanced](https://github.com/iArtorias/nfs5_enhanced) mod (v1.2.0)**, which brings its own Direct3D 11 renderer. Install 32-bit ReShade (with full add-on support) next to the game's exe with `BFIPresenter.addon32`, and run the presenter at **Refresh rate + Lowest latency**. Add the CRT-Standalone shader for the full retro look (`ENABLE_DECAY=0`, as for every game with the presenter). Earlier, with the unofficial patch in OGL3 mode, the presenter was blocked (presents of 20–46 ms) until the game's NVIDIA profile had *Vulkan/OpenGL present method* set to *Prefer layered on DXGI swapchain*, and the engine's own stutter remained, so that route isn't recommended.
 - **Legacy of Kain: Soul Reaver 1 & 2 Remastered:** works together with the DLSS 5 add-ons, which lower the frame rate well below 120. With DLSS 5 use Half refresh + Lowest latency; without it the game holds 120, so use Refresh + Lowest latency + Later release. Frame pacing Smooth stutters more in this game.
 - **Heretic II** (32-bit): works with `BFIPresenter.addon32`.
 - **DOOM 3: BFG Edition** (32-bit): the presenter's presents blocked for 30–45 ms and held the game at about 30 fps until the game's NVIDIA profile had *Vulkan/OpenGL present method* set to *Prefer layered on DXGI swapchain* (the Manager sets it when installing). Runs at full rate after that.
