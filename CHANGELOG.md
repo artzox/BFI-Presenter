@@ -7,6 +7,11 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Manager 1.3.6] — 2026-10-21
+
+- **[Manager] Fixed: PCGamingWiki lookups stopped working for everyone.** PCGamingWiki no longer answers anonymous Cargo (database) queries ("You don't have permission to run arbitrary Cargo queries"), so every lookup failed, `pcgw_cache3.txt` stayed empty, and games whose executable doesn't show the API (launchers, APIs loaded at run time) kept "?". The Manager now reads the game pages themselves through the standard MediaWiki API, up to 20 pages per request by title with redirects followed, and takes the Direct3D, Vulkan and OpenGL versions from each page's API box. A Steam game must land on a page that lists its app id; if its name doesn't lead there, the wiki's Steam app id redirect finds the page (one request per such game). Results already in the cache are kept. The first scan of a large library takes a few minutes; after that games are looked up again every 30 days (7 when not found).
+- **[Manager]** Requests now identify the Manager by name, version and repository, as wikis ask of API clients, and ask PCGamingWiki for JSON instead of GitHub's media type.
+
 ## [1.0.17] — 2026-10-21
 
 - **[Both] New: Gradual mode for the LCD image-retention protection** (`LcdSaverGradual`, Mode: **Immediate** | **Gradual**; Immediate stays the default). Immediate is the existing fade, shift by one refresh, fade back every `LcdPhaseSwapSeconds`. Gradual instead slides the light slowly from one refresh into the next, with the cycle's light kept constant, so there is no fade, no brightness change and no stutter. The design follows the LCD Saver of the [Blur Busters](https://blurbusters.com) CRT beam simulator by Mark Rejhon and Timothy Lottes (MIT), written from scratch for BFI Presenter.

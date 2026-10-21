@@ -5,6 +5,9 @@
 #include <vector>
 #include <functional>
 
+#define MANAGER_VERSION "1.3.6"
+#define MANAGER_VERSION_W L"1.3.6"
+
 namespace bfi {
 
 // UTF-8 <-> UTF-16

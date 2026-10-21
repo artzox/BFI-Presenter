@@ -984,7 +984,8 @@ static std::string TestedFor(const std::string &game)
 // ------------------------------------------------------------------ PCGamingWiki
 
 static bool HttpGet(const std::wstring &url, std::string &body, std::string &err,
-                    const std::function<void(size_t, size_t)> &prog = nullptr, const std::wstring &extraHeaders = L"");
+                    const std::function<void(size_t, size_t)> &prog = nullptr, const std::wstring &extraHeaders = L"",
+                    std::wstring *redirectTo = nullptr);
 static std::string JsonString(const std::string &json, const std::string &key);
 
 struct PcgwEntry { long long when = 0; bool found = false; unsigned apis = 0; std::string text; };
@@ -1101,6 +1102,252 @@ static std::vector<std::string> PcgwNames(const std::string &name)
     return out;
 }
 
+// A small JSON reader for the wiki's answers (objects, arrays, strings, numbers, true/false/null).
+struct Jv
+{
+    enum T { Null, Bool, Num, Str, Arr, Obj } t = Null;
+    bool b = false;
+    std::string s;                                    // string, or a number's text
+    std::vector<Jv> a;
+    std::vector<std::pair<std::string, Jv>> o;
+    const Jv *get(const char *k) const { for (auto &p : o) if (p.first == k) return &p.second; return nullptr; }
+    std::string str(const char *k) const { const Jv *v = get(k); return v && (v->t == Str || v->t == Num) ? v->s : std::string(); }
+};
+
+static void JsonWs(const std::string &j, size_t &i) { while (i < j.size() && isspace((unsigned char)j[i])) i++; }
+
+static void JsonUtf8(std::string &out, unsigned cp)
+{
+    if (cp < 0x80) out += (char)cp;
+    else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
+    else { out += (char)(0xF0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 0x3F)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
+}
+
+static bool JsonParse(const std::string &j, size_t &i, Jv &v, int depth = 0)
+{
+    if (depth > 64) return false;
+    JsonWs(j, i);
+    if (i >= j.size()) return false;
+    const char c = j[i];
+    if (c == '{' || c == '[')
+    {
+        const bool obj = c == '{';
+        v.t = obj ? Jv::Obj : Jv::Arr;
+        i++; JsonWs(j, i);
+        if (i < j.size() && j[i] == (obj ? '}' : ']')) { i++; return true; }
+        for (;;)
+        {
+            std::string key;
+            if (obj)
+            {
+                Jv k;
+                if (!JsonParse(j, i, k, depth + 1) || k.t != Jv::Str) return false;
+                key = k.s;
+                JsonWs(j, i);
+                if (i >= j.size() || j[i] != ':') return false;
+                i++;
+            }
+            Jv e;
+            if (!JsonParse(j, i, e, depth + 1)) return false;
+            if (obj) v.o.emplace_back(std::move(key), std::move(e)); else v.a.push_back(std::move(e));
+            JsonWs(j, i);
+            if (i < j.size() && j[i] == ',') { i++; continue; }
+            if (i < j.size() && j[i] == (obj ? '}' : ']')) { i++; return true; }
+            return false;
+        }
+    }
+    if (c == '"')
+    {
+        v.t = Jv::Str;
+        for (i++; i < j.size(); i++)
+        {
+            char d = j[i];
+            if (d == '"') { i++; return true; }
+            if (d != '\\') { v.s += d; continue; }
+            if (++i >= j.size()) return false;
+            d = j[i];
+            if (d == 'u' && i + 4 < j.size())
+            {
+                unsigned cp = (unsigned)strtoul(j.substr(i + 1, 4).c_str(), nullptr, 16);
+                i += 4;
+                if (cp >= 0xD800 && cp < 0xDC00 && i + 6 < j.size() && j[i + 1] == '\\' && j[i + 2] == 'u')
+                {
+                    unsigned lo = (unsigned)strtoul(j.substr(i + 3, 4).c_str(), nullptr, 16);
+                    if (lo >= 0xDC00 && lo < 0xE000) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); i += 6; }
+                }
+                JsonUtf8(v.s, cp);
+            }
+            else v.s += d == 'n' ? '\n' : d == 't' ? '\t' : d == 'r' ? '\r' : d == 'b' ? '\b' : d == 'f' ? '\f' : d;
+        }
+        return false;
+    }
+    if (j.compare(i, 4, "true") == 0) { v.t = Jv::Bool; v.b = true; i += 4; return true; }
+    if (j.compare(i, 5, "false") == 0) { v.t = Jv::Bool; i += 5; return true; }
+    if (j.compare(i, 4, "null") == 0) { i += 4; return true; }
+    size_t k = i;
+    while (k < j.size() && (isdigit((unsigned char)j[k]) || strchr("+-.eE", j[k]))) k++;
+    if (k == i) return false;
+    v.t = Jv::Num; v.s = j.substr(i, k - i); i = k;
+    return true;
+}
+
+// One field of a template in a page's wikitext: "|direct3d versions = 12, 11<ref>...</ref>" -> "12, 11".
+static std::string WikiField(const std::string &wt, size_t from, size_t to, const std::string &name)
+{
+    for (size_t p = from; (p = wt.find('|', p)) != std::string::npos && p < to; p++)
+    {
+        size_t q = p + 1;
+        while (q < to && (wt[q] == ' ' || wt[q] == '\t')) q++;
+        if (LowerA(wt.substr(q, name.size())) != name) continue;
+        q += name.size();
+        while (q < to && (wt[q] == ' ' || wt[q] == '\t')) q++;
+        if (q >= to || wt[q] != '=') continue;
+        size_t e = wt.find('\n', q);
+        std::string v = wt.substr(q + 1, (e == std::string::npos || e > to ? to : e) - q - 1);
+        for (const char *cut : { "<ref", "<!--", "{{" }) { size_t c = v.find(cut); if (c != std::string::npos) v.resize(c); }
+        while (!v.empty() && isspace((unsigned char)v.back())) v.pop_back();
+        while (!v.empty() && isspace((unsigned char)v.front())) v.erase(0, 1);
+        return v;
+    }
+    return {};
+}
+
+// What a page says: its graphics APIs (the {{API}} box) and its Steam app ids (the {{Infobox game}}).
+struct WikiPage { bool hasApi = false; unsigned apis = 0; std::string text; std::set<std::string> appids; };
+
+static WikiPage ParseWikiPage(const std::string &wt)
+{
+    WikiPage w;
+    size_t ib = wt.find("{{Infobox game");
+    if (ib != std::string::npos)
+    {
+        size_t ie = wt.find("\n}}", ib);
+        if (ie == std::string::npos) ie = wt.size();
+        for (const char *f : { "steam appid", "steam appid side" })
+        {
+            std::string v = WikiField(wt, ib, ie, f) + ",";
+            std::string cur;
+            for (char c : v) { if (isdigit((unsigned char)c)) cur += c; else { if (!cur.empty()) w.appids.insert(cur); cur.clear(); } }
+        }
+    }
+    size_t ab = std::string::npos;
+    for (size_t p = 0; (p = wt.find("{{API", p)) != std::string::npos; p += 5)
+        if (p + 5 < wt.size() && (wt[p + 5] == '\n' || wt[p + 5] == '|' || wt[p + 5] == ' ')) { ab = p; break; }
+    if (ab != std::string::npos)
+    {
+        size_t ae = wt.find("\n}}", ab);
+        if (ae == std::string::npos) ae = wt.size();
+        w.hasApi = true;
+        PcgwParseRow(WikiField(wt, ab, ae, "direct3d versions"), WikiField(wt, ab, ae, "vulkan versions"),
+                     WikiField(wt, ab, ae, "opengl versions"), w.apis, w.text);
+    }
+    return w;
+}
+
+static std::string WikiTitle(std::string t)
+{
+    for (auto &c : t) if (c == '_') c = ' ';
+    while (!t.empty() && t.back() == ' ') t.pop_back();
+    return t;
+}
+
+// Store names carry marks the wiki's page titles don't ("DOOM®", "Hades™").
+static std::string PcgwCleanName(const std::string &n)
+{
+    std::string o;
+    for (size_t i = 0; i < n.size(); i++)
+    {
+        if (n.compare(i, 2, "\xC2\xAE") == 0 || n.compare(i, 2, "\xC2\xA9") == 0) { i++; continue; }    // (R) (C)
+        if (n.compare(i, 3, "\xE2\x84\xA2") == 0) { i += 2; continue; }                                 // TM
+        o += n[i];
+    }
+    while (!o.empty() && o.back() == ' ') o.pop_back();
+    return o;
+}
+
+// PCGamingWiki no longer answers anonymous Cargo (database) queries ("You don't have permission to run arbitrary
+// Cargo queries"), so the Manager reads the pages themselves through the standard MediaWiki API, which still
+// works: up to 20 pages per request by title (redirects followed), each page's {{API}} box parsed for the Direct3D,
+// Vulkan and OpenGL versions. A Steam game must land on a page that lists its app id; when its name doesn't, the
+// wiki's own Steam redirect (api/appid.php) gives the page, one request per game.
+struct WikiBatch { std::map<std::string, std::string> resolved; std::map<std::string, WikiPage> pages; std::set<std::string> missing; };
+
+static bool WikiFetch(const std::vector<std::string> &titles, WikiBatch &out, std::string &err)
+{
+    std::string t;
+    for (auto &x : titles) { if (!t.empty()) t += "|"; t += x; }
+    const std::string url = "https://www.pcgamingwiki.com/w/api.php?action=query&format=json&formatversion=2&redirects=1"
+                            "&prop=revisions&rvprop=content&rvslots=main&titles=" + UrlEncode(t);
+    std::string body, e;
+    bool ok = false;
+    for (int attempt = 0; attempt < 2 && !ok; attempt++)
+    {
+        if (attempt) Sleep(3000);
+        body.clear(); e.clear();
+        ok = HttpGet(W(url), body, e);
+        if (ok && body.find("\"query\"") == std::string::npos)
+        {
+            ok = false;
+            size_t p = body.find("\"info\"");
+            e = p != std::string::npos ? JsonString(body.substr(p), "info") : "unexpected answer";
+        }
+    }
+    if (!ok) { err = e; return false; }
+    Jv root; size_t i = 0;
+    if (!JsonParse(body, i, root) || !root.get("query")) { err = "unreadable answer"; return false; }
+    const Jv &q = *root.get("query");
+    std::map<std::string, std::string> hop;                    // requested title -> normalized -> redirect target
+    for (const char *k : { "normalized", "redirects" })
+        if (const Jv *l = q.get(k)) for (auto &n : l->a) hop[n.str("from")] = n.str("to");
+    for (auto &x : titles)
+    {
+        std::string cur = x;
+        for (int n = 0; n < 4 && hop.count(cur); n++) cur = hop[cur];
+        out.resolved[x] = cur;
+    }
+    if (const Jv *pages = q.get("pages"))
+        for (auto &p : pages->a)
+        {
+            const std::string title = p.str("title");
+            if (p.get("missing") || p.get("invalid")) { out.missing.insert(title); continue; }
+            const Jv *revs = p.get("revisions");
+            if (!revs || revs->a.empty()) continue;            // over the answer's size limit: looked up again next scan
+            const Jv *slots = revs->a[0].get("slots");
+            const Jv *main = slots ? slots->get("main") : nullptr;
+            if (!main) continue;
+            out.pages[title] = ParseWikiPage(main->str("content"));
+        }
+    return true;
+}
+
+// The wiki's Steam redirect: api/appid.php?appid=N answers with a redirect to the game's page.
+static bool WikiAppidTitle(const std::string &appid, std::string &title, std::string &err)
+{
+    std::string body, e;
+    std::wstring loc;
+    if (!HttpGet(L"https://www.pcgamingwiki.com/api/appid.php?appid=" + W(appid), body, e, nullptr, L"", &loc)) { err = e; return false; }
+    std::string l = U8(loc);
+    if (l.empty())
+    {   // answered with a page instead of a redirect: its canonical link names it
+        size_t p = body.find("rel=\"canonical\" href=\"");
+        if (p != std::string::npos) { p += 23; l = body.substr(p, body.find('"', p) - p); }
+    }
+    size_t w = l.find("/wiki/");
+    title.clear();
+    if (w == std::string::npos) return true;                     // no page for this app id
+    std::string enc = l.substr(w + 6), dec;
+    if (size_t qm = enc.find_first_of("?#"); qm != std::string::npos) enc.resize(qm);
+    for (size_t k = 0; k < enc.size(); k++)
+    {
+        if (enc[k] == '%' && k + 2 < enc.size()) { dec += (char)strtol(enc.substr(k + 1, 2).c_str(), nullptr, 16); k += 2; }
+        else dec += enc[k];
+    }
+    title = WikiTitle(dec);
+    if (title.rfind("Special:", 0) == 0) title.clear();         // a search page: not on the wiki
+    return true;
+}
+
 std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const std::string &)> &progress)
 {
     std::vector<Game *> want;
@@ -1117,109 +1364,117 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
     }
     if (want.empty()) return {};
     std::string err;
-    // One query per batch of games, at most 25 and at most ~3,000 characters of encoded conditions: names
-    // (non-Steam games, each with its edition variants) make long URLs, and a URL that is too long failed the
-    // whole lookup, so every game after it showed "?" for its APIs.
-    auto cond = [](const Game &g) {
-        std::string w;
-        if (!g.appid.empty()) return "Infobox_game.Steam_AppID HOLDS \"" + g.appid + "\"";
-        for (const std::string &v : PcgwNames(g.name))
-        {
-            std::string n;
-            for (char c : v) { if (c == '"' || c == '\\') n += '\\'; n += c; }
-            if (!w.empty()) w += " OR ";
-            w += "Infobox_game._pageName=\"" + n + "\"";
-        }
-        return w;
+    size_t failedInRow = 0, notLooked = 0;
+    bool stopped = false;
+    std::set<Game *> settled;                                    // found, or definitely not on the wiki
+    auto fail = [&](const std::string &e, size_t n) {
+        notLooked += n;
+        err = "PCGamingWiki: " + e;
+        if (++failedInRow >= 2) stopped = true;
     };
-    std::vector<std::pair<size_t, size_t>> batches;   // [first, end) into want
-    for (size_t a = 0; a < want.size();)
+    auto record = [&](Game &g, const std::string &page, const WikiPage &w) {
+        PcgwEntry en;
+        en.when = now;
+        en.found = true;                                          // the page exists; apis 0 = its API box lists none
+        en.apis = w.apis;
+        en.text = w.text;
+        if (w.hasApi && NormName(page) != NormName(g.name)) en.text += " (page \"" + page + "\")";
+        std::lock_guard<std::mutex> l(g_pcgwLock);
+        g_pcgw[PcgwKey(g)] = en;
+        settled.insert(&g);
+    };
+    auto notFound = [&](Game &g) {
+        PcgwEntry en; en.when = now;
+        std::lock_guard<std::mutex> l(g_pcgwLock);
+        g_pcgw[PcgwKey(g)] = en;
+        settled.insert(&g);
+    };
+
+    // 1. By name: every game's name and its edition variants, 20 titles a request.
+    std::vector<std::pair<Game *, std::string>> asks;
+    for (Game *g : want) for (const std::string &v : PcgwNames(PcgwCleanName(g->name))) if (!v.empty()) asks.push_back({ g, v });
+    std::vector<Game *> needAppid;
+    for (size_t a = 0; a < asks.size() && !stopped;)
     {
         size_t b = a, len = 0;
-        while (b < want.size() && b - a < 25)
+        std::vector<std::string> titles;
+        while (b < asks.size() && titles.size() < 20)
         {
-            const size_t l = UrlEncode(cond(*want[b])).size() + 8;
-            if (b > a && len + l > 3000) break;
-            len += l; b++;
+            const size_t l = UrlEncode(asks[b].second).size() + 3;
+            if (!titles.empty() && len + l > 3000) break;
+            len += l; titles.push_back(asks[b].second); b++;
         }
-        batches.push_back({ a, b });
-        a = b;
-    }
-    size_t done = 0, failedInRow = 0, failed = 0;
-    for (auto [i, iEnd] : batches)
-    {
-        if (progress) progress("Looking up graphics APIs on PCGamingWiki (" + std::to_string(done) + "/" + std::to_string(want.size()) + ")");
-        done = iEnd;
-        std::string where;
-        for (size_t k = i; k < iEnd; k++) { if (!where.empty()) where += " OR "; where += cond(*want[k]); }
-        std::string url = "https://www.pcgamingwiki.com/w/api.php?action=cargoquery&format=json&limit=500"
-                          "&tables=Infobox_game,API&join_on=Infobox_game._pageName%3DAPI._pageName"
-                          "&fields=Infobox_game._pageName%3DPage,Infobox_game.Steam_AppID%3DAppid,"
-                          "API.Direct3D_versions%3DD3D,API.Vulkan_versions%3DVK,API.OpenGL_versions%3DGL"
-                          "&where=" + UrlEncode(where);
-        // An error page or a rate-limit answer has no "cargoquery" list: don't record those games as "not on the
-        // wiki" for a week because of it. One retry after a pause, then the batch is skipped (looked up again on
-        // the next scan) and the others go on; two failed batches in a row stop the lookup (offline, or the wiki
-        // is refusing us).
-        std::string body, e;
-        bool ok = false;
-        for (int attempt = 0; attempt < 2 && !ok; attempt++)
+        if (progress) progress("Looking up graphics APIs on PCGamingWiki (" + std::to_string(a) + "/" + std::to_string(asks.size()) + " names)");
+        WikiBatch wb;
+        std::string e;
+        if (!WikiFetch(titles, wb, e))
         {
-            if (attempt) Sleep(3000);
-            body.clear(); e.clear();
-            ok = HttpGet(W(url), body, e);
-            if (ok && body.find("\"cargoquery\"") == std::string::npos) { ok = false; e = "unexpected answer"; }
-        }
-        if (!ok)
-        {
-            failed += iEnd - i;
-            err = "PCGamingWiki: " + e + " -- " + std::to_string(failed) + " games not looked up; they're tried again on the next scan";
-            if (++failedInRow >= 2) { failed = want.size() - i; err = "PCGamingWiki: " + e + " -- " + std::to_string(failed) +
-                                      " games not looked up; they're tried again on the next scan"; break; }
+            std::set<Game *> gs;
+            for (size_t k = a; k < b; k++) gs.insert(asks[k].first);
+            fail(e, gs.size());
+            a = b;
             continue;
         }
         failedInRow = 0;
-        if (iEnd < want.size()) Sleep(500);   // be gentle with the wiki between batches
-        std::lock_guard<std::mutex> l(g_pcgwLock);
-        std::set<std::string> hit;
-        std::map<std::string, int> hitScore;   // several pages can list the same Steam AppID (mods, remasters): best name wins
-        for (size_t p = 0; (p = body.find("\"title\"", p)) != std::string::npos; p += 7)
+        for (size_t k = a; k < b; k++)
         {
-            size_t end = body.find('}', p);
-            std::string obj = body.substr(p, end == std::string::npos ? std::string::npos : end - p);
-            std::string page = JsonString(obj, "Page"), ids = JsonString(obj, "Appid");
-            PcgwEntry en;
-            en.when = now;
-            en.found = true;
-            PcgwParseRow(JsonString(obj, "D3D"), JsonString(obj, "VK"), JsonString(obj, "GL"), en.apis, en.text);
-            for (size_t k = i; k < iEnd; k++)
-            {
-                Game &g = *want[k];
-                bool match = false;
-                if (!g.appid.empty())
-                {
-                    std::string list = "," + ids + ",";
-                    for (auto &c : list) if (c == ' ') c = ',';
-                    match = list.find("," + g.appid + ",") != std::string::npos;
-                }
-                else for (const std::string &v : PcgwNames(g.name)) if (LowerA(page) == LowerA(v)) match = true;
-                if (!match) continue;
-                // The page named like the game beats other pages with its AppID; otherwise the first page stays.
-                const int score = NormName(page) == NormName(g.name) ? 2 : 1;
-                const std::string key = PcgwKey(g);
-                if (hit.count(key) && hitScore[key] >= score) continue;
-                PcgwEntry e2 = en;
-                if (score < 2 && !page.empty()) e2.text += " (page \"" + page + "\")";
-                g_pcgw[key] = e2; hit.insert(key); hitScore[key] = score;
-            }
+            Game &g = *asks[k].first;
+            if (settled.count(&g)) continue;
+            const std::string page = wb.resolved[asks[k].second];
+            auto it = wb.pages.find(page);
+            if (it == wb.pages.end()) continue;
+            if (!g.appid.empty() && !it->second.appids.count(g.appid)) continue;   // same name, another game
+            record(g, page, it->second);
         }
-        for (size_t k = i; k < iEnd; k++)
-            if (!hit.count(PcgwKey(*want[k]))) { PcgwEntry en; en.when = now; g_pcgw[PcgwKey(*want[k])] = en; }
-        PcgwSave();   // after every batch: a closed Manager or a later failure keeps what was found so far
+        a = b;
+        if (a < asks.size()) Sleep(300);                                          // be gentle with the wiki
+        std::lock_guard<std::mutex> l(g_pcgwLock);
+        PcgwSave();                                                               // keep what was found so far
     }
+    // 2. Steam games whose name didn't lead to their page: the wiki's app id redirect, then the pages it names.
+    for (Game *g : want) if (!settled.count(g) && !g->appid.empty()) needAppid.push_back(g);
+    std::vector<std::pair<Game *, std::string>> byId;
+    for (size_t k = 0; k < needAppid.size() && !stopped; k++)
+    {
+        if (progress) progress("Looking up graphics APIs on PCGamingWiki (Steam ids " + std::to_string(k) + "/" + std::to_string(needAppid.size()) + ")");
+        std::string title, e;
+        if (!WikiAppidTitle(needAppid[k]->appid, title, e)) { fail(e, 1); continue; }
+        failedInRow = 0;
+        if (title.empty()) notFound(*needAppid[k]);
+        else byId.push_back({ needAppid[k], title });
+        Sleep(150);
+    }
+    for (size_t a = 0; a < byId.size() && !stopped;)
+    {
+        std::vector<std::string> titles;
+        size_t b = a;
+        while (b < byId.size() && titles.size() < 20) titles.push_back(byId[b++].second);
+        WikiBatch wb;
+        std::string e;
+        if (!WikiFetch(titles, wb, e)) { fail(e, b - a); a = b; continue; }
+        failedInRow = 0;
+        for (size_t k = a; k < b; k++)
+        {
+            const std::string page = wb.resolved[byId[k].second];
+            auto it = wb.pages.find(page);
+            if (it != wb.pages.end()) record(*byId[k].first, page, it->second);
+            else if (wb.missing.count(page)) notFound(*byId[k].first);
+        }
+        a = b;
+        if (a < byId.size()) Sleep(300);
+    }
+    // 3. Name-only games that no title matched, after an answer for every request: not on the wiki (asked again in 7 days).
+    if (!stopped && notLooked == 0)
+        for (Game *g : want) if (!settled.count(g) && g->appid.empty()) notFound(*g);
     {
         std::lock_guard<std::mutex> l(g_pcgwLock);
         PcgwSave();
+    }
+    if (!err.empty())
+    {
+        size_t left = 0;
+        for (Game *g : want) if (!settled.count(g)) left++;
+        err += " -- " + std::to_string(left) + " games not looked up; they're tried again on the next scan";
     }
     return err;
 }
@@ -2508,8 +2763,10 @@ std::string UninstallVulkanLayer()
 
 // ------------------------------------------------------------------ GitHub
 
+// redirectTo: don't follow a redirect; a 3xx answer returns true with its Location here (empty if none).
 static bool HttpGet(const std::wstring &url, std::string &body, std::string &err,
-                    const std::function<void(size_t, size_t)> &prog, const std::wstring &extraHeaders)
+                    const std::function<void(size_t, size_t)> &prog, const std::wstring &extraHeaders,
+                    std::wstring *redirectTo)
 {
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
@@ -2519,15 +2776,24 @@ static bool HttpGet(const std::wstring &url, std::string &body, std::string &err
     uc.lpszHostName = host; uc.dwHostNameLength = 256;
     uc.lpszUrlPath = path; uc.dwUrlPathLength = (DWORD)pathBuf.size();
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) { err = "Bad URL"; return false; }
-    HINTERNET s = WinHttpOpen(L"BFIPresenterManager", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, nullptr, nullptr, 0);
-    if (!s) s = WinHttpOpen(L"BFIPresenterManager", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
+    // Wikis (PCGamingWiki) block or throttle clients that don't say who they are: name, version and a contact.
+    static const wchar_t *kAgent = L"BFIPresenterManager/" MANAGER_VERSION_W L" (https://github.com/artzox/BFI-Presenter)";
+    HINTERNET s = WinHttpOpen(kAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, nullptr, nullptr, 0);
+    if (!s) s = WinHttpOpen(kAgent, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
     HINTERNET c = s ? WinHttpConnect(s, host, uc.nPort, 0) : nullptr;
     HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path, nullptr, nullptr, nullptr,
                                          uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : nullptr;
     bool ok = false;
     if (r)
     {
-        std::wstring hdrs = L"Accept: application/vnd.github+json, application/octet-stream\r\n" + extraHeaders;
+        if (redirectTo)
+        {
+            DWORD off = WINHTTP_DISABLE_REDIRECTS;
+            WinHttpSetOption(r, WINHTTP_OPTION_DISABLE_FEATURE, &off, sizeof(off));
+        }
+        const bool gh = Lower(host).find(L"github") != std::wstring::npos;
+        std::wstring hdrs = std::wstring(gh ? L"Accept: application/vnd.github+json, application/octet-stream\r\n"
+                                            : L"Accept: application/json, text/html;q=0.8, */*;q=0.5\r\n") + extraHeaders;
         const wchar_t *hdr = hdrs.c_str();
         if (WinHttpSendRequest(r, hdr, (DWORD)-1, nullptr, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr))
         {
@@ -2549,6 +2815,14 @@ static bool HttpGet(const std::wstring &url, std::string &body, std::string &err
                 if (prog) prog(body.size(), total);
             }
             ok = status == 200;
+            if (redirectTo && status >= 300 && status < 400)
+            {
+                wchar_t loc[2048]{};
+                DWORD lz = sizeof(loc);
+                redirectTo->clear();
+                if (WinHttpQueryHeaders(r, WINHTTP_QUERY_LOCATION, nullptr, loc, &lz, nullptr)) *redirectTo = loc;
+                ok = true;
+            }
             if (!ok) err = "HTTP " + std::to_string(status);
         }
         else err = "Couldn't reach " + U8(host) + " (error " + std::to_string(GetLastError()) + ")";
