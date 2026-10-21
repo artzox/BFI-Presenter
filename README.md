@@ -89,6 +89,13 @@ If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that
 - [Latency estimates](docs/latency.md) for the main setups.
 - [Changelog](CHANGELOG.md).
 
+## Tools
+
+In the release's `BFIPresenter-Tools` zip:
+
+- [Log analyzer](tools/log-analyzer/README.md): an offline page. Drop in a session's timing logs and `ReShade.log` to see, per setting, how many flashes showed a new frame, repeated or skipped one, the latency, and which setting ran most evenly. **Copy summary** gives Markdown for an issue.
+- [Motion test](tools/motion-test/README.md): `BFIMotionTest.exe`, a small Direct3D 12 program with moving test patterns that ReShade and the presenter hook like a game, to compare settings on the same picture on any display.
+
 ## Updating many games
 
 Use the [manager app](manager/README.md): point it at the new release (**Check GitHub**, or **Use folder...** with both zips extracted into one folder) and press **Update outdated**. Every replaced file is backed up, and **Undo last change** puts it back per game.
@@ -101,6 +108,7 @@ The older PowerShell scripts (`scripts/Find-BFIPresenter.ps1`, `scripts/Update-B
 |---|---|---|
 | DX add-on | `dx/build_mingw.sh` | `dx/build_msvc.bat` from an x64 Native Tools prompt |
 | Manager app | `manager/build_mingw.sh` | — |
+| Motion test | `tools/motion-test/build_mingw.sh` | — |
 | Vulkan layer | `vulkan/build_mingw.sh` (64- and 32-bit; recompiles the shaders if `glslangValidator` is installed) | — |
 
 All headers needed are in [`third_party`](third_party/README.md).
@@ -114,6 +122,7 @@ manager/     BFIPresenterManager.exe source (finds games, installs and updates)
 shader/      BFIPresenter_Shader.fx (the BFI shader: game-clocked BFI as a ReShade effect)
 scripts/     Find-/Update-BFIPresenter.ps1 (older command-line updater)
 docs/        tested games, latency estimates
+tools/       log analyzer page, motion test program
 third_party/ ReShade, Dear ImGui and Vulkan headers
 BFIPresenter.example.ini   shared settings reference
 ```
