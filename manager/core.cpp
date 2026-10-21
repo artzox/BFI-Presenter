@@ -804,8 +804,14 @@ static bool SkipExe(const std::wstring &nameLower)
         L"helper", L"touchup", L"activation", L"physx", L"oalinst", L"vc_redist", L"ue4prereq", L"ueprereq",
         L"dowser", L"quicksfv", L"7z", L"python", L"java", L"node.exe", L"steamerrorreporter", L"ffmpeg",
         L"epiconlineservices", L"eossdk", L"galaxy", L"benchmark", L"server", L"editor", L"modmanager" };
+    // Game names that contain one of those words inside another word: Observer ("server"), Crash Bandicoot
+    // ("crash"). They're taken out of the name before the check.
+    static const wchar_t *whole[] = { L"observer", L"preserver", L"crashbandicoot", L"crashteam", L"crash_bandicoot" };
+    std::wstring n = nameLower;
+    for (auto w : whole)
+        for (size_t p; (p = n.find(w)) != std::wstring::npos;) n.erase(p, wcslen(w));
     for (auto b : bad)
-        if (nameLower.find(b) != std::wstring::npos) return true;
+        if (n.find(b) != std::wstring::npos) return true;
     return false;
 }
 
