@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.17-g4"
+#define BFI_ADDON_VERSION "1.0.17-g5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -106,7 +106,9 @@ struct Settings
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
     int   lcdGradual = 0;    // LCD saver mode: 0 Immediate (fade, shift, fade back), 1 Gradual (the lit window drifts slowly)
-    int   lcdGradSec = 120;  // Gradual: seconds for the lit window to drift through the whole cycle (20-900)
+    int   lcdGradSec = 1000; // Gradual: seconds for the lit window to drift through the whole cycle (20-1200)
+    int   lcdHoldSec = 120;  // Gradual at 2 frames: seconds held sharp between drifts (0 = drift continuously; 0-600)
+    int   lcdDriftSec = 10;  // Gradual at 2 frames: seconds one drift to the other refresh takes (2-60)
     float rollSeam = 0.0f;    // blended zone between bands, fraction of the screen height
     float rollDecay = 0.2f;   // rolling scan phosphor decay, in sub-frames (0 = off: hard bands + seam)
     float knee     = 0.75f;
@@ -226,9 +228,11 @@ static void LoadSettings(Settings &s)
     s.lcdSwap  = IniInt("LcdPhaseSwap", 0) ? 1 : 0;
     s.lcdSwapSec = IniInt("LcdPhaseSwapSeconds", 5);
     s.lcdGradual = IniInt("LcdSaverGradual", 0) ? 1 : 0;
-    s.lcdGradSec = IniInt("LcdGradualSeconds", 120);
+    s.lcdGradSec = IniInt("LcdGradualSeconds", 1000);
     if (s.lcdGradSec < 20) s.lcdGradSec = 20;
-    if (s.lcdGradSec > 900) s.lcdGradSec = 900;
+    if (s.lcdGradSec > 1200) s.lcdGradSec = 1200;
+    s.lcdHoldSec = std::min(600, std::max(0, IniInt("LcdGradualHoldSeconds", 120)));
+    s.lcdDriftSec = std::min(60, std::max(2, IniInt("LcdGradualDriftSeconds", 10)));
     if (s.lcdSwapSec < 1) s.lcdSwapSec = 1;
     if (s.lcdSwapSec > 300) s.lcdSwapSec = 300;
     s.rollSeam = IniFloat("RollingSeam", 0.0f);
@@ -379,6 +383,8 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("LcdPhaseSwapSeconds", s.lcdSwapSec);
     IniWriteInt("LcdSaverGradual", s.lcdGradual);
     IniWriteInt("LcdGradualSeconds", s.lcdGradSec);
+    IniWriteInt("LcdGradualHoldSeconds", s.lcdHoldSec);
+    IniWriteInt("LcdGradualDriftSeconds", s.lcdDriftSec);
     IniWriteFloat("RollingSeam", s.rollSeam);
     IniWriteFloat("RollingPhosphorDecay", s.rollDecay);
     IniWriteFloat("RolloffKnee", s.knee);
@@ -2244,6 +2250,7 @@ static DWORD WINAPI PresenterThread(void *)
     int      swapState = 0;          // 0 idle, 1 fading to the steady picture, 2 fading back
     float    soften = 0.0f;          // current fade (0 = full strobe, 1 = steady average)
     double   gradPhase = 0.0;        // LCD gradual saver: lit window start within the first sub-frame, 0..1
+    double   gradHold = -1.0;        // LCD gradual saver at 2 frames: refreshes left to hold sharp (-1 = start a hold)
     int secFrameRepeats = 0, secFrameSkips = 0, extraCycles = 0;
     // Strobe cycles whose step differs from the expected one: at the Refresh
     // cap at 120 fps every lit refresh moves on 2 frames (the one between is
@@ -2785,11 +2792,21 @@ static DWORD WINAPI PresenterThread(void *)
         {
             soften = 0.0f; swapState = 0;
             const double hzG = modeHz > 0.0 ? modeHz : 120.0;
-            gradPhase = std::min(1.0, gradPhase + (double)s.frames / ((double)s.lcdGradSec * hzG));
+            if (s.frames == 2 && s.lcdHoldSec > 0)
+            {
+                // 2 frames per cycle: hold, drift, hold. Mid-drift the light is split across both refreshes
+                // and motion softens, so the window sits sharp on one refresh for LcdGradualHoldSeconds and
+                // only then drifts to the other over LcdGradualDriftSeconds.
+                if (gradPhase <= 0.0 && gradHold < 0.0) gradHold = (double)s.lcdHoldSec * hzG;
+                if (gradHold > 0.0) gradHold -= 1.0;
+                else gradPhase = std::min(1.0, gradPhase + 1.0 / ((double)s.lcdDriftSec * hzG));
+            }
+            else gradPhase = std::min(1.0, gradPhase + (double)s.frames / ((double)s.lcdGradSec * hzG));
             if (gradPhase >= 1.0 && slotNow == (uint32_t)s.frames - 1)
             {
                 phaseShift++;
                 gradPhase = 0.0;
+                gradHold = -1.0;
             }
         }
         else if (s.lcdSwap && s.enabled && (s.frames % 2) == 0)
@@ -2813,7 +2830,7 @@ static DWORD WINAPI PresenterThread(void *)
                 if (soften <= 0.0f) { swapState = 0; lastPhaseSwapT = tNow; }   // interval counts full-strobe time
             }
         }
-        else { soften = 0.0f; swapState = 0; gradPhase = 0.0; }
+        else { soften = 0.0f; swapState = 0; gradPhase = 0.0; gradHold = -1.0; }
         if (!tickedAtVb)
         {
             g_tickT.store(Now());
@@ -7310,15 +7327,23 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Immediate: every N seconds the strobe fades to a steady picture, shifts by one refresh and\n"
                                                           "fades back. Best at 2 frames per cycle (e.g. 120 Hz).\n"
                                                           "Gradual: the lit window drifts later by a tiny fraction of a refresh every refresh, so it\n"
-                                                          "visits every refresh of the cycle once per period, with no fade. Meant for 4 or more\n"
-                                                          "frames per cycle (e.g. 240 Hz and up); at 2 frames the drift softens motion for a while\n"
-                                                          "in each turn. Plain strobe only: with Sine BFI, Invert cycle or Rolling scan, Immediate is used.\n"
+                                                          "visits every refresh of the cycle once per period, with no fade and no stutter. At 4 or\n"
+                                                          "more frames per cycle (e.g. 240 Hz and up) it drifts continuously. At 2 frames it holds\n"
+                                                          "sharp on one refresh, then drifts to the other over a few seconds and holds again, since\n"
+                                                          "mid-drift motion is softer. Plain strobe only: with Sine BFI, Invert cycle or Rolling scan,\n"
+                                                          "Immediate is used.\n"
                                                           "Design after the Blur Busters CRT beam simulator's LCD Saver.");
             if (s.lcdGradual)
             {
-                ImGui::SliderInt("Seconds per full drift", &s.lcdGradSec, 20, 900);
+                if (s.frames == 2)
+                {
+                    ImGui::SliderInt("Hold seconds (0 = drift continuously)", &s.lcdHoldSec, 0, 600);
+                    if (s.lcdHoldSec > 0) ImGui::SliderInt("Drift seconds", &s.lcdDriftSec, 2, 60);
+                    else ImGui::SliderInt("Seconds per full drift", &s.lcdGradSec, 20, 1200);
+                    ImGui::TextDisabled("2 frames per cycle: holds sharp, drifts briefly to the other refresh, holds again.");
+                }
+                else ImGui::SliderInt("Seconds per full drift", &s.lcdGradSec, 20, 1200);
                 if (s.sine || s.invert || s.rolling) ImGui::TextDisabled("Sine BFI / Invert cycle / Rolling scan on: Immediate is used.");
-                else if (s.frames == 2) ImGui::TextDisabled("2 frames per cycle: Immediate is recommended (the drift softens motion for a while).");
             }
             else ImGui::SliderInt("Seconds between phase swaps", &s.lcdSwapSec, 1, 300);
             if (s.frames % 2) ImGui::TextDisabled("Odd frames per cycle: the lit refresh already alternates, nothing to do.");
