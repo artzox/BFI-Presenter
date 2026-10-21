@@ -1746,9 +1746,11 @@ void Detect(Game &g)
             g.notes.push_back("Direct3D 8 game: a d3d8.dll is next to the executable (d3d8to9, if it's crosire's), so it runs "
                               "through Direct3D 9 with ReShade as d3d9.dll and the DX add-on.");
         else
-            g.notes.push_back("Direct3D 8 game: BFI Presenter works through Direct3D 9. Put d3d8to9's d3d8.dll (by crosire, "
-                              "github.com/crosire/d3d8to9) next to the executable; Install ReShade then copies ReShade as d3d9.dll. "
-                              "Or run ReShade's own setup and pick Direct3D 8, which downloads d3d8to9 for you. Needs ReShade 6.8 or newer.");
+            g.notes.push_back("Direct3D 8 game: BFI Presenter works through Direct3D 9. Download the "
+                              "[d3d8to9 converter](https://github.com/crosire/d3d8to9) by crosire and put the d3d8.dll next to the "
+                              "executable to translate DX8 to DX9. The \"Install ReShade\" button then adds the d3d9.dll file, "
+                              "necessary for ReShade to hook into the game. Or run ReShade's own setup and pick Direct3D 8, which "
+                              "downloads d3d8to9 for you. Needs ReShade 6.8 or newer.");
     }
     if (g.reshade && Lower(NameOf(g.reshadeDll.path)).rfind(L"reshade", 0) == 0)
         g.notes.push_back("ReShade is loaded as " + U8(NameOf(g.reshadeDll.path)) + (g.optiscaler ? " by OptiScaler." : " by another loader."));

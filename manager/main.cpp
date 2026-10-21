@@ -1423,6 +1423,73 @@ static void ReShadeVersionCombo(float width)
             "Some games only start with an older one. Direct3D 9 games need 6.8 or newer for BFI Presenter.");
 }
 
+// A note with optional links written as [label](url): plain notes wrap as usual; with a link the words are laid out
+// one by one so the link sits in the running text and opens in the browser.
+static void NoteText(const std::string &n)
+{
+    if (n.find("](") == std::string::npos)
+    {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextUnformatted(n.c_str());
+        ImGui::PopTextWrapPos();
+        return;
+    }
+    struct Word { std::string t, url; };
+    std::vector<Word> words;
+    auto addWords = [&](const std::string &s, const std::string &url) {
+        size_t a = 0;
+        while (a < s.size())
+        {
+            while (a < s.size() && s[a] == ' ') a++;
+            size_t b = s.find(' ', a);
+            if (b == std::string::npos) b = s.size();
+            if (b > a) words.push_back({ s.substr(a, b - a), url });
+            a = b;
+        }
+    };
+    for (size_t p = 0; p < n.size();)
+    {
+        size_t lb = n.find('[', p), mid = lb == std::string::npos ? lb : n.find("](", lb);
+        size_t rp = mid == std::string::npos ? mid : n.find(')', mid);
+        if (rp == std::string::npos) { addWords(n.substr(p), ""); break; }
+        addWords(n.substr(p, lb - p), "");
+        addWords(n.substr(lb + 1, mid - lb - 1), n.substr(mid + 2, rp - mid - 2));
+        p = rp + 1;
+        // punctuation right after a link ("...converter).") sticks to its last word
+        if (p < n.size() && n[p] != ' ' && !words.empty())
+        {
+            size_t e = n.find(' ', p);
+            if (e == std::string::npos) e = n.size();
+            words.push_back({ n.substr(p, e - p), "" });
+            words.back().t = "\x01" + words.back().t;      // marks: no space before it
+            p = e;
+        }
+    }
+    const float x0 = ImGui::GetCursorPosX(), right = ImGui::GetWindowContentRegionMax().x, sp = ImGui::CalcTextSize(" ").x;
+    float x = x0;
+    for (size_t i = 0; i < words.size(); i++)
+    {
+        bool glue = !words[i].t.empty() && words[i].t[0] == '\x01';
+        const std::string t = glue ? words[i].t.substr(1) : words[i].t;
+        const float w = ImGui::CalcTextSize(t.c_str()).x;
+        if (i > 0)
+        {
+            const float gap = glue ? 0.0f : sp;
+            if (x + gap + w > right) { ImGui::SetCursorPosX(x0); x = x0; }   // new line, at the note's indent
+            else { ImGui::SameLine(0, gap); x += gap; }
+        }
+        if (words[i].url.empty()) ImGui::TextUnformatted(t.c_str());
+        else
+        {
+            ImGui::PushID((int)i);
+            if (ImGui::TextLink(t.c_str())) ShellExecuteW(nullptr, L"open", W(words[i].url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            ImGui::PopID();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", words[i].url.c_str());
+        }
+        x += w;
+    }
+}
+
 static void NvidiaControls(Game &g, float lab)
 {
     if (!g_app.nvOk) { ImGui::TextColored(kGrey, "NVIDIA"); ImGui::SameLine(lab); ImGui::TextColored(kGrey, "no NVIDIA driver found"); return; }
@@ -1494,7 +1561,7 @@ static void DrawDetail(HWND)
         return;
     }
     Game &g = g_app.games[g_app.sel];
-    float lab = ImGui::CalcTextSize("BFI Presenter").x + ImGui::GetFontSize() * 1.2f;
+    float lab = ImGui::CalcTextSize("NVIDIA profile").x + ImGui::GetFontSize() * 1.2f;   // the longest label
     ImGui::Text("%s", g.name.c_str());
     ImGui::SameLine();
     ImGui::TextColored(kGrey, "(%s)", g.store.c_str());
@@ -1638,12 +1705,12 @@ static void DrawDetail(HWND)
     ImGui::Spacing();
     NvidiaControls(g, lab);
     ImGui::Spacing();
-    for (auto &n : g.notes)
+    for (size_t i = 0; i < g.notes.size(); i++)
     {
         ImGui::TextColored(kYellow, "  *"); ImGui::SameLine(lab);
-        ImGui::PushTextWrapPos(0);
-        ImGui::TextUnformatted(n.c_str());
-        ImGui::PopTextWrapPos();
+        ImGui::PushID((int)i);
+        NoteText(g.notes[i]);
+        ImGui::PopID();
     }
 
 }
