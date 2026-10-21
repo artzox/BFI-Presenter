@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-101 of 102 tested games and emulators run with BFI: the 52 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; three with the engine's own stutter) and 49 more listed after it. One is partial.
+102 of 103 tested games and emulators run with BFI: the 52 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; three with the engine's own stutter) and 50 more listed after it. One is partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -111,6 +111,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Mafia: Definitive Edition | Standard setup |
 | Mortal Shell | Works with DLSS 5 |
 | Need for Speed (2015) | Standard setup |
+| Observer: System Redux | Holds 120 fps at 4K: Refresh rate cap + Lowest latency |
 | Planet of Lana II | Standard setup |
 | Prodeus | Standard setup |
 | REANIMAL | Works with DLSS 5 |

@@ -7,6 +7,11 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.18] — 2026-10-21
+
+- **[DX] [Vulkan] The overlay's controls no longer move when the status changes.** The status line and the warnings at the top sit in a box of fixed height (7 lines; it scrolls if more are showing), so a warning appearing or going no longer pushes every control below it up or down. **BFI enabled** is now right under the version line, above the box.
+- **[Docs]** Tested games: Observer: System Redux holds 120 fps at 4K with the Refresh rate cap + Lowest latency.
+
 ## [Manager 1.3.8] — 2026-10-21
 
 - **[Manager] Fixed: Observer: System Redux (and Observer) were missing from the list.** Executables with "server" in the name are skipped as dedicated servers, and "Observer" contains it; every exe of the game was skipped, and a game without an exe isn't listed. Words like Observer and Crash Bandicoot are now exempt.
