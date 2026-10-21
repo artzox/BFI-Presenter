@@ -71,7 +71,7 @@ std::string ApiText(unsigned a)
 {
     std::string s;
     auto add = [&](unsigned f, const char *t) { if (a & f) { if (!s.empty()) s += " / "; s += t; } };
-    add(ApiD3D12, "D3D12"); add(ApiD3D11, "D3D11"); add(ApiD3D10, "D3D10"); add(ApiD3D9, "D3D9");
+    add(ApiD3D12, "D3D12"); add(ApiD3D11, "D3D11"); add(ApiD3D10, "D3D10"); add(ApiD3D9, "D3D9"); add(ApiD3D8, "D3D8");
     add(ApiGL, "OpenGL"); add(ApiVulkan, "Vulkan");
     return s.empty() ? "?" : s;
 }
@@ -629,6 +629,7 @@ static unsigned ApisFromImports(const std::set<std::string> &im)
     if (im.count("d3d11.dll")) a |= ApiD3D11;
     if (im.count("d3d10.dll") || im.count("d3d10_1.dll")) a |= ApiD3D10;
     if (im.count("d3d9.dll")) a |= ApiD3D9;
+    if (im.count("d3d8.dll")) a |= ApiD3D8;
     if (im.count("opengl32.dll")) a |= ApiGL;
     if (im.count("vulkan-1.dll")) a |= ApiVulkan;
     return a;
@@ -695,7 +696,7 @@ static void SaveCache()
 static ExeFacts AnalyzeExe(const std::wstring &exe)
 {
     std::wstring key = Lower(exe);
-    std::wstring stamp = L"9_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
+    std::wstring stamp = L"10_" + std::to_wstring(FileSize(exe)) + L"_" + std::to_wstring(FileTime(exe));   // "2_": old-Unity rule added
     {
         std::lock_guard<std::mutex> l(g_cacheLock);
         LoadCache();
@@ -708,7 +709,7 @@ static ExeFacts AnalyzeExe(const std::wstring &exe)
     PeInfo pi = ReadPe(f.view());
     r.bits = pi.bits;
     r.apis = ApisFromImports(pi.imports);
-    const unsigned strong = ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL | ApiVulkan;
+    const unsigned strong = ApiD3D8 | ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL | ApiVulkan;
     std::wstring dir = DirOf(exe);
     std::wstring stem = NameOf(exe);
     if (stem.size() > 4) stem.resize(stem.size() - 4);
@@ -787,7 +788,7 @@ static ExeFacts AnalyzeExe(const std::wstring &exe)
     std::lock_guard<std::mutex> l(g_cacheLock);
     // Engines link renderers the game doesn't ship on Windows (Unreal links opengl32 next to Direct3D): when the
     // executable also uses Direct3D, OpenGL isn't the game's renderer. It stays when it is the only one (Doom 3 BFG).
-    if ((r.apis & ApiGL) && (r.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12))) r.apis &= ~ApiGL;
+    if ((r.apis & ApiGL) && (r.apis & (ApiD3D8 | ApiD3D9 | ApiD3D11 | ApiD3D12))) r.apis &= ~ApiGL;
     g_cache[key] = { stamp, r };
     return r;
 }
@@ -1018,6 +1019,13 @@ static void PcgwLoad()
         e.found = c[2] == "1";
         e.apis = (unsigned)atoi(c[3].c_str());
         e.text = c[4];
+        // entries from before Direct3D 8 was recognised keep "Direct3D 9, 8" in their text: set the flag from it
+        if (e.found && e.text.rfind("Direct3D ", 0) == 0)
+        {
+            std::string d = e.text.substr(9, e.text.find_first_of(";(") - 9);
+            std::string cur;
+            for (char ch : d + ",") { if (isdigit((unsigned char)ch)) cur += ch; else { if (cur == "8") e.apis |= ApiD3D8; cur.clear(); } }
+        }
         g_pcgw[c[0]] = e;
     }
 }
@@ -1071,6 +1079,7 @@ static void PcgwParseRow(const std::string &d3d, const std::string &vk, const st
         else if (x == 11) apis |= ApiD3D11;
         else if (x == 10) apis |= ApiD3D10;
         else if (x == 9) apis |= ApiD3D9;
+        else if (x == 8) apis |= ApiD3D8;
         else if (x == 1 || x == 0) continue;
         if (x >= 2) t += (t.empty() ? "Direct3D " : ", ") + std::to_string(x);
     }
@@ -1640,7 +1649,7 @@ void Detect(Game &g)
         Mapped m(p);
         if (FindNoCase(m.view(), "dxvk")) { g.dxvk = true; break; }
     }
-    if (g.dgvoodoo) g.apis = (g.apis & ~(ApiD3D9 | ApiD3D10)) | ApiD3D11;   // dgVoodoo hands ReShade a D3D11 device
+    if (g.dgvoodoo) g.apis = (g.apis & ~(ApiD3D8 | ApiD3D9 | ApiD3D10)) | ApiD3D11;   // dgVoodoo hands ReShade a D3D11 device
 
     // Where ReShade looks for add-ons: [ADDON] AddonPath in ReShade.ini, else next to ReShade's DLL.
     std::wstring addonDir = g.reshade ? DirOf(g.reshadeDll.path) : dir;
@@ -1673,7 +1682,7 @@ void Detect(Game &g)
 
     // Route
     std::wstring ro = LoadSetting(RouteKey(g.root).c_str(), L"");
-    unsigned dxApis = g.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL);
+    unsigned dxApis = g.apis & (ApiD3D8 | ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL);   // Direct3D 8 through d3d8to9 (Direct3D 9)
     DetectShader(g);
     g.reshadeVkIni = Exists(Join(dir, L"ReShade.ini"));
     g.shaderRecommended = g.tested.find("BFI shader recommended") != std::string::npos;
@@ -1681,11 +1690,11 @@ void Detect(Game &g)
     else if (ro == L"dx") g.route = g.bits == 32 ? Route::Addon32 : Route::Addon64;
     else if (ro == L"shader") g.route = Route::Shader;
     else if (!g.shaderPath.empty() && g.addonPath.empty()) g.route = Route::Shader;       // installed that way
-    else if (g.shaderRecommended && g.addonPath.empty() && (g.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL)))
+    else if (g.shaderRecommended && g.addonPath.empty() && (g.apis & (ApiD3D8 | ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL)))
         g.route = Route::Shader;                                                          // the tested list suggests it
     else if (g.dxvk) g.route = Route::Vulkan;
     // The executable itself can only load Vulkan: that beats a store page or wiki listing Direct3D too (PT-PC).
-    else if ((g.exeApis & ApiVulkan) && !(g.exeApis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL))) g.route = Route::Vulkan;
+    else if ((g.exeApis & ApiVulkan) && !(g.exeApis & (ApiD3D8 | ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL))) g.route = Route::Vulkan;
     else if ((g.apis & ApiVulkan) && g.tested.find("(Vulkan") != std::string::npos) g.route = Route::Vulkan;
     else if (dxApis) g.route = g.bits == 32 ? Route::Addon32 : Route::Addon64;
     else if (g.apis & ApiVulkan) g.route = Route::Vulkan;
@@ -1713,10 +1722,12 @@ void Detect(Game &g)
     if (g.bits == 0) g.notes.push_back("Couldn't read the executable's header; pick the game's .exe below.");
     if (!g.apis)
         g.notes.push_back(std::string("The graphics API wasn't recognised: ") +
-                          (g.pcgwKnown ? "PCGamingWiki's page lists none" : "PCGamingWiki didn't find this game (or wasn't reached; Scan tries again)") +
+                          (g.pcgwKnown ? (g.pcgwText.empty() ? std::string("PCGamingWiki's page lists none")
+                                                             : "PCGamingWiki lists only " + g.pcgwText + ", which BFI Presenter doesn't support")
+                                       : std::string("PCGamingWiki didn't find this game (or wasn't reached; Scan tries again)")) +
                           ", and the executable doesn't show it (a launcher, or an API loaded at run time). The route below is a guess; "
                           "pick the game's own .exe below if this one is a launcher.");
-    if (g.pcgwKnown && g.pcgwApis && g.exeApis && !(g.pcgwApis & g.exeApis & (ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL | ApiVulkan)))
+    if (g.pcgwKnown && g.pcgwApis && g.exeApis && !(g.pcgwApis & g.exeApis & (ApiD3D8 | ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL | ApiVulkan)))
         g.notes.push_back("PCGamingWiki lists " + ApiText(g.pcgwApis) + "; the executable looked like " + ApiText(g.exeApis) +
                           ". The route follows PCGamingWiki.");
     if ((g.apis & ApiD3D12) && (g.apis & ApiVulkan) && !g.dxvk)
@@ -1724,15 +1735,27 @@ void Detect(Game &g)
     if (g.route == Route::Unsupported) g.notes.push_back("Direct3D 10 games aren't supported (try DXVK and the Vulkan layer).");
     if ((g.route == Route::Addon64 || g.route == Route::Addon32) && !g.reshade)
         g.notes.push_back("ReShade isn't installed for this game. Install ReShade (with full add-on support) first: reshade.me");
-    if ((g.route == Route::Addon64 || g.route == Route::Addon32) && g.reshade && (g.apis & ApiD3D9) &&
+    if ((g.route == Route::Addon64 || g.route == Route::Addon32) && g.reshade && (g.apis & (ApiD3D8 | ApiD3D9)) &&
         !(g.apis & (ApiD3D11 | ApiD3D12)) && CompareVersions(g.reshadeDll.version, "6.8") < 0)
         g.notes.push_back("Direct3D 9 needs ReShade 6.8 or newer (installed: " + g.reshadeDll.version + ").");
+    // Direct3D 8: ReShade and the presenter work on Direct3D 9, so the game needs crosire's d3d8to9 (a d3d8.dll that
+    // turns its Direct3D 8 calls into Direct3D 9) next to the exe, with ReShade as d3d9.dll.
+    if ((g.apis & ApiD3D8) && !(g.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12)) && !g.dgvoodoo && !g.exe.empty())
+    {
+        if (Exists(Join(DirOf(g.exe), L"d3d8.dll")))
+            g.notes.push_back("Direct3D 8 game: a d3d8.dll is next to the executable (d3d8to9, if it's crosire's), so it runs "
+                              "through Direct3D 9 with ReShade as d3d9.dll and the DX add-on.");
+        else
+            g.notes.push_back("Direct3D 8 game: BFI Presenter works through Direct3D 9. Put d3d8to9's d3d8.dll (by crosire, "
+                              "github.com/crosire/d3d8to9) next to the executable; Install ReShade then copies ReShade as d3d9.dll. "
+                              "Or run ReShade's own setup and pick Direct3D 8, which downloads d3d8to9 for you. Needs ReShade 6.8 or newer.");
+    }
     if (g.reshade && Lower(NameOf(g.reshadeDll.path)).rfind(L"reshade", 0) == 0)
         g.notes.push_back("ReShade is loaded as " + U8(NameOf(g.reshadeDll.path)) + (g.optiscaler ? " by OptiScaler." : " by another loader."));
     if (g.optiscaler) g.notes.push_back("OptiScaler is installed. Resident Evil 4 hung its GPU with OptiScaler and the presenter.");
     if (g.dxvk && g.bits == 32) g.notes.push_back("DXVK in a 32-bit game: the 32-bit add-on without DXVK usually works better (Twelve Minutes, Alan Wake flickered through DXVK).");
     if (g.dgvoodoo) g.notes.push_back("dgVoodoo is installed: ReShade sees a Direct3D 11 game; use the DX add-on.");
-    if (g.apis & ApiGL && !(g.apis & (ApiD3D11 | ApiD3D12 | ApiD3D9)) && !g.dgvoodoo)
+    if (g.apis & ApiGL && !(g.apis & (ApiD3D11 | ApiD3D12 | ApiD3D9 | ApiD3D8)) && !g.dgvoodoo)
         g.notes.push_back("OpenGL needs an NVIDIA GPU. Old OpenGL games may need the NVIDIA profile setting Vulkan/OpenGL present method = Prefer layered on DXGI swapchain.");
     if (g.addonWrongBits) g.notes.push_back("An add-on for the wrong bitness is installed; Install replaces it with the right one.");
     if (g.route == Route::Vulkan && ExeRunsAsAdmin(g.exe))
@@ -3110,8 +3133,8 @@ std::string InstallReShade(Game &g, const std::string &version, std::string *not
     {
         std::wstring name;
         if (g.optiscaler) name = g.bits == 32 ? L"ReShade32.dll" : L"ReShade64.dll";   // OptiScaler loads it (LoadReshade=true)
-        else if ((g.apis & ApiD3D9) && !(g.apis & (ApiD3D11 | ApiD3D12))) name = L"d3d9.dll";
-        else if ((g.apis & ApiGL) && !(g.apis & (ApiD3D9 | ApiD3D11 | ApiD3D12))) name = L"opengl32.dll";
+        else if ((g.apis & (ApiD3D8 | ApiD3D9)) && !(g.apis & (ApiD3D11 | ApiD3D12))) name = L"d3d9.dll";   // D3D8: through d3d8to9
+        else if ((g.apis & ApiGL) && !(g.apis & (ApiD3D8 | ApiD3D9 | ApiD3D11 | ApiD3D12))) name = L"opengl32.dll";
         else name = L"dxgi.dll";
         dest = Join(dir, name);
         if (Exists(dest))
