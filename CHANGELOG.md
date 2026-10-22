@@ -10,7 +10,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 ## [1.0.18] — 2026-10-21
 
 - **[DX] [Vulkan] The overlay's controls no longer move when the status changes.** The status line and the warnings at the top sit in a box of fixed height (7 lines; it scrolls if more are showing), so a warning appearing or going no longer pushes every control below it up or down. **BFI enabled** is now right under the version line, above the box.
-- **[Docs]** Tested games: Observer: System Redux holds 120 fps at 4K with the Refresh rate cap + Lowest latency. Need for Speed: Porsche Unleashed now recommended with the NFS5 Enhanced mod (its Direct3D 11 renderer) and `BFIPresenter.addon32`, at Refresh rate + Lowest latency, with the CRT-Standalone shader for the full retro look.
+- **[Docs]** Tested games: Observer: System Redux holds 120 fps at 4K with the Refresh rate cap + Lowest latency. Need for Speed: Porsche Unleashed now recommended with the NFS5 Enhanced mod (its Direct3D 11 renderer) and `BFIPresenter.addon32`, at Refresh rate + Lowest latency, with the CRT-Standalone shader for the full retro look. Riven (2023) with DLSS 5 at 4K: XeSS frame generation through OptiScaler, limited to 60 (OptiScaler.ini and Engine.ini settings in the notes), at the Refresh rate cap with the automatic frame cap off.
 
 ## [Manager 1.3.8] — 2026-10-21
 

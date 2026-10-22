@@ -29,7 +29,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Shadow of the Tomb Raider | Working | Works (OptiScaler FSR 3.1 FG) | v0.2 | Standard setup |
 | Alan Wake 2 | Working | Works (2×, 3×); 3× at \~20 fps: Half refresh + Smooth | v0.19 | Standard setup |
 | God of War Ragnarök | Working | Runs, but judders below 60 output fps | v0.24 | Standard setup; RTSS limiter off |
-| Riven (2023) | Working | Not tested | v0.13 | A steady 60 fps for smooth motion |
+| Riven (2023) | Working | Works (OptiScaler XeSS FG, limited to 60) | v0.13 | A steady 60 fps for smooth motion; with DLSS 5 at 4K, XeSS frame generation through OptiScaler limited to 60 (see the notes below) |
 | Onimusha | Working | Works (2×, 3×); Refresh cap | v0.27 | Standard setup |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
 | Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency (Refresh + automatic frame cap also works) |
@@ -161,6 +161,34 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### Riven (2023)
 
 - Motion stutters whenever the frame rate isn't a steady 60 (it ran at 45–77 fps). Half refresh plus settings that hold 60 give smooth motion; DLSS 5 off helps reach it.
+- **With DLSS 5 at 4K (v1.0.18):** the game renders about 45 fps even at DLSS Performance, so it needs frame generation for a steady 60. The game has no DLSS frame generation of its own, and OptiScaler can't add it; **XeSS frame generation through [OptiScaler](https://github.com/optiscaler/OptiScaler) works**, limited to exactly 60 output frames. Very playable for a slow-paced game: 60 of 60 flashes, about 3% repeated, about 43 ms from release to flash. FSR frame generation through OptiScaler ran too, but felt sluggish.
+  - `OptiScaler.ini`:
+
+    ```ini
+    [Upscalers]
+    Dx12Upscaler = dlss
+
+    [FrameGen]
+    FGInput = Upscaler
+    FGOutput = XeFG
+
+    [XeFG]
+    IgnoreInitChecks = true
+    HighResMV = auto
+    ForceBorderless = true
+
+    [Framerate]
+    FramerateLimit = 60
+    ```
+
+    `FramerateLimit` paces the game through XeLL, so XeSS frame generation delivers exactly 60 a second; XeFG doesn't work in exclusive fullscreen, hence `ForceBorderless`.
+  - The game's `Engine.ini` (`%LOCALAPPDATA%\Riven\Saved\Config\Windows\Engine.ini`): turn off DLSS's dilated motion vectors, which XeSS frame generation doesn't take:
+
+    ```ini
+    [SystemSettings]
+    r.NGX.DLSS.DilateMotionVectors=0
+    ```
+  - Presenter: **Refresh rate** cap with the **automatic frame cap off**, Frame pacing Lowest latency. The presenter's own Half cap held XeSS frame generation's presents and the game window stopped responding for seconds at a time; at 72 frame-generated fps without the limit, motion stuttered (12 frames a second dropped unevenly).
 
 ### Onimusha
 
