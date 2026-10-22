@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.18"
+#define BFI_ADDON_VERSION "1.0.18-s1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -691,6 +691,11 @@ static std::atomic<bool> g_dx11{false};
 // (sync interval 0, under the presenter's window), so the game's driver sees
 // its frame boundaries. Off by default: the game's swap chain normally never
 // presents. For games that slow down more and more without it (Wreckfest).
+// DX11GamePresent=2: the same, but through the overlay hooks on the game's
+// swap chain (Steam's), so the Steam overlay sets itself up on the game's own
+// window -- Steam Input (Steam Controller) goes through it. The overlay draws
+// on the game's swap chain, under the presenter's window, so it isn't seen;
+// keep ShowOverlays=0 with it (Steam crashed Wreckfest when it saw both).
 static std::atomic<int> g_gamePresent11{0};
 static IDXGISwapChain3 *g_sc11 = nullptr;          // the game's DX11 swap chain (not AddRef'd)
 static bool IsGame11(void *sc) { return g_dx11.load() && g_active.load() && sc == (void *)g_sc11; }
@@ -5751,10 +5756,16 @@ static HRESULT SubmitGameFrame11(IDXGISwapChain *sc, UINT sync, UINT flags)
             static void **forVt = nullptr;
             void **vt = *(void ***)sc;
             if (forVt != vt) { forVt = vt; direct = (PFN_Present)DirectSlot(vt, VT_Present); }
-            const HRESULT ph = (direct && direct != (PFN_Present)&hk_Present) ? direct(sc, 0, DXGI_PRESENT_DO_NOT_WAIT)
-                                                                                : o_Present(sc, 0, DXGI_PRESENT_DO_NOT_WAIT);
+            const bool viaHooks = g_gamePresent11.load() == 2;
+            const HRESULT ph = (!viaHooks && direct && direct != (PFN_Present)&hk_Present) ? direct(sc, 0, DXGI_PRESENT_DO_NOT_WAIT)
+                                                                                             : o_Present(sc, 0, DXGI_PRESENT_DO_NOT_WAIT);
             static bool logged = false;
-            if (!logged) { logged = true; LOGI("BFI Presenter: DX11: the game's own swap chain presents too (DX11GamePresent=1): 0x%08lX", (unsigned long)ph); }
+            if (!logged)
+            {
+                logged = true;
+                LOGI("BFI Presenter: DX11: the game's own swap chain presents too (DX11GamePresent=%d%s): 0x%08lX", g_gamePresent11.load(),
+                     viaHooks ? ", through the overlay hooks -- for Steam Input / the Steam overlay" : "", (unsigned long)ph);
+            }
         }
         return hr;
     }
