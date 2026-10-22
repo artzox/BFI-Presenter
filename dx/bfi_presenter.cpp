@@ -6913,6 +6913,24 @@ static void on_reshade_present_gl(reshade::api::effect_runtime *runtime)
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+    // A DX11 game that makes a new swap chain for its window while the old one still exists (DARQ, 32-bit
+    // Unity: 4x MSAA at start, a second swap chain with 2x MSAA a second later, then the old one released):
+    // the presenter stayed on the old one, the game presented to the new one under the presenter's window,
+    // and it hung at start. Move the presenter to the new swap chain.
+    if (!resize && g_dx11.load() && swapchain->get_device()->get_api() == reshade::api::device_api::d3d11 &&
+        reinterpret_cast<void *>(swapchain->get_native()) != (void *)g_sc11 && (HWND)swapchain->get_hwnd() == g_gameHwnd)
+    {
+        IDXGISwapChain *nsc = reinterpret_cast<IDXGISwapChain *>(swapchain->get_native());
+        DXGI_SWAP_CHAIN_DESC sd = {};
+        if (nsc && SUCCEEDED(nsc->GetDesc(&sd)) && sd.BufferDesc.Width >= 64 && sd.BufferDesc.Height >= 64)
+        {
+            LOGI("BFI Presenter: DX11: the game made a new swap chain for its window (%ux%u, %u samples) -- moving the presenter to it",
+                 sd.BufferDesc.Width, sd.BufferDesc.Height, sd.SampleDesc.Count);
+            ReleaseDx11();
+            RemoveHooks();
+            if (g_dx11.load() || g_sc) return;                   // the presenter couldn't be stopped: stay off
+        }
+    }
     if (g_sc) return;                                            // resizes of ours are handled in the hook
     // Direct3D 9 is handled above; 11 and 12 below. In an OpenGL or Vulkan game the native
     // handle is not a DXGI swap chain (Heretic II, OpenGL: crashed reading

@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-102 of 103 tested games and emulators run with BFI: the 52 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; one with the engine's own stutter) and 50 more listed after it. One is partial.
+103 of 104 tested games and emulators run with BFI: the 53 working in the table below (some only with a setting, without frame generation or without a conflicting mod; thirteen of them 32-bit; one with the engine's own stutter) and 50 more listed after it. One is partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -77,6 +77,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Heretic II | Working (OpenGL, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32` |
 | DOOM 3: BFG Edition | Working (OpenGL, 32-bit) | — | v1.0.4 | `BFIPresenter.addon32`; NVIDIA profile: Vulkan/OpenGL present method = Prefer layered on DXGI swapchain (else about 30 fps) |
 | Clive Barker's Undying | Working (DX11 via dgVoodoo, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32`; G-SYNC off for the game (Fixed refresh + VSync Force on), or Queue one refresh ahead |
+| DARQ | Working (DX11, 32-bit) | — | v1.0.18 | `BFIPresenter.addon32`; v1.0.18 or newer (the game makes a second swap chain at start); ReShade's overlay may react late to the mouse and keyboard in this game, with or without the presenter |
 | PCSX2 | Working (Vulkan) | — | — | Vulkan layer; Vulkan renderer, `BFIPresenter.ini` next to the emulator's .exe |
 | RPCS3 | Working (Vulkan) | — | — | Vulkan layer; `BFIPresenter.ini` next to the emulator's .exe |
 
@@ -407,6 +408,12 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - **Legacy of Kain: Soul Reaver 1 & 2 Remastered:** works together with the DLSS 5 add-ons, which lower the frame rate well below 120. With DLSS 5 use Half refresh + Lowest latency; without it the game holds 120, so use Refresh + Lowest latency + Later release. Frame pacing Smooth stutters more in this game.
 - **Heretic II** (32-bit): works with `BFIPresenter.addon32`.
 - **DOOM 3: BFG Edition** (32-bit): the presenter's presents blocked for 30–45 ms and held the game at about 30 fps until the game's NVIDIA profile had *Vulkan/OpenGL present method* set to *Prefer layered on DXGI swapchain* (the Manager sets it when installing). Runs at full rate after that.
+
+### DARQ
+
+- 32-bit Unity game on DirectX 11: `BFIPresenter.addon32` with 32-bit ReShade (as `dxgi.dll`). Holds 120 fps at the Refresh rate cap.
+- **Needs v1.0.18 or newer.** About a second after starting, the game makes a second swap chain for its window (4× MSAA, then 2×) while the first still exists; before v1.0.18 the presenter stayed on the first one and the game hung at start. ReShade opens a second set of settings for the new swap chain (`ReShade2.ini`).
+- **ReShade itself can misbehave in this game:** after clicking into a field in ReShade's overlay, the mouse moved and a "1" was typed on their own, and mouse and key input can react late. It happens without the presenter too, and only in this game. Change effect settings by dragging the sliders instead of clicking into the number fields, or edit the preset file with the game closed (e.g. `PreprocessorDefinitions=ENABLE_GEOMETRY=1,ENABLE_DECAY=0` at the top for CRT-Standalone's screen curvature).
 
 ### Clive Barker's Undying
 
