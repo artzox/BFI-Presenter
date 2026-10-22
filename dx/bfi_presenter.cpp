@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.18"
+#define BFI_ADDON_VERSION "1.0.18-o1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2023,26 +2023,32 @@ static void FgCheckCaller()
 {
     static std::atomic<unsigned> n{0};
     if ((n.fetch_add(1) % 30) != 0) return;
+    // OptiScaler's own frame generation (OptiFG) presents from the FSR / XeSS frame-generation DLLs it loads
+    // (amd_fidelityfx_framegeneration_dx12.dll, libxess_fg.dll), with ReShade and OptiScaler's swap-chain
+    // wrapper between them and this hook -- so the stack is walked deeper than DLSS-G needs (Riven with
+    // OptiScaler's FSR FG and XeFG: never seen as frame generation, the automatic cap halved its frames).
     static const char *k[] = { "nvngx_dlssg.dll", "sl.dlss_g.dll", "dlssg_to_fsr3_amd_is_better.dll",
-                               "ffx_frameinterpolation_x64.dll", "libxess_fg.dll", "amd_fidelityfx_dx12.dll" };
-    HMODULE mods[6] = {};
+                               "ffx_frameinterpolation_x64.dll", "libxess_fg.dll", "amd_fidelityfx_dx12.dll",
+                               "amd_fidelityfx_framegeneration_dx12.dll", "amd_fidelityfx_loader_dx12.dll" };
+    const int kn = (int)(sizeof(k) / sizeof(k[0]));
+    HMODULE mods[8] = {};
     bool any = false;
-    for (int i = 0; i < 6; i++) { mods[i] = GetModuleHandleA(k[i]); any = any || mods[i]; }
+    for (int i = 0; i < kn; i++) { mods[i] = GetModuleHandleA(k[i]); any = any || mods[i]; }
     if (!any) return;
-    void *frames[16];
-    const USHORT got = RtlCaptureStackBackTrace(1, 16, frames, nullptr);
+    void *frames[48];
+    const USHORT got = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
     for (USHORT f = 0; f < got; f++)
     {
         HMODULE m = nullptr;
         if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)frames[f], &m)) continue;
-        for (int i = 0; i < 6; i++)
+        for (int i = 0; i < kn; i++)
             if (mods[i] && m == mods[i]) { g_fgCallerDlss.store(i < 3); g_fgPresentT.store(Now()); return; }
     }
 }
 static bool FgModuleLoaded()
 {
     static const char *k[] = { "nvngx_dlssg.dll", "sl.dlss_g.dll", "dlssg_to_fsr3_amd_is_better.dll",
-                               "ffx_frameinterpolation_x64.dll", "libxess_fg.dll" };
+                               "ffx_frameinterpolation_x64.dll", "libxess_fg.dll", "amd_fidelityfx_framegeneration_dx12.dll" };
     for (const char *d : k) if (GetModuleHandleA(d)) return true;
     return false;
 }
