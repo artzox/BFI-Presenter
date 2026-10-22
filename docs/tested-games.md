@@ -161,7 +161,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### Riven (2023)
 
 - Motion stutters whenever the frame rate isn't a steady 60 (it ran at 45–77 fps). Half refresh plus settings that hold 60 give smooth motion; DLSS 5 off helps reach it.
-- **With DLSS 5 at 4K (v1.0.18):** the game renders about 45 fps even at DLSS Performance, so it needs frame generation for a steady 60. The game has no DLSS frame generation of its own, and OptiScaler can't add it; **XeSS frame generation through [OptiScaler](https://github.com/optiscaler/OptiScaler) works**, limited to exactly 60 output frames. Very playable for a slow-paced game: 60 of 60 flashes, about 3% repeated, about 43 ms from release to flash. FSR frame generation through OptiScaler ran too, but felt sluggish.
+- **With DLSS 5 at 4K (v1.0.18):** the game renders about 45 fps even at DLSS Performance, so it needs frame generation for a steady 60. The game has no DLSS frame generation of its own, and OptiScaler can't add it; **XeSS frame generation through [OptiScaler](https://github.com/optiscaler/OptiScaler) works**, limited to exactly 60 output frames. Very playable for a slow-paced game: 60 of 60 flashes, about 3% repeated, about 43 ms from release to flash. FSR frame generation through OptiScaler ran too, but XeSS frame generation felt quicker (it brings XeLL, Intel's low-latency mode) and had fewer artifacts, especially around the HUD.
   - `OptiScaler.ini`:
 
     ```ini
