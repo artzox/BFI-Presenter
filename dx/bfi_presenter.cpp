@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s20"
+#define BFI_ADDON_VERSION "1.0.19"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -128,7 +128,7 @@ struct Settings
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
-    int   autoCapReflex = 0;  // AutoCapWithReflex: 0 = automatic (Reflex's limit with frame generation, the presenter's own cap without), 1 = Reflex's limit always
+    int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
@@ -263,7 +263,7 @@ static void LoadSettings(Settings &s)
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
-    s.autoCapReflex = IniInt("AutoCapWithReflex", 0) ? 1 : 0;
+    s.autoCapOwn = IniInt("AutoCapOwnWithoutFg", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
     if (s.laterReleaseMs > 5.0f) s.laterReleaseMs = 5.0f;
@@ -414,7 +414,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("GameFrameStatistics", s.virtualStats);
     IniWriteInt("ReuseDrawnBuffers", s.reuseBuffers);
     IniWriteInt("FlashHints", s.flashHints);
-    IniWriteInt("AutoCapWithReflex", s.autoCapReflex);
+    IniWriteInt("AutoCapOwnWithoutFg", s.autoCapOwn);
     IniWriteInt("StartBFIAfterGameResize", s.waitResizeAll);
     IniWriteInt("BypassOverlayResizeHooks", s.bypassResizeHooks);
     IniWriteInt("ShowOverlays", s.showOverlays);
@@ -605,7 +605,6 @@ static const UINT kStage  = 6;
 static CRITICAL_SECTION       g_lock;
 static CRITICAL_SECTION       g_submitLock;      // serialises game-side Present calls (FG add-ons present from other threads)
 static DWORD                  g_presentThreads[4] = {};
-static std::atomic<long>      g_thrPresents[4] = {};   // diagnostic: game presents per present thread
 static std::atomic<HWND>      g_watchHwnd{nullptr};    // game window the watchdog checks for "not responding"
 static std::atomic<DWORD>     g_uiTid{0};              // DX11: thread that owns the presenter's child window
 static IDXGISwapChain3       *g_sc = nullptr;    // managed real swap chain (not AddRef'd)
@@ -3106,26 +3105,6 @@ static DWORD WINAPI PresenterThread(void *)
                     fgVotes = 0;
                 }
                 fpsPrevSec = g_status.gameFps;
-                {
-                    // Diagnostic (Onimusha's menus): presents per present thread, logged when the split changes.
-                    static long prevN[4] = {};
-                    static int logged = 0;
-                    long n[4];
-                    bool changed = false;
-                    for (int i = 0; i < 4; i++)
-                    {
-                        n[i] = g_thrPresents[i].exchange(0);
-                        if (labs(n[i] - prevN[i]) > 4) changed = true;
-                    }
-                    if (changed && logged < 120)
-                    {
-                        logged++;
-                        LOGI("BFI Presenter: presents a second by thread: %lu=%ld %lu=%ld %lu=%ld (rendered %.0f)",
-                             (unsigned long)g_presentThreads[0], n[0], (unsigned long)g_presentThreads[1], n[1],
-                             (unsigned long)g_presentThreads[2], n[2], g_rfxRenderedFps.load());
-                    }
-                    for (int i = 0; i < 4; i++) prevN[i] = n[i];
-                }
                 if (fg != fgWas)
                 {
                     fgWas = fg;
@@ -3210,14 +3189,14 @@ static DWORD WINAPI PresenterThread(void *)
                         else rcBadSecs = 0;
                     }
                 }
-                // Which cap steps down in a Reflex game (AutoCapWithReflex=0, automatic): with frame generation
-                // Reflex's limit, applied at the game's sleep (the presenter's cap would hold frame generation's
-                // present thread: Alan Wake 2 3x ~140 ms against ~42 ms); without it the presenter's own cap with
-                // just-in-time release, which times each frame to its flash (God of War: ~25 ms frame done -> flash
-                // against 35-45 ms with Reflex's limit). Follows frame generation going on and off, also while down.
-                // 1 = Reflex's limit always.
+                // Which cap steps down in a Reflex game: Reflex's limit (applied at the game's sleep). With frame
+                // generation the presenter's cap would hold frame generation's present thread (Alan Wake 2 3x ~140 ms
+                // frame start -> GPU against ~42 ms); without it, frame start -> flash was about the same or a little
+                // quicker with Reflex's limit (Onimusha ~54 ms against ~58, God of War 54-64 against ~70).
+                // AutoCapOwnWithoutFg=1: the presenter's own cap (just-in-time release) while frame generation is
+                // off. Follows frame generation going on and off, also while down.
                 {
-                    const bool reflexOk = s.autoCapReflex || fg;
+                    const bool reflexOk = !s.autoCapOwn || fg;
                     if (!autoCapDown) capByReflex = rfxUse && reflexOk;
                     else if (capByReflex && !reflexOk) capByReflex = false;
                     else if (!capByReflex && reflexOk && rfxUse) capByReflex = true;
@@ -3896,14 +3875,12 @@ static HRESULT SubmitGameFrame()
     g_gtSerial = Now();
     g_gtSlot = g_gtLock = g_gtCopy = g_gtAhead = 0.0;
     g_gtFallback = 0;
-    for (int i = 0; i < 4; i++)
+    for (DWORD &t : g_presentThreads)
     {
-        DWORD &t = g_presentThreads[i];
-        if (t == tid) { g_thrPresents[i].fetch_add(1); break; }
+        if (t == tid) break;
         if (t == 0)
         {
             t = tid;
-            g_thrPresents[i].fetch_add(1);
             LOGI("BFI Presenter: game frames presented from thread %lu", (unsigned long)tid);
             break;
         }
@@ -4019,23 +3996,11 @@ static bool StuckPassThrough(void *sc)
            (sc == (void *)g_sc || sc == (void *)g_sc11);
 }
 
-// Diagnostic: the game's own sync interval and present flags (Onimusha's menus drop to 30 presented / 15 rendered
-// with the presenter). Logged when they change, at most 40 times a session.
-static void NoteGamePresent(UINT sync, UINT flags)
-{
-    static std::atomic<UINT> last{0xFFFFFFFFu};
-    static std::atomic<int> logged{0};
-    const UINT v = (sync << 16) | (flags & 0xFFFF);
-    if (last.exchange(v) != v && logged.fetch_add(1) < 40)
-        LOGI("BFI Presenter: game Present: sync interval %u, flags 0x%X", sync, flags);
-}
-
 static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT flags)
 {
     if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present(sc, sync, flags); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST)) return o_Present(sc, sync, flags);
-    NoteGamePresent(sync, flags);
     return SubmitGameFrame();
 }
 
@@ -4044,7 +4009,6 @@ static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *sc, UINT sync, UIN
     if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present1(sc, sync, flags, p); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST)) return o_Present1(sc, sync, flags, p);
-    NoteGamePresent(sync, flags);
     return SubmitGameFrame();
 }
 
@@ -4660,8 +4624,8 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
         const long calls = g_sleepCalls.load();
         const bool sleeping = calls != lastCalls;     // the game calls it (each frame)
         {
-            // Sleep calls per rendered frame (OptiScaler's frame generation in Onimusha makes two). The sleep-point
-            // limit is used only with one call per frame; changes need 3 seconds in a row.
+            // Sleep calls per rendered frame (DLSS 5 injectors with frame generation in Onimusha make two). The
+            // sleep-point limit is used only with one call per frame; changes need 3 seconds in a row.
             const double tn = Now(), dt = tn - lastCallsT;
             const double rf = tn - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : 0.0;
             if (lastCallsT > 0.0 && dt > 0.5 && dt < 3.0 && rf > 5.0)
@@ -4678,12 +4642,10 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
             lastCallsT = tn;
         }
         lastCalls = calls;
-        // The game's own limit is taken over only without frame generation (Returnal). With frame generation it stays
-        // with the driver unless the presenter's own limit is on: a DLSS 5 injector in Onimusha set one, and taking it
-        // over (per presented frame, times the frame-generation factor) held the game at 15 rendered fps.
-        // More than one sleep call per rendered frame (OptiScaler's frame generation in Onimusha: two): pacing the
-        // calls made frames uneven (3-7 a second not shown) while the driver's limit held 60 evenly there, so the
-        // driver gets the limit; the collapse check still guards it.
+        // The game's own limit is taken over only without frame generation (Returnal).
+        // More than one sleep call per rendered frame (DLSS 5 injectors with frame generation in Onimusha: two):
+        // pacing the calls held the game at 15 rendered fps or made frames uneven (3-7 a second not shown), while the
+        // driver's limit held 60 evenly there, so the driver gets the limit; the collapse check still guards it.
         const bool oneCall = perFrame == 1;
         {
             static bool multiLogged = false;
@@ -4694,10 +4656,9 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
             }
         }
         g_sleepActive.store(want && oneCall && g_sleepHooked == 1 && sleeping && !g_rfxLimitBad.load() && g_sleepFgFactor.load() == 1);
-        // With frame generation a game's (or injector's) own Reflex limit collapses behind the presenter in the driver
-        // (Onimusha with ShortFuse's DLSS 5 injector: 30 presented, 15 rendered from the start of frame generation),
-        // so it is taken out, as 1.0.18 ended up doing after its collapse check: frame generation then runs freely
-        // and the automatic frame cap's own limit (at the sleep point) paces it.
+        // With frame generation a game's (or injector's) own Reflex limit would collapse behind the presenter in the
+        // driver, so it is taken out, as 1.0.18 ended up doing after its collapse check: frame generation then runs
+        // freely and the automatic frame cap's own limit (at the sleep point) paces it.
         g_sleepFgStrip.store(want && oneCall && g_sleepHooked == 1 && sleeping && g_sleepFgFactor.load() > 1);
         if (want && oneCall && g_sleepHooked == 1 && (sleeping || limitAll <= 0))
         {
@@ -7768,14 +7729,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "for this, which also paces frame generation. Frame generation without Reflex: stays at Refresh.");
             if (s.autoCap)
             {
-                bool acr = s.autoCapReflex != 0;
+                bool aco = s.autoCapOwn != 0;
                 ImGui::Indent(16.0f);
-                if (ImGui::Checkbox("Reflex's frame limit also without frame generation", &acr)) s.autoCapReflex = acr ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off (default, automatic): in games with Reflex, Reflex's frame limit while frame generation\n"
-                                                              "is on (it paces frame generation), the presenter's own cap with just-in-time release\n"
-                                                              "while it is off (each frame timed to its flash: usually quicker). Follows frame generation\n"
-                                                              "being switched on and off.\n"
-                                                              "On: Reflex's frame limit also without frame generation.");
+                if (ImGui::Checkbox("Presenter's own cap without frame generation", &aco)) s.autoCapOwn = aco ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off (default): in games with Reflex, the cap steps down with Reflex's frame limit, with\n"
+                                                              "frame generation or without.\n"
+                                                              "On: the presenter's own cap with just-in-time release while frame generation is off\n"
+                                                              "(each frame timed to its flash); Reflex's frame limit while it is on. Follows frame\n"
+                                                              "generation being switched on and off.");
                 ImGui::Unindent(16.0f);
                 ImGui::SameLine();
                 if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");

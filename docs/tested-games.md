@@ -30,7 +30,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Alan Wake 2 | Working | Works (2×, 3×); 3×: Refresh + automatic frame cap, or Half refresh + Apply the cap with Reflex's frame limit (v1.0.19) | v0.19 | Standard setup |
 | God of War Ragnarök | Working | Runs, but judders below 60 output fps | v0.24 | Standard setup; RTSS limiter off |
 | Riven (2023) | Working | Works (OptiScaler XeSS FG, limited to 60) | v0.13 | A steady 60 fps for smooth motion; with DLSS 5 at 4K, XeSS frame generation through OptiScaler limited to 60 (see the notes below) |
-| Onimusha | Working | Works (2×, 3×); Refresh cap | v0.27 | Standard setup |
+| Onimusha | Working | Works (2×, 3×); with DLSS 5 (ShortFuse's injector or OptiScaler NR) and 2×: Refresh + automatic frame cap, 60 of 60 (v1.0.19) | v0.27 | Standard setup; see the notes below for DLSS 5 |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
 | Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency (Refresh + automatic frame cap also works) |
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
@@ -196,6 +196,9 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 - About one flash per minute, each matching a game hitch of 33–244 ms. One burst of about a second when presents were briefly limited to about 63 Hz (likely a display-mode change at a transition).
 - Ran at 43–46 fps, so Half refresh never capped it; a steady 60 removes the remaining judder.
+- **v1.0.19 with DLSS 5 and 2× frame generation (ShortFuse's DLSS 5 injector, or OptiScaler NR): Refresh rate + automatic frame cap.** It steps down with Reflex's frame limit to 60 presented / 30 rendered, a new frame on 60 of 60 flashes. Both injectors call the game's Reflex sleep twice per rendered frame, so the presenter gives the limit to the driver for these (ReShade.log: "the game calls its Reflex sleep 2 times per rendered frame"); pacing at the sleep call held it at 15 rendered fps or dropped 3–7 frames a second. The default `ReflexLimitAtSleep=1` is fine.
+- The game turns frame generation off in its menus, so the menu runs at about half the game's frame-generated fps (also without the presenter). With ShortFuse's injector at Half refresh, frame generation sometimes stayed at 30 presented / 15 rendered after leaving the menu, until the menu was opened and closed again; Refresh with the automatic frame cap held 60. With OptiScaler NR frame generation stays on in the menus.
+- BFI may only start after switching the game to windowed and back to borderless.
 
 ### Resonance: A Plague Tale
 
@@ -447,7 +450,7 @@ The shader runs the presenter's strobe inside ReShade, one game frame per sub-fr
 ## Known issues across games
 
 - **Below 60 fps, motion judders.** The strobe shows 60 lit images per second; a game at 45 fps repeats frames. Clarity is unaffected.
-- **Frame generation:** use the Refresh rate cap, not Half refresh, unless frame generation only reaches about 60 fps: then Half refresh + Smooth shows every generated frame (Alan Wake 2 with 3×, Pragmata, Until Dawn). DLSS FG (2×–4×) works in Alan Wake 2, Onimusha, Control (Control-FG mod), Silent Hill 2, Directive 8020 and Until Dawn; OptiScaler FSR FG in Shadow of the Tomb Raider. Lossless Scaling frame generation mostly worked with its VSync set to 1/2. A few games collapse under any Reflex frame limit (Pragmata, Returnal); the presenter then drops the limit for the session.
+- **Frame generation:** use the Refresh rate cap with the automatic frame cap, not Half refresh: in Reflex games it steps down with Reflex's frame limit, which since v1.0.19 is far quicker than Half refresh even when frame generation only reaches about 60 fps (Alan Wake 2 with 3×). Without Reflex, Half refresh + Smooth shows every generated frame at about 60 fps. DLSS FG (2×–4×) works in Alan Wake 2, Onimusha, Control (Control-FG mod), Silent Hill 2, Directive 8020 and Until Dawn; OptiScaler FSR FG in Shadow of the Tomb Raider. Lossless Scaling frame generation mostly worked with its VSync set to 1/2. Games that collapsed under the driver's Reflex limit (The Witcher 3, Returnal, Pragmata) hold it since v1.0.19; the presenter still drops the limit for the session if a game collapses.
 - **Game hitches show as single flashes:** when the whole GPU stalls for 100 ms or more, no refresh can be presented on time. With the GPU at its limit, shorter stalls of one to four refreshes flash too (God of War Ragnarök, Indiana Jones). GPU headroom helps everywhere; in DirectX, a realtime presenter queue (launcher run as administrator) removed them.
 - **Video memory:** the presenter adds about 0.3 GB at 4K (twice that with 16-bit HDR). Games already at the limit can collapse in performance.
 - **Overlays:** in DirectX games the RTSS OSD and the Steam overlay don't draw on the strobed frames by default (their hooks are bypassed for the presenter's own presents since v0.34). `ShowOverlays=1` (v1.0.9) sends the presents through them again in 64-bit DirectX games (not 32-bit or OpenGL games); turn it off if a game crashes. Vulkan games show them anyway. Any RTSS or driver frame limiter must stay off.
