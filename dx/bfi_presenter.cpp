@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s11"
+#define BFI_ADDON_VERSION "1.0.19-s12"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -129,6 +129,7 @@ struct Settings
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapReflex = 0;  // AutoCapWithReflex: 0 = automatic (Reflex's limit with frame generation, the presenter's own cap without), 1 = Reflex's limit always
+    int   fgMinLatency = 2;   // FgMinFrameLatency: with frame generation, the game's frame-latency waitable gets at least this many slots (0 = the game's own)
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
@@ -263,6 +264,9 @@ static void LoadSettings(Settings &s)
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
+    s.fgMinLatency = IniInt("FgMinFrameLatency", 2);
+    if (s.fgMinLatency < 0) s.fgMinLatency = 0;
+    if (s.fgMinLatency > 4) s.fgMinLatency = 4;
     s.autoCapReflex = IniInt("AutoCapWithReflex", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
@@ -3273,6 +3277,26 @@ static DWORD WINAPI PresenterThread(void *)
                 g_status.autoCapDown = autoCapDown ? 1 : 0;
                 g_status.autoCapProbe = capProbe ? 1 : 0;
                 g_status.fgActive = fg ? 1 : 0;
+                {
+                    // Frame generation with a frame latency of 1 (a DLSS 5 injector in Onimusha sets it): the game's
+                    // slots come back once per presented frame the presenter takes, and frame generation then held
+                    // the game at 15 rendered fps (30 presented). With frame generation the waitable gets at least
+                    // FgMinFrameLatency slots; the extra ones are taken back when it goes off.
+                    static UINT extra = 0;
+                    const UINT have = g_maxLatency.load();
+                    const UINT want = (fg && g_waitSem && s.fgMinLatency > 0 && have < (UINT)s.fgMinLatency) ? (UINT)s.fgMinLatency - have : 0;
+                    if (want > extra)
+                    {
+                        ReleaseSemaphore(g_waitSem, (LONG)(want - extra), nullptr);
+                        LOGI("BFI Presenter: frame generation with frame latency %u -- %u extra waitable slot(s)", have, want);
+                        extra = want;
+                    }
+                    else if (want < extra && g_waitSem)
+                    {
+                        for (UINT k = want; k < extra; k++) WaitForSingleObject(g_waitSem, 0);
+                        extra = want;
+                    }
+                }
                 g_status.relFlashMs = relN ? relSum / relN : -1.0;
             }
             secFrameRepeats = secFrameSkips = 0;
