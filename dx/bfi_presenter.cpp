@@ -7712,7 +7712,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 }
                 if (per >= 2 && st.fgActive && st.rfxLimitUs <= 0)
                     ImGui::TextColored(kAmber, "Frame generation with a cap below the refresh rate: half its frames never reach the screen\n"
-                                       "(God of War: 30 new images a second at Half) and latency doubles. Use Refresh rate.");
+                                       "and latency doubles. Use Refresh rate.");
                 if (per >= 2 && per % s.frames != 0)
                     ImGui::TextColored(kAmber, "%d refreshes per game frame doesn't fit %d frames per cycle: some game frames start\n"
                                        "on a dark refresh and motion judders. Use a multiple of %d.", per, s.frames, s.frames);
