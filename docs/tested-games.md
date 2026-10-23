@@ -22,14 +22,14 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-101 of 102 tested games and emulators run with BFI: the 52 working in the table below (some only with a setting, without frame generation or without a conflicting mod; twelve of them 32-bit; three with the engine's own stutter) and 49 more listed after it. One is partial.
+103 of 104 tested games and emulators run with BFI: the 53 working in the table below (some only with a setting, without frame generation or without a conflicting mod; thirteen of them 32-bit; one with the engine's own stutter) and 50 more listed after it. One is partial.
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
 | Shadow of the Tomb Raider | Working | Works (OptiScaler FSR 3.1 FG) | v0.2 | Standard setup |
 | Alan Wake 2 | Working | Works (2×, 3×); 3× at \~20 fps: Half refresh + Smooth | v0.19 | Standard setup |
 | God of War Ragnarök | Working | Runs, but judders below 60 output fps | v0.24 | Standard setup; RTSS limiter off |
-| Riven (2023) | Working | Not tested | v0.13 | A steady 60 fps for smooth motion |
+| Riven (2023) | Working | Works (OptiScaler XeSS FG, limited to 60) | v0.13 | A steady 60 fps for smooth motion; with DLSS 5 at 4K, XeSS frame generation through OptiScaler limited to 60 (see the notes below) |
 | Onimusha | Working | Works (2×, 3×); Refresh cap | v0.27 | Standard setup |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
 | Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency (Refresh + automatic frame cap also works) |
@@ -72,11 +72,12 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | DOOM Eternal | Working (Vulkan) | Not tested | v1.0.3 | Vulkan layer without ReShade (the game didn't start with ReShade); `BFIPresenter.ini` next to `DOOMEternalx64vk.exe`; settings in the ini + hotkeys |
 | PT-PC | Working (Vulkan) | — | v1.0.5 | Vulkan layer; ReShade only through its Vulkan layer (manager: Turn on), never as `dxgi.dll` and no DX add-on in the folder (crashed). With ray tracing on: Half refresh + Lowest latency + Just-in-time release |
 | Kena: Bridge of Spirits | Working | Not tested | v1.0.3 | Refresh rate + automatic frame cap (v1.0.16) |
-| Need for Speed: Porsche Unleashed | Working (OpenGL, 32-bit), engine stutter; not recommended | — | v1.0.3 | `BFIPresenter.addon32`; in the unofficial patch's OGL3 mode: NVIDIA profile Vulkan/OpenGL present method = Prefer layered on DXGI swapchain |
+| Need for Speed: Porsche Unleashed | Working (DX11 with the NFS5 Enhanced mod, 32-bit) | — | v1.0.17 | [NFS5 Enhanced](https://github.com/iArtorias/nfs5_enhanced) v1.2.0 (its Direct3D 11 renderer) with 32-bit ReShade and `BFIPresenter.addon32`; Refresh rate + Lowest latency; the CRT-Standalone shader for the full retro look |
 | Legacy of Kain: Soul Reaver 1 & 2 Remastered | Working (OpenGL) | — | v1.0.3 | With DLSS 5: Half refresh + Lowest latency. Without: Refresh + Lowest latency + Later release (Smooth stutters more) |
 | Heretic II | Working (OpenGL, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32` |
 | DOOM 3: BFG Edition | Working (OpenGL, 32-bit) | — | v1.0.4 | `BFIPresenter.addon32`; NVIDIA profile: Vulkan/OpenGL present method = Prefer layered on DXGI swapchain (else about 30 fps) |
 | Clive Barker's Undying | Working (DX11 via dgVoodoo, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32`; G-SYNC off for the game (Fixed refresh + VSync Force on), or Queue one refresh ahead |
+| DARQ | Working (DX11, 32-bit) | — | v1.0.18 | `BFIPresenter.addon32`; v1.0.18 or newer (the game makes a second swap chain at start); ReShade's overlay may react late to the mouse and keyboard in this game, with or without the presenter |
 | PCSX2 | Working (Vulkan) | — | — | Vulkan layer; Vulkan renderer, `BFIPresenter.ini` next to the emulator's .exe |
 | RPCS3 | Working (Vulkan) | — | — | Vulkan layer; `BFIPresenter.ini` next to the emulator's .exe |
 
@@ -111,6 +112,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Mafia: Definitive Edition | Standard setup |
 | Mortal Shell | Works with DLSS 5 |
 | Need for Speed (2015) | Standard setup |
+| Observer: System Redux | Holds 120 fps at 4K: Refresh rate cap + Lowest latency |
 | Planet of Lana II | Standard setup |
 | Prodeus | Standard setup |
 | REANIMAL | Works with DLSS 5 |
@@ -160,6 +162,34 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### Riven (2023)
 
 - Motion stutters whenever the frame rate isn't a steady 60 (it ran at 45–77 fps). Half refresh plus settings that hold 60 give smooth motion; DLSS 5 off helps reach it.
+- **With DLSS 5 at 4K (v1.0.18):** the game renders about 45 fps even at DLSS Performance, so it needs frame generation for a steady 60. The game has no DLSS frame generation of its own, and OptiScaler can't add it; **XeSS frame generation through [OptiScaler](https://github.com/optiscaler/OptiScaler) works**, limited to exactly 60 output frames. Very playable for a slow-paced game: 60 of 60 flashes, about 3% repeated, about 43 ms from release to flash. FSR frame generation through OptiScaler ran too, but XeSS frame generation felt quicker (it brings XeLL, Intel's low-latency mode) and had fewer artifacts, especially around the HUD. OptiScaler's HUD fix for FSR frame generation removes the HUD artifacts, but makes the game feel even more sluggish.
+  - `OptiScaler.ini`:
+
+    ```ini
+    [Upscalers]
+    Dx12Upscaler = dlss
+
+    [FrameGen]
+    FGInput = Upscaler
+    FGOutput = XeFG
+
+    [XeFG]
+    IgnoreInitChecks = true
+    HighResMV = auto
+    ForceBorderless = true
+
+    [Framerate]
+    FramerateLimit = 60
+    ```
+
+    `FramerateLimit` paces the game through XeLL, so XeSS frame generation delivers exactly 60 a second; XeFG doesn't work in exclusive fullscreen, hence `ForceBorderless`.
+  - The game's `Engine.ini` (`%LOCALAPPDATA%\Riven\Saved\Config\Windows\Engine.ini`): turn off DLSS's dilated motion vectors, which XeSS frame generation doesn't take:
+
+    ```ini
+    [SystemSettings]
+    r.NGX.DLSS.DilateMotionVectors=0
+    ```
+  - Presenter: **Refresh rate** cap with the **automatic frame cap off**, Frame pacing Lowest latency. The presenter's own Half cap held XeSS frame generation's presents and the game window stopped responding for seconds at a time; at 72 frame-generated fps without the limit, motion stuttered (12 frames a second dropped unevenly).
 
 ### Onimusha
 
@@ -374,10 +404,16 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### OpenGL games (v1.0.3)
 
 - The add-on takes each finished OpenGL frame after ReShade's effects and shares it with its own Direct3D 11 device through NVIDIA's `WGL_NV_DX_interop2`, so OpenGL needs an NVIDIA GPU. The game's swap interval is set to 0 so its own SwapBuffers doesn't wait for vblank (`OpenGLSwapInterval0=0` turns that off).
-- **Need for Speed: Porsche Unleashed** (32-bit), with the unofficial patch in OGL3 mode: the presenter was blocked (presents of 20–46 ms) until the game's NVIDIA profile had *Vulkan/OpenGL present method* set to *Prefer layered on DXGI swapchain*. The BFI Presenter Manager doesn't set it here, because a dgVoodoo install makes the game look like Direct3D 11 to it: set it in NVIDIA Profile Inspector. Runs after that, but the engine's own stutter remains, so the game isn't recommended.
+- **Need for Speed: Porsche Unleashed** (32-bit): **recommended with the [NFS5 Enhanced](https://github.com/iArtorias/nfs5_enhanced) mod (v1.2.0)**, which brings its own Direct3D 11 renderer. Install 32-bit ReShade (with full add-on support) next to the game's exe with `BFIPresenter.addon32`, and run the presenter at **Refresh rate + Lowest latency**. Add the CRT-Standalone shader for the full retro look (`ENABLE_DECAY=0`, as for every game with the presenter). Earlier, with the unofficial patch in OGL3 mode, the presenter was blocked (presents of 20–46 ms) until the game's NVIDIA profile had *Vulkan/OpenGL present method* set to *Prefer layered on DXGI swapchain*, and the engine's own stutter remained, so that route isn't recommended.
 - **Legacy of Kain: Soul Reaver 1 & 2 Remastered:** works together with the DLSS 5 add-ons, which lower the frame rate well below 120. With DLSS 5 use Half refresh + Lowest latency; without it the game holds 120, so use Refresh + Lowest latency + Later release. Frame pacing Smooth stutters more in this game.
 - **Heretic II** (32-bit): works with `BFIPresenter.addon32`.
 - **DOOM 3: BFG Edition** (32-bit): the presenter's presents blocked for 30–45 ms and held the game at about 30 fps until the game's NVIDIA profile had *Vulkan/OpenGL present method* set to *Prefer layered on DXGI swapchain* (the Manager sets it when installing). Runs at full rate after that.
+
+### DARQ
+
+- 32-bit Unity game on DirectX 11: `BFIPresenter.addon32` with 32-bit ReShade (as `dxgi.dll`). Holds 120 fps at the Refresh rate cap.
+- **Needs v1.0.18 or newer.** About a second after starting, the game makes a second swap chain for its window (4× MSAA, then 2×) while the first still exists; before v1.0.18 the presenter stayed on the first one and the game hung at start. ReShade opens a second set of settings for the new swap chain (`ReShade2.ini`).
+- **ReShade itself can misbehave in this game:** after clicking into a field in ReShade's overlay, the mouse moved and a "1" was typed on their own, and mouse and key input can react late. It happens without the presenter too, and only in this game. Change effect settings by dragging the sliders instead of clicking into the number fields, or edit the preset file with the game closed (e.g. `PreprocessorDefinitions=ENABLE_GEOMETRY=1,ENABLE_DECAY=0` at the top for CRT-Standalone's screen curvature).
 
 ### Clive Barker's Undying
 

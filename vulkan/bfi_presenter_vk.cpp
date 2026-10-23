@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.17"
+#define BFI_VERSION "1.0.18"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -4002,10 +4002,17 @@ static void draw_overlay(reshade::api::effect_runtime *)
 
     // ================================================================ header
     ImGui::TextDisabled("BFI Presenter (Vulkan layer) v" BFI_VERSION);
-    if (st.managed) ImGui::TextWrapped("%s", st.reason);
-    else            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s", st.reason);
     bool en = s.enabled != 0;
     if (ImGui::Checkbox("BFI enabled (Ctrl+Shift+B)", &en)) s.enabled = en ? 1 : 0;
+    // The status line and the warnings sit in a box of fixed height (kStatusLines lines; it scrolls if more are
+    // showing), so the controls below don't move up and down when they change.
+    {
+        const int kStatusLines = 7;
+        const float h = ImGui::GetTextLineHeightWithSpacing() * kStatusLines + ImGui::GetStyle().WindowPadding.y;
+        const ImVec2 box(0.0f, h);
+        ImGui::BeginChild("##status", box, 0, 0);
+    if (st.managed) ImGui::TextWrapped("%s", st.reason);
+    else            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s", st.reason);
 
     // ================================================================ warnings (only when something needs attention)
     if (st.layerOrder == 2)
@@ -4030,6 +4037,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 ImGui::TextColored(kAmber, "Game frames reach the strobe unevenly: motion may stutter. If it persists, the GPU\n"
                                    "is probably finishing frames right at the refresh -- lower settings or try Smooth pacing.");
         }
+    }
+        ImGui::EndChild();
     }
 
     // ================================================================ 1. strobe
