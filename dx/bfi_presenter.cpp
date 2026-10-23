@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s8"
+#define BFI_ADDON_VERSION "1.0.19-s9"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2014,6 +2014,8 @@ static void ReflexTick(int limitUs, ReflexSecond &out);
 static std::atomic<int> g_sleepLimitUs{0};    // frame limit at the game's Reflex sleep, per rendered frame (0 = off)
 static std::atomic<bool> g_sleepActive{false};        // the sleep-point limit is in charge: the game's own limit is taken from the driver
 static std::atomic<int>  g_gameOwnUs{0};              // the game's own Reflex limit, applied at the sleep point instead
+static std::atomic<double> g_sleepLeadS{0.0};   // sleep-point limit without frame generation: wake this long before the lit refresh (0 = no phase lock)
+static std::atomic<bool> g_sleepLocked{false};
 static std::atomic<int> g_sleepFgFactor{1};   // presents per rendered frame (frame generation), for the sleep-point limit
 static IUnknown *ReflexOwnDevice();
 // The game collapsed under a Reflex frame limit (Returnal: 60 -> 7.5 fps, ours or its own).
@@ -3293,7 +3295,7 @@ static DWORD WINAPI PresenterThread(void *)
                 // pairs a second for a whole minute, against none in another run). Then the limit is
                 // shortened by 0.15 ms for one second, which moves the frames ~9 ms earlier against
                 // the strobe, and checked again 3 s later.
-                if (limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
+                if (limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && !g_sleepLocked.load() && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
                 {
                     phaseUntil = t + 1.0; phaseNextT = t + 4.0;
                     if (++phaseNudges <= 5)
@@ -3325,6 +3327,24 @@ static DWORD WINAPI PresenterThread(void *)
                     presPrev = stNow.gameFps;
                 }
                 ReflexTick(limitUs, rs);
+                {
+                    // Phase lock for the sleep-point limit without frame generation: lead = frame start -> GPU done
+                    // (Reflex reports) + a margin that widens by 0.5 ms (to 8) when the lit refresh repeats frames,
+                    // and narrows back slowly.
+                    static double marginMs = 2.5;
+                    static int quiet = 0;
+                    if (g_sleepLimitUs.load() > 0 && g_sleepFgFactor.load() == 1 && rs.frames > 0 && rs.simGpuMs > 0.0 && !hitchPaused)
+                    {
+                        if (g_sleepLocked.load() && stNow.frameRepeats >= 3) { marginMs = std::min(8.0, marginMs + 0.5); quiet = 0; }
+                        else if (++quiet >= 10 && marginMs > 2.5) { marginMs -= 0.25; quiet = 0; }
+                        const double was = g_sleepLeadS.load();
+                        g_sleepLeadS.store((rs.simGpuMs + marginMs) / 1000.0);
+                        if (was <= 0.0)
+                            LOGI("BFI Presenter: frame limit at the game's Reflex sleep: locked to the strobe (frames take %.1f ms, margin %.1f ms)",
+                                 rs.simGpuMs, marginMs);
+                    }
+                    else if (g_sleepLeadS.load() > 0.0) { g_sleepLeadS.store(0.0); marginMs = 2.5; }
+                }
                 rsLast = rs; rsLastT = t;
                 if (rs.frames > 0) rsEverT = t;
                 EnterCriticalSection(&g_cfgLock);
@@ -4441,6 +4461,35 @@ static int __cdecl hk_NvSleep(IUnknown *dev)
         const double iv = us * 1e-6;
         double now = Now();
         if (nextT <= 0.0 || now > nextT + iv || nextT - now > 2.0 * iv) nextT = now;   // start, a hitch, or a changed limit
+        // Without frame generation: lock the wake-ups to the strobe, so each frame finishes on the GPU just before
+        // the lit refresh that shows it (lead = the game's measured frame start -> GPU done, plus a margin), like
+        // just-in-time release does for the presenter's own cap. Unlocked, frames finished anywhere in the cycle
+        // and waited for their flash (God of War: ~35-45 ms release -> flash against ~25 with the presenter's cap).
+        const double lead = g_sleepLeadS.load();
+        bool locked = false;
+        if (lead > 0.0 && g_sleepFgFactor.load() == 1)
+        {
+            const double period = g_lrPeriod.load();
+            const int fr = std::max(1, g_strobeFrames.load());
+            const double cycle = fr * period;
+            UINT64 c = 0; int sl = 0; double tT = 0.0;
+            for (int i = 0; i < 4; i++)
+            {
+                c = g_tickCount.load(); sl = g_tickSlot.load(); tT = g_tickT.load();
+                if (g_tickCount.load() == c) break;
+            }
+            const double m = iv / cycle;
+            if (c > 0 && tT > 0.0 && cycle > 0.0 && m > 0.5 && std::fabs(m - std::floor(m + 0.5)) < 0.03 && now - tT < 0.25)
+            {
+                const int k0 = (fr - (sl % fr)) % fr;                 // first lit refresh from the last tick
+                const double w0 = tT + k0 * period - lead;           // a wake-up time on the strobe's grid
+                double w = w0 + std::floor((nextT - w0) / cycle + 0.5) * cycle;
+                if (w < now - 0.001) w += cycle;
+                nextT = w;
+                locked = true;
+            }
+        }
+        g_sleepLocked.store(locked);
         while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
         SleepUntil(nextT, timer);
         nextT += iv;
