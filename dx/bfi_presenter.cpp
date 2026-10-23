@@ -3274,12 +3274,6 @@ static DWORD WINAPI PresenterThread(void *)
                 g_status.autoCapDown = autoCapDown ? 1 : 0;
                 g_status.autoCapProbe = capProbe ? 1 : 0;
                 g_status.fgActive = fg ? 1 : 0;
-                    else if (want < extra && g_waitSem)
-                    {
-                        for (UINT k = want; k < extra; k++) WaitForSingleObject(g_waitSem, 0);
-                        extra = want;
-                    }
-                }
                 g_status.relFlashMs = relN ? relSum / relN : -1.0;
             }
             secFrameRepeats = secFrameSkips = 0;
