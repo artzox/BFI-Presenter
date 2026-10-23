@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s17"
+#define BFI_ADDON_VERSION "1.0.19-s18"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -605,6 +605,7 @@ static const UINT kStage  = 6;
 static CRITICAL_SECTION       g_lock;
 static CRITICAL_SECTION       g_submitLock;      // serialises game-side Present calls (FG add-ons present from other threads)
 static DWORD                  g_presentThreads[4] = {};
+static std::atomic<long>      g_thrPresents[4] = {};   // diagnostic: game presents per present thread
 static std::atomic<HWND>      g_watchHwnd{nullptr};    // game window the watchdog checks for "not responding"
 static std::atomic<DWORD>     g_uiTid{0};              // DX11: thread that owns the presenter's child window
 static IDXGISwapChain3       *g_sc = nullptr;    // managed real swap chain (not AddRef'd)
@@ -3105,6 +3106,26 @@ static DWORD WINAPI PresenterThread(void *)
                     fgVotes = 0;
                 }
                 fpsPrevSec = g_status.gameFps;
+                {
+                    // Diagnostic (Onimusha's menus): presents per present thread, logged when the split changes.
+                    static long prevN[4] = {};
+                    static int logged = 0;
+                    long n[4];
+                    bool changed = false;
+                    for (int i = 0; i < 4; i++)
+                    {
+                        n[i] = g_thrPresents[i].exchange(0);
+                        if (labs(n[i] - prevN[i]) > 4) changed = true;
+                    }
+                    if (changed && logged < 120)
+                    {
+                        logged++;
+                        LOGI("BFI Presenter: presents a second by thread: %lu=%ld %lu=%ld %lu=%ld (rendered %.0f)",
+                             (unsigned long)g_presentThreads[0], n[0], (unsigned long)g_presentThreads[1], n[1],
+                             (unsigned long)g_presentThreads[2], n[2], g_rfxRenderedFps.load());
+                    }
+                    for (int i = 0; i < 4; i++) prevN[i] = n[i];
+                }
                 if (fg != fgWas)
                 {
                     fgWas = fg;
@@ -3875,12 +3896,14 @@ static HRESULT SubmitGameFrame()
     g_gtSerial = Now();
     g_gtSlot = g_gtLock = g_gtCopy = g_gtAhead = 0.0;
     g_gtFallback = 0;
-    for (DWORD &t : g_presentThreads)
+    for (int i = 0; i < 4; i++)
     {
-        if (t == tid) break;
+        DWORD &t = g_presentThreads[i];
+        if (t == tid) { g_thrPresents[i].fetch_add(1); break; }
         if (t == 0)
         {
             t = tid;
+            g_thrPresents[i].fetch_add(1);
             LOGI("BFI Presenter: game frames presented from thread %lu", (unsigned long)tid);
             break;
         }
