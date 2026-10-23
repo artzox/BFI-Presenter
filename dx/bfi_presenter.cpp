@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s1"
+#define BFI_ADDON_VERSION "1.0.19-s2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -4498,6 +4498,34 @@ static std::atomic<int>       g_slWantUs{0};          // the presenter's limit t
 static int                    g_slState = 0;          // 0 not tried, 1 hooked, -1 not available
 static double                 g_slNextTry = 0.0;
 
+// Streamline 1.x (The Witcher 3): slSetFeatureConstants(eFeatureReflex = 3, &ReflexConstants, frameIndex, id), with
+// ReflexConstants { mode; frameLimitUs; useMarkersToOptimize; virtualKey; ...; void *ext } (24 bytes).
+struct SlReflexConsts1 { int32_t mode; uint32_t frameLimitUs; bool useMarkersToOptimize; uint8_t pad0; uint16_t virtualKey; uint32_t rsvd; void *ext; };
+static_assert(sizeof(SlReflexConsts1) == 24, "Streamline 1.x ReflexConstants layout");
+typedef bool (__cdecl *PFN_slSetFeatureConstants)(uint32_t feature, const void *consts, uint32_t frameIndex, uint32_t id);
+static PFN_slSetFeatureConstants o_slSetConsts = nullptr;
+static SlReflexConsts1 g_sl1Game = {};
+static uint32_t        g_sl1Frame = 0, g_sl1Id = 0;
+static int             g_slVer = 0;                   // 1 or 2 once hooked
+
+static bool __cdecl hk_slSetFeatureConstants(uint32_t feature, const void *consts, uint32_t frameIndex, uint32_t id)
+{
+    if (feature != 3 || !consts) return o_slSetConsts(feature, consts, frameIndex, id);
+    SlReflexConsts1 c;
+    memcpy(&c, consts, sizeof(c));
+    AcquireSRWLockExclusive(&g_slLock);
+    const bool changed = !g_slGameSeen || g_sl1Game.mode != c.mode || g_sl1Game.frameLimitUs != c.frameLimitUs;
+    g_sl1Game = c; g_sl1Frame = frameIndex; g_sl1Id = id; g_slGameSeen = true;
+    ReleaseSRWLockExclusive(&g_slLock);
+    const int us = g_slWantUs.load();
+    if (changed)
+        LOGI("BFI Presenter: Streamline 1.x Reflex constants from the game: mode %d, frame limit %u us%s", c.mode, c.frameLimitUs,
+             us > 0 ? " -- the presenter's frame limit applies instead" : "");
+    if (us <= 0) return o_slSetConsts(feature, consts, frameIndex, id);
+    c.frameLimitUs = (uint32_t)us;
+    return o_slSetConsts(feature, &c, frameIndex, id);
+}
+
 static bool SlGuidOk(const SlReflexOptions *o) { return o->guid1 == 0xf03af81au && o->guid2 == 0x6d0b && o->guid3 == 0x4902 && o->structVersion >= 1; }
 
 static int __cdecl hk_slReflexSetOptions(const SlReflexOptions *o)
@@ -4529,9 +4557,20 @@ static bool SlReflexReady()
     PFN_slGetFeatureFunction gff = (PFN_slGetFeatureFunction)(void *)GetProcAddress(sl, "slGetFeatureFunction");
     if (!gff)
     {
-        g_slState = -1;
-        LOGW("BFI Presenter: Streamline in this game has no slGetFeatureFunction (Streamline 1.x?) -- the frame limit goes through NvAPI");
-        return false;
+        // Streamline 1.x: constants per feature.
+        void *sfc = (void *)GetProcAddress(sl, "slSetFeatureConstants");
+        char why1[96] = "";
+        void *orig1 = sfc ? InlineHook64(sfc, (void *)&hk_slSetFeatureConstants, why1, sizeof(why1)) : nullptr;
+        if (!orig1)
+        {
+            g_slState = -1;
+            LOGW("BFI Presenter: Streamline 1.x in this game, but slSetFeatureConstants %s -- the frame limit goes through NvAPI",
+                 sfc ? why1 : "isn't exported");
+            return false;
+        }
+        o_slSetConsts = (PFN_slSetFeatureConstants)orig1; g_slState = 1; g_slVer = 1;
+        LOGI("BFI Presenter: Streamline 1.x Reflex found -- the frame limit goes through Streamline's Reflex constants");
+        return true;
     }
     void *fn = nullptr;
     const int r = gff(3 /* kFeatureReflex */, "slReflexSetOptions", &fn);
@@ -4544,7 +4583,7 @@ static bool SlReflexReady()
         LOGW("BFI Presenter: Streamline's slReflexSetOptions can't be hooked (%s) -- the frame limit goes through NvAPI", why);
         return false;
     }
-    g_slSetOpt = (PFN_slReflexSetOptions)fn; o_slSetOpt = (PFN_slReflexSetOptions)orig; g_slState = 1;
+    g_slSetOpt = (PFN_slReflexSetOptions)fn; o_slSetOpt = (PFN_slReflexSetOptions)orig; g_slState = 1; g_slVer = 2;
     LOGI("BFI Presenter: Streamline Reflex found -- the frame limit goes through Streamline's Reflex options");
     return true;
 }
@@ -4555,6 +4594,33 @@ static void SlReflexLimit(int limitUs)
     g_slWantUs.store(limitUs);
     static double lastSent = 0.0;
     if (limitUs == g_slAppliedUs.load() && (limitUs <= 0 || Now() - lastSent < 2.0)) return;
+    if (g_slVer == 1)
+    {
+        SlReflexConsts1 c;
+        AcquireSRWLockShared(&g_slLock);
+        const bool seen = g_slGameSeen;
+        c = g_sl1Game;
+        const uint32_t fi = g_sl1Frame, id = g_sl1Id;
+        ReleaseSRWLockShared(&g_slLock);
+        if (!seen)
+        {
+            memset(&c, 0, sizeof(c));
+            AcquireSRWLockShared(&g_rfxLock);
+            c.mode = g_rfxGameSeen ? (g_rfxGame.boost ? 2 : g_rfxGame.lowLatency ? 1 : 0) : 1;
+            c.useMarkersToOptimize = g_rfxGameSeen ? g_rfxGame.useMarkers != 0 : false;
+            ReleaseSRWLockShared(&g_rfxLock);
+            if (c.mode == 0) c.mode = 1;
+        }
+        c.ext = nullptr;
+        if (limitUs > 0) c.frameLimitUs = (uint32_t)limitUs;
+        const bool ok = o_slSetConsts(3, &c, fi, id);
+        lastSent = Now();
+        const int before = g_slAppliedUs.exchange(limitUs);
+        if (before != limitUs || !ok)
+            LOGI("BFI Presenter: Reflex frame limit through Streamline 1.x %s (mode %d, %u us%s; %s)", limitUs > 0 ? "on" : "off",
+                 c.mode, c.frameLimitUs, seen ? "" : ", options inferred", ok ? "accepted" : "refused");
+        return;
+    }
     SlReflexOptions o;
     AcquireSRWLockShared(&g_slLock);
     const bool seen = g_slGameSeen;
