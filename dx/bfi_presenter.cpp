@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s19"
+#define BFI_ADDON_VERSION "1.0.19-s20"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3935,16 +3935,6 @@ static HRESULT STDMETHODCALLTYPE hk_GetDesc1(IDXGISwapChain1 *sc, DXGI_SWAP_CHAI
     return hr;
 }
 
-// Test (s19): with a cap of N refreshes per game frame the game is shown a display of refresh/N, so each shown
-// frame is one refresh to it. With the raw counts a sync-interval-1 game (DLSS-G's present thread in Onimusha)
-// sees every frame take N refreshes, as if it kept missing vblanks.
-static void VirtualRefreshes(DXGI_FRAME_STATISTICS *st)
-{
-    const UINT per = (UINT)std::max(1, g_capPer.load());
-    st->SyncRefreshCount   /= per;
-    st->PresentRefreshCount = st->SyncRefreshCount;
-}
-
 static HRESULT STDMETHODCALLTYPE hk_GetFS(IDXGISwapChain *sc, DXGI_FRAME_STATISTICS *st)
 {
     if (!t_ownCall && !t_presenterThread && IsGame11(sc) && g_sc && st)
@@ -3956,7 +3946,7 @@ static HRESULT STDMETHODCALLTYPE hk_GetFS(IDXGISwapChain *sc, DXGI_FRAME_STATIST
         if (SUCCEEDED(hr) && g_virtualStats.load() && g_running.load())
         {
             st->PresentCount        = (UINT)g_shownGameFrames.load();
-            VirtualRefreshes(st);
+            st->PresentRefreshCount = st->SyncRefreshCount;
         }
         return hr;
     }
@@ -3969,7 +3959,7 @@ static HRESULT STDMETHODCALLTYPE hk_GetFS(IDXGISwapChain *sc, DXGI_FRAME_STATIST
     {
         // Its last shown frame appeared at the latest vblank.
         st->PresentCount        = (UINT)g_shownGameFrames.load();
-        VirtualRefreshes(st);
+        st->PresentRefreshCount = st->SyncRefreshCount;
     }
     return hr;
 }
@@ -4670,9 +4660,8 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
         const long calls = g_sleepCalls.load();
         const bool sleeping = calls != lastCalls;     // the game calls it (each frame)
         {
-            // Sleep calls per rendered frame: ShortFuse's DLSS 5 injector in Onimusha called it twice per frame with
-            // frame generation, so pacing each call to the frame interval halved the rendered rate (30 presented,
-            // 15 rendered). The interval is split between the calls; changes need 3 seconds in a row.
+            // Sleep calls per rendered frame (OptiScaler's frame generation in Onimusha makes two). The sleep-point
+            // limit is used only with one call per frame; changes need 3 seconds in a row.
             const double tn = Now(), dt = tn - lastCallsT;
             const double rf = tn - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : 0.0;
             if (lastCallsT > 0.0 && dt > 0.5 && dt < 3.0 && rf > 5.0)
@@ -4692,18 +4681,30 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
         // The game's own limit is taken over only without frame generation (Returnal). With frame generation it stays
         // with the driver unless the presenter's own limit is on: a DLSS 5 injector in Onimusha set one, and taking it
         // over (per presented frame, times the frame-generation factor) held the game at 15 rendered fps.
-        g_sleepActive.store(want && g_sleepHooked == 1 && sleeping && !g_rfxLimitBad.load() && g_sleepFgFactor.load() == 1);
+        // More than one sleep call per rendered frame (OptiScaler's frame generation in Onimusha: two): pacing the
+        // calls made frames uneven (3-7 a second not shown) while the driver's limit held 60 evenly there, so the
+        // driver gets the limit; the collapse check still guards it.
+        const bool oneCall = perFrame == 1;
+        {
+            static bool multiLogged = false;
+            if (!oneCall && want && g_sleepHooked == 1 && !multiLogged)
+            {
+                multiLogged = true;
+                LOGI("BFI Presenter: the game calls its Reflex sleep %d times per rendered frame -- the driver's frame limit is used", perFrame);
+            }
+        }
+        g_sleepActive.store(want && oneCall && g_sleepHooked == 1 && sleeping && !g_rfxLimitBad.load() && g_sleepFgFactor.load() == 1);
         // With frame generation a game's (or injector's) own Reflex limit collapses behind the presenter in the driver
         // (Onimusha with ShortFuse's DLSS 5 injector: 30 presented, 15 rendered from the start of frame generation),
         // so it is taken out, as 1.0.18 ended up doing after its collapse check: frame generation then runs freely
         // and the automatic frame cap's own limit (at the sleep point) paces it.
-        g_sleepFgStrip.store(want && g_sleepHooked == 1 && sleeping && g_sleepFgFactor.load() > 1);
-        if (want && g_sleepHooked == 1 && (sleeping || limitAll <= 0))
+        g_sleepFgStrip.store(want && oneCall && g_sleepHooked == 1 && sleeping && g_sleepFgFactor.load() > 1);
+        if (want && oneCall && g_sleepHooked == 1 && (sleeping || limitAll <= 0))
         {
             const int f = std::max(1, std::min(4, g_sleepFgFactor.load()));
             const int own = (g_rfxLimitBad.load() || f > 1) ? 0 : g_gameOwnUs.load();   // the game's own limit, if any (not with frame generation)
             const int base = std::max(limitAll, own);
-            const int us = base > 0 ? base * f / perFrame : 0;
+            const int us = base > 0 ? base * f : 0;
             const int before = g_sleepLimitUs.exchange(us);
             if ((before > 0) != (us > 0))
                 LOGI("BFI Presenter: frame limit at the game's Reflex sleep %s (%d us per rendered frame%s)", us > 0 ? "on" : "off", us,
