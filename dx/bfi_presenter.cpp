@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s12"
+#define BFI_ADDON_VERSION "1.0.19-s13"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2018,6 +2018,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out);
 static std::atomic<int> g_sleepLimitUs{0};    // frame limit at the game's Reflex sleep, per rendered frame (0 = off)
 static std::atomic<bool> g_sleepActive{false};        // the sleep-point limit is in charge: the game's own limit is taken from the driver
 static std::atomic<int>  g_gameOwnUs{0};              // the game's own Reflex limit, applied at the sleep point instead
+static std::atomic<bool> g_sleepFgStrip{false};  // frame generation: the game's own Reflex limit is taken from the driver and not applied
 static std::atomic<int> g_sleepFgFactor{1};   // presents per rendered frame (frame generation), for the sleep-point limit
 static IUnknown *ReflexOwnDevice();
 // The game collapsed under a Reflex frame limit (Returnal: 60 -> 7.5 fps, ours or its own).
@@ -4432,7 +4433,7 @@ static int __cdecl hk_NvSetSleepMode(IUnknown *dev, NvSleepParams *p)
     g_gameOwnUs.store((int)p->minIntervalUs);
     // The game's own limit also counts the presenter's presents in the driver (Returnal: 16,666 us -> 8 fps):
     // with the sleep-point limit in charge it is applied there instead, and the driver gets none.
-    const bool strip = us <= 0 && (g_rfxLimitBad.load() || g_sleepActive.load() || g_sleepLimitUs.load() > 0) && p->minIntervalUs > 0;
+    const bool strip = us <= 0 && (g_rfxLimitBad.load() || g_sleepActive.load() || g_sleepLimitUs.load() > 0 || g_sleepFgStrip.load()) && p->minIntervalUs > 0;
     if (us > 0) q.minIntervalUs = (uint32_t)us;
     if (strip) q.minIntervalUs = 0;
     if (us > 0) { g_rfxApplied = q; g_rfxAppliedValid = true; }
@@ -4649,6 +4650,11 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
         // with the driver unless the presenter's own limit is on: a DLSS 5 injector in Onimusha set one, and taking it
         // over (per presented frame, times the frame-generation factor) held the game at 15 rendered fps.
         g_sleepActive.store(want && g_sleepHooked == 1 && sleeping && !g_rfxLimitBad.load() && g_sleepFgFactor.load() == 1);
+        // With frame generation a game's (or injector's) own Reflex limit collapses behind the presenter in the driver
+        // (Onimusha with ShortFuse's DLSS 5 injector: 30 presented, 15 rendered from the start of frame generation),
+        // so it is taken out, as 1.0.18 ended up doing after its collapse check: frame generation then runs freely
+        // and the automatic frame cap's own limit (at the sleep point) paces it.
+        g_sleepFgStrip.store(want && g_sleepHooked == 1 && sleeping && g_sleepFgFactor.load() > 1);
         if (want && g_sleepHooked == 1 && (sleeping || limitAll <= 0))
         {
             const int f = std::max(1, std::min(4, g_sleepFgFactor.load()));
@@ -4665,7 +4671,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
     }
     if (atSleep) limitUs = 0;
     g_rfxWantLimitUs.store(limitUs);
-    if (limitAll > 0 || g_rfxLimitBad.load() || g_sleepActive.load()) ReflexWatch();
+    if (limitAll > 0 || g_rfxLimitBad.load() || g_sleepActive.load() || g_sleepFgStrip.load()) ReflexWatch();
     IUnknown *dev = nullptr;
     AcquireSRWLockShared(&g_rfxLock);
     dev = g_rfxDev;
@@ -4759,7 +4765,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
     }
     // The game's own limit taken out (g_rfxLimitBad): its setting again without the limit, every
     // 2 s while it has one (the hook strips it from the game's own calls).
-    if ((g_rfxLimitBad.load() || g_sleepActive.load() || g_sleepLimitUs.load() > 0) && limitUs <= 0 && seen && game.minIntervalUs > 0)
+    if ((g_rfxLimitBad.load() || g_sleepActive.load() || g_sleepLimitUs.load() > 0 || g_sleepFgStrip.load()) && limitUs <= 0 && seen && game.minIntervalUs > 0)
     {
         static double lastStrip = 0.0;
         if (Now() - lastStrip > 2.0)
