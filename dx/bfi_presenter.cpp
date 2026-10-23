@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s16"
+#define BFI_ADDON_VERSION "1.0.19-s17"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3996,11 +3996,23 @@ static bool StuckPassThrough(void *sc)
            (sc == (void *)g_sc || sc == (void *)g_sc11);
 }
 
+// Diagnostic: the game's own sync interval and present flags (Onimusha's menus drop to 30 presented / 15 rendered
+// with the presenter). Logged when they change, at most 40 times a session.
+static void NoteGamePresent(UINT sync, UINT flags)
+{
+    static std::atomic<UINT> last{0xFFFFFFFFu};
+    static std::atomic<int> logged{0};
+    const UINT v = (sync << 16) | (flags & 0xFFFF);
+    if (last.exchange(v) != v && logged.fetch_add(1) < 40)
+        LOGI("BFI Presenter: game Present: sync interval %u, flags 0x%X", sync, flags);
+}
+
 static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT flags)
 {
     if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present(sc, sync, flags); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST)) return o_Present(sc, sync, flags);
+    NoteGamePresent(sync, flags);
     return SubmitGameFrame();
 }
 
@@ -4009,6 +4021,7 @@ static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *sc, UINT sync, UIN
     if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present1(sc, sync, flags, p); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST)) return o_Present1(sc, sync, flags, p);
+    NoteGamePresent(sync, flags);
     return SubmitGameFrame();
 }
 
