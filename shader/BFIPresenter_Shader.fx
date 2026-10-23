@@ -139,7 +139,9 @@ uniform float bfi_abl_budget <
     ui_category = "Display";
     ui_label = "ABL guard budget (nits)";
     ui_min = 100.0; ui_max = 1000.0; ui_step = 10.0;
-    ui_tooltip = "The display's full-white brightness: 250 for the Sony A95L.";
+    ui_tooltip = "The display's full-white (100% window) brightness: 250 for the Sony A95L.\n"
+                 "Bright areas are held to what the panel sustains at their size, from the peak\n"
+                 "brightness at 10% of the screen down to this at 100%.";
 > = 250.0;
 
 uniform float bfi_refresh <
@@ -384,12 +386,20 @@ float CellsPS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     return sum / 16.0 * 80.0;
 }
 
-float AvgAt(float C)
+// Window curve (as in the add-on, #71): the panel holds the peak on 10% of the screen and the budget on all of it,
+// a straight line in log-log between them. A cell at L nits uses L / budget of the panel's limit up to the budget
+// and 1 / (the area held at L) above it, (L / budget)^(1 / p); the lit refresh may average at most 1.
+float LoadAt(float C)
 {
+    float B = max(bfi_abl_budget, 1.0);
+    float p = (bfi_peak > B * 1.001) ? log(bfi_peak / B) / log(10.0) : 0.0;
     float a = 0.0;
     for (int y = 0; y < 18; y++)
         for (int x = 0; x < 32; x++)
-            a += min(tex2Dfetch(bfi_cells, int2(x, y)).r, C);
+        {
+            float L = min(tex2Dfetch(bfi_cells, int2(x, y)).r, C);
+            a += (L <= B || p <= 0.0) ? L / B : pow(L / B, 1.0 / p);
+        }
     return a / (32.0 * 18.0);
 }
 #endif
@@ -450,20 +460,20 @@ float4 StatePS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     if (bad) st.x = now + bfi_hitch_hold;
     if (st.x > now + 10000.0) st.x = now;                             // timer restarted
 
-    // ABL guard: the highest ceiling at which the lit refresh averages no
-    // more than the budget; pulled down fast, released only after 1.5 s under
+    // ABL guard: the highest ceiling at which the lit refresh stays within the
+    // panel's window curve (LoadAt <= 1); pulled down fast, released only after 1.5 s under
     // budget and then slowly (a quick release bounces off the panel's limiter).
     float target = bfi_peak;
 #if BFI_ABL
     if (bfi_abl && OutType() != 0 && bfi_enabled)
     {
-        if (AvgAt(bfi_peak) > bfi_abl_budget)
+        if (LoadAt(bfi_peak) > 1.0)
         {
             float lo = 100.0, hi = bfi_peak;
             for (int it = 0; it < 14; it++)
             {
                 float mid = 0.5 * (lo + hi);
-                if (AvgAt(mid) <= bfi_abl_budget) lo = mid; else hi = mid;
+                if (LoadAt(mid) <= 1.0) lo = mid; else hi = mid;
             }
             target = lo;
         }

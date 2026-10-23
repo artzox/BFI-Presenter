@@ -136,8 +136,8 @@ The brightest your screen can get, in nits. In HDR, the boosted lit frame never 
 *When to change it:* set it to your display's real peak brightness (check a review such as RTINGS). Too high and highlights clip; too low and you waste brightness.
 
 **ABL guard** and **budget** · `AblGuard`, `AblGuardBudgetNits` · default: on, 250\
-OLED screens have a power limit: when a lot of the screen is bright at once, the TV dims everything (that's "ABL"). With BFI the lit frame is extra bright, so that limit can kick in and make bright scenes pump or flash. The guard watches how much bright area is on screen and gently lowers the boost in very bright scenes, so the TV never hits its limit.\
-*When to change it:* set the budget to your screen's full-white brightness: about 250 for the Sony A95L and similar QD-OLEDs, 150–200 for many LG-panel OLEDs.
+OLED screens have a power limit: when a lot of the screen is bright at once, the TV dims everything (that's "ABL"). With BFI the lit frame is extra bright, so that limit can kick in and make bright scenes pump or flash. The guard watches how much bright area is on screen and gently lowers the boost in very bright scenes, so the TV never hits its limit. It knows that a panel holds more brightness on a small area than on the whole screen: by default it assumes your **Peak brightness** on 10% of the screen, falling to the budget on all of it (v1.0.20).\
+*When to change it:* set the budget to your screen's full-white brightness: about 250 for the Sony A95L and similar QD-OLEDs, 150–200 for many LG-panel OLEDs. If a review lists your panel's sustained brightness by window size, enter it as `AblCurve` in the ini (e.g. `AblCurve=10:1400,25:600,50:400,100:250`).
 
 ## Smoothness and latency
 

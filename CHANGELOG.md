@@ -10,6 +10,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 ## [1.0.20] — unreleased
 
 - **[Vulkan] Fixed: SDR games shown as HDR10 (`SdrToHdr`) were oversaturated.** Their BT.709 colours went into the HDR10 output unconverted; they now go through the BT.709 → BT.2020 conversion (ITU-R BT.2087) first. Thanks to speedlemur (#70).
+- **[DX] [Vulkan] [Shader] The ABL guard follows the panel's window curve.** It only kept the lit refresh's average under `AblGuardBudgetNits`, but an OLED holds less brightness on a large area than on a small one: a 25% area at 800 nits (average 200) went through and the TV's own limiter dimmed it. Each bright area is now held to what the panel sustains at its size, by default from **Peak brightness** (`DisplayPeakNits`) at 10% of the screen down to the budget at 100% (e.g. about 700 nits at 25% and 420 at 50% with 1400 and 250). `AblCurve=10:1400,25:600,50:400,100:250` takes a panel's measured curve (DX and Vulkan). Thanks to speedlemur (#71).
 - **[DX] [Vulkan] [Shader] The ABL guard measures HDR10 with BT.2020 luminance weights.** It used BT.709's, which under-counted red by about 19% in HDR10. SDR and scRGB are unchanged. (#70)
 
 ## [1.0.19] — 2026-10-23
