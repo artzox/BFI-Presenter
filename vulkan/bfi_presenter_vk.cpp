@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.18"
+#define BFI_VERSION "1.0.19"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -280,6 +280,7 @@ struct Settings
     int   ablGuard = 1;       // HDR: keep the lit refresh within the panel's full-screen budget
     int   ablBudget = 250;    // panel budget: average nits of a lit refresh after capping
     int   hitchGuard = 1;     // show every refresh lit while refreshes are missed or the game stalls
+    int   flashHints = 1;     // overlay: suggest the next step when refreshes keep being missed (flashes)
     int   hitchGapMs = 1000;  // no new game frame for this long counts as loading
     int   pacing   = 1;       // wait for vblank before each present
     int   queueAhead = 0;     // keep one extra refresh queued (covers a late draw; +1 refresh latency)
@@ -361,6 +362,7 @@ static void LoadSettings(Settings &s)
     s.ablGuard = KvInt(kv, "AblGuard", 1) ? 1 : 0;
     s.ablBudget = Clamp(KvInt(kv, "AblGuardBudgetNits", 250), 100, 1500);
     s.hitchGuard = KvInt(kv, "HitchGuard", 1) ? 1 : 0;
+    s.flashHints = KvInt(kv, "FlashHints", 1) ? 1 : 0;
     s.hitchGapMs = Clamp(KvInt(kv, "HitchGuardLoadingMs", 1000), 150, 5000);
     s.pacing   = KvInt(kv, "WaitForVBlank", 1);
     s.queueAhead = KvInt(kv, "QueueAhead", 0) ? 1 : 0;
@@ -391,7 +393,7 @@ static void LoadSettings(Settings &s)
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
     I("AutoFramesAhead", s.autoAhead); I("SmoothCatchUp", s.smoothCatchUp); I("PresenterBuffers", s.presBuffers); I("VulkanExclusiveFullscreen", s.vkExclusive); I("VulkanAutoRecover", s.vkAutoRecover); I("AblGuard", s.ablGuard);
-    I("AblGuardBudgetNits", s.ablBudget); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs);
+    I("AblGuardBudgetNits", s.ablBudget); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs); I("FlashHints", s.flashHints);
     I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
     F("SdrHighlightKnee", s.sdrKnee);
@@ -423,6 +425,7 @@ struct Status
     int    lrMisses = 0;
     int    qaPrimes = 0, qaSkips = 0;           // queue ahead: extra refreshes queued / ticks skipped (per second)
     bool   hitchPaused = false;
+    int    flashHint = 0;          // missed refreshes keep coming back (3 of the last 10 s; off after 30 s without)
     bool   limitSuspect = false;   // something caps the presenter below the display refresh
     int    aheadInUse = 1;
     int    autoCapDown = 0;                 // automatic frame cap: one game frame per strobe cycle in use
@@ -1332,6 +1335,10 @@ static void PresenterThread(Swapchain *sc)
     int lateIdx = 0;
     double lastNewFrameT = 0.0, hitchUntil = 0.0;
     bool hitchPaused = false;
+    bool secStalled = false;                 // the game stalled (loading) during this second
+    int flashWin[10] = {}, flashIdx = 0;     // seconds with missed refreshes, outside loading
+    double flashLastT = -1e9;
+    bool flashOn = false;
     // Automatic frame cap (as the DX add-on): at the Refresh cap, one game frame per
     // strobe cycle while the game can't hold the refresh rate. Back to Refresh after a
     // short try that holds the refresh rate (tries 30 s, 60 s, then every 120 s).
@@ -1947,6 +1954,7 @@ static void PresenterThread(Swapchain *sc)
             const double third = lateTimes[(lateIdx + 1) & 3];
             const bool lateBurst = lateIdx >= 3 && t - third < 0.5;
             const bool stalled = lastNewFrameT > 0.0 && (t - lastNewFrameT) * 1000.0 > s.hitchGapMs;
+            if (stalled) secStalled = true;
             if (lateBurst || stalled) hitchUntil = t + 1.0;
             const bool now = t < hitchUntil;
             if (now != hitchPaused)
@@ -2065,6 +2073,19 @@ static void PresenterThread(Swapchain *sc)
             g_status.slotWaits    = sc->slotWaits.exchange(0);
             g_status.reused       = secReused;
             g_status.hitchPaused  = hitchPaused;
+            {
+                // Flash hint: missed refreshes in 3 of the last 10 seconds, not counting seconds the game
+                // stalled (loading); it goes away after 30 s without any.
+                const bool fl = s.enabled && !secStalled && secLate > 0;
+                flashWin[flashIdx++ % 10] = fl ? 1 : 0;
+                if (fl) flashLastT = t;
+                int nfl = 0;
+                for (int k = 0; k < 10; k++) nfl += flashWin[k];
+                if (!flashOn && nfl >= 3) flashOn = true;
+                else if (flashOn && t - flashLastT > 30.0) flashOn = false;
+                secStalled = false;
+                g_status.flashHint = flashOn ? 1 : 0;
+            }
             g_status.litAvg       = (s.ablGuard && R.psoMeas) ? litAvg : -1.0;
             g_status.rawAvg       = (s.ablGuard && R.psoMeas) ? rawAvg : -1.0;
             g_status.ceilInUse    = c.ceilLin * 80.0;
@@ -4023,7 +4044,37 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (st.limitSuspect)
             ImGui::TextColored(kRed, "A frame limiter is holding the presenter below the display's refresh rate.\n"
                                "Turn off the RTSS limit and NVIDIA's Max Frame Rate (global and for this exe; check NVIDIA Profile Inspector).");
-        if (st.late > 0)
+        // Flash hint: when missed refreshes keep coming back, the first step that isn't done yet (the red
+        // warnings above come first).
+        if (st.flashHint && s.flashHints && s.enabled && !st.limitSuspect && st.layerOrder != 2)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            const bool fits4 = (s.frames == 2 || s.frames == 4) && st.realImages > 0 && st.realImages < 4;
+            if (fits4 && s.presBuffers == 4)
+                ImGui::TextWrapped("4 presenter buffers apply when the swap chain is made again: press Ctrl+Shift+O, or "
+                                   "restart the game.");
+            else if (fits4)
+            {
+                ImGui::TextWrapped("Flashes? Try 4 presenter buffers: more slack for the strobe, and refreshes that show the same "
+                                   "picture again need no drawing. No extra latency.");
+                if (ImGui::SmallButton("Use 4 presenter buffers")) { s.presBuffers = 4; WriteIni({ { "PresenterBuffers", "4" } }, false); }
+                ImGui::SameLine();
+            }
+            else if (s.pacing && !s.queueAhead)
+            {
+                ImGui::TextWrapped("Still flashing? Queue one refresh ahead keeps a finished refresh ready, so a late one doesn't "
+                                   "flash. It adds one refresh of latency (about %.0f ms).", st.refreshHz > 1.0 ? 1000.0 / st.refreshHz : 8.0);
+                if (ImGui::SmallButton("Queue one refresh ahead")) { s.queueAhead = 1; WriteIni({ { "QueueAhead", "1" } }, false); }
+                ImGui::SameLine();
+            }
+            else
+                ImGui::TextWrapped("Still flashing: the GPU is at its limit. Lower the game's settings or resolution, or use the "
+                                   "Half refresh cap.");
+            ImGui::PopStyleColor(1);
+            if (ImGui::SmallButton("Hide flash hints")) { s.flashHints = 0; WriteIni({ { "FlashHints", "0" } }, false); }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("For this game. Advanced > Flash hints brings them back.");
+        }
+        else if (!s.flashHints && st.late > 0)
             ImGui::TextColored(kAmber, "Missed refreshes break the strobe: check VRR is off and nothing caps the presenter.");
         if (st.hitchPaused)
             ImGui::TextColored(kAmber, "Hitch guard: BFI paused (loading or missed refreshes)");
@@ -4276,6 +4327,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "flashes until the swap chain is made again. When that lasts 3 seconds the game is asked to\n"
                                                           "rebuild its swap chain (a short pause; at most every 20 s). By hand: Ctrl+Shift+O.");
         }
+        bool fh = s.flashHints != 0;
+        if (ImGui::Checkbox("Flash hints (suggest the next step when the strobe keeps flashing)", &fh)) s.flashHints = fh ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("When refreshes are missed in 3 of 10 seconds (loading doesn't count), the status box\n"
+                                                      "suggests one step at a time: 4 presenter buffers, Queue one refresh ahead, then\n"
+                                                      "lighter game settings.");
         bool hg = s.hitchGuard != 0;
         if (ImGui::Checkbox("Hitch guard (pause BFI during loading and missed refreshes)", &hg)) s.hitchGuard = hg ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("While the presenter misses refreshes or the game delivers no new frame for the loading\ntime, every refresh is shown at the strobe's average brightness instead of strobing.");
