@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-h3"
+#define BFI_ADDON_VERSION "1.0.19-h2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3291,10 +3291,7 @@ static DWORD WINAPI PresenterThread(void *)
                 // pairs a second for a whole minute, against none in another run). Then the limit is
                 // shortened by 0.15 ms for one second, which moves the frames ~9 ms earlier against
                 // the strobe, and checked again 3 s later.
-                // Not in the first 8 s after the limit goes on: frame generation is still settling then (The Witcher 3:
-                // repeats and skips the first second, and the game fell to 16 fps after a nudge, every time).
-                const bool limitSettled = t - rfxChkT >= 8.0 && t - rcOnT >= 8.0;
-                if (limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && limitSettled && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
+                if (limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
                 {
                     phaseUntil = t + 1.0; phaseNextT = t + 4.0;
                     if (++phaseNudges <= 5)
@@ -3303,9 +3300,6 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 if (limitUs > 0 && t < phaseUntil) limitUs -= 150;
                 ReflexTick(limitUs, rs);
-                if (rs.limitUs > 0 && (t - rfxChkT < 12.0 || t - rcOnT < 12.0 || t - (phaseNextT - 4.0) < 6.0))
-                    LOGI("BFI Presenter: [test] Reflex limit %d us: %.1f presented, %.1f rendered fps, %d repeated, %d skipped%s", rs.limitUs,
-                         stNow.gameFps, g_rfxRenderedFps.load(), stNow.frameRepeats, stNow.frameSkips, t < phaseUntil ? " (nudge)" : "");
                 rsLast = rs; rsLastT = t;
                 if (rs.frames > 0) rsEverT = t;
                 EnterCriticalSection(&g_cfgLock);
