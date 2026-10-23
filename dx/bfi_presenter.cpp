@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s15"
+#define BFI_ADDON_VERSION "1.0.19-s16"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -129,7 +129,6 @@ struct Settings
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapReflex = 0;  // AutoCapWithReflex: 0 = automatic (Reflex's limit with frame generation, the presenter's own cap without), 1 = Reflex's limit always
-    int   fgMinLatency = 2;   // FgMinFrameLatency: with frame generation, the game's frame-latency waitable gets at least this many slots (0 = the game's own)
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
@@ -264,9 +263,6 @@ static void LoadSettings(Settings &s)
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
-    s.fgMinLatency = IniInt("FgMinFrameLatency", 2);
-    if (s.fgMinLatency < 0) s.fgMinLatency = 0;
-    if (s.fgMinLatency > 4) s.fgMinLatency = 4;
     s.autoCapReflex = IniInt("AutoCapWithReflex", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
@@ -3278,20 +3274,6 @@ static DWORD WINAPI PresenterThread(void *)
                 g_status.autoCapDown = autoCapDown ? 1 : 0;
                 g_status.autoCapProbe = capProbe ? 1 : 0;
                 g_status.fgActive = fg ? 1 : 0;
-                {
-                    // Frame generation with a frame latency of 1 (a DLSS 5 injector in Onimusha sets it): the game's
-                    // slots come back once per presented frame the presenter takes, and frame generation then held
-                    // the game at 15 rendered fps (30 presented). With frame generation the waitable gets at least
-                    // FgMinFrameLatency slots; the extra ones are taken back when it goes off.
-                    static UINT extra = 0;
-                    const UINT have = g_maxLatency.load();
-                    const UINT want = (fg && g_waitSem && s.fgMinLatency > 0 && have < (UINT)s.fgMinLatency) ? (UINT)s.fgMinLatency - have : 0;
-                    if (want > extra)
-                    {
-                        ReleaseSemaphore(g_waitSem, (LONG)(want - extra), nullptr);
-                        LOGI("BFI Presenter: frame generation with frame latency %u -- %u extra waitable slot(s)", have, want);
-                        extra = want;
-                    }
                     else if (want < extra && g_waitSem)
                     {
                         for (UINT k = want; k < extra; k++) WaitForSingleObject(g_waitSem, 0);
@@ -4633,8 +4615,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
     bool atSleep = false;
     {
         EnterCriticalSection(&g_cfgLock);
-        static bool giveUp = false;   // the sleep-point limit held the game well below its target: driver limit for the session
-        const bool want = g_shared.reflexAtSleep != 0 && !giveUp;
+        const bool want = g_shared.reflexAtSleep != 0;
         LeaveCriticalSection(&g_cfgLock);
         if (want && g_nvSleep && g_sleepHooked == 0)
         {
@@ -4688,23 +4669,6 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
                 LOGI("BFI Presenter: frame limit at the game's Reflex sleep %s (%d us per rendered frame%s)", us > 0 ? "on" : "off", us,
                      f > 1 ? ", frame generation" : "");
             atSleep = us > 0;
-            // Safety net: some injectors (ShortFuse's DLSS 5 injector in Onimusha with frame generation) make the game
-            // render far below the sleep-point target (15-19 rendered for 30-60). After 3 such seconds the limit goes
-            // back to the driver for the session, as with ReflexLimitAtSleep=0 (1.0.18 behaviour).
-            static int underRun = 0, onRun = 0;
-            const double rf = Now() - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : 0.0;
-            if (us > 0 && before == us) ++onRun; else onRun = 0;
-            if (onRun >= 2 && rf > 1.0 && rf < 0.7 * 1e6 / ((double)us * perFrame)) ++underRun; else underRun = 0;
-            if (underRun >= 3)
-            {
-                LOGW("BFI Presenter: frame limit at the game's Reflex sleep held the game at %.0f rendered fps of %.0f -- the driver's frame limit is used for this session",
-                     rf, 1e6 / ((double)us * perFrame));
-                giveUp = true;
-                g_sleepLimitUs.store(0);
-                g_sleepActive.store(false);
-                g_sleepFgStrip.store(false);
-                atSleep = false;
-            }
         }
         else if (g_sleepLimitUs.load() > 0) g_sleepLimitUs.store(0);
     }
