@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19"
+#define BFI_ADDON_VERSION "1.0.20-t1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -1417,7 +1417,8 @@ float PSMeasure(float4 pos : SV_Position) : SV_Target
         float3 lin = max(Decode(src.Load(int3(p, 0)).rgb), 0);
         float m = max(max(lin.r, lin.g), lin.b);
         float S = (m > 1e-6) ? max(ceilLin / m, 1.0) : 1e6;
-        sum += dot(lin, float3(0.2126, 0.7152, 0.0722)) * min(litGain, S);
+        // Luminance weights of the output's primaries: BT.2020 for HDR10, BT.709 for SDR and scRGB.
+        sum += dot(lin, outType == 2 ? float3(0.2627, 0.6780, 0.0593) : float3(0.2126, 0.7152, 0.0722)) * min(litGain, S);
     }
     return sum / 16.0;
 }

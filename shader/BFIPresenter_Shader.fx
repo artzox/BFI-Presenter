@@ -379,7 +379,7 @@ float CellsPS(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
         float3 lin = max(Decode(tex2Dlod(BFI_BackBuffer, float4(p / float2(BUFFER_WIDTH, BUFFER_HEIGHT), 0, 0)).rgb, t), 0.0);
         float m = max(max(lin.r, lin.g), lin.b);
         float S = (m > 1e-6) ? max(ceilLin / m, 1.0) : 1e6;
-        sum += dot(lin, float3(0.2126, 0.7152, 0.0722)) * min(litGain, S);
+        sum += dot(lin, t == 2 ? float3(0.2627, 0.6780, 0.0593) : float3(0.2126, 0.7152, 0.0722)) * min(litGain, S);   // BT.2020 weights for HDR10
     }
     return sum / 16.0 * 80.0;
 }

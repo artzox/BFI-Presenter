@@ -7,6 +7,11 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.20] — unreleased
+
+- **[Vulkan] Fixed: SDR games shown as HDR10 (`SdrToHdr`) were oversaturated.** Their BT.709 colours went into the HDR10 output unconverted; they now go through the BT.709 → BT.2020 conversion (ITU-R BT.2087) first. Thanks to speedlemur (#70).
+- **[DX] [Vulkan] [Shader] The ABL guard measures HDR10 with BT.2020 luminance weights.** It used BT.709's, which under-counted red by about 19% in HDR10. SDR and scRGB are unchanged. (#70)
+
 ## [1.0.19] — 2026-10-23
 
 - **[DX] [Vulkan] Flash hints.** When refreshes keep being missed (3 of the last 10 seconds, loading screens not counted), the status box suggests the next step, one at a time, instead of the general "Missed refreshes break the strobe" line: start Steam or the game's launcher as administrator when the presenter's GPU queue fell back from realtime (DX); 4 presenter buffers at 2 or 4 frames per cycle (no extra latency); Queue one refresh ahead (+1 refresh of latency); then lighter game settings or the Half refresh cap. The VRR, frame-limiter and VSync warnings still come first. Buttons apply a step and save it to the game's `BFIPresenter.ini`; nothing is switched on without a click. **Hide flash hints** turns them off for the game (`FlashHints=0`; Advanced > Flash hints brings them back). The hint goes away after 30 s without missed refreshes.
