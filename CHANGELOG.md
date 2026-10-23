@@ -7,6 +7,10 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.21] — unreleased
+
+- **[DX] [Vulkan] [Shader] Support on Ko-fi.** A **Support on Ko-fi** button at the bottom of the overlay, next to Save and Reload, opens ko-fi.com/artzox in the browser; the shader shows the link in a Support section at the end of its settings.
+
 ## [1.0.20] — 2026-10-23
 
 - **[Vulkan] Fixed: SDR games shown as HDR10 (`SdrToHdr`) were oversaturated.** Their BT.709 colours went into the HDR10 output unconverted; they now go through the BT.709 → BT.2020 conversion (ITU-R BT.2087) first. Thanks to speedlemur (#70).

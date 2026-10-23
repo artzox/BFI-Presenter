@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.20"
+#define BFI_ADDON_VERSION "1.0.21-k1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -7552,6 +7552,30 @@ static float OverlayTextWidth(const char *text)
     return r.x;
 }
 
+// Ko-fi button at the bottom of the overlay. shell32 is loaded on the click only, so the add-on links nothing new.
+static void OpenKofi()
+{
+    typedef HINSTANCE (WINAPI *PFN_ShellExecuteW)(HWND, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, INT);
+    HMODULE sh = LoadLibraryW(L"shell32.dll");
+    PFN_ShellExecuteW se = sh ? (PFN_ShellExecuteW)(void *)GetProcAddress(sh, "ShellExecuteW") : nullptr;
+    if (se) se(nullptr, L"open", L"https://ko-fi.com/artzox", nullptr, nullptr, SW_SHOWNORMAL);
+}
+static void KofiButton()
+{
+    const char *kf = "Support on Ko-fi";
+    const float w = ImGui::CalcTextSize(kf).x + ImGui::GetStyle().FramePadding.x * 2;
+    ImGui::SameLine();
+    const float room = ImGui::GetContentRegionAvail().x;      // right-aligned when it fits on the line
+    if (room > w) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + room - w);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.50f, 0.78f, 1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.58f, 0.88f, 1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.42f, 0.68f, 1));
+    if (ImGui::Button(kf)) OpenKofi();
+    ImGui::PopStyleColor(3);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("BFI Presenter is free. If it helps you, you can support its development on Ko-fi\n(ko-fi.com/artzox). Opens in your browser.");
+}
+
 static void draw_overlay(reshade::api::effect_runtime *)
 {
     Status st;
@@ -7950,6 +7974,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
     if (ImGui::Button("Save to BFIPresenter.ini")) SaveSettings(s);
     ImGui::SameLine();
     if (ImGui::Button("Reload ini")) LoadShared();
+    KofiButton();
     ImGui::TextDisabled("Use ENABLE_DECAY=0 in CRT-Standalone. Fixed 120 Hz, VRR off.");
 }
 
