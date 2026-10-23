@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s18"
+#define BFI_ADDON_VERSION "1.0.19-s19"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3935,6 +3935,16 @@ static HRESULT STDMETHODCALLTYPE hk_GetDesc1(IDXGISwapChain1 *sc, DXGI_SWAP_CHAI
     return hr;
 }
 
+// Test (s19): with a cap of N refreshes per game frame the game is shown a display of refresh/N, so each shown
+// frame is one refresh to it. With the raw counts a sync-interval-1 game (DLSS-G's present thread in Onimusha)
+// sees every frame take N refreshes, as if it kept missing vblanks.
+static void VirtualRefreshes(DXGI_FRAME_STATISTICS *st)
+{
+    const UINT per = (UINT)std::max(1, g_capPer.load());
+    st->SyncRefreshCount   /= per;
+    st->PresentRefreshCount = st->SyncRefreshCount;
+}
+
 static HRESULT STDMETHODCALLTYPE hk_GetFS(IDXGISwapChain *sc, DXGI_FRAME_STATISTICS *st)
 {
     if (!t_ownCall && !t_presenterThread && IsGame11(sc) && g_sc && st)
@@ -3946,7 +3956,7 @@ static HRESULT STDMETHODCALLTYPE hk_GetFS(IDXGISwapChain *sc, DXGI_FRAME_STATIST
         if (SUCCEEDED(hr) && g_virtualStats.load() && g_running.load())
         {
             st->PresentCount        = (UINT)g_shownGameFrames.load();
-            st->PresentRefreshCount = st->SyncRefreshCount;
+            VirtualRefreshes(st);
         }
         return hr;
     }
@@ -3959,7 +3969,7 @@ static HRESULT STDMETHODCALLTYPE hk_GetFS(IDXGISwapChain *sc, DXGI_FRAME_STATIST
     {
         // Its last shown frame appeared at the latest vblank.
         st->PresentCount        = (UINT)g_shownGameFrames.load();
-        st->PresentRefreshCount = st->SyncRefreshCount;
+        VirtualRefreshes(st);
     }
     return hr;
 }
