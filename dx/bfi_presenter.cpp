@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s7"
+#define BFI_ADDON_VERSION "1.0.19-s8"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -128,6 +128,7 @@ struct Settings
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
+    int   autoCapReflex = 1;  // AutoCapWithReflex: without frame generation, the automatic frame cap uses Reflex's limit (0 = the presenter's own cap)
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
@@ -262,6 +263,7 @@ static void LoadSettings(Settings &s)
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
+    s.autoCapReflex = IniInt("AutoCapWithReflex", 1) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
     if (s.laterReleaseMs > 5.0f) s.laterReleaseMs = 5.0f;
@@ -412,6 +414,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("GameFrameStatistics", s.virtualStats);
     IniWriteInt("ReuseDrawnBuffers", s.reuseBuffers);
     IniWriteInt("FlashHints", s.flashHints);
+    IniWriteInt("AutoCapWithReflex", s.autoCapReflex);
     IniWriteInt("StartBFIAfterGameResize", s.waitResizeAll);
     IniWriteInt("BypassOverlayResizeHooks", s.bypassResizeHooks);
     IniWriteInt("ShowOverlays", s.showOverlays);
@@ -2009,6 +2012,8 @@ struct ReflexSecond
 };
 static void ReflexTick(int limitUs, ReflexSecond &out);
 static std::atomic<int> g_sleepLimitUs{0};    // frame limit at the game's Reflex sleep, per rendered frame (0 = off)
+static std::atomic<bool> g_sleepActive{false};        // the sleep-point limit is in charge: the game's own limit is taken from the driver
+static std::atomic<int>  g_gameOwnUs{0};              // the game's own Reflex limit, applied at the sleep point instead
 static std::atomic<int> g_sleepFgFactor{1};   // presents per rendered frame (frame generation), for the sleep-point limit
 static IUnknown *ReflexOwnDevice();
 // The game collapsed under a Reflex frame limit (Returnal: 60 -> 7.5 fps, ours or its own).
@@ -3183,7 +3188,15 @@ static DWORD WINAPI PresenterThread(void *)
                         else rcBadSecs = 0;
                     }
                 }
-                if (!autoCapDown) capByReflex = rfxUse;
+                // AutoCapWithReflex=0: without frame generation the presenter's own cap (with just-in-time release)
+                // steps down instead; frame generation always uses Reflex's limit (the presenter's cap would hold
+                // its present thread). The choice also applies while the cap is down.
+                {
+                    const bool reflexOk = s.autoCapReflex || fg;
+                    if (!autoCapDown) capByReflex = rfxUse && reflexOk;
+                    else if (capByReflex && !reflexOk) capByReflex = false;
+                    else if (!capByReflex && reflexOk && rfxUse && s.autoCapReflex) capByReflex = true;
+                }
                 if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg))
                 {
                     const double refMs = 1000.0 / hzA;
@@ -4389,7 +4402,10 @@ static int __cdecl hk_NvSetSleepMode(IUnknown *dev, NvSleepParams *p)
     g_rfxDev = dev;
     const int us = g_rfxWantLimitUs.load();
     NvSleepParams q = *p;
-    const bool strip = us <= 0 && g_rfxLimitBad.load() && p->minIntervalUs > 0;
+    g_gameOwnUs.store((int)p->minIntervalUs);
+    // The game's own limit also counts the presenter's presents in the driver (Returnal: 16,666 us -> 8 fps):
+    // with the sleep-point limit in charge it is applied there instead, and the driver gets none.
+    const bool strip = us <= 0 && (g_rfxLimitBad.load() || g_sleepActive.load()) && p->minIntervalUs > 0;
     if (us > 0) q.minIntervalUs = (uint32_t)us;
     if (strip) q.minIntervalUs = 0;
     if (us > 0) { g_rfxApplied = q; g_rfxAppliedValid = true; }
@@ -4397,7 +4413,7 @@ static int __cdecl hk_NvSetSleepMode(IUnknown *dev, NvSleepParams *p)
     if (changed)
         LOGI("BFI Presenter: game Reflex: low latency %s%s, frame limit %u us%s", p->lowLatency ? "on" : "off",
              p->boost ? " + Boost" : "", p->minIntervalUs, us > 0 ? " -- the presenter's frame limit applies on top" :
-             strip ? " -- taken out (the game collapsed under it)" : "");
+             strip ? (g_sleepActive.load() ? " -- applied at the game's Reflex sleep instead" : " -- taken out (the game collapsed under it)") : "");
     return o_NvSetSleepMode(dev, (us > 0 || strip) ? &q : p);
 }
 
@@ -4602,10 +4618,13 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
         const long calls = g_sleepCalls.load();
         const bool sleeping = calls != lastCalls;     // the game calls it (each frame)
         lastCalls = calls;
+        g_sleepActive.store(want && g_sleepHooked == 1 && sleeping && !g_rfxLimitBad.load());
         if (want && g_sleepHooked == 1 && (sleeping || limitAll <= 0))
         {
             const int f = std::max(1, std::min(4, g_sleepFgFactor.load()));
-            const int us = limitAll > 0 ? limitAll * f : 0;
+            const int own = g_rfxLimitBad.load() ? 0 : g_gameOwnUs.load();   // the game's own limit, if any
+            const int base = std::max(limitAll, own);
+            const int us = base > 0 ? base * f : 0;
             const int before = g_sleepLimitUs.exchange(us);
             if ((before > 0) != (us > 0))
                 LOGI("BFI Presenter: frame limit at the game's Reflex sleep %s (%d us per rendered frame%s)", us > 0 ? "on" : "off", us,
@@ -4616,7 +4635,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
     }
     if (atSleep) limitUs = 0;
     g_rfxWantLimitUs.store(limitUs);
-    if (limitAll > 0 || g_rfxLimitBad.load()) ReflexWatch();
+    if (limitAll > 0 || g_rfxLimitBad.load() || g_sleepActive.load()) ReflexWatch();
     IUnknown *dev = nullptr;
     AcquireSRWLockShared(&g_rfxLock);
     dev = g_rfxDev;
@@ -4710,7 +4729,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
     }
     // The game's own limit taken out (g_rfxLimitBad): its setting again without the limit, every
     // 2 s while it has one (the hook strips it from the game's own calls).
-    if (g_rfxLimitBad.load() && limitUs <= 0 && seen && game.minIntervalUs > 0)
+    if ((g_rfxLimitBad.load() || g_sleepActive.load()) && limitUs <= 0 && seen && game.minIntervalUs > 0)
     {
         static double lastStrip = 0.0;
         if (Now() - lastStrip > 2.0)
@@ -7669,6 +7688,13 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "for this, which also paces frame generation. Frame generation without Reflex: stays at Refresh.");
             if (s.autoCap)
             {
+                bool acr = s.autoCapReflex != 0;
+                ImGui::Indent(16.0f);
+                if (ImGui::Checkbox("Use Reflex's frame limit without frame generation", &acr)) s.autoCapReflex = acr ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("On (default): in games with Reflex the cap paces the game where it starts each frame.\n"
+                                                              "Off: the presenter's own cap with just-in-time release, as in games without Reflex.\n"
+                                                              "With frame generation Reflex's limit is always used.");
+                ImGui::Unindent(16.0f);
                 ImGui::SameLine();
                 if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
                 else if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: Reflex frame limit %.1f ms, one frame per strobe cycle)", st.rfxLimitUs / 1000.0);

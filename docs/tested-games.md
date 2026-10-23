@@ -34,7 +34,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
 | Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency (Refresh + automatic frame cap also works) |
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
-| Pragmata | Working | Works at Half refresh + Smooth (\~30 rendered, 60 presented); the automatic cap can't hold Refresh | v1.0.16 | Half refresh + Smooth with FG; change resolution once to start BFI |
+| Pragmata | Working | Refresh cap + automatic frame cap with FG 2× or 3× (60 of 60), or Half refresh + Apply the cap with Reflex's frame limit | v1.0.19 | Change resolution once to start BFI; don't use ShortFuse's DLSS 5 add-on (even set to off it breaks frame generation's pacing) |
 | Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps |
 | Control | Working | Works (2×, 3×, 4× with the [Control-FG](https://github.com/Frooglemcdoo/Control-FG) mod, also with DLSS 5); Refresh cap | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54 |
 | Marvel's Spider-Man 2 | Working without FG | Must be off (unstable even without the presenter) | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency or Smooth, or Refresh + Lowest latency |
@@ -213,7 +213,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### Returnal
 
 - FG off: frame generation caused menu freezes and flickering UI elements, and with v1.0.13 bright highlights flicker under BFI (the lit refresh mixes real and generated frames unevenly).
-- Any Reflex frame limit collapses the game to 7–8 fps, including the game's own 16,666 µs limit, which it switches on and off by itself. From v1.0.14 the automatic frame cap notices the collapse, takes the limit out (the game's own too) for the rest of the session and caps with the presenter instead: a steady 60 fps without FG. Without a Reflex limit nothing paces DLSS-G here, which is another reason to keep FG off.
+- v1.0.19: the presenter applies Reflex frame limits in the game's Reflex sleep call, including the game's own 16,666 µs limit, so they no longer collapse it (the driver's limit counted the presenter's own presents). Before: any Reflex frame limit collapsed the game to 7–8 fps, including the game's own 16,666 µs limit, which it switches on and off by itself. From v1.0.14 the automatic frame cap notices the collapse, takes the limit out (the game's own too) for the rest of the session and caps with the presenter instead: a steady 60 fps without FG. Without a Reflex limit nothing paces DLSS-G here, which is another reason to keep FG off.
 - Remaining flashes (about 5 per minute) coincide with the game's own GPU hitches of 100–276 ms. Buffer reuse (v0.27) removed the presenter's own GPU stalls.
 - A realtime GPU queue needs Steam itself run as administrator (v0.81); not yet measured in this game.
 
@@ -224,7 +224,8 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - **BFI starts only after the game rebuilds its swap chain:** change the resolution once in the game's settings (and back) to start it.
 - **Recommended with frame generation (v1.0.16): Half refresh + Frame pacing Smooth.** With DLSS FG at about 30 rendered fps, every flash showed the next generated frame (60 of 60 a second), at about 108 ms from the game's input to the flash.
 - Refresh rate + Smooth is the next best: also 60 of 60, but frame generation delivers about 65 a second, so about 5 a second are dropped (small skips), at about 117 ms. Refresh + Lowest latency repeated a frame on about 40% of flashes.
-- The automatic frame cap can't hold Refresh with frame generation: the game collapses under any Reflex frame limit (e.g. 50 → 8 fps), so the presenter drops the limit for the session and frame generation runs uncapped at about 65–70 fps. The in-game limit is inactive with FG, and NVIDIA's Max Frame Rate also limits the presenter's own presents and breaks the strobe, so pick Half refresh yourself.
+- **v1.0.19: the automatic frame cap holds Refresh with frame generation.** The collapse under Reflex frame limits (50 → 8 fps) came from the driver counting the presenter's own presents; the presenter now applies the limit in the game's Reflex sleep call. 2× frame generation: 60 presented from 30 rendered, 57–60 new frames a second, about 21–28 ms from release to flash; 3× at Half with Reflex's limit: 60 of 60 from 20 rendered, about 23–30 ms. Earlier, Half refresh + Smooth was the recommendation.
+- **Remove ShortFuse's DLSS 5 add-on:** even set to off, it made DLSS frame generation deliver its frames in bunches (three within a few ms, then a 40 ms gap), so only 20–45 new frames a second reached the flashes.
 - Before v1.0.14, DLSS Frame Generation dropped to about 15 base fps (shown as 30) with the presenter, because Reflex pacing misread the presenter's presents. OptiScaler limited the frame rate in a v1.0.15 test.
 
 ### The Elder Scrolls IV: Oblivion Remastered
