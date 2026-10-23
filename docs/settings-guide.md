@@ -214,6 +214,10 @@ Keeps one finished flash ready in advance, so if the graphics card is briefly to
 When the game freezes for a moment (loading screens, big stutters), a lit or dark frame would be held too long and you'd see a flash. The hitch guard notices and shows a steady, evenly bright picture until things settle, then resumes BFI after a second. Motion is less sharp during the pause, but nothing flashes.\
 *When to change it:* leave on. The loading time (1000 ms) is how long the game may stop sending new pictures before it counts as a loading screen.
 
+**Flash hints** · `FlashHints` · default: on\
+When the strobe keeps flashing (refreshes missed in 3 of 10 seconds; loading screens don't count), the status box at the top of the overlay suggests what to try next, one step at a time: start Steam or the game's launcher as administrator for a realtime GPU queue (DirectX), 4 presenter buffers, Queue one refresh ahead (+1 refresh of latency), and if it still flashes, lighter game settings or the Half refresh cap. The buttons apply and save the step for this game; nothing changes unless you click. The hint goes away after 30 seconds without flashes.\
+*When to change it:* **Hide flash hints** turns them off for this game if you accept the odd flash.
+
 **Allow RivaTuner** · `AllowRTSS` · default: on\
 Lets BFI Presenter run when RivaTuner (the frame counter / limiter tool) is active. Its frame limiter must be off for BFI games, or it causes flashes.
 

@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.18"
+#define BFI_ADDON_VERSION "1.0.19-h1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -133,6 +133,7 @@ struct Settings
     int   deferRecreated = 1; // recreated swap chains: no BFI until the game resizes (safe)
     int   virtualStats = 1;   // report frame statistics in terms of the game's own frames
     int   reuseBuffers = 1;   // present an already-drawn buffer again instead of redrawing it
+    int   flashHints = 1;     // overlay: suggest the next step when refreshes keep being missed (flashes)
     int   waitResizeAll = 1;  // every swap chain: no BFI until the game first resizes it
     int   bypassResizeHooks = 1; // move to the presenter queue with DXGI's own ResizeBuffers1
     int   showOverlays = 0;   // 1 = the presenter's presents go through overlay hooks (RTSS OSD, Steam overlay
@@ -265,6 +266,7 @@ static void LoadSettings(Settings &s)
     s.deferRecreated = IniInt("WaitForResizeOnRecreatedSwapChain", 1) ? 1 : 0;
     s.virtualStats = IniInt("GameFrameStatistics", 1) ? 1 : 0;
     s.reuseBuffers = IniInt("ReuseDrawnBuffers", 1) ? 1 : 0;
+    s.flashHints = IniInt("FlashHints", 1) ? 1 : 0;
     s.waitResizeAll = IniInt("StartBFIAfterGameResize", 1) ? 1 : 0;
     s.bypassResizeHooks = IniInt("BypassOverlayResizeHooks", 1) ? 1 : 0;
     s.showOverlays = IniInt("ShowOverlays", 0) ? 1 : 0;
@@ -407,6 +409,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
     IniWriteInt("GameFrameStatistics", s.virtualStats);
     IniWriteInt("ReuseDrawnBuffers", s.reuseBuffers);
+    IniWriteInt("FlashHints", s.flashHints);
     IniWriteInt("StartBFIAfterGameResize", s.waitResizeAll);
     IniWriteInt("BypassOverlayResizeHooks", s.bypassResizeHooks);
     IniWriteInt("ShowOverlays", s.showOverlays);
@@ -460,6 +463,8 @@ struct Status
     double ceilInUse = 0.0;                     // ABL guard: lit-refresh ceiling in effect (nits)                  // display refreshing slower than it can, with no missed refreshes
     int    reused = 0;                          // per second: refreshes that reused an already-drawn buffer   // per second: strobe cycles with no new game frame / frames never shown
     int    deviceLost = 0;
+    int    flashHint = 0;                       // missed refreshes keep coming back (3 of the last 10 s; off after 30 s without)
+    int    presBufs = 0;                        // real swap chain buffers behind the presenter
 };
 static Status g_status;
 static char   g_hooksSeen[256] = "";               // other Present hooks found in the process
@@ -2324,6 +2329,10 @@ static DWORD WINAPI PresenterThread(void *)
     bool   limitLogged = false;
     bool   lostLogged = false;
     bool   hitchPaused = false;
+    bool   secStalled = false;                 // the game stalled (loading) during this second
+    int    flashWin[10] = {}, flashIdx = 0;    // seconds with missed refreshes, outside loading
+    double flashLastT = -1e9;
+    bool   flashOn = false;
     UINT lastSync = 0, lastPC = 0;
     bool haveStats = false;
     bool kb = false, km = false, kr = false, krs = false;
@@ -2872,6 +2881,7 @@ static DWORD WINAPI PresenterThread(void *)
             const double third = lateTimes[(lateIdx + 1) & 3];
             const bool lateBurst = lateIdx >= 3 && t - third < 0.5;
             const bool stalled   = lastNewFrameT > 0.0 && (t - lastNewFrameT) * 1000.0 > s.hitchGapMs;
+            if (stalled) secStalled = true;
             if (lateBurst || stalled) hitchUntil = t + 1.0;
             const bool now = t < hitchUntil;
             if (now != hitchPaused)
@@ -2958,6 +2968,20 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.queued       = queuedNow;
             g_status.reused       = secReused;
             g_status.hitchPaused  = hitchPaused;
+            {
+                // Flash hint: missed refreshes or display repeats in 3 of the last 10 seconds, not counting
+                // seconds the game stalled (loading); it goes away after 30 s without any.
+                const bool fl = s.enabled && !secStalled && (secLate > 0 || rep > 0);
+                flashWin[flashIdx++ % 10] = fl ? 1 : 0;
+                if (fl) flashLastT = t;
+                int nfl = 0;
+                for (int k = 0; k < 10; k++) nfl += flashWin[k];
+                if (!flashOn && nfl >= 3) flashOn = true;
+                else if (flashOn && t - flashLastT > 30.0) flashOn = false;
+                secStalled = false;
+                g_status.flashHint = flashOn ? 1 : 0;
+                g_status.presBufs  = (int)n;
+            }
             g_status.hotArea      = (s.ablGuard && psoMeas) ? hotArea : -1.0;
             g_status.rawAvg       = (s.ablGuard && psoMeas) ? rawAvg : -1.0;
             g_status.ceilInUse    = c.ceilLin * 80.0;
@@ -7297,7 +7321,40 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                "Vulkan/OpenGL present method = Prefer layered on DXGI swapchain (BFI Presenter Manager does it).");
         if (st.vsyncOverridden)
             ImGui::TextColored(kRed, "The driver is ignoring VSync (NVIDIA profile: Force off / Fast Sync?).\nPacing to vblank instead; tearing is likely. Set Vertical Sync to Force on.");
-        if (st.repeats > 0 || st.late > 0)
+        // Flash hint: when missed refreshes keep coming back, the first step that isn't done yet (the red
+        // warnings above come first: nothing below helps while one of them applies).
+        const bool redWarn = st.vrrSuspect || st.limitSuspect || st.glPresentBlocked || st.vsyncOverridden;
+        if (st.flashHint && s.flashHints && s.enabled && !redWarn)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            if (s.queuePriority >= 2 && g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH)
+                ImGui::TextWrapped("Flashes? Start Steam (or the game's launcher) as administrator, then the game: the presenter's "
+                                   "GPU queue then runs at realtime priority, so the game's GPU work can't hold up the flashes.");
+            else if (s.reuseBuffers && (s.frames == 2 || s.frames == 4) && st.presBufs > 0 && st.presBufs < 4 && s.presBuffers == 4)
+                ImGui::TextWrapped("4 presenter buffers apply at the game's next resize: change the resolution or display mode "
+                                   "once (and back), or restart the game.");
+            else if (s.reuseBuffers && (s.frames == 2 || s.frames == 4) && st.presBufs > 0 && st.presBufs < 4)
+            {
+                ImGui::TextWrapped("Flashes? Try 4 presenter buffers: more slack for the strobe, and refreshes that show the same "
+                                   "picture again need no drawing. No extra latency.");
+                if (ImGui::SmallButton("Use 4 presenter buffers")) { s.presBuffers = 4; IniWriteInt("PresenterBuffers", 4); }
+                ImGui::SameLine();
+            }
+            else if (s.pacing && !s.queueAhead)
+            {
+                ImGui::TextWrapped("Still flashing? Queue one refresh ahead keeps a finished refresh ready, so a late one doesn't "
+                                   "flash. It adds one refresh of latency (about %.0f ms).", st.refreshHz > 1.0 ? 1000.0 / st.refreshHz : 8.0);
+                if (ImGui::SmallButton("Queue one refresh ahead")) { s.queueAhead = 1; IniWriteInt("QueueAhead", 1); }
+                ImGui::SameLine();
+            }
+            else
+                ImGui::TextWrapped("Still flashing: the GPU is at its limit. Lower the game's settings or resolution, or use the "
+                                   "Half refresh cap.");
+            ImGui::PopStyleColor(1);
+            if (ImGui::SmallButton("Hide flash hints")) { s.flashHints = 0; IniWriteInt("FlashHints", 0); }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("For this game. Advanced > Flash hints brings them back.");
+        }
+        else if (!s.flashHints && (st.repeats > 0 || st.late > 0))
             ImGui::TextColored(kAmber, "Missed refreshes break the strobe: check VRR is off and nothing caps the presenter.");
         if (st.hitchPaused)
             ImGui::TextColored(kAmber, "Hitch guard: BFI paused (loading or missed refreshes)");
@@ -7551,6 +7608,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
         ImGui::SliderInt("Presenter buffers (applies at the game's next resize)", &s.presBuffers, 2, 4);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Real swap chain buffers behind the presenter. With 3 or 4 AND 'Wait for vblank' off,\nthe presenter queues frames ahead, so a late slot no longer holds a lit or dark frame\ntwice (a flash) -- at the cost of 1-2 refreshes (8-17 ms) of extra latency.");
         if (ImGui::Checkbox("Present on own queue (applies when the game next creates its swap chain)", &oq)) s.ownQueue = oq ? 1 : 0;
+        bool fh = s.flashHints != 0;
+        if (ImGui::Checkbox("Flash hints (suggest the next step when the strobe keeps flashing)", &fh)) s.flashHints = fh ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("When refreshes are missed in 3 of 10 seconds (loading doesn't count), the status box\n"
+                                                      "suggests one step at a time: run the launcher as administrator, 4 presenter buffers,\n"
+                                                      "Queue one refresh ahead, then lighter game settings.");
         bool hg = s.hitchGuard != 0;
         if (ImGui::Checkbox("Hitch guard (pause BFI during loading and missed refreshes)", &hg)) s.hitchGuard = hg ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("While the presenter misses refreshes (3 within half a second) or the game delivers no\nnew frame for the loading time, every refresh is shown at the strobe's average brightness\ninstead of strobing (no brightness change). BFI returns after one second without either.");
