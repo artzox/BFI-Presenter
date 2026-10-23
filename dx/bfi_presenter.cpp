@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s8"
+#define BFI_ADDON_VERSION "1.0.19-s10"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -128,7 +128,7 @@ struct Settings
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
-    int   autoCapReflex = 1;  // AutoCapWithReflex: without frame generation, the automatic frame cap uses Reflex's limit (0 = the presenter's own cap)
+    int   autoCapReflex = 0;  // AutoCapWithReflex: 0 = automatic (Reflex's limit with frame generation, the presenter's own cap without), 1 = Reflex's limit always
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
@@ -263,7 +263,7 @@ static void LoadSettings(Settings &s)
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
-    s.autoCapReflex = IniInt("AutoCapWithReflex", 1) ? 1 : 0;
+    s.autoCapReflex = IniInt("AutoCapWithReflex", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
     if (s.laterReleaseMs > 5.0f) s.laterReleaseMs = 5.0f;
@@ -3188,14 +3188,17 @@ static DWORD WINAPI PresenterThread(void *)
                         else rcBadSecs = 0;
                     }
                 }
-                // AutoCapWithReflex=0: without frame generation the presenter's own cap (with just-in-time release)
-                // steps down instead; frame generation always uses Reflex's limit (the presenter's cap would hold
-                // its present thread). The choice also applies while the cap is down.
+                // Which cap steps down in a Reflex game (AutoCapWithReflex=0, automatic): with frame generation
+                // Reflex's limit, applied at the game's sleep (the presenter's cap would hold frame generation's
+                // present thread: Alan Wake 2 3x ~140 ms against ~42 ms); without it the presenter's own cap with
+                // just-in-time release, which times each frame to its flash (God of War: ~25 ms frame done -> flash
+                // against 35-45 ms with Reflex's limit). Follows frame generation going on and off, also while down.
+                // 1 = Reflex's limit always.
                 {
                     const bool reflexOk = s.autoCapReflex || fg;
                     if (!autoCapDown) capByReflex = rfxUse && reflexOk;
                     else if (capByReflex && !reflexOk) capByReflex = false;
-                    else if (!capByReflex && reflexOk && rfxUse && s.autoCapReflex) capByReflex = true;
+                    else if (!capByReflex && reflexOk && rfxUse) capByReflex = true;
                 }
                 if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg))
                 {
@@ -7690,10 +7693,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
             {
                 bool acr = s.autoCapReflex != 0;
                 ImGui::Indent(16.0f);
-                if (ImGui::Checkbox("Use Reflex's frame limit without frame generation", &acr)) s.autoCapReflex = acr ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("On (default): in games with Reflex the cap paces the game where it starts each frame.\n"
-                                                              "Off: the presenter's own cap with just-in-time release, as in games without Reflex.\n"
-                                                              "With frame generation Reflex's limit is always used.");
+                if (ImGui::Checkbox("Reflex's frame limit also without frame generation", &acr)) s.autoCapReflex = acr ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off (default, automatic): in games with Reflex, Reflex's frame limit while frame generation\n"
+                                                              "is on (it paces frame generation), the presenter's own cap with just-in-time release\n"
+                                                              "while it is off (each frame timed to its flash: usually quicker). Follows frame generation\n"
+                                                              "being switched on and off.\n"
+                                                              "On: Reflex's frame limit also without frame generation.");
                 ImGui::Unindent(16.0f);
                 ImGui::SameLine();
                 if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
