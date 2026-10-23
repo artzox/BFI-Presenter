@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s10"
+#define BFI_ADDON_VERSION "1.0.19-s11"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -4408,7 +4408,7 @@ static int __cdecl hk_NvSetSleepMode(IUnknown *dev, NvSleepParams *p)
     g_gameOwnUs.store((int)p->minIntervalUs);
     // The game's own limit also counts the presenter's presents in the driver (Returnal: 16,666 us -> 8 fps):
     // with the sleep-point limit in charge it is applied there instead, and the driver gets none.
-    const bool strip = us <= 0 && (g_rfxLimitBad.load() || g_sleepActive.load()) && p->minIntervalUs > 0;
+    const bool strip = us <= 0 && (g_rfxLimitBad.load() || g_sleepActive.load() || g_sleepLimitUs.load() > 0) && p->minIntervalUs > 0;
     if (us > 0) q.minIntervalUs = (uint32_t)us;
     if (strip) q.minIntervalUs = 0;
     if (us > 0) { g_rfxApplied = q; g_rfxAppliedValid = true; }
@@ -4621,11 +4621,14 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
         const long calls = g_sleepCalls.load();
         const bool sleeping = calls != lastCalls;     // the game calls it (each frame)
         lastCalls = calls;
-        g_sleepActive.store(want && g_sleepHooked == 1 && sleeping && !g_rfxLimitBad.load());
+        // The game's own limit is taken over only without frame generation (Returnal). With frame generation it stays
+        // with the driver unless the presenter's own limit is on: a DLSS 5 injector in Onimusha set one, and taking it
+        // over (per presented frame, times the frame-generation factor) held the game at 15 rendered fps.
+        g_sleepActive.store(want && g_sleepHooked == 1 && sleeping && !g_rfxLimitBad.load() && g_sleepFgFactor.load() == 1);
         if (want && g_sleepHooked == 1 && (sleeping || limitAll <= 0))
         {
             const int f = std::max(1, std::min(4, g_sleepFgFactor.load()));
-            const int own = g_rfxLimitBad.load() ? 0 : g_gameOwnUs.load();   // the game's own limit, if any
+            const int own = (g_rfxLimitBad.load() || f > 1) ? 0 : g_gameOwnUs.load();   // the game's own limit, if any (not with frame generation)
             const int base = std::max(limitAll, own);
             const int us = base > 0 ? base * f : 0;
             const int before = g_sleepLimitUs.exchange(us);
@@ -4732,7 +4735,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
     }
     // The game's own limit taken out (g_rfxLimitBad): its setting again without the limit, every
     // 2 s while it has one (the hook strips it from the game's own calls).
-    if ((g_rfxLimitBad.load() || g_sleepActive.load()) && limitUs <= 0 && seen && game.minIntervalUs > 0)
+    if ((g_rfxLimitBad.load() || g_sleepActive.load() || g_sleepLimitUs.load() > 0) && limitUs <= 0 && seen && game.minIntervalUs > 0)
     {
         static double lastStrip = 0.0;
         if (Now() - lastStrip > 2.0)
