@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s13"
+#define BFI_ADDON_VERSION "1.0.19-s14"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -4643,8 +4643,29 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
             else { g_sleepHooked = -1; LOGW("BFI Presenter: the game's Reflex sleep can't be hooked (%s) -- the driver's frame limit is used", why); }
         }
         static long lastCalls = 0;
+        static double lastCallsT = 0.0;
+        static int perFrame = 1, pfCand = 1, pfRun = 0;
         const long calls = g_sleepCalls.load();
         const bool sleeping = calls != lastCalls;     // the game calls it (each frame)
+        {
+            // Sleep calls per rendered frame: ShortFuse's DLSS 5 injector in Onimusha called it twice per frame with
+            // frame generation, so pacing each call to the frame interval halved the rendered rate (30 presented,
+            // 15 rendered). The interval is split between the calls; changes need 3 seconds in a row.
+            const double tn = Now(), dt = tn - lastCallsT;
+            const double rf = tn - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : 0.0;
+            if (lastCallsT > 0.0 && dt > 0.5 && dt < 3.0 && rf > 5.0)
+            {
+                const int c = std::max(1, std::min(4, (int)((calls - lastCalls) / dt / rf + 0.5)));
+                pfRun = c == pfCand ? pfRun + 1 : 1;
+                pfCand = c;
+                if (c != perFrame && pfRun >= 3)
+                {
+                    LOGI("BFI Presenter: frame limit at the game's Reflex sleep: %d sleep call(s) per rendered frame", c);
+                    perFrame = c;
+                }
+            }
+            lastCallsT = tn;
+        }
         lastCalls = calls;
         // The game's own limit is taken over only without frame generation (Returnal). With frame generation it stays
         // with the driver unless the presenter's own limit is on: a DLSS 5 injector in Onimusha set one, and taking it
@@ -4660,7 +4681,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
             const int f = std::max(1, std::min(4, g_sleepFgFactor.load()));
             const int own = (g_rfxLimitBad.load() || f > 1) ? 0 : g_gameOwnUs.load();   // the game's own limit, if any (not with frame generation)
             const int base = std::max(limitAll, own);
-            const int us = base > 0 ? base * f : 0;
+            const int us = base > 0 ? base * f / perFrame : 0;
             const int before = g_sleepLimitUs.exchange(us);
             if ((before > 0) != (us > 0))
                 LOGI("BFI Presenter: frame limit at the game's Reflex sleep %s (%d us per rendered frame%s)", us > 0 ? "on" : "off", us,
