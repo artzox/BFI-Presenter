@@ -54,10 +54,19 @@ vec3 Decode(vec3 c)
     if (pc.outType == 5u) return SdrExpand(c);
     return c;
 }
+// BT.709 -> BT.2020 primaries (ITU-R BT.2087), for SDR games presented as HDR10. Every row is a positive blend
+// summing to 1, so greys stay grey and no channel goes above the brightest input channel.
+vec3 Bt709To2020(vec3 l)
+{
+    return vec3(dot(l, vec3(0.627404, 0.329283, 0.043313)),
+                dot(l, vec3(0.069097, 0.919540, 0.011362)),
+                dot(l, vec3(0.016391, 0.088013, 0.895595)));
+}
 vec3 Encode(vec3 l)
 {
     if (pc.outType == 0u) return clamp(LinToSrgb(l), 0.0, 1.0);
-    if (pc.outType == 2u || pc.outType >= 4u) return LinToPq(l);
+    if (pc.outType >= 4u) return LinToPq(Bt709To2020(l));
+    if (pc.outType == 2u) return LinToPq(l);
     if (pc.outType == 3u) return clamp(l, 0.0, 1.0);
     return l;
 }

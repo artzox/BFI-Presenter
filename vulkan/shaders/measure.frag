@@ -19,7 +19,9 @@ void main()
         vec3 lin = max(Decode(texelFetch(src, p, 0).rgb), 0.0);
         float m = max(max(lin.r, lin.g), lin.b);
         float S = (m > 1e-6) ? max(pc.ceilLin / m, 1.0) : 1e6;
-        sum += dot(lin, vec3(0.2126, 0.7152, 0.0722)) * min(litGain, S);
+        // HDR10 (2) is in BT.2020 primaries; SDR, scRGB and SDR shown as HDR10 (4, 5: measured before the
+        // BT.709 -> BT.2020 conversion) in BT.709.
+        sum += dot(lin, pc.outType == 2u ? vec3(0.2627, 0.6780, 0.0593) : vec3(0.2126, 0.7152, 0.0722)) * min(litGain, S);
     }
     outLum = sum / 16.0;
 }

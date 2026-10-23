@@ -41,7 +41,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Sifu | Working (DX11) | Not tested | — | Borderless window |
 | God of War (2018) | Working (DX11) | Not tested | v0.60 | Borderless window |
 | No Rest for the Wicked | Working | Not tested | v0.61 | Standard setup (froze on a resize after loading before v0.61) |
-| Mirror's Edge Catalyst | Working (DX11) | Not tested | v0.65 | Borderless window, not exclusive fullscreen; lower Gain and ABL guard budget (bright scenes trigger the TV's ABL) |
+| Mirror's Edge Catalyst | Working (DX11) | Not tested | v0.65 | Borderless window, not exclusive fullscreen; with Windows Auto HDR lower Gain or Auto HDR's intensity (bright scenes trigger the TV's ABL; the ABL guard can't see Auto HDR's output) |
 | Grip | Working | Not tested | v0.65 | Standard setup (didn't load in v0.64) |
 | Prince of Persia: The Lost Crown | Working | Not tested | v0.64 | Standard setup (was held at 60 fps before v0.64) |
 | ABZU | Working | Not tested | v0.66 | Standard setup |
@@ -196,7 +196,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 - About one flash per minute, each matching a game hitch of 33–244 ms. One burst of about a second when presents were briefly limited to about 63 Hz (likely a display-mode change at a transition).
 - Ran at 43–46 fps, so Half refresh never capped it; a steady 60 removes the remaining judder.
-- **v1.0.19 with DLSS 5 and 2× frame generation (ShortFuse's DLSS 5 injector, or OptiScaler NR): Refresh rate + automatic frame cap.** It steps down with Reflex's frame limit to 60 presented / 30 rendered, a new frame on 60 of 60 flashes. Both injectors call the game's Reflex sleep twice per rendered frame, so the presenter gives the limit to the driver for these (ReShade.log: "the game calls its Reflex sleep 2 times per rendered frame"); pacing at the sleep call held it at 15 rendered fps or dropped 3–7 frames a second. The default `ReflexLimitAtSleep=1` is fine.
+- **v1.0.19 with DLSS 5 and 2× frame generation (ShortFuse's DLSS 5 injector, or OptiScaler NR): Refresh rate + automatic frame cap.** It steps down with Reflex's frame limit to 60 presented / 30 rendered, a new frame on 60 of 60 flashes. Both injectors call the game's Reflex sleep twice per rendered frame, so the presenter gives the limit to the driver for these (ReShade.log: "the game calls its Reflex sleep 2 times per rendered frame"); pacing at the sleep call held it at 15 rendered fps or dropped 3–7 frames a second. The default `ReflexLimitAtSleep=1` is fine. Half refresh + **Apply the cap with Reflex's frame limit** works as well; Half refresh with the presenter's own cap does not (see the next point).
 - The game turns frame generation off in its menus, so the menu runs at about half the game's frame-generated fps (also without the presenter). With ShortFuse's injector at Half refresh, frame generation sometimes stayed at 30 presented / 15 rendered after leaving the menu, until the menu was opened and closed again; Refresh with the automatic frame cap held 60. With OptiScaler NR frame generation stays on in the menus.
 - BFI may only start after switching the game to windowed and back to borderless.
 
@@ -271,7 +271,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### Mirror's Edge Catalyst
 
 - DirectX 11. Crashed on exit in exclusive fullscreen; works in a borderless window.
-- **Lower Gain vs blur and a lower ABL guard budget** (`AblGuardBudgetNits`) than usual. The game's large, very bright areas (white rooftops and sky) push the lit refresh high enough to trigger the TV's own ABL, which shows as flicker; a lower Gain and a lower budget keep the strobe below that point.
+- **With Windows Auto HDR, lower Gain (below 1.0) or Auto HDR's intensity** (Settings > Display > HDR). The game's large, very bright areas (white rooftops and sky) push the lit refresh high enough to trigger the TV's own ABL, which shows as flicker. The game's swap chain is SDR, so the presenter outputs SDR and Auto HDR expands it afterwards: the ABL guard only works on HDR output and can't see it, and its budget has no effect here (v1.0.20).
 
 ### Grip
 

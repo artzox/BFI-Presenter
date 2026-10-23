@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.19"
+#define BFI_VERSION "1.0.20"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -279,6 +279,7 @@ struct Settings
     int   vkAutoRecover = 1;  // presentation slowed for 3 s (a window covered the game, ReShade's menu): rebuild the swap chain
     int   ablGuard = 1;       // HDR: keep the lit refresh within the panel's full-screen budget
     int   ablBudget = 250;    // panel budget: average nits of a lit refresh after capping
+    char  ablCurve[128] = {}; // AblCurve: the panel's window curve (area %:nits, e.g. "10:1400,25:600,50:400,100:250"); empty = from DisplayPeakNits and the budget
     int   hitchGuard = 1;     // show every refresh lit while refreshes are missed or the game stalls
     int   flashHints = 1;     // overlay: suggest the next step when refreshes keep being missed (flashes)
     int   hitchGapMs = 1000;  // no new game frame for this long counts as loading
@@ -361,6 +362,10 @@ static void LoadSettings(Settings &s)
     s.vkAutoRecover = KvInt(kv, "VulkanAutoRecover", 1) ? 1 : 0;
     s.ablGuard = KvInt(kv, "AblGuard", 1) ? 1 : 0;
     s.ablBudget = Clamp(KvInt(kv, "AblGuardBudgetNits", 250), 100, 1500);
+    {
+        auto it = kv.find("ablcurve");
+        snprintf(s.ablCurve, sizeof(s.ablCurve), "%s", it == kv.end() ? "" : it->second.c_str());
+    }
     s.hitchGuard = KvInt(kv, "HitchGuard", 1) ? 1 : 0;
     s.flashHints = KvInt(kv, "FlashHints", 1) ? 1 : 0;
     s.hitchGapMs = Clamp(KvInt(kv, "HitchGuardLoadingMs", 1000), 150, 5000);
@@ -393,7 +398,7 @@ static void LoadSettings(Settings &s)
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
     I("AutoFramesAhead", s.autoAhead); I("SmoothCatchUp", s.smoothCatchUp); I("PresenterBuffers", s.presBuffers); I("VulkanExclusiveFullscreen", s.vkExclusive); I("VulkanAutoRecover", s.vkAutoRecover); I("AblGuard", s.ablGuard);
-    I("AblGuardBudgetNits", s.ablBudget); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs); I("FlashHints", s.flashHints);
+    I("AblGuardBudgetNits", s.ablBudget); k.push_back({"AblCurve", s.ablCurve}); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs); I("FlashHints", s.flashHints);
     I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
     F("SdrHighlightKnee", s.sdrKnee);
@@ -563,6 +568,78 @@ struct Constants
 // own ABL still dimmed bright areas with rolling scan on, so its limiter does
 // not go by each refresh's average -- the guard keeps measuring as if the
 // whole screen were lit, rolling or not.
+// ABL guard window curve (#71): the brightness the panel sustains for a white area of a given size. An OLED's
+// limit depends on how much of the screen is bright, not only on the average: a panel holding 250 nits full-screen
+// may hold 600 on 25% of it and 1400 on 10%, so a 25% area at 800 nits trips its limiter at an average of only
+// 200. Each cell counts as its brightness against the largest area the panel holds at that brightness (a 600-nit
+// cell counts 4 on that curve), and the lit refresh may average at most 1. Without AblCurve the curve runs from
+// DisplayPeakNits at 10% to AblGuardBudgetNits full-screen.
+struct AblCurveT { int n = 0; double a[8] = {}, L[8] = {}; };   // area fraction (ascending), nits (non-increasing)
+
+static AblCurveT AblMakeCurve(const char *spec, double peak, double budget)
+{
+    AblCurveT c;
+    for (const char *p = spec; p && *p && c.n < 8;)
+    {
+        double ar = 0.0, nt = 0.0;
+        if (sscanf(p, " %lf : %lf", &ar, &nt) == 2 && ar > 0.0 && ar <= 100.0 && nt >= 50.0 && nt <= 10000.0)
+        {
+            c.a[c.n] = ar / 100.0;
+            c.L[c.n] = nt;
+            c.n++;
+        }
+        const char *q = strchr(p, ',');
+        if (!q) break;
+        p = q + 1;
+    }
+    if (c.n == 0)
+    {
+        c.a[0] = 1.0; c.L[0] = budget; c.n = 1;
+        if (peak > budget) { c.a[0] = 0.10; c.L[0] = peak; c.a[1] = 1.0; c.L[1] = budget; c.n = 2; }
+        return c;
+    }
+    for (int i = 1; i < c.n; i++)                       // sort by area
+        for (int j = i; j > 0 && c.a[j] < c.a[j - 1]; j--)
+        {
+            std::swap(c.a[j], c.a[j - 1]);
+            std::swap(c.L[j], c.L[j - 1]);
+        }
+    for (int i = 1; i < c.n; i++) c.L[i] = std::min(c.L[i], c.L[i - 1]);   // a larger area never holds more
+    if (c.a[c.n - 1] < 1.0)
+    {
+        if (c.n < 8) c.n++;
+        c.a[c.n - 1] = 1.0;
+        c.L[c.n - 1] = std::min(budget, c.L[c.n - 2]);   // no full-screen point: the budget
+    }
+    return c;
+}
+
+// How much of the panel's budget one cell at L nits uses: L / full-screen level up to that level, then 1 / (the
+// largest area the panel holds at L), interpolated in log-log between the curve's points.
+static double AblWeight(const AblCurveT &c, double L)
+{
+    const double full = c.L[c.n - 1];
+    if (L <= full || c.n < 2) return L / full;
+    int i = c.n - 2;
+    while (i > 0 && L > c.L[i]) i--;
+    double la;
+    if (c.L[i] <= c.L[i + 1] * 1.0001) la = (L <= c.L[i]) ? log(c.a[i + 1]) : log(1e-3);
+    else
+    {
+        const double t = (log(L) - log(c.L[i])) / (log(c.L[i + 1]) - log(c.L[i]));
+        la = log(c.a[i]) + t * (log(c.a[i + 1]) - log(c.a[i]));
+    }
+    return 1.0 / std::max(exp(la), 1e-3);
+}
+
+// Average budget use of a lit refresh with every cell capped at C (1 = at the panel's limit).
+static double AblLoadAt(const float *cells, double C, const AblCurveT &curve)
+{
+    double a = 0.0;
+    for (int i = 0; i < 32 * 18; i++) a += AblWeight(curve, std::min((double)cells[i], C));
+    return a / (32.0 * 18.0);
+}
+
 static double AblAvgAt(const float *cells, double C, bool rolling, int frames, bool mprt)
 {
     if (frames < 2) frames = 2;          // BFI off: a measurement taken while it was on
@@ -1596,15 +1673,17 @@ static void PresenterThread(Swapchain *sc)
             static float cells[32 * 18];
             for (int i = 0; i < 32 * 18; i++) cells[i] = std::max(R.measPtr[i], 0.0f) * 80.0f;
             auto avgAt = [&](double C) { return AblAvgAt(cells, C, false, s.frames, s.method == 1); };
-            const double peak = s.peakNits, B = s.ablBudget;
-            if (avgAt(peak) <= B) ablSolve = peak;
+            const double peak = s.peakNits;
+            const AblCurveT curve = AblMakeCurve(s.ablCurve, peak, (double)s.ablBudget);
+            auto loadAt = [&](double C) { return AblLoadAt(cells, C, curve); };
+            if (loadAt(peak) <= 1.0) ablSolve = peak;
             else
             {
                 double lo = 100.0, hi = peak;
                 for (int it = 0; it < 24; it++)
                 {
                     const double mid = 0.5 * (lo + hi);
-                    if (avgAt(mid) <= B) lo = mid; else hi = mid;
+                    if (loadAt(mid) <= 1.0) lo = mid; else hi = mid;
                 }
                 ablSolve = lo;
             }
@@ -4187,6 +4266,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         {
             ImGui::Indent(16.0f);
             ImGui::SliderInt("Panel budget (average nits of a lit refresh)", &s.ablBudget, 100, 1500);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Your panel's full-screen (100%% window) white brightness. Bright areas are held to what the\npanel sustains at their size: from Peak brightness at 10%% of the screen down to this budget at\n100%% (AblCurve in the ini takes your panel's measured curve). The ceiling is lowered just enough;\nsmall highlights keep the full one. Lower it if bright scenes still darken.");
             if (st.litAvg >= 0.0)
                 ImGui::Text("Scene asks for: %.0f nits average   After ceiling: %.0f   Ceiling in use: %.0f nits", st.rawAvg, st.litAvg, st.ceilInUse);
             ImGui::Unindent(16.0f);
