@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s2"
+#define BFI_ADDON_VERSION "1.0.19-s3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3288,6 +3288,19 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 if (limitUs > 0 && t < phaseUntil) limitUs -= 150;
                 ReflexTick(limitUs, rs);
+                {
+                    // [test] every 2 s: presented and rendered fps, frames ahead and Reflex limit, to compare settings.
+                    static int every2 = 0;
+                    if (++every2 >= 2)
+                    {
+                        every2 = 0;
+                        const int gameUs = ReflexGameLimitUs();
+                        LOGI("BFI Presenter: [test] %.1f presented, %.1f rendered fps; frames ahead %d (auto %d); Reflex limit: presenter %d us, "
+                             "game/driver %d us; FG %d; repeated %d, skipped %d, late %d", stNow.gameFps,
+                             Now() - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : -1.0, stNow.aheadInUse, s.autoAhead, rs.limitUs, gameUs,
+                             stNow.fgActive, stNow.frameRepeats, stNow.frameSkips, stNow.late);
+                    }
+                }
                 if (rs.limitUs > 0 && (t - rfxChkT < 12.0 || t - rcOnT < 12.0))
                     LOGI("BFI Presenter: [test] Reflex limit %d us%s: %.1f presented, %.1f rendered fps, %d repeated, %d skipped", rs.limitUs,
                          g_slAppliedUs.load() > 0 ? " (Streamline)" : "", stNow.gameFps, g_rfxRenderedFps.load(), stNow.frameRepeats, stNow.frameSkips);
