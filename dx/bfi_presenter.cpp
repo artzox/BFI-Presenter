@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s5"
+#define BFI_ADDON_VERSION "1.0.19-s6"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -4413,6 +4413,48 @@ static int __cdecl hk_NvSleep(IUnknown *dev)
     return o_NvSleep(dev);
 }
 
+// A function that already starts with a jump (someone else's inline hook, or a jump stub: Pragmata's
+// NvAPI_D3D_Sleep and Streamline's slReflexSetOptions start with a 2-byte nop and a jmp rel32): the jump's
+// target is changed to a relay to hook, and the returned "original" runs the bytes before the jump and
+// then jumps where it used to go, so the earlier hook keeps working behind ours.
+static void *HookByJumpChain(BYTE *code, size_t at, void *hook, char *why, size_t whyLen)
+{
+    int32_t rel;
+    memcpy(&rel, code + at + 1, 4);
+    BYTE *dest = code + at + 5 + rel;
+    BYTE *page = nullptr;
+    const uintptr_t base = (uintptr_t)code & ~(uintptr_t)0xFFFF;
+    for (uintptr_t d = 0x10000; d < 0x40000000 && !page; d += 0x10000)
+    {
+        page = (BYTE *)VirtualAlloc((void *)(base - d), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (!page) page = (BYTE *)VirtualAlloc((void *)(base + d), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    }
+    if (!page) { snprintf(why, whyLen, "no memory near the function"); return nullptr; }
+    // page+0: the original -- the bytes before the jump, then jmp [rip] -> dest
+    memcpy(page, code, at);
+    BYTE *j = page + at;
+    j[0] = 0xFF; j[1] = 0x25; j[2] = j[3] = j[4] = j[5] = 0;
+    const uint64_t d64 = (uint64_t)(uintptr_t)dest;
+    memcpy(j + 6, &d64, 8);
+    // page+64: relay to the hook
+    BYTE *relay = page + 64;
+    relay[0] = 0xFF; relay[1] = 0x25; relay[2] = relay[3] = relay[4] = relay[5] = 0;
+    const uint64_t h64 = (uint64_t)(uintptr_t)hook;
+    memcpy(relay + 6, &h64, 8);
+    const int64_t nrel = (int64_t)(uintptr_t)relay - ((int64_t)(uintptr_t)code + (int64_t)at + 5);
+    if (nrel < INT32_MIN || nrel > INT32_MAX) { VirtualFree(page, 0, MEM_RELEASE); snprintf(why, whyLen, "relay out of range"); return nullptr; }
+    DWORD old;
+    VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), page, 128);
+    if (!VirtualProtect(code + at + 1, 4, PAGE_EXECUTE_READWRITE, &old)) { snprintf(why, whyLen, "can't write the function"); return nullptr; }
+    const int32_t n32 = (int32_t)nrel;
+    InterlockedExchange((volatile LONG *)(code + at + 1), (LONG)n32);   // not always aligned; x64 tolerates it
+    VirtualProtect(code + at + 1, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, at + 5);
+    snprintf(why, whyLen, "chained behind the jump at +%zu", at);
+    return page;
+}
+
 // Patches target's first instructions with a jump to hook; returns a callable copy
 // of the original start (nullptr if the start can't be relocated).
 static void *InlineHook64(void *target, void *hook, char *why, size_t whyLen)
@@ -4423,6 +4465,13 @@ static void *InlineHook64(void *target, void *hook, char *why, size_t whyLen)
     while (len < 14)
     {
         int rd;
+        // A jump already at the start (only plain instructions before it, no RIP-relative ones): chain behind it.
+        if (code[len] == 0xE9 && len <= 8)
+        {
+            bool plain = true;
+            for (int k = 0; k < n; k++) if (rip[k] >= 0) plain = false;
+            if (plain) return HookByJumpChain(code, len, hook, why, whyLen);
+        }
         const int l = InsnLength(code + len, &rd);
         if (l <= 0 || n >= 16) { snprintf(why, whyLen, "unsupported instruction at +%zu (%02X)", len, code[len]); return nullptr; }
         ins[n] = (int)len; rip[n] = rd; n++;
@@ -4527,7 +4576,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
         {
             char why[96] = "";
             void *orig = InlineHook64((void *)g_nvSleep, (void *)&hk_NvSleep, why, sizeof(why));
-            if (orig) { o_NvSleep = (PFN_NvSleep)orig; g_sleepHooked = 1; LOGI("BFI Presenter: frame limit at the game's Reflex sleep: hooked"); }
+            if (orig) { o_NvSleep = (PFN_NvSleep)orig; g_sleepHooked = 1; LOGI("BFI Presenter: frame limit at the game's Reflex sleep: hooked%s%s%s", why[0] ? " (" : "", why, why[0] ? ")" : ""); }
             else { g_sleepHooked = -1; LOGW("BFI Presenter: the game's Reflex sleep can't be hooked (%s) -- the driver's frame limit is used", why); }
         }
         static long lastCalls = 0;
