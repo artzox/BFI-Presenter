@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-h1"
+#define BFI_ADDON_VERSION "1.0.19-h2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2292,6 +2292,7 @@ static DWORD WINAPI PresenterThread(void *)
     double rfxChkT = -100.0;      // start of the collapse check after a step-down with Reflex's limit (moved on by stalls)
     int    rcBadSecs = 0;
     int    rfxBadSecs = 0, gameLimBadSecs = 0;   // seconds collapsed under our Reflex limit / the game's own
+    double rfxBadUntil = 0.0, rfxStrikeT = -1e9;  // a first collapse: the limit is off until rfxBadUntil, then tried again
     double fpsGoodT = -100.0;     // last second the game held at least half the strobe rate
     double fpsAtDown = 0.0;       // game fps when the automatic frame cap stepped down   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
     int    fgVotes = 0;           // seconds in a row the counts said the frame-generation state changed
@@ -3114,19 +3115,38 @@ static DWORD WINAPI PresenterThread(void *)
                 // 50 ms after the step-down, the window not responding) set it off. A collapsed game keeps
                 // drawing steadily with the hitch guard running (Returnal ~7 fps, Pragmata ~8), so a second
                 // with the hitch guard paused or below 3 fps restarts the check instead of counting.
+                // A first collapse takes the limit off for 20 s only, then it is tried again: a dip right after
+                // the step-down can be the game compiling shaders after a load (The Witcher 3: 82 -> 16 fps for
+                // 2 s, while the same 60 fps limit holds fine by hand). A second collapse within 2 minutes of the
+                // retry (Returnal collapses every time) keeps it off for the session.
+                auto rfxStrike = [&](const char *what, double fell, double before) {
+                    g_rfxLimitBad.store(true); capByReflex = false; reflexCap = false;
+                    if (t - rfxStrikeT < 140.0)
+                    {
+                        rfxBadUntil = 0.0;
+                        LOGW("BFI Presenter: Reflex frame limit: the game fell to %.0f fps under it again (%.0f before) -- no Reflex "
+                             "frame limit for the rest of this session (the game's own is taken out too); %s", fell, before, what);
+                    }
+                    else
+                    {
+                        rfxBadUntil = t + 20.0;
+                        LOGW("BFI Presenter: Reflex frame limit: the game fell to %.0f fps under it (%.0f before) -- off for 20 s, "
+                             "then tried again (a second fall keeps it off for the session)", fell, before);
+                    }
+                    rfxStrikeT = t;
+                };
+                if (rfxBadUntil > 0.0 && t >= rfxBadUntil)
+                {
+                    rfxBadUntil = 0.0; rfxStrikeT = t; g_rfxLimitBad.store(false);
+                    LOGI("BFI Presenter: Reflex frame limit: trying it again");
+                }
                 const bool rfxLimitBad = g_rfxLimitBad.load();
                 const bool stallSec = fpsA < 3.0 || hitchPaused;
                 if (stallSec) { rfxChkT = t; rcOnT = t; }
                 if (autoCapDown && capByReflex && !rfxLimitBad && !stallSec && t - rfxChkT >= 1.5 && t - rfxChkT < 6.0 &&
                     fpsAtDown > 0.8 * hzA / s.frames && fpsA < 0.5 * hzA / s.frames)
                 {
-                    if (++rfxBadSecs >= 2)
-                    {
-                        g_rfxLimitBad.store(true); capByReflex = false;
-                        LOGW("BFI Presenter: Reflex frame limit: the game fell to %.0f fps under it (%.0f before) -- no Reflex frame "
-                             "limit for the rest of this session (the game's own is taken out too); the automatic frame cap uses the "
-                             "presenter's own cap", fpsA, fpsAtDown);
-                    }
+                    if (++rfxBadSecs >= 2) { rfxStrike("the automatic frame cap uses the presenter's own cap", fpsA, fpsAtDown); rfxBadSecs = 0; }
                 }
                 else rfxBadSecs = 0;
                 // The same collapse under the game's own Reflex limit (Returnal sets 16,666 us now and then:
@@ -3137,9 +3157,9 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     if (++gameLimBadSecs >= 2)
                     {
-                        g_rfxLimitBad.store(true); capByReflex = false;
-                        LOGW("BFI Presenter: the game's own Reflex frame limit (%d us): the game fell to %.0f fps under it -- taken out "
-                             "for the rest of this session", gameLimUs, fpsA);
+                        LOGW("BFI Presenter: the game's own Reflex frame limit (%d us): the game fell to %.0f fps under it", gameLimUs, fpsA);
+                        rfxStrike("the game's own limit stays out", fpsA, 0.5 * hzA / s.frames);
+                        gameLimBadSecs = 0;
                     }
                 }
                 else gameLimBadSecs = 0;
@@ -3169,12 +3189,7 @@ static DWORD WINAPI PresenterThread(void *)
                         const double capFps = hzA / rcPer;
                         if (!stallSec && t - rcOnT >= 1.5 && t - rcOnT < 6.0 && fpsAtRc > 0.8 * capFps && fpsA < 0.5 * capFps)
                         {
-                            if (++rcBadSecs >= 2)
-                            {
-                                g_rfxLimitBad.store(true); reflexCap = false;
-                                LOGW("BFI Presenter: Reflex frame limit: the game fell to %.0f fps under it (%.0f before) -- no Reflex frame "
-                                     "limit for the rest of this session; the game frame cap uses the presenter's own cap", fpsA, fpsAtRc);
-                            }
+                            if (++rcBadSecs >= 2) { rfxStrike("the game frame cap uses the presenter's own cap", fpsA, fpsAtRc); rcBadSecs = 0; }
                         }
                         else rcBadSecs = 0;
                     }
