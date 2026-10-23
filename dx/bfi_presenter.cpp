@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s14"
+#define BFI_ADDON_VERSION "1.0.19-s15"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -4633,7 +4633,8 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
     bool atSleep = false;
     {
         EnterCriticalSection(&g_cfgLock);
-        const bool want = g_shared.reflexAtSleep != 0;
+        static bool giveUp = false;   // the sleep-point limit held the game well below its target: driver limit for the session
+        const bool want = g_shared.reflexAtSleep != 0 && !giveUp;
         LeaveCriticalSection(&g_cfgLock);
         if (want && g_nvSleep && g_sleepHooked == 0)
         {
@@ -4687,6 +4688,23 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
                 LOGI("BFI Presenter: frame limit at the game's Reflex sleep %s (%d us per rendered frame%s)", us > 0 ? "on" : "off", us,
                      f > 1 ? ", frame generation" : "");
             atSleep = us > 0;
+            // Safety net: some injectors (ShortFuse's DLSS 5 injector in Onimusha with frame generation) make the game
+            // render far below the sleep-point target (15-19 rendered for 30-60). After 3 such seconds the limit goes
+            // back to the driver for the session, as with ReflexLimitAtSleep=0 (1.0.18 behaviour).
+            static int underRun = 0, onRun = 0;
+            const double rf = Now() - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : 0.0;
+            if (us > 0 && before == us) ++onRun; else onRun = 0;
+            if (onRun >= 2 && rf > 1.0 && rf < 0.7 * 1e6 / ((double)us * perFrame)) ++underRun; else underRun = 0;
+            if (underRun >= 3)
+            {
+                LOGW("BFI Presenter: frame limit at the game's Reflex sleep held the game at %.0f rendered fps of %.0f -- the driver's frame limit is used for this session",
+                     rf, 1e6 / ((double)us * perFrame));
+                giveUp = true;
+                g_sleepLimitUs.store(0);
+                g_sleepActive.store(false);
+                g_sleepFgStrip.store(false);
+                atSleep = false;
+            }
         }
         else if (g_sleepLimitUs.load() > 0) g_sleepLimitUs.store(0);
     }
