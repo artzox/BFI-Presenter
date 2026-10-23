@@ -14,7 +14,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 - **Recommended presenter settings (v0.82):** PresenterBuffers 3, Wait for vblank on, Queue one refresh ahead off, Automatic frames ahead on.
   - Game holds 120 fps: Game frame cap Refresh rate + Frame pacing Lowest latency. Light games: add Later release (Cuphead: \~5 ms less latency).
   - Game can't hold 120: Game frame cap Half refresh + Frame pacing Smooth, with Just-in-time release on (the default). Some games are smoother with Lowest latency instead (Soul Reaver).
-  - **With frame generation (DLSS FG, FSR FG, Lossless Scaling): Game frame cap Refresh rate, not Half refresh.** FG doubles (or triples) the game's output, so let the presenter take every generated frame; Half refresh throws half of them away. Exception: when frame generation only reaches about the strobe rate (e.g. 60 at 120 Hz: 2× at about 30 rendered fps, 3× at about 20), use Half refresh + Smooth: it shows every generated frame evenly and was quicker than Reflex's limit at Refresh (Alan Wake 2 with 3×, Pragmata, Until Dawn).
+  - **With frame generation (DLSS FG, FSR FG, Lossless Scaling): Game frame cap Refresh rate, not Half refresh.** FG doubles (or triples) the game's output, so let the presenter take every generated frame; Half refresh throws half of them away. Exception: when frame generation only reaches about the strobe rate (e.g. 60 at 120 Hz: 2× at about 30 rendered fps, 3× at about 20), use Refresh + the automatic frame cap, or Half refresh + *Apply the cap with Reflex's frame limit* (v1.0.19): Reflex's limit paces frame generation with about 100 ms less latency than Half + Smooth with the presenter's own cap (Alan Wake 2 with 3×: ~42 ms against ~140 ms from frame start to GPU). Before v1.0.19 Half refresh + Smooth was the better choice (Alan Wake 2 with 3×, Pragmata, Until Dawn).
 - **DirectX 11 games: borderless or windowed, not exclusive fullscreen.** The DX11 path presents through its own window over the game (Mirror's Edge Catalyst crashed on exit in exclusive fullscreen).
 - **Realtime GPU priority (DirectX):** start Steam (or the game's launcher) as administrator for the session. The presenter queue then runs at global realtime priority, which removed the \~30 ms stalls behind God of War Ragnarök's flashes. The overlay's Status section shows the queue priority.
 - **Vulkan games:** install the Vulkan layer once with `install_vulkan_layer.bat` and put `BFIPresenter.ini` next to the game's .exe. The layer loads only when the game runs without administrator rights.
@@ -27,7 +27,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
 | Shadow of the Tomb Raider | Working | Works (OptiScaler FSR 3.1 FG) | v0.2 | Standard setup |
-| Alan Wake 2 | Working | Works (2×, 3×); 3× at \~20 fps: Half refresh + Smooth | v0.19 | Standard setup |
+| Alan Wake 2 | Working | Works (2×, 3×); 3×: Refresh + automatic frame cap, or Half refresh + Apply the cap with Reflex's frame limit (v1.0.19) | v0.19 | Standard setup |
 | God of War Ragnarök | Working | Runs, but judders below 60 output fps | v0.24 | Standard setup; RTSS limiter off |
 | Riven (2023) | Working | Works (OptiScaler XeSS FG, limited to 60) | v0.13 | A steady 60 fps for smooth motion; with DLSS 5 at 4K, XeSS frame generation through OptiScaler limited to 60 (see the notes below) |
 | Onimusha | Working | Works (2×, 3×); Refresh cap | v0.27 | Standard setup |
@@ -147,7 +147,8 @@ Also tested and working with the standard setup above. Their notes weren't recor
 ### Alan Wake 2
 
 - No issues found. The game calls exclusive fullscreen and changes HDR format several times at start-up; the presenter handles both.
-- **With 3× frame generation at about 20 rendered fps (60 presented): Half refresh + Smooth (v1.0.16).** A new frame on 60 of 60 flashes (0.5% repeated) at about 99 ms from input to flash. Reflex's limit (Refresh with the automatic frame cap, or Half with *Apply the cap with Reflex's frame limit*) repeated about 7% of flashes at about 130 ms; Half + Lowest latency repeated or skipped about a third.
+- **v1.0.19, 3× frame generation (20 rendered, 60 presented): Reflex's limit now works and is far quicker.** Refresh + automatic frame cap: about 59 of 60 flashes with a new frame, about 39–42 ms from the game's frame start to the GPU finishing it. Half + *Apply the cap with Reflex's frame limit*: 60 of 60 (Smooth) at about 43 ms. Half + Smooth with the presenter's own cap: also 60 of 60, but about 140 ms, because frame generation's frames wait behind the cap. The earlier Reflex numbers below came from the driver's limit, which counted the presenter's own presents.
+- **Before v1.0.19, with 3× frame generation at about 20 rendered fps (60 presented): Half refresh + Smooth (v1.0.16).** A new frame on 60 of 60 flashes (0.5% repeated) at about 99 ms from input to flash. Reflex's limit (Refresh with the automatic frame cap, or Half with *Apply the cap with Reflex's frame limit*) repeated about 7% of flashes at about 130 ms; Half + Lowest latency repeated or skipped about a third.
 
 ### God of War Ragnarök
 
