@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s6"
+#define BFI_ADDON_VERSION "1.0.19-s7"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3289,8 +3289,27 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 if (limitUs > 0 && t < phaseUntil) limitUs -= 150;
                 {
+                    // Frame-generation factor for the sleep-point limit: presents per rendered frame, over the same
+                    // second (the rendered count was taken at the end of the last second, so it goes with last
+                    // second's presents), and changed only after 3 seconds in a row agree. Comparing it with this
+                    // second's presents swung it between 2 and 4 after a hitch in Pragmata (3x frame generation:
+                    // 50 / 77 presented, every other second, until the limit was switched off and on).
+                    static double presPrev = 0.0;
+                    static int candPrev = 0, candRun = 0;
                     const double rf = Now() - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : 0.0;
-                    g_sleepFgFactor.store(stNow.fgActive && rf > 1.0 ? (int)(stNow.gameFps / rf + 0.5) : 1);
+                    int cand = 1;
+                    if (stNow.fgActive && rf > 1.0 && presPrev > 1.0) cand = std::max(2, std::min(4, (int)(presPrev / rf + 0.5)));
+                    if (!stNow.fgActive) cand = 1;
+                    candRun = (cand == candPrev) ? candRun + 1 : 1;
+                    candPrev = cand;
+                    const int cur = g_sleepFgFactor.load();
+                    if (cand != cur && (candRun >= 3 || cand == 1 || cur == 1))
+                    {
+                        g_sleepFgFactor.store(cand);
+                        if (g_sleepLimitUs.load() > 0)
+                            LOGI("BFI Presenter: frame limit at the game's Reflex sleep: frame generation %dx", cand);
+                    }
+                    presPrev = stNow.gameFps;
                 }
                 ReflexTick(limitUs, rs);
                 rsLast = rs; rsLastT = t;
