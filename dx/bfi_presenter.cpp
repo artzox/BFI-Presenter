@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.19-s3"
+#define BFI_ADDON_VERSION "1.0.19-s4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -128,6 +128,7 @@ struct Settings
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
+    int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
     int   reflexViaSl = 1;    // ReflexLimitViaStreamline: in Streamline games, set the frame limit through Streamline's Reflex options
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
@@ -262,6 +263,7 @@ static void LoadSettings(Settings &s)
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
     s.reflexViaSl = IniInt("ReflexLimitViaStreamline", 1) ? 1 : 0;
+    s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
     if (s.laterReleaseMs > 5.0f) s.laterReleaseMs = 5.0f;
@@ -2008,6 +2010,8 @@ struct ReflexSecond
     int    limitUs = 0;          // Reflex frame limit in effect
 };
 static void ReflexTick(int limitUs, ReflexSecond &out);
+static std::atomic<int> g_sleepLimitUs{0};    // frame limit at the game's Reflex sleep, per rendered frame (0 = off)
+static std::atomic<int> g_sleepFgFactor{1};   // presents per rendered frame (frame generation), for the sleep-point limit
 static std::atomic<int> g_slAppliedUs{0};   // frame limit the presenter last gave Streamline's Reflex (0 = none)
 static IUnknown *ReflexOwnDevice();
 // The game collapsed under a Reflex frame limit (Returnal: 60 -> 7.5 fps, ours or its own).
@@ -3287,6 +3291,10 @@ static DWORD WINAPI PresenterThread(void *)
                              "last second) -- moving them earlier", stNow.frameRepeats, stNow.frameSkips);
                 }
                 if (limitUs > 0 && t < phaseUntil) limitUs -= 150;
+                {
+                    const double rf = Now() - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : 0.0;
+                    g_sleepFgFactor.store(stNow.fgActive && rf > 1.0 ? (int)(stNow.gameFps / rf + 0.5) : 1);
+                }
                 ReflexTick(limitUs, rs);
                 {
                     // [test] every 2 s: presented and rendered fps, frames ahead and Reflex limit, to compare settings.
@@ -3296,8 +3304,8 @@ static DWORD WINAPI PresenterThread(void *)
                         every2 = 0;
                         const int gameUs = ReflexGameLimitUs();
                         LOGI("BFI Presenter: [test] %.1f presented, %.1f rendered fps; frames ahead %d (auto %d); Reflex limit: presenter %d us, "
-                             "game/driver %d us; FG %d; repeated %d, skipped %d, late %d", stNow.gameFps,
-                             Now() - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : -1.0, stNow.aheadInUse, s.autoAhead, rs.limitUs, gameUs,
+                             "game/driver %d us, at sleep %d us; FG %d; repeated %d, skipped %d, late %d", stNow.gameFps,
+                             Now() - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : -1.0, stNow.aheadInUse, s.autoAhead, rs.limitUs, gameUs, g_sleepLimitUs.load(),
                              stNow.fgActive, stNow.frameRepeats, stNow.frameSkips, stNow.late);
                     }
                 }
@@ -4393,6 +4401,37 @@ static int __cdecl hk_NvSetSleepMode(IUnknown *dev, NvSleepParams *p)
     return o_NvSetSleepMode(dev, (us > 0 || strip) ? &q : p);
 }
 
+// ---------------------------------------------------------------- frame limit at the game's Reflex sleep
+// The driver's frame limit (Reflex's minimum interval, and NVIDIA's Max Frame Rate while Reflex is on)
+// paces the game by the presents it sees on the swap chain. With the presenter those are the presenter's
+// own, 120 a second whatever the game does, so the driver keeps sleeping the game longer and it ends at
+// ~7 rendered fps (The Witcher 3 under NVPI's 60 fps limit and under the presenter's Reflex limit; Returnal
+// ~7.5). Instead the presenter paces the game where Reflex would: in the game's own NvAPI_D3D_Sleep call at
+// the start of each frame, one rendered frame per (limit x frame-generation factor), and the driver gets
+// no limit of its own.
+typedef int (__cdecl *PFN_NvSleep)(IUnknown *);
+static PFN_NvSleep       g_nvSleep = nullptr, o_NvSleep = nullptr;
+static int               g_sleepHooked = 0;           // 0 not tried, 1 hooked, -1 couldn't
+static std::atomic<long> g_sleepCalls{0};
+static int __cdecl hk_NvSleep(IUnknown *dev)
+{
+    g_sleepCalls.fetch_add(1);
+    const int us = g_sleepLimitUs.load();
+    if (us > 0)
+    {
+        static thread_local HANDLE timer = nullptr;
+        static double nextT = 0.0;
+        if (!timer) timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /*HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
+        const double iv = us * 1e-6;
+        double now = Now();
+        if (nextT <= 0.0 || now > nextT + iv || nextT - now > 2.0 * iv) nextT = now;   // start, a hitch, or a changed limit
+        while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
+        SleepUntil(nextT, timer);
+        nextT += iv;
+    }
+    return o_NvSleep(dev);
+}
+
 // Patches target's first instructions with a jump to hook; returns a callable copy
 // of the original start (nullptr if the start can't be relocated).
 static void *InlineHook64(void *target, void *hook, char *why, size_t whyLen)
@@ -4461,6 +4500,7 @@ static bool ReflexApi()
         g_nvSetSleepMode   = (PFN_NvSetSleepMode)qi(0xAC1CA9E0);
         g_nvGetSleepStatus = (PFN_NvGetSleepStatus)qi(0xAEF96CA1);
         g_nvGetLatency     = (PFN_NvGetLatency)qi(0x1A587F9C);
+        g_nvSleep          = (PFN_NvSleep)qi(0x852CD1D2);
     }
     g_rfxApi = (g_nvSetSleepMode && g_nvGetLatency) ? 1 : -1;
     if (g_rfxApi < 0) LOGW("BFI Presenter: Reflex: NvAPI latency functions not available");
@@ -4690,7 +4730,37 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
         if (want && (limitUs > 0 || g_slAppliedUs.load() > 0) && SlReflexReady()) { SlReflexLimit(limitUs); viaSl = true; }
         else if (g_slState == 1 && g_slAppliedUs.load() > 0) SlReflexLimit(0);
     }
-    if (viaSl) limitUs = 0;
+    // The game's own frames paced in its Reflex sleep call (see hk_NvSleep): nothing for the driver.
+    bool atSleep = false;
+    {
+        EnterCriticalSection(&g_cfgLock);
+        const bool want = g_shared.reflexAtSleep != 0;
+        LeaveCriticalSection(&g_cfgLock);
+        if (want && g_nvSleep && g_sleepHooked == 0)
+        {
+            char why[96] = "";
+            void *orig = InlineHook64((void *)g_nvSleep, (void *)&hk_NvSleep, why, sizeof(why));
+            if (orig) { o_NvSleep = (PFN_NvSleep)orig; g_sleepHooked = 1; LOGI("BFI Presenter: frame limit at the game's Reflex sleep: hooked"); }
+            else { g_sleepHooked = -1; LOGW("BFI Presenter: the game's Reflex sleep can't be hooked (%s) -- the driver's frame limit is used", why); }
+        }
+        static long lastCalls = 0;
+        const long calls = g_sleepCalls.load();
+        const bool sleeping = calls != lastCalls;     // the game calls it (each frame)
+        lastCalls = calls;
+        if (want && g_sleepHooked == 1 && (sleeping || limitAll <= 0))
+        {
+            const int f = std::max(1, std::min(4, g_sleepFgFactor.load()));
+            const int us = limitAll > 0 ? limitAll * f : 0;
+            const int before = g_sleepLimitUs.exchange(us);
+            if (before != us)
+                LOGI("BFI Presenter: frame limit at the game's Reflex sleep %s (%d us per rendered frame%s)", us > 0 ? "on" : "off", us,
+                     f > 1 ? ", frame generation" : "");
+            atSleep = us > 0;
+        }
+        else if (g_sleepLimitUs.load() > 0) g_sleepLimitUs.store(0);
+    }
+    if (atSleep && viaSl) { SlReflexLimit(0); viaSl = false; }
+    if (viaSl || atSleep) limitUs = 0;
     g_rfxWantLimitUs.store(limitUs);
     if (limitAll > 0 || g_rfxLimitBad.load()) ReflexWatch();
     IUnknown *dev = nullptr;
@@ -4799,7 +4869,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
             lastStrip = Now();
         }
     }
-    out.limitUs = (limitAll > 0 && (gameUses || viaSl)) ? limitAll : 0;
+    out.limitUs = (limitAll > 0 && (gameUses || viaSl || atSleep)) ? limitAll : 0;
 }
 #else
 static int ReflexGameLimitUs() { return 0; }
