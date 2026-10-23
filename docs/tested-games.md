@@ -8,7 +8,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 - **G-SYNC and VSync: check per game.** The presenter's steady 120 presents per second usually hold the display at a fixed 120 Hz even with G-SYNC on globally. Only where that fails (for example God of War Ragnarök with 2× FG, Control in heavy scenes, or Resonance ignoring VSync) set G-SYNC off and Vertical Sync Force on in the game's NVIDIA Profile Inspector profile. The BFI Presenter window should show 120 refreshes per second with no display repeats.
 - **Vertical Sync: never Force off or Fast Sync** in the game's NVIDIA profile: the strobe loses its cadence. “Use the 3D application setting” works in most games; Force on where the game ignores VSync.
-- **No frame-rate limiter that touches the presenter:** NVIDIA Max Frame Rate off, globally and in NVIDIA Profile Inspector. With a global RTSS profile (for example 118 fps for VRR), give each BFI game its own RTSS profile with the frame limit set to 0: a 118 cap caused a flash twice a second, and even 120 can drop an occasional refresh. The overlay warns when a limiter holds the presenter below the display rate.
+- **No frame-rate limiter that touches the presenter:** NVIDIA Max Frame Rate off, globally and in NVIDIA Profile Inspector (with Reflex on it paces by the presenter's presents and dropped The Witcher 3 to about 8 fps; use the presenter's caps). With a global RTSS profile (for example 118 fps for VRR), give each BFI game its own RTSS profile with the frame limit set to 0: a 118 cap caused a flash twice a second, and even 120 can drop an occasional refresh. The overlay warns when a limiter holds the presenter below the display rate.
 - **CRT-Standalone:** set `ENABLE_DECAY=0`, so the shader's own BFI doesn't stack on the presenter's.
 - **ABL guard budget (HDR, v0.52+): set it to the display's full-white brightness.** `AblGuardBudgetNits=250` for the A95L (spec 250–260 nits at a 100 % window). South of Midnight's sky still flashed at 300 and was clean at 250; God of War Ragnarök's brightest scene passed at 300. One value covers all games.
 - **Recommended presenter settings (v0.82):** PresenterBuffers 3, Wait for vblank on, Queue one refresh ahead off, Automatic frames ahead on.
@@ -129,7 +129,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | The Elder Scrolls IV: Oblivion Remastered | Works with DLSS 5; frame generation off (artifacts). 2 frames per cycle at Half refresh + Smooth + Apply the cap with Reflex's frame limit (see the notes below) |
 | The Last of Us Part I | Works with DLSS 5. Needs `TypedBackBufferDesc=1` (the default; it crashed without it) |
 | The Vanishing of Ethan Carter Redux | Standard setup |
-| The Witcher 3: Wild Hunt (patch 4.04, DirectX 12) | Works with DLSS 5 |
+| The Witcher 3: Wild Hunt (patch 4.04, DirectX 12) | Works with DLSS 5 and FG 2× (v1.0.19): Refresh cap with the automatic frame cap, or Half refresh + Apply the cap with Reflex's frame limit (60 of 60) |
 | Thief (2014) | Half refresh + Smooth; with catch-up on (before v1.0.3) Smooth repeated and then skipped a frame about once a second |
 | Tony Hawk's Pro Skater 1 + 2 | Standard setup |
 | Trine 5 | Standard setup |
