@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.21-f3"
+#define BFI_ADDON_VERSION "1.0.21-f4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2106,14 +2106,19 @@ static int ReflexGameLimitUs();
 static std::atomic<double> g_fgPresentT{0.0};   // last time a frame-generation DLL was seen presenting
 static std::atomic<bool>   g_fgCallerDlss{false};  // ... and it was DLSS-G's (also on the stack without frame generation)
 static std::atomic<double> g_rfxRenderedFps{0.0}, g_rfxRenderedT{0.0};   // rendered frames/s from Reflex frame numbers
-// Every 30th game present: is a frame-generation DLL on the call stack? DLSS-G presents its
+// Every quarter second of game presents: is a frame-generation DLL on the call stack? DLSS-G presents its
 // real and generated frames from its own thread (sl.dlss_g / nvngx_dlssg); without frame
 // generation the game's own thread presents. The DLL being loaded alone said nothing: God of
 // War loads DLSS-G and sets a frame latency of 2 with frame generation off.
 static void FgCheckCaller()
 {
-    static std::atomic<unsigned> n{0};
-    if ((n.fetch_add(1) % 30) != 0) return;
+    // Every quarter second, not every 30th present: at the ~8 fps Returnal fell to with frame generation,
+    // 30 presents took ~4 s, longer than the 2 s the result counts for, so frame generation read on, off,
+    // on... every two seconds, the frame cap and the limit with it.
+    static std::atomic<double> lastT{0.0};
+    const double now = Now();
+    if (now - lastT.load() < 0.25) return;
+    lastT.store(now);
     static const char *k[] = { "nvngx_dlssg.dll", "sl.dlss_g.dll", "dlssg_to_fsr3_amd_is_better.dll",
                                "ffx_frameinterpolation_x64.dll", "libxess_fg.dll", "amd_fidelityfx_dx12.dll" };
     HMODULE mods[6] = {};
