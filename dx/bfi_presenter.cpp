@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.20"
+#define BFI_ADDON_VERSION "1.0.21-f1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2386,6 +2386,7 @@ static DWORD WINAPI PresenterThread(void *)
     int    phaseNudges = 0;     // last second's presents (goes with the rendered count taken then)
     ReflexSecond rsLast;           // last second's Reflex reports (frames == 0: the game doesn't use Reflex)
     double rsEverT = -1.0;         // last time this swap chain had Reflex reports
+    bool   fgEarlyLogged = false;  // the "Reflex counts not in yet" line was written
     double rsLastT = -100.0;
     // Release -> lit flash of the frames shown this second (timing log, Reflex tests).
     bool   pickNew = false;
@@ -3179,7 +3180,18 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     // DLSS-G presenting counts too once the game has stopped giving Reflex reports it gave
                     // before (Returnal with frame generation on): the presenter's cap would halve its frames.
-                    fg = Now() - g_fgPresentT.load() < 2.0 && (!g_fgCallerDlss.load() || rsEverT > 0.0);
+                    // Stopped, not just started: God of War Ragnarok has DLSS-G on its present path with frame
+                    // generation off, and in its first second of Reflex reports there were no rendered counts yet
+                    // -- frame generation 'active', a 2x limit, 30 fps, and Reflex's limit dropped for the session.
+                    const bool dlssOnPath = Now() - g_fgPresentT.load() < 2.0;
+                    const bool rfxStopped = rsEverT > 0.0 && t - rsEverT >= 3.0;
+                    fg = dlssOnPath && (!g_fgCallerDlss.load() || rfxStopped);
+                    if (dlssOnPath && g_fgCallerDlss.load() && rsEverT > 0.0 && !rfxStopped && !fgEarlyLogged)
+                    {
+                        fgEarlyLogged = true;
+                        LOGI("BFI Presenter: frame generation check: DLSS-G is on the present path but the game's Reflex frame "
+                             "counts aren't in yet -- not counted as frame generation");
+                    }
                     fgVotes = 0;
                 }
                 fpsPrevSec = g_status.gameFps;
@@ -3398,7 +3410,10 @@ static DWORD WINAPI PresenterThread(void *)
                     candRun = (cand == candPrev) ? candRun + 1 : 1;
                     candPrev = cand;
                     const int cur = g_sleepFgFactor.load();
-                    if (cand != cur && (candRun >= 3 || cand == 1 || cur == 1))
+                    // Up only after 3 seconds in a row, also from 1x: the second the limit goes on pairs the presents
+                    // from before it with the rendered frames under it (God of War Ragnarok: 109 / 55 read as 2x).
+                    // Back to 1x at once.
+                    if (cand != cur && (candRun >= 3 || cand == 1))
                     {
                         g_sleepFgFactor.store(cand);
                         if (g_sleepLimitUs.load() > 0)
