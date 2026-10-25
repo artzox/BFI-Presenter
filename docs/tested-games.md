@@ -37,7 +37,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Pragmata | Working | Refresh cap + automatic frame cap with FG 2× or 3× (60 of 60), or Half refresh + Apply the cap with Reflex's frame limit | v1.0.19 | To start BFI (also with FG), change the resolution once or switch the display mode to windowed and back to borderless; don't use ShortFuse's DLSS 5 add-on (even set to off it breaks frame generation's pacing) |
 | Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps |
 | Control | Working | Works (2×, 3×, 4× with the [Control-FG](https://github.com/Frooglemcdoo/Control-FG) mod, also with DLSS 5); Refresh cap | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54 |
-| Marvel's Spider-Man 2 | Working without FG | Must be off (unstable even without the presenter) | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency or Smooth, or Refresh + Lowest latency |
+| Marvel's Spider-Man 2 | Working | Works in borderless (the game's "Fullscreen"), not in exclusive fullscreen; Refresh + automatic frame cap (v1.0.20) | v1.0.16 | Recommended without FG and ray tracing, in exclusive fullscreen (BFI starts with the game); with FG: borderless and change resolution once to start BFI |
 | Sifu | Working (DX11) | Not tested | — | Borderless window |
 | God of War (2018) | Working (DX11) | Not tested | v0.60 | Borderless window |
 | No Rest for the Wicked | Working | Not tested | v0.61 | Standard setup (froze on a resize after loading before v0.61) |
@@ -198,6 +198,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - Ran at 43–46 fps, so Half refresh never capped it; a steady 60 removes the remaining judder.
 - **v1.0.19 with DLSS 5 and 2× frame generation (ShortFuse's DLSS 5 injector, or OptiScaler NR): Refresh rate + automatic frame cap.** It steps down with Reflex's frame limit to 60 presented / 30 rendered, a new frame on 60 of 60 flashes. Both injectors call the game's Reflex sleep twice per rendered frame, so the presenter gives the limit to the driver for these (ReShade.log: "the game calls its Reflex sleep 2 times per rendered frame"); pacing at the sleep call held it at 15 rendered fps or dropped 3–7 frames a second. The default `ReflexLimitAtSleep=1` is fine. Half refresh + **Apply the cap with Reflex's frame limit** works as well; Half refresh with the presenter's own cap does not (see the next point).
 - The game turns frame generation off in its menus, so the menu runs at about half the game's frame-generated fps (also without the presenter). With ShortFuse's injector at Half refresh, frame generation sometimes stayed at 30 presented / 15 rendered after leaving the menu, until the menu was opened and closed again; Refresh with the automatic frame cap held 60. With OptiScaler NR frame generation stays on in the menus.
+- OptiScaler NR keeps frame generation on in the menus, so the menus don't drop to half the frame rate (v1.0.21: 60 presented / 30 rendered in game and menus).
 - BFI may only start after switching the game to windowed and back to borderless.
 
 ### Resonance: A Plague Tale
@@ -220,6 +221,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - v1.0.19: the presenter applies Reflex frame limits in the game's Reflex sleep call, including the game's own 16,666 µs limit, so they no longer collapse it (the driver's limit counted the presenter's own presents). Before: any Reflex frame limit collapsed the game to 7–8 fps, including the game's own 16,666 µs limit, which it switches on and off by itself. From v1.0.14 the automatic frame cap notices the collapse, takes the limit out (the game's own too) for the rest of the session and caps with the presenter instead: a steady 60 fps without FG. Without a Reflex limit nothing paces DLSS-G here, which is another reason to keep FG off.
 - Remaining flashes (about 5 per minute) coincide with the game's own GPU hitches of 100–276 ms. Buffer reuse (v0.27) removed the presenter's own GPU stalls.
 - A realtime GPU queue needs Steam itself run as administrator (v0.81); not yet measured in this game.
+- **Change frame generation only from the main menu, or restart the game after changing it.** Turning it off during play left the game's own GPU work at 45–110 ms a frame (10–12 ms before), at 15–25 fps, until a restart; turning it on again made it worse. The same happens without the presenter (v1.0.20 and v1.0.21).
 
 ### Pragmata
 
@@ -250,11 +252,10 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### Marvel's Spider-Man 2
 
-- **Set the game to exclusive fullscreen** (as in Ratchet & Clank: Rift Apart, the same engine). In borderless mode BFI was hard to start and performance collapsed once it did (5–6 fps), which earlier looked like video memory running out.
-- **BFI starts only after the game resizes its swap chain:** change the resolution once in the game's settings (and back).
-- **Frame generation off.** Toggling it with ReShade alone already recreates the swap chain twice and destabilises the game; one GPU hang occurred in the game's DirectStorage GPU decompression.
-- **Ray tracing only if you can afford it:** without frame generation it is very heavy, even on an RTX 5080.
-- Recommended (v1.0.16), by the frame rate the game holds: below 120, Half refresh + Lowest latency (or Smooth); close to 120, Refresh rate + Lowest latency with the automatic frame cap.
+- **Recommended: without frame generation and without ray tracing**, for the smoothest and cleanest picture. Set the game to **exclusive fullscreen**: BFI then starts with the game and there are no issues. By the frame rate the game holds: below 120, Half refresh + Lowest latency (or Smooth); close to 120, Refresh rate + Lowest latency with the automatic frame cap.
+- **With frame generation: borderless** (the game's "Fullscreen" option, not "Exclusive fullscreen"), and **change the resolution once in the game's settings (and back) to start BFI**. Refresh rate with the automatic frame cap (v1.0.20): 3× held 120 presented from 40 rendered, and when the game dips the cap steps down with Reflex's frame limit.
+- **Frame generation in exclusive fullscreen doesn't work with the presenter:** it locks at 30 presented / 15 rendered, with the GPU idle most of each frame and frame generation stalling for seconds at a time. Without the presenter it runs fine there.
+- Ray tracing is very heavy, even on an RTX 5080.
 
 ### Sifu
 
