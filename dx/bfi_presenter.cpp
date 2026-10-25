@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.21-f4"
+#define BFI_ADDON_VERSION "1.0.21-f5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -7613,10 +7613,15 @@ static void draw_overlay(reshade::api::effect_runtime *)
     // known) or off.
     if (g_fgSeen[0])
     {
+        // State first and wrapped: with four components loaded (Onimusha with OptiScaler) the state at the
+        // end of one line was past the window's edge.
         const int fgF = g_sleepFgFactor.load();
-        if (st.fgActive && fgF >= 2) ImGui::TextColored(kAmber, "Frame generation (loaded): %s -- active, %dx", g_fgSeen, fgF);
-        else if (st.fgActive)        ImGui::TextColored(kAmber, "Frame generation (loaded): %s -- active", g_fgSeen);
-        else                         ImGui::TextDisabled("Frame generation (loaded): %s -- off", g_fgSeen);
+        char fgState[24];
+        if (st.fgActive && fgF >= 2) snprintf(fgState, sizeof(fgState), "active, %dx", fgF);
+        else snprintf(fgState, sizeof(fgState), "%s", st.fgActive ? "active" : "off");
+        ImGui::PushStyleColor(ImGuiCol_Text, st.fgActive ? kAmber : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+        ImGui::TextWrapped("Frame generation: %s (loaded: %s)", fgState, g_fgSeen);
+        ImGui::PopStyleColor();
     }
     if (st.managed)
     {
