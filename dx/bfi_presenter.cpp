@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.21-f2"
+#define BFI_ADDON_VERSION "1.0.21-f3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3216,8 +3216,12 @@ static DWORD WINAPI PresenterThread(void *)
                 // with the hitch guard paused or below 3 fps restarts the check instead of counting.
                 const bool rfxLimitBad = g_rfxLimitBad.load();
                 const bool stallSec = fpsA < 3.0 || hitchPaused;
+                // Nor is frame generation switching off: until 5 seconds agree it stays 'active' and the limit keeps
+                // its 2x per rendered frame, so the game runs at half the cap for those seconds (Returnal with frame
+                // generation turned off in the options: "fell to 30 fps", Reflex's limit gone for the session).
+                const bool fgChanging = fgVotes > 0;
                 if (stallSec) { rfxChkT = t; rcOnT = t; }
-                if (autoCapDown && capByReflex && !rfxLimitBad && !stallSec && t - rfxChkT >= 1.5 && t - rfxChkT < 6.0 &&
+                if (autoCapDown && capByReflex && !rfxLimitBad && !stallSec && !fgChanging && t - rfxChkT >= 1.5 && t - rfxChkT < 6.0 &&
                     fpsAtDown > 0.8 * hzA / s.frames && fpsA < 0.5 * hzA / s.frames)
                 {
                     if (++rfxBadSecs >= 2)
@@ -3267,7 +3271,7 @@ static DWORD WINAPI PresenterThread(void *)
                     if (reflexCap)
                     {
                         const double capFps = hzA / rcPer;
-                        if (!stallSec && t - rcOnT >= 1.5 && t - rcOnT < 6.0 && fpsAtRc > 0.8 * capFps && fpsA < 0.5 * capFps)
+                        if (!stallSec && !fgChanging && t - rcOnT >= 1.5 && t - rcOnT < 6.0 && fpsAtRc > 0.8 * capFps && fpsA < 0.5 * capFps)
                         {
                             if (++rcBadSecs >= 2)
                             {
