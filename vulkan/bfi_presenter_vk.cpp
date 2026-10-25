@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.21-k1"
+#define BFI_VERSION "1.0.21-k2"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -4087,6 +4087,14 @@ static float OverlayTextWidth(const char *text)
     reinterpret_cast<CalcTextSizeMsvc>(imgui_function_table_instance()->CalcTextSize)(&r, text, nullptr, false, -1.0f);
     return r.x;
 }
+// Width left on the current line, the same way (GetContentRegionAvail returns ImVec2 too).
+static float OverlayAvailWidth()
+{
+    typedef ImVec2 *(*GetContentRegionAvailMsvc)(ImVec2 *);
+    ImVec2 r(0.0f, 0.0f);
+    reinterpret_cast<GetContentRegionAvailMsvc>(imgui_function_table_instance()->GetContentRegionAvail)(&r);
+    return r.x;
+}
 
 // Ko-fi button at the bottom of the overlay. shell32 is loaded on the click only, so the add-on links nothing new.
 static void OpenKofi()
@@ -4099,9 +4107,9 @@ static void OpenKofi()
 static void KofiButton()
 {
     const char *kf = "Support on Ko-fi";
-    const float w = ImGui::CalcTextSize(kf).x + ImGui::GetStyle().FramePadding.x * 2;
+    const float w = OverlayTextWidth(kf) + ImGui::GetStyle().FramePadding.x * 2;   // not ImGui::CalcTextSize: MSVC return ABI (see OverlayTextWidth)
     ImGui::SameLine();
-    const float room = ImGui::GetContentRegionAvail().x;      // right-aligned when it fits on the line
+    const float room = OverlayAvailWidth();      // right-aligned when it fits on the line
     if (room > w) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + room - w);
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.50f, 0.78f, 1));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.58f, 0.88f, 1));
