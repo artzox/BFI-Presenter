@@ -7,6 +7,11 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.21] — unreleased
+
+- **[DX] Fixed: God of War Ragnarok lost Reflex's frame limit at launch.** The game has DLSS Frame Generation on its present path with frame generation off. In the first second of Reflex reports, before the rendered-frame counts came in, that was taken as frame generation, the limit doubled to 30 fps, and the collapse check switched Reflex's limit off for the session (the automatic frame cap then used the presenter's own cap: about 45–53 ms from frame start to the GPU against about 15 ms). DLSS-G on the present path now counts only once Reflex reports have stopped (Returnal), and the frame-generation factor steps up only after 3 seconds in a row agree. The collapse check also waits while frame generation is switching on or off: turning it off in Returnal ran the game at half the cap until the switch was confirmed, which dropped Reflex's limit for the session.
+- **[DX] Status box: the frame-generation line says whether frame generation is active (with its factor) or off.** It listed the frame-generation DLLs the game had loaded, which some games load with frame generation off.
+
 ## [1.0.20] — 2026-10-23
 
 - **[Vulkan] Fixed: SDR games shown as HDR10 (`SdrToHdr`) were oversaturated.** Their BT.709 colours went into the HDR10 output unconverted; they now go through the BT.709 → BT.2020 conversion (ITU-R BT.2087) first. Thanks to speedlemur (#70).

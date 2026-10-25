@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.20"
+#define BFI_ADDON_VERSION "1.0.21-f5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2106,14 +2106,19 @@ static int ReflexGameLimitUs();
 static std::atomic<double> g_fgPresentT{0.0};   // last time a frame-generation DLL was seen presenting
 static std::atomic<bool>   g_fgCallerDlss{false};  // ... and it was DLSS-G's (also on the stack without frame generation)
 static std::atomic<double> g_rfxRenderedFps{0.0}, g_rfxRenderedT{0.0};   // rendered frames/s from Reflex frame numbers
-// Every 30th game present: is a frame-generation DLL on the call stack? DLSS-G presents its
+// Every quarter second of game presents: is a frame-generation DLL on the call stack? DLSS-G presents its
 // real and generated frames from its own thread (sl.dlss_g / nvngx_dlssg); without frame
 // generation the game's own thread presents. The DLL being loaded alone said nothing: God of
 // War loads DLSS-G and sets a frame latency of 2 with frame generation off.
 static void FgCheckCaller()
 {
-    static std::atomic<unsigned> n{0};
-    if ((n.fetch_add(1) % 30) != 0) return;
+    // Every quarter second, not every 30th present: at the ~8 fps Returnal fell to with frame generation,
+    // 30 presents took ~4 s, longer than the 2 s the result counts for, so frame generation read on, off,
+    // on... every two seconds, the frame cap and the limit with it.
+    static std::atomic<double> lastT{0.0};
+    const double now = Now();
+    if (now - lastT.load() < 0.25) return;
+    lastT.store(now);
     static const char *k[] = { "nvngx_dlssg.dll", "sl.dlss_g.dll", "dlssg_to_fsr3_amd_is_better.dll",
                                "ffx_frameinterpolation_x64.dll", "libxess_fg.dll", "amd_fidelityfx_dx12.dll" };
     HMODULE mods[6] = {};
@@ -2386,6 +2391,7 @@ static DWORD WINAPI PresenterThread(void *)
     int    phaseNudges = 0;     // last second's presents (goes with the rendered count taken then)
     ReflexSecond rsLast;           // last second's Reflex reports (frames == 0: the game doesn't use Reflex)
     double rsEverT = -1.0;         // last time this swap chain had Reflex reports
+    bool   fgEarlyLogged = false;  // the "Reflex counts not in yet" line was written
     double rsLastT = -100.0;
     // Release -> lit flash of the frames shown this second (timing log, Reflex tests).
     bool   pickNew = false;
@@ -3179,7 +3185,18 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     // DLSS-G presenting counts too once the game has stopped giving Reflex reports it gave
                     // before (Returnal with frame generation on): the presenter's cap would halve its frames.
-                    fg = Now() - g_fgPresentT.load() < 2.0 && (!g_fgCallerDlss.load() || rsEverT > 0.0);
+                    // Stopped, not just started: God of War Ragnarok has DLSS-G on its present path with frame
+                    // generation off, and in its first second of Reflex reports there were no rendered counts yet
+                    // -- frame generation 'active', a 2x limit, 30 fps, and Reflex's limit dropped for the session.
+                    const bool dlssOnPath = Now() - g_fgPresentT.load() < 2.0;
+                    const bool rfxStopped = rsEverT > 0.0 && t - rsEverT >= 3.0;
+                    fg = dlssOnPath && (!g_fgCallerDlss.load() || rfxStopped);
+                    if (dlssOnPath && g_fgCallerDlss.load() && rsEverT > 0.0 && !rfxStopped && !fgEarlyLogged)
+                    {
+                        fgEarlyLogged = true;
+                        LOGI("BFI Presenter: frame generation check: DLSS-G is on the present path but the game's Reflex frame "
+                             "counts aren't in yet -- not counted as frame generation");
+                    }
                     fgVotes = 0;
                 }
                 fpsPrevSec = g_status.gameFps;
@@ -3204,8 +3221,12 @@ static DWORD WINAPI PresenterThread(void *)
                 // with the hitch guard paused or below 3 fps restarts the check instead of counting.
                 const bool rfxLimitBad = g_rfxLimitBad.load();
                 const bool stallSec = fpsA < 3.0 || hitchPaused;
+                // Nor is frame generation switching off: until 5 seconds agree it stays 'active' and the limit keeps
+                // its 2x per rendered frame, so the game runs at half the cap for those seconds (Returnal with frame
+                // generation turned off in the options: "fell to 30 fps", Reflex's limit gone for the session).
+                const bool fgChanging = fgVotes > 0;
                 if (stallSec) { rfxChkT = t; rcOnT = t; }
-                if (autoCapDown && capByReflex && !rfxLimitBad && !stallSec && t - rfxChkT >= 1.5 && t - rfxChkT < 6.0 &&
+                if (autoCapDown && capByReflex && !rfxLimitBad && !stallSec && !fgChanging && t - rfxChkT >= 1.5 && t - rfxChkT < 6.0 &&
                     fpsAtDown > 0.8 * hzA / s.frames && fpsA < 0.5 * hzA / s.frames)
                 {
                     if (++rfxBadSecs >= 2)
@@ -3255,7 +3276,7 @@ static DWORD WINAPI PresenterThread(void *)
                     if (reflexCap)
                     {
                         const double capFps = hzA / rcPer;
-                        if (!stallSec && t - rcOnT >= 1.5 && t - rcOnT < 6.0 && fpsAtRc > 0.8 * capFps && fpsA < 0.5 * capFps)
+                        if (!stallSec && !fgChanging && t - rcOnT >= 1.5 && t - rcOnT < 6.0 && fpsAtRc > 0.8 * capFps && fpsA < 0.5 * capFps)
                         {
                             if (++rcBadSecs >= 2)
                             {
@@ -3398,7 +3419,10 @@ static DWORD WINAPI PresenterThread(void *)
                     candRun = (cand == candPrev) ? candRun + 1 : 1;
                     candPrev = cand;
                     const int cur = g_sleepFgFactor.load();
-                    if (cand != cur && (candRun >= 3 || cand == 1 || cur == 1))
+                    // Up only after 3 seconds in a row, also from 1x: the second the limit goes on pairs the presents
+                    // from before it with the rendered frames under it (God of War Ragnarok: 109 / 55 read as 2x).
+                    // Back to 1x at once.
+                    if (cand != cur && (candRun >= 3 || cand == 1))
                     {
                         g_sleepFgFactor.store(cand);
                         if (g_sleepLimitUs.load() > 0)
@@ -7584,7 +7608,21 @@ static void draw_overlay(reshade::api::effect_runtime *)
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
                            "RTSS is hooked: keep its frame limiter off and don't toggle its OSD while playing.");
     if (g_hooksSeen[0]) ImGui::TextColored(kAmber, "Other Present hooks: %s", g_hooksSeen);
-    if (g_fgSeen[0])    ImGui::TextColored(kAmber, "Frame generation: %s", g_fgSeen);
+    // The DLLs being loaded says nothing about frame generation being on (God of War Ragnarok loads DLSS-G
+    // with it off), so the line also says what the presenter found: active (with the factor once it is
+    // known) or off.
+    if (g_fgSeen[0])
+    {
+        // State first and wrapped: with four components loaded (Onimusha with OptiScaler) the state at the
+        // end of one line was past the window's edge.
+        const int fgF = g_sleepFgFactor.load();
+        char fgState[24];
+        if (st.fgActive && fgF >= 2) snprintf(fgState, sizeof(fgState), "active, %dx", fgF);
+        else snprintf(fgState, sizeof(fgState), "%s", st.fgActive ? "active" : "off");
+        ImGui::PushStyleColor(ImGuiCol_Text, st.fgActive ? kAmber : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+        ImGui::TextWrapped("Frame generation: %s (loaded: %s)", fgState, g_fgSeen);
+        ImGui::PopStyleColor();
+    }
     if (st.managed)
     {
         if (g_deferPresenter.load() && !g_ownPresentQueue)
