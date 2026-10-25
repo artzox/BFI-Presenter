@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.21-f1"
+#define BFI_ADDON_VERSION "1.0.21-f2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -7599,7 +7599,16 @@ static void draw_overlay(reshade::api::effect_runtime *)
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
                            "RTSS is hooked: keep its frame limiter off and don't toggle its OSD while playing.");
     if (g_hooksSeen[0]) ImGui::TextColored(kAmber, "Other Present hooks: %s", g_hooksSeen);
-    if (g_fgSeen[0])    ImGui::TextColored(kAmber, "Frame generation: %s", g_fgSeen);
+    // The DLLs being loaded says nothing about frame generation being on (God of War Ragnarok loads DLSS-G
+    // with it off), so the line also says what the presenter found: active (with the factor once it is
+    // known) or off.
+    if (g_fgSeen[0])
+    {
+        const int fgF = g_sleepFgFactor.load();
+        if (st.fgActive && fgF >= 2) ImGui::TextColored(kAmber, "Frame generation (loaded): %s -- active, %dx", g_fgSeen, fgF);
+        else if (st.fgActive)        ImGui::TextColored(kAmber, "Frame generation (loaded): %s -- active", g_fgSeen);
+        else                         ImGui::TextDisabled("Frame generation (loaded): %s -- off", g_fgSeen);
+    }
     if (st.managed)
     {
         if (g_deferPresenter.load() && !g_ownPresentQueue)
