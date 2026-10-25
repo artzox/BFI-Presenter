@@ -204,6 +204,14 @@ uniform bool bfi_show_status <
                  "red = the game is not running at the refresh rate (average frame time off).";
 > = false;
 
+uniform int bfi_kofi <
+    ui_type = "radio";
+    ui_category = "Support";
+    ui_label = " ";
+    ui_text = "BFI Presenter is free. If it helps you, you can support its development on Ko-fi:\n"
+              "ko-fi.com/artzox";
+> = 0;
+
 uniform uint  BFI_FRAMECOUNT < source = "framecount"; >;
 uniform float BFI_TIMER      < source = "timer"; >;       // ms since ReShade started
 uniform float BFI_FRAMETIME  < source = "frametime"; >;   // ms since the previous frame

@@ -198,6 +198,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - Ran at 43–46 fps, so Half refresh never capped it; a steady 60 removes the remaining judder.
 - **v1.0.19 with DLSS 5 and 2× frame generation (ShortFuse's DLSS 5 injector, or OptiScaler NR): Refresh rate + automatic frame cap.** It steps down with Reflex's frame limit to 60 presented / 30 rendered, a new frame on 60 of 60 flashes. Both injectors call the game's Reflex sleep twice per rendered frame, so the presenter gives the limit to the driver for these (ReShade.log: "the game calls its Reflex sleep 2 times per rendered frame"); pacing at the sleep call held it at 15 rendered fps or dropped 3–7 frames a second. The default `ReflexLimitAtSleep=1` is fine. Half refresh + **Apply the cap with Reflex's frame limit** works as well; Half refresh with the presenter's own cap does not (see the next point).
 - The game turns frame generation off in its menus, so the menu runs at about half the game's frame-generated fps (also without the presenter). With ShortFuse's injector at Half refresh, frame generation sometimes stayed at 30 presented / 15 rendered after leaving the menu, until the menu was opened and closed again; Refresh with the automatic frame cap held 60. With OptiScaler NR frame generation stays on in the menus.
+- OptiScaler NR keeps frame generation on in the menus, so the menus don't drop to half the frame rate (v1.0.21: 60 presented / 30 rendered in game and menus).
 - BFI may only start after switching the game to windowed and back to borderless.
 
 ### Resonance: A Plague Tale
@@ -220,6 +221,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - v1.0.19: the presenter applies Reflex frame limits in the game's Reflex sleep call, including the game's own 16,666 µs limit, so they no longer collapse it (the driver's limit counted the presenter's own presents). Before: any Reflex frame limit collapsed the game to 7–8 fps, including the game's own 16,666 µs limit, which it switches on and off by itself. From v1.0.14 the automatic frame cap notices the collapse, takes the limit out (the game's own too) for the rest of the session and caps with the presenter instead: a steady 60 fps without FG. Without a Reflex limit nothing paces DLSS-G here, which is another reason to keep FG off.
 - Remaining flashes (about 5 per minute) coincide with the game's own GPU hitches of 100–276 ms. Buffer reuse (v0.27) removed the presenter's own GPU stalls.
 - A realtime GPU queue needs Steam itself run as administrator (v0.81); not yet measured in this game.
+- **Change frame generation only from the main menu, or restart the game after changing it.** Turning it off during play left the game's own GPU work at 45–110 ms a frame (10–12 ms before), at 15–25 fps, until a restart; turning it on again made it worse. The same happens without the presenter (v1.0.20 and v1.0.21).
 
 ### Pragmata
 
