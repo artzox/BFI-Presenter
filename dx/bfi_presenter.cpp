@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.22-a2"
+#define BFI_ADDON_VERSION "1.0.22-a3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2397,8 +2397,8 @@ static DWORD WINAPI PresenterThread(void *)
     double fpsPrevSec = -1.0;
     // ReflexAlign: how long before the lit refresh's pick each new game frame was ready, and the controller.
     double alignSlack[256]; int alignN = 0;
-    double alignTarget = 0.003, alignShiftTot = 0.0, alignCoolT = 0.0, alignLastLog = -1.0;
-    int    alignCleanSecs = 0;
+    double alignTarget = 0.0015, alignShiftTot = 0.0, alignCoolT = 0.0, alignLastLog = -1.0;
+    int    alignCleanSecs = 0, alignExcessSecs = 0;
     double alignLogSlack = -1.0, alignPrevP10 = -1.0, alignLastStep = 0.0;
     double phaseUntil = 0.0, phaseNextT = 0.0;   // Reflex limit phase nudge (see the per-second block)
     int    phaseNudges = 0;     // last second's presents (goes with the rendered count taken then)
@@ -3435,6 +3435,7 @@ static DWORD WINAPI PresenterThread(void *)
                 // the target by 1 ms (at most 8 ms; back down by 0.25 ms every 10 clean seconds). Only at the
                 // game's sleep without frame generation, and only while the game holds the cap.
                 {
+                    bool alignIdle = false;
                     double p10 = -1.0;
                     if (alignN >= 10)
                     {
@@ -3471,11 +3472,13 @@ static DWORD WINAPI PresenterThread(void *)
                         }
                         else if (p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
                         {
-                            if (stNow.frameRepeats == 0 && ++alignCleanSecs >= 10 && alignTarget > 0.003)
-                            { alignTarget = std::max(0.003, alignTarget - 0.00025); alignCleanSecs = 0; }
+                            if (stNow.frameRepeats == 0 && ++alignCleanSecs >= 10 && alignTarget > 0.0015)
+                            { alignTarget = std::max(0.0015, alignTarget - 0.00025); alignCleanSecs = 0; }
                             const double excess = p10 - alignTarget;
                             alignLastStep = 0.0;
-                            if (excess > 0.001)
+                            // Two seconds in a row over the target: one second can be the tail of a cap change or a hitch.
+                            alignExcessSecs = excess > 0.001 ? alignExcessSecs + 1 : 0;
+                            if (alignExcessSecs >= 2)
                             {
                                 const double step = std::min(0.003, 0.5 * excess);
                                 g_sleepShiftUs.fetch_add((int)(step * 1e6)); alignShiftTot += step; alignLastStep = step;
@@ -3489,12 +3492,12 @@ static DWORD WINAPI PresenterThread(void *)
                             }
                         }
                     }
-                    else alignCleanSecs = 0;
+                    else { alignCleanSecs = 0; alignLastStep = 0.0; alignExcessSecs = 0; alignIdle = true; }
                     EnterCriticalSection(&g_cfgLock);
                     g_status.alignSlackMs = p10 >= 0.0 ? p10 * 1000.0 : -1.0;
                     g_status.alignShiftMs = alignShiftTot * 1000.0;
                     LeaveCriticalSection(&g_cfgLock);
-                    alignLogSlack = p10; alignPrevP10 = p10;
+                    alignLogSlack = p10; alignPrevP10 = alignIdle ? -1.0 : p10;
                     alignN = 0;
                 }
                 {
