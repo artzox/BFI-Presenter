@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.22"
+#define BFI_VERSION "1.0.23-r1"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -495,7 +495,8 @@ struct InstanceData
 #define BFI_DEVICE_OPT_FUNCS(X) \
     X(QueueSubmit2) X(QueueSubmit2KHR) X(QueueBindSparse) X(AcquireNextImage2KHR) X(WaitForPresentKHR) \
     X(GetSwapchainStatusKHR) X(ReleaseSwapchainImagesEXT) X(GetDeviceQueue2) \
-    X(AcquireFullScreenExclusiveModeEXT) X(ReleaseFullScreenExclusiveModeEXT)
+    X(AcquireFullScreenExclusiveModeEXT) X(ReleaseFullScreenExclusiveModeEXT) \
+    X(SetLatencySleepModeNV) X(LatencySleepNV) X(SetLatencyMarkerNV) X(GetLatencyTimingsNV)
 
 struct Swapchain;
 struct DeviceData
@@ -537,6 +538,7 @@ static DeviceData *GetDev(void *key)
     return it == g_devices.end() ? nullptr : it->second;
 }
 
+static std::atomic<long> g_vkGamePresents{0};   // game presents (Reflex test log)
 static bool g_active = false;      // BFIPresenter.ini found: the layer manages swap chains in this process
 static std::atomic<bool> g_surfCaps2Ext{false};    // VK_KHR_get_surface_capabilities2 enabled (needed by full_screen_exclusive)
 static std::atomic<bool> g_colorspaceExt{false};   // VK_EXT_swapchain_colorspace enabled (HDR10 presentation possible)
@@ -3495,6 +3497,7 @@ static void CheckCaller(void *ret)
 
 static VKAPI_ATTR VkResult VKAPI_CALL Bfi_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pi)
 {
+    g_vkGamePresents.fetch_add(1);
     DeviceData *d = GetDev(Key(queue));
     if (!d) return VK_ERROR_DEVICE_LOST;
     std::vector<uint32_t> ours, others;
@@ -3984,6 +3987,77 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_EnumerateDeviceExtensionProperties(VkP
     return id->EnumerateDeviceExtensionProperties(phys, layer, count, props);
 }
 
+// ---------------------------------------------------------------- Reflex (VK_NV_low_latency2), test: logging only
+// What the game does with Reflex in Vulkan, and whether its timing reports come through with the presenter
+// presenting: every call passes through unchanged. Every 5 s a summary line goes to the log.
+static std::atomic<long> g_vkSleepCalls{0}, g_vkMarkers[16];
+static std::atomic<int>  g_vkLlMode{-1}, g_vkLlBoost{-1}, g_vkLlMinUs{-1};
+static double            g_vkRfxT = 0.0;
+static uint64_t          g_vkLastReportId = 0;
+static void VkReflexSummary(DeviceData *d, VkDevice dev, VkSwapchainKHR sc)
+{
+    const double now = Now();
+    if (g_vkRfxT <= 0.0) { g_vkRfxT = now; return; }
+    const double dt = now - g_vkRfxT;
+    if (dt < 5.0) return;
+    g_vkRfxT = now;
+    const long sleeps = g_vkSleepCalls.exchange(0), pres = g_vkGamePresents.exchange(0);
+    long mk[16];
+    for (int i = 0; i < 16; i++) mk[i] = g_vkMarkers[i].exchange(0);
+    int nNew = 0; double simGpu = 0.0, gpu = 0.0, simPres = 0.0; uint32_t got = 0;
+    if (d->GetLatencyTimingsNV)
+    {
+        VkLatencyTimingsFrameReportNV rep[64];
+        for (auto &r : rep) { r = {}; r.sType = VK_STRUCTURE_TYPE_LATENCY_TIMINGS_FRAME_REPORT_NV; }
+        VkGetLatencyMarkerInfoNV gi = {};
+        gi.sType = VK_STRUCTURE_TYPE_GET_LATENCY_MARKER_INFO_NV;
+        gi.timingCount = 64; gi.pTimings = rep;
+        d->GetLatencyTimingsNV(dev, sc, &gi);
+        got = gi.timingCount;
+        for (uint32_t i = 0; i < got && i < 64; i++)
+        {
+            const VkLatencyTimingsFrameReportNV &r = rep[i];
+            if (r.presentID <= g_vkLastReportId || r.simStartTimeUs == 0) continue;
+            nNew++;
+            if (r.gpuRenderEndTimeUs > r.simStartTimeUs) simGpu += (r.gpuRenderEndTimeUs - r.simStartTimeUs) * 0.001;
+            if (r.gpuRenderEndTimeUs > r.gpuRenderStartTimeUs) gpu += (r.gpuRenderEndTimeUs - r.gpuRenderStartTimeUs) * 0.001;
+            if (r.presentStartTimeUs > r.simStartTimeUs) simPres += (r.presentStartTimeUs - r.simStartTimeUs) * 0.001;
+        }
+        for (uint32_t i = 0; i < got && i < 64; i++) if (rep[i].presentID > g_vkLastReportId) g_vkLastReportId = rep[i].presentID;
+    }
+    LOGI("BFI Presenter: Reflex (Vulkan) over %.1f s: %.1f sleeps/s, %.1f game presents/s, markers/s sim start %.1f, present start "
+         "%.1f, input %.1f; timing reports: %u returned, %d new (%.1f/s), sim->GPU end %.1f ms, GPU render %.1f ms, sim->present %.1f ms",
+         dt, sleeps / dt, pres / dt, mk[VK_LATENCY_MARKER_SIMULATION_START_NV] / dt, mk[VK_LATENCY_MARKER_PRESENT_START_NV] / dt,
+         mk[VK_LATENCY_MARKER_INPUT_SAMPLE_NV] / dt, got, nNew, nNew / dt,
+         nNew ? simGpu / nNew : -1.0, nNew ? gpu / nNew : -1.0, nNew ? simPres / nNew : -1.0);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL Bfi_SetLatencySleepModeNV(VkDevice device, VkSwapchainKHR sc, const VkLatencySleepModeInfoNV *info)
+{
+    DeviceData *d = GetDev(Key(device));
+    if (!d || !d->SetLatencySleepModeNV) return VK_ERROR_DEVICE_LOST;
+    const int mode = info ? (int)info->lowLatencyMode : 0, boost = info ? (int)info->lowLatencyBoost : 0;
+    const int us = info ? (int)info->minimumIntervalUs : 0;
+    const bool ch1 = g_vkLlMode.exchange(mode) != mode, ch2 = g_vkLlBoost.exchange(boost) != boost, ch3 = g_vkLlMinUs.exchange(us) != us;
+    if (ch1 || ch2 || ch3)
+        LOGI("BFI Presenter: game Reflex (Vulkan): low latency %s%s, frame limit %d us", mode ? "on" : "off", boost ? " + Boost" : "", us);
+    return d->SetLatencySleepModeNV(device, sc, info);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL Bfi_LatencySleepNV(VkDevice device, VkSwapchainKHR sc, const VkLatencySleepInfoNV *info)
+{
+    DeviceData *d = GetDev(Key(device));
+    if (!d || !d->LatencySleepNV) return VK_ERROR_DEVICE_LOST;
+    if (g_vkSleepCalls.fetch_add(1) == 0 && g_vkRfxT <= 0.0) LOGI("BFI Presenter: game Reflex (Vulkan): the game calls its Reflex sleep");
+    VkReflexSummary(d, device, sc);
+    return d->LatencySleepNV(device, sc, info);
+}
+static VKAPI_ATTR void VKAPI_CALL Bfi_SetLatencyMarkerNV(VkDevice device, VkSwapchainKHR sc, const VkSetLatencyMarkerInfoNV *info)
+{
+    DeviceData *d = GetDev(Key(device));
+    if (!d || !d->SetLatencyMarkerNV) return;
+    if (info && (unsigned)info->marker < 16) g_vkMarkers[info->marker].fetch_add(1);
+    d->SetLatencyMarkerNV(device, sc, info);
+}
+
 // ---------------------------------------------------------------- proc addr
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Bfi_GetDeviceProcAddr(VkDevice device, const char *name);
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Bfi_GetInstanceProcAddr(VkInstance instance, const char *name);
@@ -4011,6 +4085,9 @@ static PFN_vkVoidFunction DeviceHook(const char *name, DeviceData *d)
     H(DeviceWaitIdle, Bfi_DeviceWaitIdle)
     H(GetDeviceQueue, Bfi_GetDeviceQueue)
     H(GetDeviceQueue2, Bfi_GetDeviceQueue2)
+    H(SetLatencySleepModeNV, Bfi_SetLatencySleepModeNV)
+    H(LatencySleepNV, Bfi_LatencySleepNV)
+    H(SetLatencyMarkerNV, Bfi_SetLatencyMarkerNV)
 #undef H
     return nullptr;
 }
