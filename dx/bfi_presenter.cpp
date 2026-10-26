@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.22-a7"
+#define BFI_ADDON_VERSION "1.0.22-a8"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3465,19 +3465,19 @@ static DWORD WINAPI PresenterThread(void *)
                             // little earlier, and a wider target.
                             const int back = (int)((alignLastStep + 0.002) * 1e6);
                             g_sleepShiftUs.fetch_sub(back); alignShiftTot -= back * 1e-6;
-                            alignTarget = std::min(0.008, alignTarget + 0.001);
+                            alignTarget = std::min(0.005, alignTarget + 0.001);
                             alignCleanSecs = 0; alignCoolT = t + 2.0; alignLastStep = 0.0;
                             LOGI("BFI Presenter: Reflex frame limit alignment went past the pick (%.1f -> %.1f ms) -- moved back, "
                                  "target %.1f ms", alignPrevP10 * 1000.0, p10 * 1000.0, alignTarget * 1000.0);
                         }
-                        // Repeats only count against the alignment when frames were close to the pick: Dead Space's own
-                        // stutters (100+ ms frames) repeat frames with 4-9 ms to spare, and backing off for those kept
-                        // the wait at 5-9 ms.
-                        else if (stNow.frameRepeats >= 2 && (p10 < 0.0 || p10 < alignTarget + 0.001))
+                        // Repeats only count against the alignment when frames were close to the pick (under 3 ms): Dead
+                        // Space's own stutters repeat frames with 4-9 ms to spare. Measured against the target instead, the
+                        // target climbed to 8 ms and from then on every stutter counted (-56 ms in 6 minutes).
+                        else if (stNow.frameRepeats >= 2 && (p10 < 0.0 || p10 < 0.003))
                         {
                             alignLastStep = 0.0;
                             g_sleepShiftUs.fetch_sub(2000); alignShiftTot -= 0.002;
-                            alignTarget = std::min(0.008, alignTarget + 0.001);
+                            alignTarget = std::min(0.005, alignTarget + 0.001);
                             alignCleanSecs = 0; alignCoolT = t + 2.0;
                         }
                         else if (p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
