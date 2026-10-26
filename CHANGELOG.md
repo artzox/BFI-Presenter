@@ -7,6 +7,12 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.23] — 2026-10-26
+
+- **[Vulkan] Automatic frame cap with frame generation in Reflex games.** The layer now passes the game's NVIDIA Reflex calls (`VK_NV_low_latency2`) through itself: frame generation is recognised from the game's Reflex sleep (one call per rendered frame) against its presents, and with the Refresh rate cap and the automatic frame cap it is capped to one presented frame per strobe cycle by a frame limit in the game's Reflex sleep, as in the DirectX add-on. Only while that leaves about 30 rendered fps or more: Indiana Jones and the Great Circle with 2× at 120 Hz holds a steady 30 rendered / 60 presented with a new frame on every flash; 3× (20 rendered) lagged and presented unevenly, so it stays at Refresh. While the limit paces frame generation, the game's presents are not held (frames ahead, the Refresh cap's release): holding them built a backlog (about 120 ms from frame start to the GPU). The game's own Reflex frame limit is taken out of the driver, which would count the presenter's presents; if the game falls far below the limit, it is dropped for the session.
+- **[DX]** No changes; version number only.
+- **[Docs]** Settings guide, example ini, Vulkan README; tested games: Indiana Jones and the Great Circle with 2× frame generation.
+
 ## [1.0.22] — 2026-10-26
 
 - **[DX] Line Reflex's frame limit up with the flash (`ReflexAlign`, off by default).** Reflex's frame limit starts each game frame on its own clock, so a finished frame waited up to a whole strobe cycle before the lit refresh showed it, by an amount that changed from launch to launch. With this on, the presenter measures that wait (from the frame's copy finishing on the GPU) and moves the start of each frame until frames are ready about 2 ms before their flash, backing off when frames start missing it. God of War Ragnarök: about 31 ms from release to flash every launch, against 31–44 ms. Games with uneven frame times gain little and can repeat a frame now and then (Spider-Man 2: 1.5 ms quicker, more repeats; Dead Space: no change), so it is off by default. Needs Lowest latency pacing; not with frame generation. The reflex timing log has two new columns: how long frames waited before their flash (also with the option off) and how far the frame start has moved.

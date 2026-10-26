@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.23-r4"
+#define BFI_VERSION "1.0.23"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -497,7 +497,7 @@ struct InstanceData
     X(QueueSubmit2) X(QueueSubmit2KHR) X(QueueBindSparse) X(AcquireNextImage2KHR) X(WaitForPresentKHR) \
     X(GetSwapchainStatusKHR) X(ReleaseSwapchainImagesEXT) X(GetDeviceQueue2) \
     X(AcquireFullScreenExclusiveModeEXT) X(ReleaseFullScreenExclusiveModeEXT) \
-    X(SetLatencySleepModeNV) X(LatencySleepNV) X(SetLatencyMarkerNV) X(GetLatencyTimingsNV)
+    X(SetLatencySleepModeNV) X(LatencySleepNV)
 
 struct Swapchain;
 struct DeviceData
@@ -539,7 +539,6 @@ static DeviceData *GetDev(void *key)
     return it == g_devices.end() ? nullptr : it->second;
 }
 
-static std::atomic<long> g_vkGamePresents{0};   // game presents (Reflex test log)
 static std::atomic<long> g_vkSleepSec{0};       // the game's Reflex sleep calls this second (rendered frames)
 static std::atomic<double> g_vkSleepLastT{0.0};  // last Reflex sleep call
 static std::atomic<int>  g_vkSleepLimitUs{0};    // Reflex frame limit applied in the game's sleep call, per rendered frame (0 = off)
@@ -2924,7 +2923,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
 
     // Latency limit: before the game starts its next frame, the frame from
     // MaxFramesAhead frames ago must be finished on the GPU.
-    // With the Reflex frame limit pacing frame generation (test), the game's presents are not held: frame generation
+    // With the Reflex frame limit pacing frame generation, the game's presents are not held: frame generation
     // paces its own frames, and holding them (frames ahead, the Refresh cap's release) let a backlog build up in
     // Indiana Jones (frame start -> GPU done ~120 ms at 20 rendered fps against ~30 ms at 40).
     const bool rfxPaced = g_vkSleepLimitUs.load() > 0;
@@ -3563,7 +3562,6 @@ static void CheckCaller(void *ret)
 
 static VKAPI_ATTR VkResult VKAPI_CALL Bfi_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pi)
 {
-    g_vkGamePresents.fetch_add(1);
     DeviceData *d = GetDev(Key(queue));
     if (!d) return VK_ERROR_DEVICE_LOST;
     std::vector<uint32_t> ours, others;
@@ -4053,50 +4051,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_EnumerateDeviceExtensionProperties(VkP
     return id->EnumerateDeviceExtensionProperties(phys, layer, count, props);
 }
 
-// ---------------------------------------------------------------- Reflex (VK_NV_low_latency2), test: logging only
-// What the game does with Reflex in Vulkan, and whether its timing reports come through with the presenter
-// presenting: every call passes through unchanged. Every 5 s a summary line goes to the log.
-static std::atomic<long> g_vkSleepCalls{0}, g_vkMarkers[16];
+// ---------------------------------------------------------------- Reflex (VK_NV_low_latency2)
+// The game's Reflex calls pass through the layer. Its sleep call (once per rendered frame) tells frame generation
+// apart (presents well above it) and is where the automatic frame cap's limit is applied with frame generation; the
+// game's own limit is taken out of the driver, which would count the presenter's presents.
 static std::atomic<int>  g_vkLlMode{-1}, g_vkLlBoost{-1}, g_vkLlMinUs{-1};
-static double            g_vkRfxT = 0.0;
-static uint64_t          g_vkLastReportId = 0;
-static void VkReflexSummary(DeviceData *d, VkDevice dev, VkSwapchainKHR sc)
-{
-    const double now = Now();
-    if (g_vkRfxT <= 0.0) { g_vkRfxT = now; return; }
-    const double dt = now - g_vkRfxT;
-    if (dt < 5.0) return;
-    g_vkRfxT = now;
-    const long sleeps = g_vkSleepCalls.exchange(0), pres = g_vkGamePresents.exchange(0);
-    long mk[16];
-    for (int i = 0; i < 16; i++) mk[i] = g_vkMarkers[i].exchange(0);
-    int nNew = 0; double simGpu = 0.0, gpu = 0.0, simPres = 0.0; uint32_t got = 0;
-    if (d->GetLatencyTimingsNV)
-    {
-        VkLatencyTimingsFrameReportNV rep[64];
-        for (auto &r : rep) { r = {}; r.sType = VK_STRUCTURE_TYPE_LATENCY_TIMINGS_FRAME_REPORT_NV; }
-        VkGetLatencyMarkerInfoNV gi = {};
-        gi.sType = VK_STRUCTURE_TYPE_GET_LATENCY_MARKER_INFO_NV;
-        gi.timingCount = 64; gi.pTimings = rep;
-        d->GetLatencyTimingsNV(dev, sc, &gi);
-        got = gi.timingCount;
-        for (uint32_t i = 0; i < got && i < 64; i++)
-        {
-            const VkLatencyTimingsFrameReportNV &r = rep[i];
-            if (r.presentID <= g_vkLastReportId || r.simStartTimeUs == 0) continue;
-            nNew++;
-            if (r.gpuRenderEndTimeUs > r.simStartTimeUs) simGpu += (r.gpuRenderEndTimeUs - r.simStartTimeUs) * 0.001;
-            if (r.gpuRenderEndTimeUs > r.gpuRenderStartTimeUs) gpu += (r.gpuRenderEndTimeUs - r.gpuRenderStartTimeUs) * 0.001;
-            if (r.presentStartTimeUs > r.simStartTimeUs) simPres += (r.presentStartTimeUs - r.simStartTimeUs) * 0.001;
-        }
-        for (uint32_t i = 0; i < got && i < 64; i++) if (rep[i].presentID > g_vkLastReportId) g_vkLastReportId = rep[i].presentID;
-    }
-    LOGI("BFI Presenter: Reflex (Vulkan) over %.1f s: %.1f sleeps/s, %.1f game presents/s, markers/s sim start %.1f, present start "
-         "%.1f, input %.1f; timing reports: %u returned, %d new (%.1f/s), sim->GPU end %.1f ms, GPU render %.1f ms, sim->present %.1f ms",
-         dt, sleeps / dt, pres / dt, mk[VK_LATENCY_MARKER_SIMULATION_START_NV] / dt, mk[VK_LATENCY_MARKER_PRESENT_START_NV] / dt,
-         mk[VK_LATENCY_MARKER_INPUT_SAMPLE_NV] / dt, got, nNew, nNew / dt,
-         nNew ? simGpu / nNew : -1.0, nNew ? gpu / nNew : -1.0, nNew ? simPres / nNew : -1.0);
-}
+static std::atomic<bool> g_vkSleepSeen{false};
 static VKAPI_ATTR VkResult VKAPI_CALL Bfi_SetLatencySleepModeNV(VkDevice device, VkSwapchainKHR sc, const VkLatencySleepModeInfoNV *info)
 {
     DeviceData *d = GetDev(Key(device));
@@ -4120,10 +4080,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_LatencySleepNV(VkDevice device, VkSwap
 {
     DeviceData *d = GetDev(Key(device));
     if (!d || !d->LatencySleepNV) return VK_ERROR_DEVICE_LOST;
-    if (g_vkSleepCalls.fetch_add(1) == 0 && g_vkRfxT <= 0.0) LOGI("BFI Presenter: game Reflex (Vulkan): the game calls its Reflex sleep");
+    if (!g_vkSleepSeen.exchange(true)) LOGI("BFI Presenter: game Reflex (Vulkan): the game calls its Reflex sleep");
     g_vkSleepSec.fetch_add(1);
     g_vkSleepLastT.store(Now());
-    VkReflexSummary(d, device, sc);
     // Frame limit at the game's sleep, as in the DX add-on: one rendered frame per (limit), i.e. with frame
     // generation one presented frame per strobe cycle. The driver's own limit would count the presenter's presents.
     const int us = g_vkSleepLimitUs.load();
@@ -4136,13 +4095,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_LatencySleepNV(VkDevice device, VkSwap
         nextT += iv;
     }
     return d->LatencySleepNV(device, sc, info);
-}
-static VKAPI_ATTR void VKAPI_CALL Bfi_SetLatencyMarkerNV(VkDevice device, VkSwapchainKHR sc, const VkSetLatencyMarkerInfoNV *info)
-{
-    DeviceData *d = GetDev(Key(device));
-    if (!d || !d->SetLatencyMarkerNV) return;
-    if (info && (unsigned)info->marker < 16) g_vkMarkers[info->marker].fetch_add(1);
-    d->SetLatencyMarkerNV(device, sc, info);
 }
 
 // ---------------------------------------------------------------- proc addr
@@ -4174,7 +4126,6 @@ static PFN_vkVoidFunction DeviceHook(const char *name, DeviceData *d)
     H(GetDeviceQueue2, Bfi_GetDeviceQueue2)
     H(SetLatencySleepModeNV, Bfi_SetLatencySleepModeNV)
     H(LatencySleepNV, Bfi_LatencySleepNV)
-    H(SetLatencyMarkerNV, Bfi_SetLatencyMarkerNV)
 #undef H
     return nullptr;
 }
@@ -4520,7 +4471,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the Refresh rate cap: while the game can't hold the refresh rate, the cap drops to one\n"
                                                           "game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames), so every flash shows the\n"
                                                           "next frame instead of frames dropped unevenly (judder). Back to Refresh rate after a short\n"
-                                                          "try that holds the refresh rate (every 30 to 120 s). Not with frame generation.");
+                                                          "try that holds the refresh rate (every 30 to 120 s). With frame generation only in games with\n"
+                                                          "NVIDIA Reflex, and only at 2x where it leaves about 30 rendered fps (one presented frame per\n"
+                                                          "strobe cycle, applied at the game's Reflex sleep); otherwise frame generation stays at Refresh.");
             if (s.autoCap)
             {
                 int down, fgA, probe;

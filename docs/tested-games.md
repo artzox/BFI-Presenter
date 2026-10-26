@@ -330,6 +330,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - Queue one refresh ahead (VK 0.8.2) doesn't hold here: the NVIDIA Vulkan present path accepts only one pending present, with 3 or 4 buffers. "Prefer native" present method made it worse.
 - To try: a lower Texture Pool Size (VRAM paging stalls the GPU at 16 GB), lower settings, Dark frame floor 0.1–0.15.
 - 1.0.11: with exclusive fullscreen for the presenter's swap chain (on by default) it stays steady, also after alt-tab, which used to bring the flashes back for good.
+- **v1.0.23: 2× frame generation + Refresh rate cap + automatic frame cap.** The layer caps frame generation with the game's Reflex frame limit: a steady 30 rendered / 60 presented, a new frame on every flash, about 55 ms from frame start to the GPU. 3× (20 rendered for 60) lagged badly and presented unevenly, so 3× stays at the Refresh cap (about 115 presented, frames dropped unevenly).
 
 ### shadPS4
 
