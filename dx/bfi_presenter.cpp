@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.22-a4"
+#define BFI_ADDON_VERSION "1.0.22-a5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3213,7 +3213,11 @@ static DWORD WINAPI PresenterThread(void *)
                     // -- frame generation 'active', a 2x limit, 30 fps, and Reflex's limit dropped for the session.
                     const bool dlssOnPath = Now() - g_fgPresentT.load() < 2.0;
                     const bool rfxStopped = rsEverT > 0.0 && t - rsEverT >= 3.0;
-                    fg = dlssOnPath && (!g_fgCallerDlss.load() || rfxStopped);
+                    // ... and only at a frame rate frame generation would give: The Witcher 3 with frame generation off
+                    // stopped its reports in loading stalls at 27-29 fps and was read as frame generation for ~20 s
+                    // (the cap at Refresh, Reflex's limit off). Returnal with frame generation presented 50-60.
+                    const bool fgRate = hzA <= 0.0 || g_status.gameFps >= 0.35 * hzA;
+                    fg = dlssOnPath && (!g_fgCallerDlss.load() || (rfxStopped && (fgWas || fgRate)));
                     if (dlssOnPath && g_fgCallerDlss.load() && rsEverT > 0.0 && !rfxStopped && !fgEarlyLogged)
                     {
                         fgEarlyLogged = true;
