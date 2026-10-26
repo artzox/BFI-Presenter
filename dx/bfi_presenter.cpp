@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.22-a1"
+#define BFI_ADDON_VERSION "1.0.22-a2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -200,6 +200,8 @@ static double              g_lrRelT[kLr] = {};     // when game frame id was rel
 static double              g_lrDeadline[kLr] = {}; // vblank it was released for (0 = not held back)
 static UINT64              g_lrRelId[kLr] = {};
 static UINT64              g_lrFence[kLr] = {};
+static double              g_lrDoneT[kLr] = {};    // when game frame id's copy finished on the GPU (ReflexAlign)
+static UINT64              g_lrDoneId[kLr] = {};
 static std::atomic<UINT64> g_lrStaged{0};          // newest frame id with g_lrFence set
 static HANDLE              g_lrEv = nullptr;       // set when a frame is staged
 static HANDLE              g_lrThread = nullptr;
@@ -816,6 +818,7 @@ static DWORD WINAPI LrWatchThread(void *)
                 WaitForSingleObject(ev, 100);
             }
             const double fin = Now();
+            g_lrDoneT[k] = fin; g_lrDoneId[k] = id;
             if (g_lrRelId[k] == id)
             {
                 const double b = fin - g_lrRelT[k];
@@ -2396,7 +2399,7 @@ static DWORD WINAPI PresenterThread(void *)
     double alignSlack[256]; int alignN = 0;
     double alignTarget = 0.003, alignShiftTot = 0.0, alignCoolT = 0.0, alignLastLog = -1.0;
     int    alignCleanSecs = 0;
-    double alignLogSlack = -1.0;
+    double alignLogSlack = -1.0, alignPrevP10 = -1.0, alignLastStep = 0.0;
     double phaseUntil = 0.0, phaseNextT = 0.0;   // Reflex limit phase nudge (see the per-second block)
     int    phaseNudges = 0;     // last second's presents (goes with the rendered count taken then)
     ReflexSecond rsLast;           // last second's Reflex reports (frames == 0: the game doesn't use Reflex)
@@ -2688,7 +2691,16 @@ static DWORD WINAPI PresenterThread(void *)
         pickTime = g_stageTime[pick];
         pickNew = cycleStart && pickId != lastShownId;
         pickRelT = (pickNew && g_relId[pickId % kRel] == pickId) ? g_relT[pickId % kRel] : 0.0;
-        if (pickNew && pickTime > 0.0 && alignN < 256) { const double sl = Now() - pickTime; if (sl >= 0.0 && sl < 0.1) alignSlack[alignN++] = sl; }
+        // Measured from when the frame's copy finished on the GPU, not from its Present: in God of War Ragnarok
+        // the GPU still needed 10-13 ms after Present, so a frame "ready" 12 ms before the pick by its Present
+        // was really ready just in time, and moving it later wrapped it round to the next cycle. Not recorded
+        // yet means it has only just finished: 0.
+        if (pickNew && alignN < 256)
+        {
+            const int kd = (int)(pickId % kLr);
+            const double sl = g_lrDoneId[kd] == pickId ? Now() - g_lrDoneT[kd] : 0.0;
+            if (sl >= 0.0 && sl < 0.1) alignSlack[alignN++] = sl;
+        }
 
         Constants c = {};
         c.outType = (uint32_t)ResolveOutput(s);
@@ -3439,8 +3451,20 @@ static DWORD WINAPI PresenterThread(void *)
                     const bool holds = capFps > 0.0 && stNow.gameFps > 0.95 * capFps && stNow.gameFps < 1.05 * capFps;
                     if (s.reflexAlign && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
                     {
-                        if (stNow.frameRepeats >= 2)
+                        if (alignLastStep > 0.0 && p10 >= 0.0 && alignPrevP10 >= 0.0 && p10 - alignPrevP10 > 0.5 * cyc)
                         {
+                            // Moved past the pick: the frames now wait a whole cycle more. Back to before that step, a
+                            // little earlier, and a wider target.
+                            const int back = (int)((alignLastStep + 0.002) * 1e6);
+                            g_sleepShiftUs.fetch_sub(back); alignShiftTot -= back * 1e-6;
+                            alignTarget = std::min(0.008, alignTarget + 0.001);
+                            alignCleanSecs = 0; alignCoolT = t + 2.0; alignLastStep = 0.0;
+                            LOGI("BFI Presenter: Reflex frame limit alignment went past the pick (%.1f -> %.1f ms) -- moved back, "
+                                 "target %.1f ms", alignPrevP10 * 1000.0, p10 * 1000.0, alignTarget * 1000.0);
+                        }
+                        else if (stNow.frameRepeats >= 2)
+                        {
+                            alignLastStep = 0.0;
                             g_sleepShiftUs.fetch_sub(2000); alignShiftTot -= 0.002;
                             alignTarget = std::min(0.008, alignTarget + 0.001);
                             alignCleanSecs = 0; alignCoolT = t + 2.0;
@@ -3450,10 +3474,11 @@ static DWORD WINAPI PresenterThread(void *)
                             if (stNow.frameRepeats == 0 && ++alignCleanSecs >= 10 && alignTarget > 0.003)
                             { alignTarget = std::max(0.003, alignTarget - 0.00025); alignCleanSecs = 0; }
                             const double excess = p10 - alignTarget;
+                            alignLastStep = 0.0;
                             if (excess > 0.001)
                             {
                                 const double step = std::min(0.003, 0.5 * excess);
-                                g_sleepShiftUs.fetch_add((int)(step * 1e6)); alignShiftTot += step;
+                                g_sleepShiftUs.fetch_add((int)(step * 1e6)); alignShiftTot += step; alignLastStep = step;
                             }
                             if (alignLastLog < 0.0 || t - alignLastLog > 30.0)
                             {
@@ -3469,7 +3494,7 @@ static DWORD WINAPI PresenterThread(void *)
                     g_status.alignSlackMs = p10 >= 0.0 ? p10 * 1000.0 : -1.0;
                     g_status.alignShiftMs = alignShiftTot * 1000.0;
                     LeaveCriticalSection(&g_cfgLock);
-                    alignLogSlack = p10;
+                    alignLogSlack = p10; alignPrevP10 = p10;
                     alignN = 0;
                 }
                 {
