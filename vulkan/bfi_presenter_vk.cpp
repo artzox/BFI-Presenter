@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.23-r2"
+#define BFI_VERSION "1.0.23-r3"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -2912,7 +2912,11 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
 
     // Latency limit: before the game starts its next frame, the frame from
     // MaxFramesAhead frames ago must be finished on the GPU.
-    const int ahead = sc->maxAhead.load();
+    // With the Reflex frame limit pacing frame generation (test), the game's presents are not held: frame generation
+    // paces its own frames, and holding them (frames ahead, the Refresh cap's release) let a backlog build up in
+    // Indiana Jones (frame start -> GPU done ~120 ms at 20 rendered fps against ~30 ms at 40).
+    const bool rfxPaced = g_vkSleepLimitUs.load() > 0;
+    const int ahead = rfxPaced ? 0 : sc->maxAhead.load();
     if (ahead > 0 && id > (uint64_t)ahead)
     {
         const uint64_t need = id - (uint64_t)ahead;
@@ -2951,7 +2955,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
         sc->presIdCv.notify_all();
     }
     const uint64_t per = cap >= 1 ? (uint64_t)std::max(0, capPer) : 0;
-    if (per && sc->running.load()) CapWait(sc, per);
+    if (per && sc->running.load() && !rfxPaced) CapWait(sc, per);
     const int st2 = sc->status.load();
     if (st2 != VK_SUCCESS) return (VkResult)st2;
     return sc->suboptimal.load() ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
