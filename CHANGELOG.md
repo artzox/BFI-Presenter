@@ -7,7 +7,7 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [1.0.22] — unreleased
+## [1.0.22] — 2026-10-26
 
 - **[DX] Line Reflex's frame limit up with the flash (`ReflexAlign`, off by default).** Reflex's frame limit starts each game frame on its own clock, so a finished frame waited up to a whole strobe cycle before the lit refresh showed it, by an amount that changed from launch to launch. With this on, the presenter measures that wait (from the frame's copy finishing on the GPU) and moves the start of each frame until frames are ready about 2 ms before their flash, backing off when frames start missing it. God of War Ragnarök: about 31 ms from release to flash every launch, against 31–44 ms. Games with uneven frame times gain little and can repeat a frame now and then (Spider-Man 2: 1.5 ms quicker, more repeats; Dead Space: no change), so it is off by default. Needs Lowest latency pacing; not with frame generation. The reflex timing log has two new columns: how long frames waited before their flash (also with the option off) and how far the frame start has moved.
 - **[DX] Fixed: loading stalls read as frame generation.** The Witcher 3 with frame generation off stopped its Reflex reports in loading stalls at 27–29 fps, which counted as frame generation for about 20 s (the cap at Refresh, Reflex's limit off). DLSS-G on the present path now counts only at a frame rate frame generation would give.
