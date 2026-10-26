@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.23-r3"
+#define BFI_VERSION "1.0.23-r4"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -2250,9 +2250,21 @@ static void PresenterThread(Swapchain *sc)
                     const int f = g_vkFgFactor.load();
                     if (f > 1) fg = true;
                     // Refresh cap + automatic frame cap with frame generation: one presented frame per strobe cycle.
+                    // Only while that leaves at least ~30 rendered fps: Indiana Jones at 3x (20 rendered for 60 presented at
+                    // 120 Hz) lagged and presented unevenly; at 2x (30 for 60) it was smooth. Otherwise the Refresh cap stays.
                     int want = 0;
+                    const double baseFps = hzA > 0.0 ? hzA / s.frames / f : 0.0;
+                    static int lowLogged = 0;
                     if (f > 1 && sleeping && s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !g_vkRfxBad.load())
-                        want = (int)(1e6 * s.frames / hzA * f + 0.5);
+                    {
+                        if (baseFps >= 28.0) want = (int)(1e6 * s.frames / hzA * f + 0.5);
+                        else if (lowLogged != f)
+                        {
+                            lowLogged = f;
+                            LOGI("BFI Presenter: frame generation %dx: one presented frame per strobe cycle would leave %.0f rendered fps "
+                                 "-- the Refresh rate cap stays (use 2x for the Reflex frame limit)", f, baseFps);
+                        }
+                    }
                     static double onT = 0.0, fpsOn = 0.0; static int badSecs = 0;
                     const int was = g_vkSleepLimitUs.exchange(want);
                     if ((was > 0) != (want > 0))
