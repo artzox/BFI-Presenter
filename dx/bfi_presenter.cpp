@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.22-a5"
+#define BFI_ADDON_VERSION "1.0.22-a6"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3452,7 +3452,10 @@ static DWORD WINAPI PresenterThread(void *)
                     const double cyc = hzL > 0.0 ? s.frames / hzL : 0.0;
                     const double cycles = cyc > 0.0 && sleepUs > 0 ? sleepUs * 1e-6 / cyc : 0.0;
                     const bool locked = cycles >= 0.9 && fabs(cycles - std::floor(cycles + 0.5)) * cyc < 0.0003;
-                    const bool atSleepNoFg = sleepUs > 0 && locked && g_sleepFgFactor.load() == 1 && !stNow.fgActive;
+                    // Lowest-latency pacing only: Smooth shows the oldest waiting frame, so with two waiting a late frame
+                    // just leaves the older one to be shown -- no repeat -- and the wait jumps a whole cycle instead.
+                    // In Dead Space (Smooth) the wake-up chased that round and round (318 ms in 6 minutes).
+                    const bool atSleepNoFg = sleepUs > 0 && locked && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
                     const bool holds = capFps > 0.0 && stNow.gameFps > 0.95 * capFps && stNow.gameFps < 1.05 * capFps;
                     if (s.reflexAlign && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
                     {
@@ -7974,7 +7977,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                     {
                         ImGui::SameLine();
                         if (st.alignSlackMs >= 0.0) ImGui::TextDisabled("(frames ready %.1f ms before the pick, moved %+.1f ms)", st.alignSlackMs, st.alignShiftMs);
-                        else ImGui::TextDisabled("(not in use)");
+                        else ImGui::TextDisabled(s.pacingMode == 0 ? "(not in use: needs Lowest latency pacing)" : "(not in use)");
                     }
                 }
                 if (per >= 2 && st.fgActive && st.rfxLimitUs <= 0)
