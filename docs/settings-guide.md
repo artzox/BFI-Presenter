@@ -188,6 +188,10 @@ With Half, Quarter or another cap below the refresh rate, the cap is applied by 
 It costs latency: about 10–20 ms more than just-in-time release (Silent Hill 2 at Half: 34 ms against 25 ms from release to flash; Alan Wake 2 at Quarter: 56 ms against 35 ms), and in games where just-in-time release works it is no smoother. Games without Reflex keep the presenter's cap; the overlay shows whether the limit is in use.\
 *When to change it:* leave off. Turn on only for a game that still stutters at Half or Quarter while the overlay shows just-in-time release switching off, and compare.
 
+**Line Reflex's frame limit up with the flash** · `ReflexAlign` · default: off · DirectX games with NVIDIA Reflex, Lowest latency pacing, no frame generation\
+Reflex's frame limit starts each game frame on its own clock, so a finished frame can wait up to a whole strobe cycle before the lit refresh shows it, and how long depends on the launch. With this on, BFI Presenter measures that wait and moves the start of each frame until frames are ready about 2 ms before their flash; if frames start missing it, it backs off. God of War Ragnarok: about 31 ms from release to flash every launch, against 31–44 ms depending on the launch. In games whose frame times vary a lot it gains little and can repeat a frame now and then (Spider-Man 2: 1.5 ms quicker, more repeats; Dead Space: no change).\
+*When to change it:* turn on for Reflex games with steady frame times that hold the cap. The overlay shows how long frames wait before their flash.
+
 **Later release** and **margin** · `LaterRelease`, `LaterReleaseMarginMs` · default: off, 1.5 ms\
 The same trick for the Refresh cap with Lowest latency: the game starts each frame as late as safely possible, which cuts up to about 5 ms of input delay in light games. The margin is the safety gap it keeps (it grows by itself if frames start arriving late).\
 *When to change it:* turn on for light games that hold 120 fps comfortably (Cuphead, indies). Not with frame generation.

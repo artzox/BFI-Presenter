@@ -95,7 +95,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Cocoon | Standard setup |
 | Crash Bandicoot N. Sane Trilogy | Standard setup |
 | Days Gone | Standard setup |
-| Dead Space (2023) | Standard setup |
+| Dead Space (2023) | Standard setup; Frame pacing Lowest latency (about 37 ms from release to flash against about 44 ms with Smooth, v1.0.22) |
 | Dishonored 2 | Standard setup |
 | FAR: Lone Sails | Standard setup |
 | GRIS | Standard setup |
@@ -159,6 +159,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 * At about 100 fps, Smooth used to cost 20–30 fps against Lowest latency (it handed frame slots back only at the 60 lit picks); fixed in v0.79. Lowest latency + Refresh feels smoother at these frame rates; Half refresh + just-in-time is the even option.
 * Occasional flashes with DLSS 5 were \~30 ms GPU stalls the presenter's draw waited behind. Running Steam as administrator (realtime presenter queue, v0.81) removed them: 0 long holds in 126 s against 6 in 176 s.
+- **v1.0.22 without frame generation: Line Reflex's frame limit up with the flash (`ReflexAlign=1`).** With the automatic frame cap on Reflex's limit, frames waited 1–14 ms before their flash depending on the launch (31–44 ms from release to flash); lined up they wait about 2 ms, about 31 ms every launch, with a repeated frame about once a minute or less.
 
 ### Riven (2023)
 

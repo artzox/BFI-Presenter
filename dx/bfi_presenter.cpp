@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.22-a8"
+#define BFI_ADDON_VERSION "1.0.22"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -7971,11 +7971,13 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 }
                 {
                     bool ra = s.reflexAlign != 0;
-                    if (ImGui::Checkbox("Line Reflex's frame limit up with the flash (test)", &ra)) s.reflexAlign = ra ? 1 : 0;
+                    if (ImGui::Checkbox("Line Reflex's frame limit up with the flash", &ra)) s.reflexAlign = ra ? 1 : 0;
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Games with Reflex, capped with Reflex's frame limit (e.g. the automatic frame cap) and without frame\n"
                                                                   "generation: the presenter moves the moment the game starts each frame so the frame is ready just\n"
                                                                   "before the lit refresh picks it, instead of waiting there for up to a whole strobe cycle.\n"
-                                                                  "Test option (ReflexAlign=1).");
+                                                                  "Needs Lowest latency pacing. Best in games with steady frame times (God of War Ragnarok: about\n"
+                                                                  "7 ms less from release to flash); in games whose frame times vary it gains little and can\n"
+                                                                  "repeat a frame now and then (Spider-Man 2). Off by default.");
                     if (s.reflexAlign)
                     {
                         ImGui::SameLine();
