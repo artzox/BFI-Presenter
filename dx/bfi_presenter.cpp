@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.22-a3"
+#define BFI_ADDON_VERSION "1.0.22-a4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2397,7 +2397,7 @@ static DWORD WINAPI PresenterThread(void *)
     double fpsPrevSec = -1.0;
     // ReflexAlign: how long before the lit refresh's pick each new game frame was ready, and the controller.
     double alignSlack[256]; int alignN = 0;
-    double alignTarget = 0.0015, alignShiftTot = 0.0, alignCoolT = 0.0, alignLastLog = -1.0;
+    double alignTarget = 0.002, alignShiftTot = 0.0, alignCoolT = 0.0, alignLastLog = -1.0;
     int    alignCleanSecs = 0, alignExcessSecs = 0;
     double alignLogSlack = -1.0, alignPrevP10 = -1.0, alignLastStep = 0.0;
     double phaseUntil = 0.0, phaseNextT = 0.0;   // Reflex limit phase nudge (see the per-second block)
@@ -3472,8 +3472,10 @@ static DWORD WINAPI PresenterThread(void *)
                         }
                         else if (p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
                         {
-                            if (stNow.frameRepeats == 0 && ++alignCleanSecs >= 10 && alignTarget > 0.0015)
-                            { alignTarget = std::max(0.0015, alignTarget - 0.00025); alignCleanSecs = 0; }
+                            // Back down slowly: at 1.5 ms and 10 s per step God of War Ragnarok missed the pick about once a
+                            // minute (frames ready 0-0.6 ms before it), each time soon after the target had come back down.
+                            if (stNow.frameRepeats == 0 && ++alignCleanSecs >= 30 && alignTarget > 0.002)
+                            { alignTarget = std::max(0.002, alignTarget - 0.00025); alignCleanSecs = 0; }
                             const double excess = p10 - alignTarget;
                             alignLastStep = 0.0;
                             // Two seconds in a row over the target: one second can be the tail of a cap change or a hitch.
