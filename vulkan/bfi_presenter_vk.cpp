@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.23"
+#define BFI_VERSION "1.0.24-w1"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -4240,6 +4240,34 @@ static void KofiButton()
         ImGui::SetTooltip("BFI Presenter is free. If it helps you, you can support its development on Ko-fi\n(ko-fi.com/artzox). Opens in your browser.");
 }
 
+
+// ReLimiter (a ReShade add-on, relimiter.addon64) paces the game with its own frame limiter, Present hooks and
+// Reflex markers, which works against the presenter's frame cap and strobe. ReShade may load it after this
+// add-on, so it is looked for every few seconds until found; the overlay and the log then say so.
+static bool RelimiterLoaded()
+{
+    static bool found = false;
+    static double nextT = 0.0;
+    if (found) return true;
+    const double t = Now();
+    if (t < nextT) return false;
+    nextT = t + 3.0;
+    static const char *k[] = { "relimiter.addon64", "relimiter.addon32", "relimiter.addon", "relimiter.dll" };
+    for (const char *n : k)
+    {
+        HMODULE m = GetModuleHandleA(n);
+        if (!m) continue;
+        char path[MAX_PATH] = "";
+        GetModuleFileNameA(m, path, MAX_PATH);
+        LOGW("BFI Presenter: ReLimiter is loaded (%s). It paces the game with its own frame limiter, which works "
+             "against the presenter's frame cap and strobe: remove it from this game's folder and use the presenter's "
+             "frame cap.", path);
+        found = true;
+        return true;
+    }
+    return false;
+}
+
 static void draw_overlay(reshade::api::effect_runtime *)
 {
     Status st;
@@ -4267,6 +4295,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
     else            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s", st.reason);
 
     // ================================================================ warnings (only when something needs attention)
+    if (RelimiterLoaded())
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                           "ReLimiter is loaded: its frame limiter works against the presenter's frame cap and strobe.\n"
+                           "Remove relimiter.addon64 from the game's folder and use the presenter's frame cap.");
     if (st.layerOrder == 2)
         ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "The layer is ABOVE ReShade (presents come from %s).\n"
                            "Re-run install_vulkan_layer.bat so it is registered after ReShade.", st.caller);

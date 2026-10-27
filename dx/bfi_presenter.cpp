@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.23"
+#define BFI_ADDON_VERSION "1.0.24-w1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -5386,6 +5386,34 @@ static bool SmoothMotionActive()
     return found;
 }
 
+
+// ReLimiter (a ReShade add-on, relimiter.addon64) paces the game with its own frame limiter, Present hooks and
+// Reflex markers, which works against the presenter's frame cap and strobe. ReShade may load it after this
+// add-on, so it is looked for every few seconds until found; the overlay and the log then say so.
+static bool RelimiterLoaded()
+{
+    static bool found = false;
+    static double nextT = 0.0;
+    if (found) return true;
+    const double t = Now();
+    if (t < nextT) return false;
+    nextT = t + 3.0;
+    static const char *k[] = { "relimiter.addon64", "relimiter.addon32", "relimiter.addon", "relimiter.dll" };
+    for (const char *n : k)
+    {
+        HMODULE m = GetModuleHandleA(n);
+        if (!m) continue;
+        char path[MAX_PATH] = "";
+        GetModuleFileNameA(m, path, MAX_PATH);
+        LOGW("BFI Presenter: ReLimiter is loaded (%s). It paces the game with its own frame limiter, which works "
+             "against the presenter's frame cap and strobe: remove it from this game's folder and use the presenter's "
+             "frame cap.", path);
+        found = true;
+        return true;
+    }
+    return false;
+}
+
 static bool DetectPresentHooks()
 {
     static const struct { const char *dll; const char *name; } k[] = {
@@ -7747,6 +7775,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
     else            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s", st.reason);
 
     // ================================================================ warnings (only when something needs attention)
+    if (RelimiterLoaded())
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                           "ReLimiter is loaded: its frame limiter works against the presenter's frame cap and strobe.\n"
+                           "Remove relimiter.addon64 from the game's folder and use the presenter's frame cap.");
     if (strstr(g_hooksSeen, "RTSS"))
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
                            "RTSS is hooked: keep its frame limiter off and don't toggle its OSD while playing.");
