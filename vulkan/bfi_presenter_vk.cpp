@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.22"
+#define BFI_VERSION "1.0.23"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -436,6 +436,7 @@ struct Status
     int    autoCapDown = 0;                 // automatic frame cap: one game frame per strobe cycle in use
     int    autoCapProbe = 0;                // automatic frame cap: trying the Refresh rate again
     int    fgActive = 0;                    // a frame-generation DLL is loaded (the automatic cap stays at Refresh)
+    int    rfxLimitUs = 0;                  // Reflex frame limit at the game's sleep (frame generation), per rendered frame
     double rawAvg = -1.0, litAvg = -1.0, ceilInUse = 0.0;
     int    sharedQueue = 0;
     int    layerOrder = 0;      // 0 unknown, 1 below ReShade (good), 2 ReShade not above the layer
@@ -495,7 +496,8 @@ struct InstanceData
 #define BFI_DEVICE_OPT_FUNCS(X) \
     X(QueueSubmit2) X(QueueSubmit2KHR) X(QueueBindSparse) X(AcquireNextImage2KHR) X(WaitForPresentKHR) \
     X(GetSwapchainStatusKHR) X(ReleaseSwapchainImagesEXT) X(GetDeviceQueue2) \
-    X(AcquireFullScreenExclusiveModeEXT) X(ReleaseFullScreenExclusiveModeEXT)
+    X(AcquireFullScreenExclusiveModeEXT) X(ReleaseFullScreenExclusiveModeEXT) \
+    X(SetLatencySleepModeNV) X(LatencySleepNV)
 
 struct Swapchain;
 struct DeviceData
@@ -537,6 +539,11 @@ static DeviceData *GetDev(void *key)
     return it == g_devices.end() ? nullptr : it->second;
 }
 
+static std::atomic<long> g_vkSleepSec{0};       // the game's Reflex sleep calls this second (rendered frames)
+static std::atomic<double> g_vkSleepLastT{0.0};  // last Reflex sleep call
+static std::atomic<int>  g_vkSleepLimitUs{0};    // Reflex frame limit applied in the game's sleep call, per rendered frame (0 = off)
+static std::atomic<int>  g_vkFgFactor{1};        // presents per rendered frame, from Reflex sleep calls
+static std::atomic<bool> g_vkRfxBad{false};      // the game collapsed under the limit: off for the session
 static bool g_active = false;      // BFIPresenter.ini found: the layer manages swap chains in this process
 static std::atomic<bool> g_surfCaps2Ext{false};    // VK_KHR_get_surface_capabilities2 enabled (needed by full_screen_exclusive)
 static std::atomic<bool> g_colorspaceExt{false};   // VK_EXT_swapchain_colorspace enabled (HDR10 presentation possible)
@@ -2224,6 +2231,67 @@ static void PresenterThread(Swapchain *sc)
                     if (fg && s.autoCap) LOGI("BFI Presenter: frame generation DLL loaded -- the automatic frame cap stays at Refresh rate");
                 }
                 const double fpsA = g_status.gameFps;
+                // Frame generation from the game's Reflex sleep calls (one per rendered frame): presents well above
+                // them. Changed after 3 seconds in a row agree.
+                {
+                    static int fgCand = 1, fgRun = 0;
+                    const long rend = g_vkSleepSec.exchange(0);
+                    const bool sleeping = Now() - g_vkSleepLastT.load() < 2.0 && rend > 0;
+                    int cand = 1;
+                    if (sleeping && fpsA > 1.5 * rend) cand = std::max(2, std::min(4, (int)(fpsA / rend + 0.5)));
+                    // A second with far fewer presents than rendered frames is a stall or a rebuilt swap chain (its first
+                    // second: 3 presented, 34 rendered), not frame generation switching off: it doesn't count. It switched
+                    // the limit off after every rebuild in Indiana Jones.
+                    const bool stallSec = hitchPaused || (sleeping && fpsA < 0.8 * rend);
+                    if (stallSec) cand = fgCand;
+                    else { fgRun = cand == fgCand ? fgRun + 1 : 1; fgCand = cand; }
+                    if (fgRun >= 3 && g_vkFgFactor.load() != cand)
+                    {
+                        g_vkFgFactor.store(cand);
+                        LOGI("BFI Presenter: frame generation %s (Reflex: %.0f presented, %ld rendered a second)",
+                             cand > 1 ? "active" : "not active", fpsA, rend);
+                    }
+                    const int f = g_vkFgFactor.load();
+                    if (f > 1) fg = true;
+                    // Refresh cap + automatic frame cap with frame generation: one presented frame per strobe cycle.
+                    // Only while that leaves at least ~30 rendered fps: Indiana Jones at 3x (20 rendered for 60 presented at
+                    // 120 Hz) lagged and presented unevenly; at 2x (30 for 60) it was smooth. Otherwise the Refresh cap stays.
+                    int want = 0;
+                    const double baseFps = hzA > 0.0 ? hzA / s.frames / f : 0.0;
+                    static int lowLogged = 0;
+                    if (f > 1 && sleeping && s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !g_vkRfxBad.load())
+                    {
+                        if (baseFps >= 28.0) want = (int)(1e6 * s.frames / hzA * f + 0.5);
+                        else if (lowLogged != f)
+                        {
+                            lowLogged = f;
+                            LOGI("BFI Presenter: frame generation %dx: one presented frame per strobe cycle would leave %.0f rendered fps "
+                                 "-- the Refresh rate cap stays (use 2x for the Reflex frame limit)", f, baseFps);
+                        }
+                    }
+                    static double onT = 0.0, fpsOn = 0.0; static int badSecs = 0;
+                    const int was = g_vkSleepLimitUs.exchange(want);
+                    if ((was > 0) != (want > 0))
+                    {
+                        LOGI("BFI Presenter: frame limit at the game's Reflex sleep %s (%d us per rendered frame, frame generation %dx)",
+                             want > 0 ? "on" : "off", want, f);
+                        onT = t; fpsOn = fpsA; badSecs = 0;
+                    }
+                    else if (want > 0 && was != want)
+                        LOGI("BFI Presenter: frame limit at the game's Reflex sleep: %d us per rendered frame (frame generation %dx)", want, f);
+                    // Collapse check: under the limit the game should present one frame per strobe cycle.
+                    if (want > 0 && !hitchPaused && t - onT >= 1.5 && t - onT < 6.0 && fpsOn > 0.8 * hzA / s.frames && fpsA < 0.5 * hzA / s.frames)
+                    {
+                        if (++badSecs >= 2)
+                        {
+                            g_vkRfxBad.store(true); g_vkSleepLimitUs.store(0);
+                            LOGW("BFI Presenter: Reflex frame limit (Vulkan): the game fell to %.0f fps under it (%.0f before) -- off "
+                                 "for the rest of this session", fpsA, fpsOn);
+                        }
+                    }
+                    else badSecs = 0;
+                    g_status.rfxLimitUs = g_vkSleepLimitUs.load();
+                }
                 bool down = sc->autoCapDown.load();
                 if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg)
                 {
@@ -2860,7 +2928,11 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
 
     // Latency limit: before the game starts its next frame, the frame from
     // MaxFramesAhead frames ago must be finished on the GPU.
-    const int ahead = sc->maxAhead.load();
+    // With the Reflex frame limit pacing frame generation, the game's presents are not held: frame generation
+    // paces its own frames, and holding them (frames ahead, the Refresh cap's release) let a backlog build up in
+    // Indiana Jones (frame start -> GPU done ~120 ms at 20 rendered fps against ~30 ms at 40).
+    const bool rfxPaced = g_vkSleepLimitUs.load() > 0;
+    const int ahead = rfxPaced ? 0 : sc->maxAhead.load();
     if (ahead > 0 && id > (uint64_t)ahead)
     {
         const uint64_t need = id - (uint64_t)ahead;
@@ -2899,7 +2971,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
         sc->presIdCv.notify_all();
     }
     const uint64_t per = cap >= 1 ? (uint64_t)std::max(0, capPer) : 0;
-    if (per && sc->running.load()) CapWait(sc, per);
+    if (per && sc->running.load() && !rfxPaced) CapWait(sc, per);
     const int st2 = sc->status.load();
     if (st2 != VK_SUCCESS) return (VkResult)st2;
     return sc->suboptimal.load() ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
@@ -3984,6 +4056,52 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_EnumerateDeviceExtensionProperties(VkP
     return id->EnumerateDeviceExtensionProperties(phys, layer, count, props);
 }
 
+// ---------------------------------------------------------------- Reflex (VK_NV_low_latency2)
+// The game's Reflex calls pass through the layer. Its sleep call (once per rendered frame) tells frame generation
+// apart (presents well above it) and is where the automatic frame cap's limit is applied with frame generation; the
+// game's own limit is taken out of the driver, which would count the presenter's presents.
+static std::atomic<int>  g_vkLlMode{-1}, g_vkLlBoost{-1}, g_vkLlMinUs{-1};
+static std::atomic<bool> g_vkSleepSeen{false};
+static VKAPI_ATTR VkResult VKAPI_CALL Bfi_SetLatencySleepModeNV(VkDevice device, VkSwapchainKHR sc, const VkLatencySleepModeInfoNV *info)
+{
+    DeviceData *d = GetDev(Key(device));
+    if (!d || !d->SetLatencySleepModeNV) return VK_ERROR_DEVICE_LOST;
+    const int mode = info ? (int)info->lowLatencyMode : 0, boost = info ? (int)info->lowLatencyBoost : 0;
+    const int us = info ? (int)info->minimumIntervalUs : 0;
+    const bool ch1 = g_vkLlMode.exchange(mode) != mode, ch2 = g_vkLlBoost.exchange(boost) != boost, ch3 = g_vkLlMinUs.exchange(us) != us;
+    if (ch1 || ch2 || ch3)
+        LOGI("BFI Presenter: game Reflex (Vulkan): low latency %s%s, frame limit %d us", mode ? "on" : "off", boost ? " + Boost" : "", us);
+    // The driver's limit counts the presenter's presents (it collapsed DX games to ~7 fps): taken out.
+    if (info && info->minimumIntervalUs > 0 && g_active)
+    {
+        VkLatencySleepModeInfoNV m = *info;
+        m.minimumIntervalUs = 0;
+        LOGI("BFI Presenter: game Reflex (Vulkan): its frame limit (%u us) taken out of the driver", info->minimumIntervalUs);
+        return d->SetLatencySleepModeNV(device, sc, &m);
+    }
+    return d->SetLatencySleepModeNV(device, sc, info);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL Bfi_LatencySleepNV(VkDevice device, VkSwapchainKHR sc, const VkLatencySleepInfoNV *info)
+{
+    DeviceData *d = GetDev(Key(device));
+    if (!d || !d->LatencySleepNV) return VK_ERROR_DEVICE_LOST;
+    if (!g_vkSleepSeen.exchange(true)) LOGI("BFI Presenter: game Reflex (Vulkan): the game calls its Reflex sleep");
+    g_vkSleepSec.fetch_add(1);
+    g_vkSleepLastT.store(Now());
+    // Frame limit at the game's sleep, as in the DX add-on: one rendered frame per (limit), i.e. with frame
+    // generation one presented frame per strobe cycle. The driver's own limit would count the presenter's presents.
+    const int us = g_vkSleepLimitUs.load();
+    if (us > 0)
+    {
+        static double nextT = 0.0;
+        const double iv = us * 1e-6, now = Now();
+        if (nextT <= 0.0 || now > nextT + iv || nextT - now > 2.0 * iv) nextT = now;
+        SleepUntil(nextT);
+        nextT += iv;
+    }
+    return d->LatencySleepNV(device, sc, info);
+}
+
 // ---------------------------------------------------------------- proc addr
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Bfi_GetDeviceProcAddr(VkDevice device, const char *name);
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Bfi_GetInstanceProcAddr(VkInstance instance, const char *name);
@@ -4011,6 +4129,8 @@ static PFN_vkVoidFunction DeviceHook(const char *name, DeviceData *d)
     H(DeviceWaitIdle, Bfi_DeviceWaitIdle)
     H(GetDeviceQueue, Bfi_GetDeviceQueue)
     H(GetDeviceQueue2, Bfi_GetDeviceQueue2)
+    H(SetLatencySleepModeNV, Bfi_SetLatencySleepModeNV)
+    H(LatencySleepNV, Bfi_LatencySleepNV)
 #undef H
     return nullptr;
 }
@@ -4356,13 +4476,17 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the Refresh rate cap: while the game can't hold the refresh rate, the cap drops to one\n"
                                                           "game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames), so every flash shows the\n"
                                                           "next frame instead of frames dropped unevenly (judder). Back to Refresh rate after a short\n"
-                                                          "try that holds the refresh rate (every 30 to 120 s). Not with frame generation.");
+                                                          "try that holds the refresh rate (every 30 to 120 s). With frame generation only in games with\n"
+                                                          "NVIDIA Reflex, and only at 2x where it leaves about 30 rendered fps (one presented frame per\n"
+                                                          "strobe cycle, applied at the game's Reflex sleep); otherwise frame generation stays at Refresh.");
             if (s.autoCap)
             {
                 int down, fgA, probe;
                 { std::lock_guard<std::mutex> l(g_cfgLock); down = g_status.autoCapDown; fgA = g_status.fgActive; probe = g_status.autoCapProbe; }
                 ImGui::SameLine();
+                int rfxUs = 0; { std::lock_guard<std::mutex> l(g_cfgLock); rfxUs = g_status.rfxLimitUs; }
                 if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
+                else if (rfxUs > 0) ImGui::TextDisabled("(in use: one presented frame per strobe cycle, Reflex frame limit %.1f ms per rendered frame)", rfxUs / 1000.0);
                 else ImGui::TextDisabled("%s", fgA ? "(Refresh rate: frame generation)" : probe ? "(trying Refresh rate)" : down ? "(in use: one game frame per strobe cycle)" : "(in use: Refresh rate)");
             }
         }
