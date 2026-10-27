@@ -88,7 +88,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.24-w1"
+#define BFI_ADDON_VERSION "1.0.24-w2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -5388,7 +5388,8 @@ static bool SmoothMotionActive()
 
 
 // ReLimiter (a ReShade add-on, relimiter.addon64) paces the game with its own frame limiter, Present hooks and
-// Reflex markers, which works against the presenter's frame cap and strobe. ReShade may load it after this
+// Reflex markers. In user reports (#26, #27) its limit stacked with the presenter's cap, and its G-SYNC detection
+// kept switching DLSS-G's mode, locking frame generation at ~30 fps (Control) until G-SYNC was off for the game. ReShade may load it after this
 // add-on, so it is looked for every few seconds until found; the overlay and the log then say so.
 static bool RelimiterLoaded()
 {
@@ -5405,9 +5406,11 @@ static bool RelimiterLoaded()
         if (!m) continue;
         char path[MAX_PATH] = "";
         GetModuleFileNameA(m, path, MAX_PATH);
-        LOGW("BFI Presenter: ReLimiter is loaded (%s). It paces the game with its own frame limiter, which works "
-             "against the presenter's frame cap and strobe: remove it from this game's folder and use the presenter's "
-             "frame cap.", path);
+        LOGW("BFI Presenter: ReLimiter is loaded (%s). Its frame limit stacks with the presenter's frame cap, its "
+             "G-SYNC handling can switch DLSS frame generation's mode back and forth (Control: a ~30 fps lock until "
+             "G-SYNC was turned off for the game), and its smoothness reading looks worse than the screen because the "
+             "presenter holds each frame for its flash. Remove it from this game's folder, or turn its limiter off, and "
+             "use the presenter's frame cap.", path);
         found = true;
         return true;
     }
@@ -7777,8 +7780,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
     // ================================================================ warnings (only when something needs attention)
     if (RelimiterLoaded())
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
-                           "ReLimiter is loaded: its frame limiter works against the presenter's frame cap and strobe.\n"
-                           "Remove relimiter.addon64 from the game's folder and use the presenter's frame cap.");
+                           "ReLimiter is loaded. Its frame limit stacks with the presenter's cap, its G-SYNC handling can switch\n"
+                           "frame generation's mode back and forth (a ~30 fps lock), and its smoothness reading looks worse than\n"
+                           "the screen (the presenter holds each frame for its flash). Remove relimiter.addon64 from the game's\n"
+                           "folder, or turn its limiter off, and use the presenter's frame cap.");
     if (strstr(g_hooksSeen, "RTSS"))
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
                            "RTSS is hooked: keep its frame limiter off and don't toggle its OSD while playing.");
