@@ -2239,7 +2239,12 @@ static void PresenterThread(Swapchain *sc)
                     const bool sleeping = Now() - g_vkSleepLastT.load() < 2.0 && rend > 0;
                     int cand = 1;
                     if (sleeping && fpsA > 1.5 * rend) cand = std::max(2, std::min(4, (int)(fpsA / rend + 0.5)));
-                    fgRun = cand == fgCand ? fgRun + 1 : 1; fgCand = cand;
+                    // A second with far fewer presents than rendered frames is a stall or a rebuilt swap chain (its first
+                    // second: 3 presented, 34 rendered), not frame generation switching off: it doesn't count. It switched
+                    // the limit off after every rebuild in Indiana Jones.
+                    const bool stallSec = hitchPaused || (sleeping && fpsA < 0.8 * rend);
+                    if (stallSec) cand = fgCand;
+                    else { fgRun = cand == fgCand ? fgRun + 1 : 1; fgCand = cand; }
                     if (fgRun >= 3 && g_vkFgFactor.load() != cand)
                     {
                         g_vkFgFactor.store(cand);
