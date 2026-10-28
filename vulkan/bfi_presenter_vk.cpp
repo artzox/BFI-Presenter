@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.24-d5"
+#define BFI_VERSION "1.0.24-d6"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -433,6 +433,8 @@ struct Status
     bool   hitchPaused = false;
     int    flashHint = 0;          // missed refreshes keep coming back (3 of the last 10 s; off after 30 s without)
     bool   limitSuspect = false;   // something caps the presenter below the display refresh
+    bool   vramOver = false;       // the game uses more video memory than its budget (DXGI)
+    double vramUse = 0.0, vramBudget = 0.0;   // MB
     int    aheadInUse = 1;
     int    autoCapDown = 0;                 // automatic frame cap: one game frame per strobe cycle in use
     int    autoCapProbe = 0;                // automatic frame cap: trying the Refresh rate again
@@ -2129,7 +2131,9 @@ static void PresenterThread(Swapchain *sc)
             // the desktop compositor) makes the next one wait twice as long; after 3 in a row automatic
             // recovery stops for the session (Indiana Jones with heavy settings: a rebuild every 20-30 s).
             if (g_rebuildMisses > 0 && g_rebuildMisses < 3 && t - g_lastAutoRebuildT > 180.0) { g_rebuildMisses = 0; g_rebuildGap = 20.0; }
-            if (s.vkAutoRecover && slowRun >= 3 && !rebuildReq && g_rebuildMisses < 3)
+            // 5 s: with the game close to its video memory budget presentation slows for 2-3 s now and then and
+            // recovers by itself (Indiana Jones); a rebuild there only adds a hitch.
+            if (s.vkAutoRecover && slowRun >= 5 && !rebuildReq && g_rebuildMisses < 3)
             {
                 if (t - g_lastRebuildT >= g_rebuildGap)
                 {
@@ -2150,7 +2154,7 @@ static void PresenterThread(Swapchain *sc)
                              g_rebuildMisses ? " (the last one didn't help for long: the next waits longer)" : "");
                     }
                 }
-                else if (slowRun == 3)
+                else if (slowRun == 5)
                     LOGI("BFI Presenter: automatic recovery -- waiting: the last rebuild was %.0f s ago (%.0f s apart)", t - g_lastRebuildT,
                          g_rebuildGap);
             }
@@ -2282,7 +2286,10 @@ static void PresenterThread(Swapchain *sc)
                     // A second with far fewer presents than rendered frames is a stall or a rebuilt swap chain (its first
                     // second: 3 presented, 34 rendered), not frame generation switching off: it doesn't count. It switched
                     // the limit off after every rebuild in Indiana Jones.
-                    const bool stallSec = hitchPaused || (sleeping && fpsA < 0.8 * rend);
+                    // Slowed presentation (8+ slow image returns): frame generation drops its generated frames for a
+                    // few seconds and comes back by itself (Indiana Jones close to its video memory budget), so those
+                    // seconds don't count either: the limit stays on instead of going off and on again.
+                    const bool stallSec = hitchPaused || (sleeping && fpsA < 0.8 * rend) || lastSlow >= 8;
                     if (stallSec) cand = fgCand;
                     else { fgRun = cand == fgCand ? fgRun + 1 : 1; fgCand = cand; }
                     // Slowed presentation in the last 3 seconds (slow image returns).
@@ -2334,6 +2341,33 @@ static void PresenterThread(Swapchain *sc)
                     }
                     else badSecs = 0;
                     g_status.rfxLimitUs = g_vkSleepLimitUs.load();
+                    // Video memory over the game's budget: Windows moves part of it to system memory, and the GPU then
+                    // stalls now and then (Indiana Jones at 4K with frame generation: presentation slowed, generated
+                    // frames dropped, BFI paused and resumed). Over budget 3 of the last 5 seconds; clears after 10 s under.
+                    {
+                        static int overWin = 0, underSecs = 0;
+                        double vu = 0.0, vbud = 0.0;
+                        const bool have = VramMB(vu, vbud) && vbud > 0.0;
+                        const bool over = have && vu > vbud;
+                        overWin = ((overWin << 1) | (over ? 1 : 0)) & 31;
+                        int n = 0; for (int b = 0; b < 5; b++) n += (overWin >> b) & 1;
+                        underSecs = over ? 0 : underSecs + 1;
+                        bool on = g_status.vramOver;
+                        if (!on && n >= 3)
+                        {
+                            on = true;
+                            LOGW("BFI Presenter: the game uses more video memory than Windows gives it (%.0f of %.0f MB). Part of it "
+                                 "is moved to system memory and the GPU stalls now and then: presentation slows, frame generation "
+                                 "drops frames, BFI pauses. Lower the game's texture or memory settings (e.g. texture pool size).",
+                                 vu, vbud);
+                        }
+                        else if (on && underSecs >= 10)
+                        {
+                            on = false;
+                            LOGI("BFI Presenter: video memory back under the budget (%.0f of %.0f MB)", vu, vbud);
+                        }
+                        g_status.vramOver = on; g_status.vramUse = vu; g_status.vramBudget = vbud;
+                    }
                     // [diag] the vote's inputs each second while a frame-generation DLL is loaded and the limit is off
                     // or the vote disagrees; otherwise every 10 s.
                     {
@@ -4334,6 +4368,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
                            "Re-run install_vulkan_layer.bat so it is registered after ReShade.", st.caller);
     if (st.managed)
     {
+        if (st.vramOver)
+            ImGui::TextColored(kRed, "The game uses more video memory than Windows gives it (%.0f of %.0f MB): the GPU stalls,\n"
+                               "presentation slows, frame generation drops frames. Lower its texture or memory settings.",
+                               st.vramUse, st.vramBudget);
         if (st.limitSuspect)
             ImGui::TextColored(kRed, "A frame limiter is holding the presenter below the display's refresh rate.\n"
                                "Turn off the RTSS limit and NVIDIA's Max Frame Rate (global and for this exe; check NVIDIA Profile Inspector).");
@@ -4342,7 +4380,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (st.flashHint && s.flashHints && s.enabled && !st.limitSuspect && st.layerOrder != 2)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
-            const bool fits4 = (s.frames == 2 || s.frames == 4) && st.realImages > 0 && st.realImages < 4;
+            // Not when video memory is tight: each buffer is a full-size image (about 33 MB at 4K).
+            const bool vramTight = st.vramOver || (st.vramBudget > 0.0 && st.vramUse > st.vramBudget - 256.0);
+            const bool fits4 = (s.frames == 2 || s.frames == 4) && st.realImages > 0 && st.realImages < 4 && !vramTight;
             if (fits4 && s.presBuffers == 4)
                 ImGui::TextWrapped("4 presenter buffers apply when the swap chain is made again: press Ctrl+Shift+O, or "
                                    "restart the game.");
