@@ -645,6 +645,173 @@ static void DoAction(const std::string &what, const std::string &err)
     g_app.vk = DetectVulkanLayer();
 }
 
+
+// ------------------------------------------------------------------ What's new
+// From the release's CHANGELOG.md (in the downloaded DX and Vulkan folders): the entries for the part being updated,
+// newer than the installed version. Shown before an update (Update / Cancel), on "What's new" buttons, and after.
+struct Notes { std::string title; std::vector<ChangeItem> items; };
+static Notes g_notes;                          // shown in the What's new window
+static std::function<void()> g_notesAction;    // the update to run after reading it (empty: only showing)
+static std::function<void()> g_runAfter;       // run outside the popup (it may open another one)
+static std::string g_notesVerb;
+static bool g_openNotes = false;
+static Notes g_lastNotes;                      // the last update's changes, for the button next to its message
+static bool g_lastNotesPending = false;
+static std::string g_lastNotesFor;             // the message that button belongs to
+static std::string g_lastNotesOld;             // the message before the update (the next different one is its result)
+
+static std::wstring ChangelogPath()
+{
+    for (const std::wstring &d : { g_app.src.dxDir, g_app.src.vkDir })
+    {
+        if (d.empty()) continue;
+        std::wstring p = d + L"\\CHANGELOG.md";
+        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+    }
+    return L"";
+}
+
+// part: the label in front of each version when several parts are listed together ("" = only "v1.0.24").
+static std::vector<ChangeItem> NotesFor(const char *tag, const std::string &from, const std::string &to, const char *part = "")
+{
+    std::wstring p = ChangelogPath();
+    std::vector<ChangeItem> v = p.empty() ? std::vector<ChangeItem>{} : WhatsNew(p, tag, from, to);
+    for (auto &it : v) it.version = std::string(part) + (part[0] ? " v" : "v") + it.version;
+    return v;
+}
+
+static void ConfirmUpdate(const std::string &title, std::vector<ChangeItem> items, const std::string &verb, std::function<void()> action)
+{
+    Notes n{ title, std::move(items) };
+    if (n.items.empty() || LoadSetting(L"WhatsNewBeforeUpdate", L"1") != L"1")
+    {
+        if (!n.items.empty()) { g_lastNotes = n; g_lastNotesPending = true; g_lastNotesOld = g_app.msg; }
+        action();
+        return;
+    }
+    g_notes = std::move(n);
+    g_notesAction = std::move(action);
+    g_notesVerb = verb;
+    g_openNotes = true;
+}
+
+static void ShowNotes(const std::string &title, std::vector<ChangeItem> items)
+{
+    g_notes = Notes{ title, std::move(items) };
+    g_notesAction = nullptr;
+    g_openNotes = true;
+}
+
+static void DrawNotesList(const Notes &n, float h)
+{
+    static std::set<std::string> opened;
+    ImGui::BeginChild("##noteslist", ImVec2(0, h), ImGuiChildFlags_Borders);
+    std::string lastV;
+    int id = 0;
+    for (auto &it : n.items)
+    {
+        if (it.version != lastV)
+        {
+            if (!lastV.empty()) ImGui::Spacing();
+            ImGui::TextColored(kAccent, "%s", it.version.c_str());
+            lastV = it.version;
+        }
+        ImGui::PushID(id++);
+        const std::string key = it.version + "|" + it.title;
+        const bool canOpen = !it.text.empty();
+        bool isOpen = canOpen && opened.count(key);
+        if (canOpen)
+        {
+            if (ImGui::ArrowButton("##more", isOpen ? ImGuiDir_Down : ImGuiDir_Right))
+            {
+                if (isOpen) opened.erase(key); else opened.insert(key);
+                isOpen = !isOpen;
+            }
+        }
+        else ImGui::Dummy(ImVec2(ImGui::GetFrameHeight(), ImGui::GetFrameHeight()));
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextWrapped("%s", it.title.c_str());
+        if (canOpen && ImGui::IsItemClicked())
+        {
+            if (isOpen) opened.erase(key); else opened.insert(key);
+            isOpen = !isOpen;
+        }
+        if (isOpen)
+        {
+            ImGui::Indent(ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x);
+            ImGui::PushStyleColor(ImGuiCol_Text, kGrey);
+            ImGui::TextWrapped("%s", it.text.c_str());
+            ImGui::PopStyleColor();
+            ImGui::Unindent(ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x);
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+}
+
+static void DrawNotes()
+{
+    static bool open = false;
+    if (g_openNotes) { g_openNotes = false; ImGui::OpenPopup("What's new##notes"); open = true; }
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(std::min(ImGui::GetFontSize() * 44, vp->WorkSize.x * 0.9f), 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("What's new##notes", &open, ImGuiWindowFlags_NoSavedSettings))
+    {
+        if (!open) g_notesAction = nullptr;   // closed with the X
+        return;
+    }
+    ImGui::TextWrapped("%s", g_notes.title.c_str());
+    ImGui::TextColored(kGrey, "Click a line for the details.");
+    if (g_notes.items.empty()) ImGui::TextColored(kGrey, "No changes listed for this part.");
+    else DrawNotesList(g_notes, std::min(vp->WorkSize.y * 0.55f, ImGui::GetFontSize() * 26));
+    std::string url;
+    { std::lock_guard<std::mutex> l(g_app.lock); url = g_app.remote.notesUrl; }
+    if (url.empty()) url = "https://github.com/artzox/BFI-Presenter/releases";
+    if (ImGui::SmallButton("Full release notes on GitHub"))
+        ShellExecuteW(nullptr, L"open", W(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    ImGui::Separator();
+    if (g_notesAction)
+    {
+        if (ImGui::Button(g_notesVerb.c_str()))
+        {
+            g_lastNotes = g_notes; g_lastNotesPending = true; g_lastNotesOld = g_app.msg;
+            g_runAfter = std::move(g_notesAction);
+            g_notesAction = nullptr;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) { g_notesAction = nullptr; ImGui::CloseCurrentPopup(); }
+        ImGui::SameLine();
+        bool show = LoadSetting(L"WhatsNewBeforeUpdate", L"1") == L"1";
+        if (ImGui::Checkbox("Show this before updating", &show)) SaveSetting(L"WhatsNewBeforeUpdate", show ? L"1" : L"0");
+        Tooltip("Off: Update starts right away; the What's new button next to the message afterwards still shows the changes.");
+    }
+    else if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+static void UpdateOutdated(bool vkOld)
+{
+    std::string layerErr;
+    if (vkOld) layerErr = InstallVulkanLayer(g_app.src);
+    std::vector<std::wstring> roots;
+    for (auto &g : g_app.games)
+    {
+        St s = StatusOf(g);
+        if ((s == St::Update || s == St::WrongBits) && g.route != Route::Vulkan) roots.push_back(g.root);
+    }
+    StartJob("Updating BFI Presenter in " + std::to_string(roots.size()) + " games...", roots,
+             [](Game &g, Job &) { return InstallOrUpdate(g, g_app.src); },
+             [vkOld, layerErr](Job &j) {
+                 g_app.vk = DetectVulkanLayer();
+                 std::string m = JobSummary(j, "Updated");
+                 if (vkOld) m += layerErr.empty() ? " Vulkan layer updated." : " Vulkan layer: " + layerErr;
+                 g_app.SetMsg(m, j.fail || !layerErr.empty());
+             });
+}
+
 // ------------------------------------------------------------------ UI
 
 static void DrawTop(HWND hwnd)
@@ -693,7 +860,9 @@ static void DrawTop(HWND hwnd)
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.65f, 0.36f, 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.16f, 0.45f, 0.24f, 1));
-        if (ImGui::Button(("Update Manager to " + v).c_str())) StartManagerUpdate();
+        if (ImGui::Button(("Update Manager to " + v).c_str()))
+            ConfirmUpdate("BFI Presenter Manager " MANAGER_VERSION " \xE2\x86\x92 " + v, NotesFor("Manager", MANAGER_VERSION, v),
+                          "Update Manager", [] { StartManagerUpdate(); });
         ImGui::PopStyleColor(3);
         Tooltip("Downloads the new Manager from GitHub, puts it in place of this one and restarts it. "
                 "Your game list and settings are kept.");
@@ -721,6 +890,13 @@ static void DrawTop(HWND hwnd)
         bool old = !g_app.src.vkVersion.empty() && CompareVersions(g_app.vk.version, g_app.src.vkVersion) < 0;
         ImGui::TextColored(old ? kYellow : kGreen, "Installed v%s%s%s", g_app.vk.version.c_str(),
                            g_app.vk.machine ? " for all users" : " for your user", old ? " (update available)" : "");
+        if (old)
+        {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("What's new##vk"))
+                ShowNotes("Vulkan layer v" + g_app.vk.version + " \xE2\x86\x92 v" + g_app.src.vkVersion,
+                          NotesFor("Vulkan", g_app.vk.version, g_app.src.vkVersion));
+        }
     }
     else ImGui::TextColored(kGrey, "Not installed (only needed for Vulkan and DXVK games)");
     ImGui::SameLine();
@@ -729,8 +905,16 @@ static void DrawTop(HWND hwnd)
     ImGui::SameLine();
     ImGui::BeginDisabled(g_app.busy || g_app.src.vkDir.empty());
     if (ImGui::Button(g_app.vk.installed ? "Update layer" : "Install layer"))
-        DoAction(IsElevated() || g_app.vk.machine ? "Vulkan layer installed for all users." : "Vulkan layer installed for your Windows user.",
-                 InstallVulkanLayer(g_app.src));
+    {
+        auto act = [] {
+            DoAction(IsElevated() || g_app.vk.machine ? "Vulkan layer installed for all users." : "Vulkan layer installed for your Windows user.",
+                     InstallVulkanLayer(g_app.src));
+        };
+        if (g_app.vk.installed && !g_app.src.vkVersion.empty() && CompareVersions(g_app.vk.version, g_app.src.vkVersion) < 0)
+            ConfirmUpdate("Vulkan layer v" + g_app.vk.version + " \xE2\x86\x92 v" + g_app.src.vkVersion,
+                          NotesFor("Vulkan", g_app.vk.version, g_app.src.vkVersion), "Update layer", act);
+        else act();
+    }
     ImGui::EndDisabled();
     if (g_app.vk.installed)
     {
@@ -783,28 +967,30 @@ static void DrawTop(HWND hwnd)
     char lbl[64];
     snprintf(lbl, 64, "Update outdated (%d%s)", nUpd, vkOld ? " + layer" : "");
     bool clicked = ImGui::Button(lbl);
+    if (clicked)
+    {
+        // What's new for everything it updates: the DX add-on and shader from the oldest version installed, and the layer.
+        std::string dxFrom, shFrom;
+        bool dxAny = false, shAny = false;
+        for (auto &g : g_app.games)
+        {
+            if (StatusOf(g) != St::Update || g.route == Route::Vulkan) continue;
+            if (g.route == Route::Shader) { if (!shAny || CompareVersions(g.shaderVersion, shFrom) < 0) shFrom = g.shaderVersion; shAny = true; }
+            else { if (!dxAny || CompareVersions(g.addonVersion, dxFrom) < 0) dxFrom = g.addonVersion; dxAny = true; }
+        }
+        std::vector<ChangeItem> items;
+        auto add = [&items](std::vector<ChangeItem> v) { items.insert(items.end(), v.begin(), v.end()); };
+        if (dxAny) add(NotesFor("DX", dxFrom, g_app.src.dxVersion, "DX add-on"));
+        if (vkOld) add(NotesFor("Vulkan", g_app.vk.version, g_app.src.vkVersion, "Vulkan layer"));
+        if (shAny) add(NotesFor("Shader", shFrom, g_app.src.shaderVersion, "Shader"));
+        std::string title = "Update " + std::to_string(nUpd) + (nUpd == 1 ? " game" : " games") + (vkOld ? " and the Vulkan layer" : "") +
+                            " to " + (g_app.src.dxVersion.empty() ? g_app.src.vkVersion : g_app.src.dxVersion);
+        clicked = false;
+        ConfirmUpdate(title, items, "Update", [vkOld] { UpdateOutdated(vkOld); });
+    }
     Tooltip("Updates every game whose BFI Presenter add-on is older than the selected release (or built for the wrong "
             "bitness), and the Vulkan layer if it is older. No ticks needed; for a chosen set of games, tick them and "
             "use the buttons on the right.");
-    if (clicked)
-    {
-        std::string layerErr;
-        if (vkOld) layerErr = InstallVulkanLayer(g_app.src);
-        std::vector<std::wstring> roots;
-        for (auto &g : g_app.games)
-        {
-            St s = StatusOf(g);
-            if ((s == St::Update || s == St::WrongBits) && g.route != Route::Vulkan) roots.push_back(g.root);
-        }
-        StartJob("Updating BFI Presenter in " + std::to_string(roots.size()) + " games...", roots,
-                 [](Game &g, Job &) { return InstallOrUpdate(g, g_app.src); },
-                 [vkOld, layerErr](Job &j) {
-                     g_app.vk = DetectVulkanLayer();
-                     std::string m = JobSummary(j, "Updated");
-                     if (vkOld) m += layerErr.empty() ? " Vulkan layer updated." : " Vulkan layer: " + layerErr;
-                     g_app.SetMsg(m, j.fail || !layerErr.empty());
-                 });
-    }
     ImGui::EndDisabled();
     ImGui::EndDisabled();
     ImGui::SameLine();
@@ -829,6 +1015,12 @@ static void DrawTop(HWND hwnd)
         if (g_app.needAdmin)
         {
             if (ImGui::SmallButton("Restart as administrator")) RestartAsAdmin();
+            ImGui::SameLine();
+        }
+        if (g_lastNotesPending && g_app.msg != g_lastNotesOld) { g_lastNotesFor = g_app.msgErr ? "" : g_app.msg; g_lastNotesPending = false; }
+        if (!g_lastNotes.items.empty() && g_app.msg == g_lastNotesFor)
+        {
+            if (ImGui::SmallButton("What's new##last")) ShowNotes(g_lastNotes.title, g_lastNotes.items);
             ImGui::SameLine();
         }
         ImGui::PushTextWrapPos(0);
@@ -992,6 +1184,18 @@ static void DrawTable(float height)
 
 static void RequestInstall(const std::vector<Game *> &list);
 
+// What's new for one game's update: the part it uses and its installed version.
+struct GameNotes { const char *tag; std::string from, to, title; };
+static GameNotes NotesOf(const Game &g)
+{
+    GameNotes n;
+    if (g.route == Route::Vulkan) { n.tag = "Vulkan"; n.from = g_app.vk.version; n.to = g_app.src.vkVersion; n.title = "Vulkan layer"; }
+    else if (g.route == Route::Shader) { n.tag = "Shader"; n.from = g.shaderVersion; n.to = g_app.src.shaderVersion; n.title = "BFI shader"; }
+    else { n.tag = "DX"; n.from = g.addonVersion; n.to = g_app.src.dxVersion; n.title = "DX add-on"; }
+    n.title = g.name + ": " + n.title + " v" + n.from + " \xE2\x86\x92 v" + n.to;
+    return n;
+}
+
 static void DrawActions(Game &g)
 {
     St s = StatusOf(g);
@@ -1001,8 +1205,29 @@ static void DrawActions(Game &g)
                        ((g.route == Route::Addon64 || g.route == Route::Addon32) && g.reshade && !g_app.src.dxDir.empty()));
     const char *verb = (s == St::Update || s == St::WrongBits) ? "Update" : (s == St::Installed ? "Reinstall" : "Install");
     ImGui::BeginDisabled(!canInstall || (s == St::Installed && g.route == Route::Vulkan));
-    if (ImGui::Button(verb)) RequestInstall({ &g });
+    if (ImGui::Button(verb))
+    {
+        if (s == St::Update)
+        {
+            const std::wstring root = g.root;
+            auto act = [root] {
+                for (auto &x : g_app.games) if (x.root == root) { RequestInstall({ &x }); break; }
+            };
+            const GameNotes gn = NotesOf(g);
+            ConfirmUpdate(gn.title, NotesFor(gn.tag, gn.from, gn.to), "Update", act);
+        }
+        else RequestInstall({ &g });
+    }
     ImGui::EndDisabled();
+    if (s == St::Update)
+    {
+        ImGui::SameLine();
+        if (ImGui::Button("What's new"))
+        {
+            const GameNotes gn = NotesOf(g);
+            ShowNotes(gn.title, NotesFor(gn.tag, gn.from, gn.to));
+        }
+    }
     if (!g_app.src.ok()) { ImGui::SameLine(); ImGui::TextColored(kGrey, "(pick a release first)"); }
     SameLineIfFits(ButtonW("Remove"));
     bool installed = !g.addonPath.empty() || g.ini || !g.shaderPath.empty();
@@ -1842,6 +2067,8 @@ static void DrawFrame(HWND hwnd)
     DrawLibraries(hwnd);
     DrawInstallQuestion();
     DrawRiskQuestion();
+    DrawNotes();
+    if (g_runAfter) { auto f = std::move(g_runAfter); g_runAfter = nullptr; f(); }
     DrawJob();
     ImGui::End();
 }

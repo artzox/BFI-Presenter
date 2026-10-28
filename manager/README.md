@@ -24,6 +24,7 @@ A small Windows app that finds your games, works out what each one needs, and in
 
 - **Check GitHub** downloads the latest release of [artzox/BFI-Presenter](https://github.com/artzox/BFI-Presenter) into `%LOCALAPPDATA%\BFIPresenter\releases`. When you use a downloaded release, the app checks once per start for a newer one (`AutoCheck=0` under `[Manager]` in `manager.ini` turns that off).
 - **Use folder...** takes an extracted release or a test build from any folder instead.
+- **What's new.** Before an update (a game's **Update**, **Update layer**, **Update outdated**, **Update Manager to …**) a window lists what changed since the installed version, from the release's `CHANGELOG.md`: only the entries for that part (DX add-on, Vulkan layer, shader or Manager), one line each, click a line for the details. **Update** goes ahead, **Cancel** doesn't; untick **Show this before updating** to skip it (a **What's new** button next to the message afterwards still shows it). Games and the Vulkan layer with an update available also have a **What's new** button.
 - **Update Manager to …** appears when the latest GitHub release carries a newer Manager (checked with **Check GitHub**, and once after the first scan of each start). It downloads the new `BFIPresenterManager.exe`, puts it in place of the running one and restarts it; your game list, settings and backups are kept. In a folder Windows protects (Program Files), it says where the new exe was saved instead.
 
 ## What it doesn't do

@@ -2889,6 +2889,140 @@ RemoteRelease ParseRelease(const std::string &body)
     return rr;
 }
 
+// ---------------------------------------------------------------- What's new (CHANGELOG.md)
+// Sections: "## [1.0.24] — date", "## [1.0.12] — date (Manager 1.3.4)", "## [Manager 1.3.8] — date".
+// Entries: "- **[DX] [Vulkan] Title.** text" with indented sub-points; tags in brackets at the start.
+static std::string StripMarkdown(std::string t)
+{
+    std::string o;
+    for (size_t i = 0; i < t.size(); i++)
+    {
+        if (t.compare(i, 2, "**") == 0) { i++; continue; }
+        if (t[i] == '`') continue;
+        if (t[i] == '[')   // [text](url) -> text
+        {
+            const size_t e = t.find("](", i);
+            const size_t c = e == std::string::npos ? e : t.find(')', e);
+            if (e != std::string::npos && c != std::string::npos && t.find('\n', i) > c)
+            {
+                o += t.substr(i + 1, e - i - 1);
+                i = c;
+                continue;
+            }
+        }
+        o += t[i];
+    }
+    return o;
+}
+
+std::vector<ChangeItem> WhatsNew(const std::wstring &changelog, const char *tag, const std::string &from, const std::string &to)
+{
+    std::vector<ChangeItem> out;
+    FILE *f = _wfopen(changelog.c_str(), L"rb");
+    if (!f) return out;
+    std::string all;
+    char buf[65536];
+    for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) all.append(buf, n);
+    fclose(f);
+    const bool mgr = strcmp(tag, "Manager") == 0;
+    std::string ver;          // version of the current section for this part ("" = not this part)
+    std::string cur;          // the entry being read
+    auto flush = [&]() {
+        if (cur.empty() || ver.empty()) { cur.clear(); return; }
+        // tags at the start: "**[DX] [Vulkan] Title.**" or "**[DX]** text" or "[Docs] text"
+        std::string t = cur; cur.clear();
+        size_t p = 0;
+        bool bold = t.compare(0, 2, "**") == 0;
+        if (bold) p = 2;
+        std::vector<std::string> tags;
+        while (p < t.size() && t[p] == '[')
+        {
+            const size_t e = t.find(']', p);
+            if (e == std::string::npos) break;
+            tags.push_back(t.substr(p + 1, e - p - 1));
+            p = e + 1;
+            while (p < t.size() && t[p] == ' ') p++;
+            if (t.compare(p, 2, "**") == 0 && p + 2 < t.size() && t[p + 2] == ' ') { p += 3; bold = false; break; }   // "**[DX]** text"
+        }
+        bool want = false;
+        for (auto &g : tags)
+            if (g == tag || (!mgr && strcmp(tag, "Shader") != 0 && g == "Both")) want = true;
+        if (!want) return;
+        ChangeItem it;
+        it.version = ver;
+        std::string rest = t.substr(p);
+        if (rest.compare(0, 10, "No changes") == 0) return;   // "No changes; version number only."
+        const size_t be = bold ? rest.find("**") : std::string::npos;
+        std::string bt = (be != std::string::npos && be > 0 && be < 200 && rest.find('\n') > be) ? StripMarkdown(rest.substr(0, be)) : "";
+        while (!bt.empty() && bt.back() == ' ') bt.pop_back();
+        if (!bt.empty() && (bt.back() == '.' || bt.back() == ':' || bt.back() == ')'))
+        {
+            it.title = bt;
+            it.text = StripMarkdown(rest.substr(be + 2));
+        }
+        else
+        {
+            // no bold title (or one that runs on into the text): the first sentence, not split at "e.g." / "i.e."
+            std::string plain = StripMarkdown(rest);
+            size_t e = 0;
+            for (;;)
+            {
+                e = plain.find(". ", e);
+                if (e == std::string::npos) break;
+                if (e >= 3 && (plain.compare(e - 3, 3, "e.g") == 0 || plain.compare(e - 3, 3, "i.e") == 0)) { e++; continue; }
+                break;
+            }
+            if (e == std::string::npos || e > 140) e = std::min<size_t>(plain.find('\n'), 120);
+            it.title = plain.substr(0, std::min(e + 1, plain.size()));
+            if (it.title.size() < plain.size()) it.text = plain.substr(it.title.size());
+        }
+        while (!it.title.empty() && (it.title.back() == ' ' || it.title.back() == '\n')) it.title.pop_back();
+        while (!it.text.empty() && (it.text[0] == ' ' || it.text[0] == '\n')) it.text.erase(0, 1);
+        out.push_back(it);
+    };
+    size_t pos = 0;
+    while (pos < all.size())
+    {
+        size_t e = all.find('\n', pos);
+        if (e == std::string::npos) e = all.size();
+        std::string line = all.substr(pos, e - pos);
+        pos = e + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.compare(0, 4, "## [") == 0)
+        {
+            flush();
+            const size_t c = line.find(']');
+            std::string in = c == std::string::npos ? std::string() : line.substr(4, c - 4);
+            std::string v;
+            if (mgr)
+            {
+                size_t m = in.find("Manager ");
+                if (m != std::string::npos) v = in.substr(m + 8);
+                else if ((m = line.find("(Manager ")) != std::string::npos)
+                {
+                    const size_t q = line.find(')', m);
+                    v = line.substr(m + 9, q == std::string::npos ? std::string::npos : q - m - 9);
+                }
+            }
+            else if (!in.empty() && isdigit((unsigned char)in[0])) v = in;
+            ver = (!v.empty() && CompareVersions(v, from) > 0 && (to.empty() || CompareVersions(v, to) <= 0)) ? v : "";
+            continue;
+        }
+        if (line.compare(0, 2, "- ") == 0) { flush(); cur = line.substr(2); continue; }
+        if (!cur.empty() && !line.empty() && (line[0] == ' ' || line[0] == '\t'))
+        {
+            size_t k = line.find_first_not_of(" \t");
+            std::string sub = line.substr(k);
+            if (sub.compare(0, 2, "- ") == 0) sub = "\xE2\x80\xA2 " + sub.substr(2);   // bullet
+            cur += "\n" + sub;
+            continue;
+        }
+        if (line.empty()) flush();
+    }
+    flush();
+    return out;
+}
+
 RemoteRelease FetchLatestRelease()
 {
     RemoteRelease rr;
