@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.25-f2"
+#define BFI_ADDON_VERSION "1.0.25-f3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -504,6 +504,7 @@ static DiagCount g_dgEvent, g_dgHook, g_dgPass, g_dgSec;
 // sleep; frame generation's presents (its own thread) pass. 0 = off.
 static std::atomic<int>   g_fgPaceUs{0};
 static std::atomic<DWORD> g_fgGameTid{0};
+static std::atomic<int>   g_fgShiftUs{0};     // phase step requested by the presenter (one refresh)
 static void DiagAdd(DiagCount &c)
 {
     const DWORD tid = GetCurrentThreadId();
@@ -3141,6 +3142,21 @@ static DWORD WINAPI PresenterThread(void *)
                     hzP / s.frames / fgFact >= 28.0)
                     want = (int)(1e6 * s.frames / hzP * fgFact + 0.5);
                 g_fgGameTid.store(gtid);
+                // Phase: when about half the frames reach a flash (both of a pair land in one strobe cycle), the
+                // rendered frame starts one refresh later; tried again after 2 s.
+                {
+                    static int lowSecs = 0, steps = 0;
+                    const double expect = hzP > 0.0 && s.frames > 0 ? hzP / s.frames : 0.0;
+                    if (want > 0 && expect > 0.0 && tot >= 0.9 * expect && relN < 0.85 * expect) lowSecs++;
+                    else lowSecs = 0;
+                    if (lowSecs >= 2)
+                    {
+                        lowSecs = 0; steps++;
+                        g_fgShiftUs.store((int)(1e6 / hzP));
+                        LOGI("BFI Presenter: [test] frame-start sleep: %d of %.0f frames reached a flash -- starting frames one "
+                             "refresh later (step %d)", relN, expect, steps);
+                    }
+                }
                 const int was = g_fgPaceUs.exchange(want);
                 if ((was > 0) != (want > 0))
                     LOGI("BFI Presenter: [test] frame-start sleep for frame generation without Reflex %s (%d us per rendered frame, "
@@ -4265,6 +4281,15 @@ static void FgPaceAfterPresent()
     const double iv = us * 1e-6;
     const double now = Now();
     if (nextT <= 0.0 || now > nextT + iv || nextT - now > 2.0 * iv) nextT = now;   // start, a hitch, or a changed limit
+    const int sh = g_fgShiftUs.exchange(0);
+    if (sh != 0) nextT += sh * 1e-6;
+    // On the display's vblank grid (the last vblank the presenter saw): the interval is a whole number of refreshes,
+    // so frame generation's two frames keep the same place against the flashes instead of drifting until both
+    // land in one strobe cycle (Riven: then only 30 of 60 frames a second were shown).
+    {
+        const double tick = g_tickT.load(), per = g_lrPeriod.load();
+        if (tick > 0.0 && per > 0.0 && now - tick < 0.1) nextT = tick + std::floor((nextT - tick) / per + 0.5) * per;
+    }
     while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
     SleepUntil(nextT, timer);
     nextT += iv;
