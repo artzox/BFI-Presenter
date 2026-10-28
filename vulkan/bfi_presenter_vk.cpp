@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.24-d3"
+#define BFI_VERSION "1.0.24-d4"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -2248,8 +2248,22 @@ static void PresenterThread(Swapchain *sc)
                     const bool stallSec = hitchPaused || (sleeping && fpsA < 0.8 * rend);
                     if (stallSec) cand = fgCand;
                     else { fgRun = cand == fgCand ? fgRun + 1 : 1; fgCand = cand; }
+                    // Slowed presentation in the last 3 seconds (slow image returns).
+                    static int slowWin = 0;
+                    slowWin = ((slowWin << 1) | (lastSlow >= 8 ? 1 : 0)) & 7;
                     if (fgRun >= 3 && g_vkFgFactor.load() != cand)
                     {
+                        // Indiana Jones: when presentation slows (after loads and checkpoint reloads), DLSS-G stops
+                        // presenting generated frames -- presents fall to the rendered count, also uncapped (55 for 55)
+                        // -- and stays that way until the swap chain is rebuilt. A drop from frame generation to 1x
+                        // while presentation is slow asks the game for one rebuild (at most once a minute).
+                        static double fgRecoverT = -1.0e9;
+                        if (g_vkFgFactor.load() > 1 && cand == 1 && slowWin && t - fgRecoverT > 60.0 && t - g_lastRebuildT > 20.0 && !rebuildReq)
+                        {
+                            fgRecoverT = t; rebuildReq = true;
+                            LOGI("BFI Presenter: frame generation stopped while presentation slowed -- rebuilding the swap chain to "
+                                 "bring it back (once a minute at most)");
+                        }
                         g_vkFgFactor.store(cand);
                         LOGI("BFI Presenter: frame generation %s (Reflex: %.0f presented, %ld rendered a second)",
                              cand > 1 ? "active" : "not active", fpsA, rend);
