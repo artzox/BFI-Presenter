@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.25-f6"
+#define BFI_ADDON_VERSION "1.0.25-f5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3666,44 +3666,7 @@ static DWORD WINAPI PresenterThread(void *)
                     // In Dead Space (Smooth) the wake-up chased that round and round (318 ms in 6 minutes).
                     const bool atSleepNoFg = sleepUs > 0 && locked && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
                     const bool holds = capFps > 0.0 && stNow.gameFps > 0.95 * capFps && stNow.gameFps < 1.05 * capFps;
-                    // Frame-start sleep with frame generation (test): measured once and then held. The continuous
-                    // controller below hunted there (Riven: 3 ms later every second, past the pick, back -- the
-                    // game's frame times changed every second and motion stuttered). After 5 steady seconds the
-                    // wake-up moves once so frames are ready ~3 ms before the pick; 2 ms earlier when frames repeat
-                    // close to the pick; measured again only after 30 s with frames waiting over 8 ms.
-                    if (fgOn)
-                    {
-                        static double calP10[8]; static int calN = 0, repSecs = 0, waitSecs = 0;
-                        static bool calDone = false;
-                        static double heldT = 0.0;
-                        const bool steady = locked && s.pacingMode == 1 && holds && !hitchPaused && p10 >= 0.0 && relN >= (int)(0.95 * capFps);
-                        if (!calDone)
-                        {
-                            if (steady) calP10[calN++] = p10; else calN = 0;
-                            if (calN >= 5)
-                            {
-                                std::sort(calP10, calP10 + calN);
-                                const double med = calP10[calN / 2];
-                                const double step = std::min(med - 0.003, 0.8 * cyc);
-                                if (step > 0.0005) { shiftUs.fetch_add((int)(step * 1e6)); alignShiftTot += step; }
-                                calDone = true; calN = 0; heldT = t;
-                                LOGI("BFI Presenter: [test] frame-start sleep aligned once: frames were ready %.1f ms before the pick, "
-                                     "wake-up moved %+.1f ms -- held from here", med * 1000.0, step > 0.0005 ? step * 1000.0 : 0.0);
-                            }
-                        }
-                        else
-                        {
-                            repSecs = (stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.003) ? repSecs + 1 : 0;
-                            if (repSecs >= 3)
-                            {
-                                shiftUs.fetch_sub(2000); alignShiftTot -= 0.002; repSecs = 0; heldT = t;
-                                LOGI("BFI Presenter: [test] frame-start sleep: frames repeated close to the pick -- 2 ms earlier, held");
-                            }
-                            waitSecs = (steady && p10 > 0.008) ? waitSecs + 1 : 0;
-                            if (waitSecs >= 10 && t - heldT > 30.0) { calDone = false; waitSecs = 0; }
-                        }
-                    }
-                    if (!fgOn && s.reflexAlign && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
+                    if (((s.reflexAlign && atSleepNoFg) || (fgOn && locked && s.pacingMode == 1)) && holds && !hitchPaused && t >= alignCoolT)
                     {
                         if (alignLastStep > 0.0 && p10 >= 0.0 && alignPrevP10 >= 0.0 && p10 - alignPrevP10 > 0.5 * cyc)
                         {
