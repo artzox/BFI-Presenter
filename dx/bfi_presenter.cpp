@@ -479,6 +479,8 @@ struct Status
     int    deviceLost = 0;
     int    flashHint = 0;                       // missed refreshes keep coming back (3 of the last 10 s; off after 30 s without)
     int    presBufs = 0;                        // real swap chain buffers behind the presenter
+    bool   vramOver = false;                    // the game uses more video memory than its budget (DXGI)
+    double vramUse = 0.0, vramBudget = 0.0;     // MB
 };
 static Status g_status;
 static char   g_hooksSeen[256] = "";               // other Present hooks found in the process
@@ -489,6 +491,40 @@ static std::atomic<bool> g_glActive{false};       // an OpenGL game is managed
 static std::atomic<double> g_lastPresentT{0.0};   // presenter heartbeat
 static std::atomic<bool>   g_stallLogged{false};
 static std::atomic<int> g_stagedThisSecond{0};
+
+
+// The game's video memory use against the budget Windows gives it (DXGI, per process, the adapter with the most
+// dedicated memory), in MB.
+static bool VramMB(double &use, double &budget)
+{
+    static IDXGIAdapter3 *ad = nullptr; static bool tried = false;
+    if (!tried)
+    {
+        tried = true;
+        IDXGIFactory1 *fac = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&fac)) && fac)
+        {
+            IDXGIAdapter1 *a = nullptr; SIZE_T best = 0;
+            for (UINT k = 0; fac->EnumAdapters1(k, &a) == S_OK; k++)
+            {
+                DXGI_ADAPTER_DESC1 d; a->GetDesc1(&d);
+                IDXGIAdapter3 *a3 = nullptr;
+                if (d.DedicatedVideoMemory > best && SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter3), (void **)&a3)) && a3)
+                {
+                    if (ad) ad->Release();
+                    ad = a3; best = d.DedicatedVideoMemory;
+                }
+                a->Release();
+            }
+            fac->Release();
+        }
+    }
+    if (!ad) return false;
+    DXGI_QUERY_VIDEO_MEMORY_INFO mi = {};
+    if (FAILED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) return false;
+    use = mi.CurrentUsage / 1048576.0; budget = mi.Budget / 1048576.0;
+    return true;
+}
 
 static void SetReason(int managed, const char *fmt, ...)
 {
@@ -2440,7 +2476,7 @@ static DWORD WINAPI PresenterThread(void *)
     bool   flashOn = false;
     UINT lastSync = 0, lastPC = 0;
     bool haveStats = false;
-    bool kb = false, km = false, kr = false, krs = false;
+    bool kb = false, km = false, kr = false, krs = false, kk = false;
 
     while (ok && g_running.load())
     {
@@ -2456,6 +2492,22 @@ static DWORD WINAPI PresenterThread(void *)
         }
         krs = rs;
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
+        // Ctrl+Shift+K: a marker in the log with the last second's state, to find a moment the player noticed (a
+        // stutter, a lost frame limit) in a long session.
+        {
+            const bool k = KeyCombo('K');
+            if (k && !kk)
+            {
+                EnterCriticalSection(&g_cfgLock);
+                const Status ms = g_status;
+                LeaveCriticalSection(&g_cfgLock);
+                LOGI("BFI Presenter: ---- Ctrl+Shift+K marker ---- game %.1f fps, refreshes %.1f/s, %d missed, frame age %.1f ms, "
+                     "frame generation %s, Reflex limit %d us, frames ahead %d%s, video memory %.0f of %.0f MB",
+                     ms.gameFps, ms.refreshHz, ms.late, ms.frameAgeMs, ms.fgActive ? "active" : "off", ms.rfxLimitUs,
+                     ms.aheadInUse, ms.hitchPaused ? ", hitch guard paused" : "", ms.vramUse, ms.vramBudget);
+            }
+            kk = k;
+        }
         kb = b; km = m; kr = r;
 
         EnterCriticalSection(&g_cfgLock);
@@ -3105,6 +3157,32 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.displayHz    = displayHz;
             g_status.vrrSuspect   = vrrSlowSecs >= 3;
             g_status.limitSuspect = limitSecs >= 3;
+            // Video memory over the game's budget: Windows moves part of it to system memory and the GPU stalls now
+            // and then (Indiana Jones at 4K with frame generation, Vulkan: presentation slowed, generated frames
+            // dropped, BFI paused). Over budget 3 of the last 5 seconds; clears after 10 s under.
+            {
+                static int overWin = 0, underSecs = 0;
+                double vu = 0.0, vbud = 0.0;
+                const bool have = VramMB(vu, vbud) && vbud > 0.0;
+                const bool over = have && vu > vbud;
+                overWin = ((overWin << 1) | (over ? 1 : 0)) & 31;
+                int nOver = 0; for (int b = 0; b < 5; b++) nOver += (overWin >> b) & 1;
+                underSecs = over ? 0 : underSecs + 1;
+                bool on = g_status.vramOver;
+                if (!on && nOver >= 3)
+                {
+                    on = true;
+                    LOGW("BFI Presenter: the game uses more video memory than Windows gives it (%.0f of %.0f MB). Part of it is "
+                         "moved to system memory and the GPU stalls now and then: missed refreshes, frame generation drops "
+                         "frames, BFI pauses. Lower the game's texture or memory settings.", vu, vbud);
+                }
+                else if (on && underSecs >= 10)
+                {
+                    on = false;
+                    LOGI("BFI Presenter: video memory back under the budget (%.0f of %.0f MB)", vu, vbud);
+                }
+                g_status.vramOver = on; g_status.vramUse = vu; g_status.vramBudget = vbud;
+            }
             // OpenGL games that present by exchange (Need for Speed: Porsche
             // Unleashed, DOOM 3 BFG) block the presenter's own presents for
             // several refreshes until the game's NVIDIA profile presents
@@ -7811,6 +7889,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::TextColored(kRed, "The display is refreshing slower than it can: VRR (G-SYNC) is active.\nTurn G-SYNC off for this game in the NVIDIA profile, or turn on Queue one refresh ahead.");
         if (st.limitSuspect)
             ImGui::TextColored(kRed, "A frame limiter is holding the presenter below the display's refresh rate.\nSet the RTSS frame limit to 0 for this game (and check NVIDIA Profile Inspector).");
+        if (st.vramOver)
+            ImGui::TextColored(kRed, "The game uses more video memory than Windows gives it (%.0f of %.0f MB): the GPU stalls,\n"
+                               "refreshes are missed, frame generation drops frames. Lower its texture or memory settings.",
+                               st.vramUse, st.vramBudget);
         if (st.glPresentBlocked)
             ImGui::TextColored(kRed, "The presenter's presents are blocked (OpenGL). In this game's NVIDIA profile set\n"
                                "Vulkan/OpenGL present method = Prefer layered on DXGI swapchain (BFI Presenter Manager does it).");
@@ -7819,6 +7901,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
         // Flash hint: when missed refreshes keep coming back, the first step that isn't done yet (the red
         // warnings above come first: nothing below helps while one of them applies).
         const bool redWarn = st.vrrSuspect || st.limitSuspect || st.glPresentBlocked || st.vsyncOverridden;
+        // Not 4 presenter buffers when video memory is tight: each is a full-size image (about 33 MB at 4K).
+        const bool vramTight = st.vramOver || (st.vramBudget > 0.0 && st.vramUse > st.vramBudget - 256.0);
         if (st.flashHint && s.flashHints && s.enabled && !redWarn)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
@@ -7828,7 +7912,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
             else if (s.reuseBuffers && (s.frames == 2 || s.frames == 4) && st.presBufs > 0 && st.presBufs < 4 && s.presBuffers == 4)
                 ImGui::TextWrapped("4 presenter buffers apply at the game's next resize: change the resolution or display mode "
                                    "once (and back), or restart the game.");
-            else if (s.reuseBuffers && (s.frames == 2 || s.frames == 4) && st.presBufs > 0 && st.presBufs < 4)
+            else if (s.reuseBuffers && (s.frames == 2 || s.frames == 4) && st.presBufs > 0 && st.presBufs < 4 && !vramTight)
             {
                 ImGui::TextWrapped("Flashes? Try 4 presenter buffers: more slack for the strobe, and refreshes that show the same "
                                    "picture again need no drawing. No extra latency.");

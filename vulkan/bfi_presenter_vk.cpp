@@ -1344,7 +1344,7 @@ static double g_lastAutoRebuildT = -1.0e9;  // ... automatically
 static double g_rebuildGap = 20.0;          // automatic rebuilds at least this far apart (doubles while they don't help)
 static int    g_rebuildMisses = 0;          // automatic rebuilds in a row after which presentation slowed again within a minute
 
-// [diag] the game's video memory use against the budget Windows gives it (DXGI, the NVIDIA adapter), in MB.
+// The game's video memory use against the budget Windows gives it (DXGI, the NVIDIA adapter), in MB.
 static bool VramMB(double &use, double &budget)
 {
     static IDXGIAdapter3 *ad = nullptr; static bool tried = false;
@@ -1439,7 +1439,7 @@ static void PresenterThread(Swapchain *sc)
     int autoAhead = 1, missSecs = 0, spareSecs = 0;
     double fseRetryT = 0.0; int fseShown = -2;
     // presentation health: slow image returns per second, automatic rebuild
-    int slowCount = 0, slowRun = 0, goodRun = 0, lastSlow = 0; bool kMark = false;
+    int slowCount = 0, slowRun = 0, goodRun = 0, lastSlow = 0; bool kMark = false, markReq = false;
     bool afterRebuild = Now() - g_lastRebuildT < 20.0, rebuildReq = false, kRebuild = false;
     double slowSecT = Now();
     // Uneven strobe cycles over the last 30 seconds (one count per second), so
@@ -2101,7 +2101,9 @@ static void PresenterThread(Swapchain *sc)
         if ((tFence - tAcq) > 0.002 || (tAcq - tVb) > 0.002) slowCount++;
         {
             const bool mNow = KeyCombo('K');
-            if (mNow && !kMark) LOGI("BFI Presenter: [diag] ---- Ctrl+Shift+K marker ----");
+            // Ctrl+Shift+K: a marker in the log, with a snapshot of the pacing state at the next second, to find
+            // a moment the player noticed (a stutter, a lost frame limit) in a long session.
+            if (mNow && !kMark) { LOGI("BFI Presenter: ---- Ctrl+Shift+K marker ----"); markReq = true; }
             kMark = mNow;
             const bool kNow = KeyCombo('O');
             // (held keys aren't taken again by the new swap chain's presenter right after a rebuild)
@@ -2368,24 +2370,16 @@ static void PresenterThread(Swapchain *sc)
                         }
                         g_status.vramOver = on; g_status.vramUse = vu; g_status.vramBudget = vbud;
                     }
-                    // [diag] the vote's inputs each second while a frame-generation DLL is loaded and the limit is off
-                    // or the vote disagrees; otherwise every 10 s.
+                    // Ctrl+Shift+K snapshot: frame generation's reading and the Reflex limit, video memory.
+                    if (markReq)
                     {
-                        static double diagT = 0.0;
-                        const bool odd = fgWas && (want == 0 || cand != f || stallSec);
-                        if (odd || t - diagT >= 5.0)
-                        {
-                            diagT = t;
-                            double vu = 0.0, vb2 = 0.0;
-                            char vram[64] = "";
-                            if (VramMB(vu, vb2)) snprintf(vram, sizeof(vram), ", VRAM %.0f of %.0f MB", vu, vb2);
-                            LOGI("BFI Presenter: [diag] fg: %.0f presents/s, %ld sleeps/s%s%s%s, vote %dx (%d s), factor %dx, limit %d us%s, "
-                                 "frames ahead %d, %d slow image returns, refreshes %.0f/s%s",
-                                 fpsA, rend, sleeping ? "" : " (no sleep)", hitchPaused ? ", hitch paused" : "",
-                                 stallSec ? ", stall (not counted)" : "", cand, fgRun, f, want,
-                                 g_vkRfxBad.load() ? " (off for the session)" : "", (int)sc->maxAhead.load(), lastSlow,
-                                 g_status.refreshHz, vram);
-                        }
+                        markReq = false;
+                        LOGI("BFI Presenter: marker snapshot: %.0f game presents/s, %ld Reflex sleeps/s, frame generation %dx "
+                             "(reading %dx for %d s%s%s), Reflex limit %d us%s, frames ahead %d, %d slow image returns, "
+                             "refreshes %.0f/s, video memory %.0f of %.0f MB",
+                             fpsA, rend, f, cand, fgRun, hitchPaused ? ", hitch paused" : "", stallSec ? ", not counted" : "",
+                             want, g_vkRfxBad.load() ? " (off for the session)" : "", (int)sc->maxAhead.load(), lastSlow,
+                             g_status.refreshHz, g_status.vramUse, g_status.vramBudget);
                     }
                 }
                 bool down = sc->autoCapDown.load();
