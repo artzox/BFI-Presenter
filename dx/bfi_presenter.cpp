@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.25-f1"
+#define BFI_ADDON_VERSION "1.0.25-f2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -498,7 +498,12 @@ static std::atomic<int> g_stagedThisSecond{0};
 // the hook on other swap chains.
 struct DiagCount { DWORD tid[6] = {}; long n[6] = {}; long other = 0; };
 static SRWLOCK g_diagLock = SRWLOCK_INIT;
-static DiagCount g_dgEvent, g_dgHook, g_dgPass;
+static DiagCount g_dgEvent, g_dgHook, g_dgPass, g_dgSec;
+// Frame generation without Reflex (test): the game's own presents (its first present thread) are paced after they
+// return, one rendered frame per (strobe cycle x frame-generation factor) -- a frame-start sleep where Reflex would
+// sleep; frame generation's presents (its own thread) pass. 0 = off.
+static std::atomic<int>   g_fgPaceUs{0};
+static std::atomic<DWORD> g_fgGameTid{0};
 static void DiagAdd(DiagCount &c)
 {
     const DWORD tid = GetCurrentThreadId();
@@ -3105,6 +3110,48 @@ static DWORD WINAPI PresenterThread(void *)
         if (t - secStart >= 1.0)
         {
             {
+                // Frame generation without Reflex: the game's thread (its first present thread) against all presents.
+                static int fgCand = 1, fgRun = 0, fgFact = 1;
+                static double fgLogT = 0.0;
+                static int fgPaceIni = -1;
+                if (fgPaceIni < 0) fgPaceIni = GetPrivateProfileIntA("BFI", "FgPaceWithoutReflex", 1, g_iniPath);
+                long tot = 0, gt = 0;
+                const DWORD gtid = g_presentThreads[0];
+                AcquireSRWLockExclusive(&g_diagLock);
+                for (int k = 0; k < 6 && g_dgSec.tid[k]; k++)
+                {
+                    tot += g_dgSec.n[k];
+                    if (g_dgSec.tid[k] == gtid) gt = g_dgSec.n[k];
+                    g_dgSec.n[k] = 0;
+                }
+                tot += g_dgSec.other; g_dgSec.other = 0;
+                ReleaseSRWLockExclusive(&g_diagLock);
+                int cnd = 1;
+                if (g_fgSeen[0] && gt > 0 && tot >= 1.5 * gt) cnd = std::max(2, std::min(4, (int)((double)tot / gt + 0.5)));
+                fgRun = cnd == fgCand ? fgRun + 1 : 1; fgCand = cnd;
+                if (fgRun >= 3 && fgFact != cnd)
+                {
+                    fgFact = cnd;
+                    LOGI("BFI Presenter: [test] frame generation without Reflex: %dx (%ld presents, %ld from the game's thread %lu)",
+                         fgFact, tot, gt, (unsigned long)gtid);
+                }
+                const double hzP = modeHz > 0.0 ? modeHz : peakHz;
+                int want = 0;
+                if (fgPaceIni && fgFact > 1 && !g_status.rfxGameUses && s.enabled && s.frames >= 2 && userCap == 1 && hzP > 0.0 &&
+                    hzP / s.frames / fgFact >= 28.0)
+                    want = (int)(1e6 * s.frames / hzP * fgFact + 0.5);
+                g_fgGameTid.store(gtid);
+                const int was = g_fgPaceUs.exchange(want);
+                if ((was > 0) != (want > 0))
+                    LOGI("BFI Presenter: [test] frame-start sleep for frame generation without Reflex %s (%d us per rendered frame, "
+                         "game thread %lu, %dx)", want > 0 ? "on" : "off", want, (unsigned long)gtid, fgFact);
+                if (t - fgLogT >= 10.0)
+                {
+                    fgLogT = t;
+                    LOGI("BFI Presenter: [test] fg pace: %ld presents/s, %ld from the game's thread, %dx, sleep %d us", tot, gt, fgFact, want);
+                }
+            }
+            {
                 static double diagT = 0.0;
                 if (diagT == 0.0) diagT = t;
                 else if (t - diagT >= 10.0)
@@ -4208,9 +4255,25 @@ static void GameReleased(UINT64 lastId)
     g_relId[next % kRel] = next;
 }
 
+static void FgPaceAfterPresent()
+{
+    const int us = g_fgPaceUs.load();
+    if (us <= 0 || GetCurrentThreadId() != g_fgGameTid.load()) return;
+    static thread_local HANDLE timer = nullptr;
+    static double nextT = 0.0;
+    if (!timer) timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /*HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
+    const double iv = us * 1e-6;
+    const double now = Now();
+    if (nextT <= 0.0 || now > nextT + iv || nextT - now > 2.0 * iv) nextT = now;   // start, a hitch, or a changed limit
+    while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
+    SleepUntil(nextT, timer);
+    nextT += iv;
+}
+
 static HRESULT SubmitGameFrame()
 {
     DiagAdd(g_dgHook);
+    DiagAdd(g_dgSec);
     const DWORD tid = GetCurrentThreadId();
     const double enter = Now();
     FgCheckCaller();
@@ -4350,7 +4413,9 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT 
         if (!t_ownCall && !t_presenterThread && !(flags & DXGI_PRESENT_TEST)) DiagAdd(g_dgPass);
         return o_Present(sc, sync, flags);
     }
-    return SubmitGameFrame();
+    const HRESULT hr = SubmitGameFrame();
+    FgPaceAfterPresent();
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p)
@@ -4362,7 +4427,9 @@ static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *sc, UINT sync, UIN
         if (!t_ownCall && !t_presenterThread && !(flags & DXGI_PRESENT_TEST)) DiagAdd(g_dgPass);
         return o_Present1(sc, sync, flags, p);
     }
-    return SubmitGameFrame();
+    const HRESULT hr = SubmitGameFrame();
+    FgPaceAfterPresent();
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE hk_GetBuffer(IDXGISwapChain *sc, UINT idx, REFIID riid, void **pp)
