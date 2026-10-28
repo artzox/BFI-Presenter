@@ -44,6 +44,7 @@ With frame generation and the Refresh rate cap, the automatic frame cap limits i
 | Refresh + automatic frame cap, 2× (The Witcher 3, DX) | 30 / 60 | ~30 | Release → flash |
 | Refresh + automatic frame cap, 3× (Alan Wake 2, DX) | 20 / 60 | ~42 (~140 with the presenter's own cap) | Frame start → GPU |
 | Refresh + automatic frame cap, 2× (Indiana Jones, Vulkan, v1.0.23) | 30 / 60 | 6–9 (30–36 uncapped) | Frame age at the flash |
+| Refresh + frame limit without Reflex, 2× XeSS FG through OptiScaler (Riven, DX, v1.0.25) | 30 / 60 | ~38 (~43 with OptiScaler's 60 fps limit) | Release → flash |
 | Half + Smooth, 3× (Alan Wake 2, DX, no Reflex limit) | 20 / 60 | ~99 (~130 Reflex limit at Refresh, with ~7% repeats) | Input → flash |
 | Refresh + Smooth instead of Lowest latency (God of War Ragnarök, DX) | – / 60 | ~38 against ~21.5 | Same measure for both |
 

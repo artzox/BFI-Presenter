@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.25-f5"
+#define BFI_ADDON_VERSION "1.0.25"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -131,6 +131,7 @@ struct Settings
     int   reflexAlign = 0;    // Reflex frame limit at the sleep point lined up with the lit refresh's pick (test)
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
+    int   fgLimitNoReflex = 1; // FrameGenLimitWithoutReflex: frame generation without Reflex limited to one presented frame per strobe cycle
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
@@ -269,6 +270,7 @@ static void LoadSettings(Settings &s)
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
     s.reflexAlign = IniInt("ReflexAlign", 0) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
+    s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapOwn = IniInt("AutoCapOwnWithoutFg", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
@@ -417,6 +419,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("AutoFrameCap", s.autoCap);
     IniWriteInt("CapWithReflex", s.capReflex);
     IniWriteInt("ReflexAlign", s.reflexAlign);
+    IniWriteInt("FrameGenLimitWithoutReflex", s.fgLimitNoReflex);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
     IniWriteInt("GameFrameStatistics", s.virtualStats);
@@ -466,6 +469,7 @@ struct Status
     double lrEst = 0.0, lrMargin = 0.0;
     int    lrMisses = 0;
     int    aheadInUse = 1;
+    int    fgLimitUs = 0;                       // frame limit for frame generation without Reflex: per rendered frame (0 = off)
     int    autoCapDown = 0;                     // automatic frame cap: one game frame per strobe cycle in use
     int    autoCapProbe = 0;                    // automatic frame cap: trying the Refresh rate again
     int    fgActive = 0;                        // frame generation looks active (presented well above rendered frames)
@@ -493,49 +497,26 @@ static std::atomic<double> g_lastPresentT{0.0};   // presenter heartbeat
 static std::atomic<bool>   g_stallLogged{false};
 static std::atomic<int> g_stagedThisSecond{0};
 
-// [diag] Frame generation without Reflex: which layer the presenter sees. Counts per thread: ReShade's present event
-// (the game's Present above anything below ReShade), game frames taken in the swap-chain hook, and presents that pass
-// the hook on other swap chains.
-struct DiagCount { DWORD tid[6] = {}; long n[6] = {}; long other = 0; };
-static SRWLOCK g_diagLock = SRWLOCK_INIT;
-static DiagCount g_dgEvent, g_dgHook, g_dgPass, g_dgSec;
-// Frame generation without Reflex (test): the game's own presents (its first present thread) are paced after they
+// The game's presents per thread, counted in the swap-chain hook: frame generation without Reflex presents its
+// generated frames from a thread of its own, so the game's own thread against all presents gives its factor.
+struct ThreadCount { DWORD tid[6] = {}; long n[6] = {}; long other = 0; };
+static SRWLOCK g_presCountLock = SRWLOCK_INIT;
+static ThreadCount g_presCount;
+// Frame generation without Reflex (FrameGenLimitWithoutReflex): the game's own presents (its first present thread) are paced after they
 // return, one rendered frame per (strobe cycle x frame-generation factor) -- a frame-start sleep where Reflex would
 // sleep; frame generation's presents (its own thread) pass. 0 = off.
 static std::atomic<int>   g_fgPaceUs{0};
 static std::atomic<DWORD> g_fgGameTid{0};
 static std::atomic<int>   g_fgShiftUs{0};     // phase step requested by the presenter (one refresh)
-static void DiagAdd(DiagCount &c)
+static void CountPresent()
 {
     const DWORD tid = GetCurrentThreadId();
-    AcquireSRWLockExclusive(&g_diagLock);
+    AcquireSRWLockExclusive(&g_presCountLock);
     int k = 0;
-    while (k < 6 && c.tid[k] && c.tid[k] != tid) k++;
-    if (k < 6) { if (!c.tid[k]) c.tid[k] = tid; c.n[k]++; }
-    else c.other++;
-    ReleaseSRWLockExclusive(&g_diagLock);
-}
-static std::string DiagTake(DiagCount &c, double secs, long &total)
-{
-    AcquireSRWLockExclusive(&g_diagLock);
-    std::string o; total = c.other;
-    char b[64];
-    for (int k = 0; k < 6 && c.tid[k]; k++)
-    {
-        if (!c.n[k]) continue;
-        total += c.n[k];
-        snprintf(b, sizeof(b), " %lu:%.1f/s", (unsigned long)c.tid[k], c.n[k] / secs);
-        o += b;
-        c.n[k] = 0;
-    }
-    c.other = 0;
-    ReleaseSRWLockExclusive(&g_diagLock);
-    return o;
-}
-static void on_present_diag(reshade::api::command_queue *, reshade::api::swapchain *, const reshade::api::rect *,
-                            const reshade::api::rect *, uint32_t, const reshade::api::rect *)
-{
-    DiagAdd(g_dgEvent);
+    while (k < 6 && g_presCount.tid[k] && g_presCount.tid[k] != tid) k++;
+    if (k < 6) { if (!g_presCount.tid[k]) g_presCount.tid[k] = tid; g_presCount.n[k]++; }
+    else g_presCount.other++;
+    ReleaseSRWLockExclusive(&g_presCountLock);
 }
 
 
@@ -3122,32 +3103,29 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 // Frame generation without Reflex: the game's thread (its first present thread) against all presents.
                 static int fgCand = 1, fgRun = 0, fgFact = 1;
-                static double fgLogT = 0.0;
-                static int fgPaceIni = -1;
-                if (fgPaceIni < 0) fgPaceIni = GetPrivateProfileIntA("BFI", "FgPaceWithoutReflex", 1, g_iniPath);
                 long tot = 0, gt = 0;
                 const DWORD gtid = g_presentThreads[0];
-                AcquireSRWLockExclusive(&g_diagLock);
-                for (int k = 0; k < 6 && g_dgSec.tid[k]; k++)
+                AcquireSRWLockExclusive(&g_presCountLock);
+                for (int k = 0; k < 6 && g_presCount.tid[k]; k++)
                 {
-                    tot += g_dgSec.n[k];
-                    if (g_dgSec.tid[k] == gtid) gt = g_dgSec.n[k];
-                    g_dgSec.n[k] = 0;
+                    tot += g_presCount.n[k];
+                    if (g_presCount.tid[k] == gtid) gt = g_presCount.n[k];
+                    g_presCount.n[k] = 0;
                 }
-                tot += g_dgSec.other; g_dgSec.other = 0;
-                ReleaseSRWLockExclusive(&g_diagLock);
+                tot += g_presCount.other; g_presCount.other = 0;
+                ReleaseSRWLockExclusive(&g_presCountLock);
                 int cnd = 1;
                 if (g_fgSeen[0] && gt > 0 && tot >= 1.5 * gt) cnd = std::max(2, std::min(4, (int)((double)tot / gt + 0.5)));
                 fgRun = cnd == fgCand ? fgRun + 1 : 1; fgCand = cnd;
                 if (fgRun >= 3 && fgFact != cnd)
                 {
                     fgFact = cnd;
-                    LOGI("BFI Presenter: [test] frame generation without Reflex: %dx (%ld presents, %ld from the game's thread %lu)",
+                    LOGI("BFI Presenter: frame generation without Reflex: %dx (%ld presents a second, %ld from the game's thread %lu)",
                          fgFact, tot, gt, (unsigned long)gtid);
                 }
                 const double hzP = modeHz > 0.0 ? modeHz : peakHz;
                 int want = 0;
-                if (fgPaceIni && fgFact > 1 && !g_status.rfxGameUses && s.enabled && s.frames >= 2 && userCap == 1 && hzP > 0.0 &&
+                if (s.fgLimitNoReflex && fgFact > 1 && !g_status.rfxGameUses && s.enabled && s.frames >= 2 && userCap == 1 && hzP > 0.0 &&
                     hzP / s.frames / fgFact >= 28.0)
                     want = (int)(1e6 * s.frames / hzP * fgFact + 0.5);
                 g_fgGameTid.store(gtid);
@@ -3162,33 +3140,15 @@ static DWORD WINAPI PresenterThread(void *)
                     {
                         lowSecs = 0; steps++;
                         g_fgShiftUs.store((int)(1e6 / hzP));
-                        LOGI("BFI Presenter: [test] frame-start sleep: %d of %.0f frames reached a flash -- starting frames one "
+                        LOGI("BFI Presenter: frame limit for frame generation: %d of %.0f frames reached a flash -- starting frames one "
                              "refresh later (step %d)", relN, expect, steps);
                     }
                 }
                 const int was = g_fgPaceUs.exchange(want);
                 if ((was > 0) != (want > 0))
-                    LOGI("BFI Presenter: [test] frame-start sleep for frame generation without Reflex %s (%d us per rendered frame, "
+                    LOGI("BFI Presenter: frame limit for frame generation without Reflex %s (%d us per rendered frame, "
                          "game thread %lu, %dx)", want > 0 ? "on" : "off", want, (unsigned long)gtid, fgFact);
-                if (t - fgLogT >= 10.0)
-                {
-                    fgLogT = t;
-                    LOGI("BFI Presenter: [test] fg pace: %ld presents/s, %ld from the game's thread, %dx, sleep %d us", tot, gt, fgFact, want);
-                }
-            }
-            {
-                static double diagT = 0.0;
-                if (diagT == 0.0) diagT = t;
-                else if (t - diagT >= 10.0)
-                {
-                    const double sp = t - diagT;
-                    long ne = 0, nh = 0, np = 0;
-                    const std::string se = DiagTake(g_dgEvent, sp, ne), sh = DiagTake(g_dgHook, sp, nh), sps = DiagTake(g_dgPass, sp, np);
-                    diagT = t;
-                    LOGI("BFI Presenter: [diag] last %.0f s: ReShade present events %.1f/s (by thread:%s), game frames in the swap-chain "
-                         "hook %.1f/s (by thread:%s), other swap chains' presents %.1f/s (by thread:%s); frame generation: %s",
-                         sp, ne / sp, se.c_str(), nh / sp, sh.c_str(), np / sp, sps.c_str(), g_fgSeen[0] ? g_fgSeen : "none");
-                }
+                g_status.fgLimitUs = want;
             }
             DXGI_FRAME_STATISTICS st = {};
             const bool sok = SUCCEEDED(ScStats(&st));
@@ -3652,7 +3612,7 @@ static DWORD WINAPI PresenterThread(void *)
                         p10 = alignSlack[alignN / 10];
                     }
                     // The limit has to be a whole number of strobe cycles, or its frames drift past the pick by design.
-                    // Also for the frame-start sleep with frame generation without Reflex (test): one presented frame
+                    // Also for the frame limit with frame generation without Reflex: one presented frame
                     // per strobe cycle, moved through g_fgShiftUs.
                     const bool fgOn = g_fgPaceUs.load() > 0;
                     std::atomic<int> &shiftUs = fgOn ? g_fgShiftUs : g_sleepShiftUs;
@@ -4314,8 +4274,7 @@ static void FgPaceAfterPresent()
 
 static HRESULT SubmitGameFrame()
 {
-    DiagAdd(g_dgHook);
-    DiagAdd(g_dgSec);
+    CountPresent();
     const DWORD tid = GetCurrentThreadId();
     const double enter = Now();
     FgCheckCaller();
@@ -4451,10 +4410,7 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT 
     if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present(sc, sync, flags); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST))
-    {
-        if (!t_ownCall && !t_presenterThread && !(flags & DXGI_PRESENT_TEST)) DiagAdd(g_dgPass);
         return o_Present(sc, sync, flags);
-    }
     const HRESULT hr = SubmitGameFrame();
     FgPaceAfterPresent();
     return hr;
@@ -4465,10 +4421,7 @@ static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *sc, UINT sync, UIN
     if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present1(sc, sync, flags, p); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST))
-    {
-        if (!t_ownCall && !t_presenterThread && !(flags & DXGI_PRESENT_TEST)) DiagAdd(g_dgPass);
         return o_Present1(sc, sync, flags, p);
-    }
     const HRESULT hr = SubmitGameFrame();
     FgPaceAfterPresent();
     return hr;
@@ -8295,7 +8248,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "next frame instead of frames dropped unevenly (judder). Back to Refresh rate when the game's\n"
                                                           "frames fit a refresh again (its Reflex reports, or a short try every 30 to 120 s).\n"
                                                           "In games with NVIDIA Reflex (every DLSS frame-generation game) it uses Reflex's own frame limit\n"
-                                                          "for this, which also paces frame generation. Frame generation without Reflex: stays at Refresh.");
+                                                          "for this, which also paces frame generation. Frame generation without Reflex: see the frame limit below.");
             if (s.autoCap)
             {
                 bool aco = s.autoCapOwn != 0;
@@ -8310,9 +8263,26 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 ImGui::SameLine();
                 if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
                 else if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: Reflex frame limit %.1f ms, one frame per strobe cycle)", st.rfxLimitUs / 1000.0);
+                else if (st.fgLimitUs > 0) ImGui::TextDisabled("(frame generation without Reflex: one presented frame per strobe cycle)");
                 else if (st.fgActive && !st.rfxGameUses) ImGui::TextDisabled("(frame generation without Reflex: Refresh rate)");
                 else ImGui::TextDisabled("%s", st.autoCapProbe ? "(trying Refresh rate)" :
                                                st.autoCapDown ? "(in use: one game frame per strobe cycle)" : "(in use: Refresh rate)");
+            }
+            {
+                bool fl = s.fgLimitNoReflex != 0;
+                if (ImGui::Checkbox("Frame limit for frame generation without Reflex", &fl)) s.fgLimitNoReflex = fl ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame generation in games without NVIDIA Reflex (e.g. XeSS frame generation through\n"
+                                                              "OptiScaler): the presenter holds the game's own frames to one per (strobe cycle x\n"
+                                                              "frame-generation factor) -- e.g. 30 rendered fps at 120 Hz with 2 frames and 2x -- so every\n"
+                                                              "flash shows the next frame, and lines the frame start up with the flash.\n"
+                                                              "Needs the Refresh rate cap; best with Lowest latency pacing. Turn off any frame limit in the\n"
+                                                              "game or in OptiScaler (FramerateLimit = 0). On by default.");
+                if (s.fgLimitNoReflex && st.fgLimitUs > 0)
+                {
+                    ImGui::SameLine();
+                    if (st.alignSlackMs >= 0.0) ImGui::TextDisabled("(in use: %.1f ms per rendered frame, ready %.1f ms before the pick)", st.fgLimitUs / 1000.0, st.alignSlackMs);
+                    else ImGui::TextDisabled("(in use: %.1f ms per rendered frame)", st.fgLimitUs / 1000.0);
+                }
             }
             if (st.relFlashMs >= 0.0) ImGui::TextDisabled("Game released -> lit flash: %.1f ms", st.relFlashMs);
         }
@@ -8510,7 +8480,6 @@ static void UnregisterAll(HMODULE hModule)
     if (g_unregistered) return;
     g_unregistered = true;
     if (g_crashHandler) { RemoveVectoredExceptionHandler(g_crashHandler); g_crashHandler = nullptr; }
-    reshade::unregister_event<reshade::addon_event::present>(on_present_diag);
     reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
     reshade::unregister_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
     reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
@@ -8538,7 +8507,6 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
     reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
-    reshade::register_event<reshade::addon_event::present>(on_present_diag);
     RegisterDx9Events(true);
     reshade::register_overlay("BFI Presenter", draw_overlay);
     if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
@@ -8594,7 +8562,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
-        reshade::register_event<reshade::addon_event::present>(on_present_diag);
         RegisterDx9Events(true);
         reshade::register_overlay("BFI Presenter", draw_overlay);
         // DRED must be switched on before the game creates its device; a
