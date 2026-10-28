@@ -3629,9 +3629,10 @@ static DWORD WINAPI PresenterThread(void *)
                     // minutes, and motion stuttered; in another run it settled at once). Instead, start times across
                     // one strobe cycle are tried about 2 ms apart, 3 s each (1 s to settle, 2 s measured): the one
                     // with every frame reaching a flash and the shortest release -> flash is kept. Tried again only
-                    // after 10 s in a row with under 90% of the frames reaching a flash, at most once a minute.
+                    // after 10 s in a row with under 90% of the frames reaching a flash or 6 ms slower, at most once
+                    // a minute. Riven: 29 ms (start +8.3 ms in the cycle) against 34-45 ms at the other start times.
                     static int swIdx = -1, swN = 0, swSecs = 0, swBad = 0, swShown = 0, swRelN = 0, swRep = 0;
-                    static double swPhase = 0.0, swStart = 0.0, swDoneT = -1.0, swRel = 0.0, swScore[16] = {}, swRelMs[16] = {};
+                    static double swPhase = 0.0, swStart = 0.0, swDoneT = -1.0, swBestMs = 0.0, swRel = 0.0, swScore[16] = {}, swRelMs[16] = {};
                     static int swShownK[16] = {};
                     static bool swWasOn = false;
                     if (fgOn && !swWasOn) { swDoneT = -1.0; swIdx = -1; swBad = 0; }
@@ -3675,7 +3676,7 @@ static DWORD WINAPI PresenterThread(void *)
                                         int best = 0;
                                         for (int k = 1; k < swN; k++) if (swScore[k] < swScore[best]) best = k;
                                         moveTo(start + best * cyc / swN);
-                                        swIdx = -1; swDoneT = t;
+                                        swIdx = -1; swDoneT = t; swBestMs = swRelMs[best];
                                         char list[400]; int len = 0;
                                         for (int k = 0; k < swN && len < (int)sizeof(list) - 32; k++)
                                             len += snprintf(list + len, sizeof(list) - len, " %.1f:%d/%.0f", k * cyc / swN * 1000.0,
@@ -3687,7 +3688,9 @@ static DWORD WINAPI PresenterThread(void *)
                                 }
                             }
                         }
-                        else swBad = (ok && relN < (int)(0.9 * capFps)) ? swBad + 1 : 0;
+                        // Held: tried again after 10 s in a row with under 90% of the frames shown, or 6 ms or more
+                        // slower than the start time found.
+                        else swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + 6.0))) ? swBad + 1 : 0;
                     }
                     if (s.reflexAlign && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
                     {
@@ -4320,15 +4323,28 @@ static void FgPaceAfterPresent()
     if (nextT <= 0.0 || now > nextT + iv || nextT - now > 2.0 * iv) nextT = now;   // start, a hitch, or a changed limit
     const int sh = g_fgShiftUs.exchange(0);
     if (sh != 0) { nextT += sh * 1e-6; phase += sh * 1e-6; }
-    // On the display's vblank grid (the last vblank the presenter saw): the interval is a whole number of refreshes,
-    // so frame generation's two frames keep the same place against the flashes instead of drifting until both
-    // land in one strobe cycle (Riven: then only 30 of 60 frames a second were shown).
+    // On the strobe-cycle grid (the last refresh the presenter drew, less its slot in the cycle): the interval is a
+    // whole number of cycles, so frame generation's two frames keep the same place against the flashes instead of
+    // drifting until both land in one strobe cycle (Riven: then only 30 of 60 frames a second were shown). On the
+    // cycle and not just the refresh grid: after a hitch the start time is taken up again from the clock, and on the
+    // refresh grid alone it came back a refresh or two off (Riven: 28 ms from release to flash before a hitch,
+    // 37, 42 and 50 ms after the next ones).
     {
-        const double tick = g_tickT.load(), per = g_lrPeriod.load();
+        UINT64 c = 0; int sl = 0; double tick = 0.0;
+        for (int i = 0; i < 4; i++)
+        {
+            c = g_tickCount.load(); sl = g_tickSlot.load(); tick = g_tickT.load();
+            if (g_tickCount.load() == c) break;
+        }
+        const double per = g_lrPeriod.load();
+        const int frames = std::max(1, g_strobeFrames.load());
+        const double cyc = per * frames;
         if (tick > 0.0 && per > 0.0 && now - tick < 0.1)
         {
-            const double ph = std::fmod(phase, per);
-            nextT = tick + ph + std::floor((nextT - tick - ph) / per + 0.5) * per;
+            const double cycStart = tick - sl * per;
+            double ph = std::fmod(phase, cyc);
+            if (ph < 0.0) ph += cyc;
+            nextT = cycStart + ph + std::floor((nextT - cycStart - ph) / cyc + 0.5) * cyc;
         }
     }
     while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
