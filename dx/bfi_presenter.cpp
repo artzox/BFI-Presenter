@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.25-f3"
+#define BFI_ADDON_VERSION "1.0.25-f4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2751,7 +2751,16 @@ static DWORD WINAPI PresenterThread(void *)
             }
         }
         else if (newest >= 0)
+        {
             pick = (s.pacingMode == 0 && lastShown >= 0 && g_stageId[lastShown] == lastShownId) ? lastShown : newest;
+            // Frame generation paced at the game's frame start (no Reflex): XeSS frame generation submits its
+            // generated frame and the game's frame together (0.4 ms apart, Riven). When both are ready at one
+            // flash, Lowest latency showed only the newer -- 30 of 60 frames a second. Show the generated one now
+            // and the game's frame at the next flash.
+            if (cycleStart && g_fgPaceUs.load() > 0 && unseen == 2 && oldestNew >= 0 && oldestNewId + 1 == newestId &&
+                std::fabs(g_stageTime[newest] - g_stageTime[oldestNew]) < 0.004)
+                pick = oldestNew;
+        }
         if (pick >= 0) { pickId = g_stageId[pick]; g_presCurSlot = pick; }
         if (pick < 0)
         {
