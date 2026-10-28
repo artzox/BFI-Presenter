@@ -281,7 +281,7 @@ The presenter's own output runs in exclusive fullscreen; the game's window mode 
 *When to change it:* only if a game misbehaves with it; it applies at the next game start.
 
 **Recover automatically** · `VulkanAutoRecover` · default: on\
-Some things can still put Windows into that slower mode, and it stays there after they're gone: a window briefly covering the game (a launcher's splash screen) or the ReShade menu. When the presenter sees it for 3 seconds, it has the game rebuild its swap chain, which brings the flashes back in step. That's a short pause (in most games a blink; up to a few seconds in heavy ones), at most every 20 seconds. If presentation slows again soon after, the game is probably just using the whole GPU, which a rebuild can't fix: the next one waits longer (40, then 80 seconds), and after 3 such rebuilds it stops for the session. Slow moments while the automatic frame cap tries Refresh don't count. Ctrl+Shift+O does it by hand.\
+Some things can still put Windows into that slower mode, and it stays there after they're gone: a window briefly covering the game (a launcher's splash screen) or the ReShade menu. When the presenter sees it for 5 seconds, it has the game rebuild its swap chain, which brings the flashes back in step. That's a short pause (in most games a blink; up to a few seconds in heavy ones), at most every 20 seconds. If presentation slows again soon after, the game is probably just using the whole GPU, which a rebuild can't fix: the next one waits longer (40, then 80 seconds), and after 3 such rebuilds it stops for the session. Slow moments while the automatic frame cap tries Refresh don't count. Ctrl+Shift+O does it by hand.\
 *Tip:* in Vulkan games, change settings in `BFIPresenter.ini` rather than the ReShade menu while playing where you can; the game picks up the change within a second.
 
 **SDR to HDR**, **SDR white**, **SDR highlights** · `SdrToHdr`, `SdrWhiteNits`, `SdrHighlightNits`, `SdrHighlightKnee` · default: on, 200, 800, 0.65\
@@ -307,6 +307,7 @@ If a game crashes, these write a short report of what went wrong (`BFIPresenter_
 | Ctrl+Shift+S | Rolling scan on / off |
 | Ctrl+Shift+R | Reload `BFIPresenter.ini` after editing it |
 | Ctrl+Shift+O | Vulkan: rebuild the swap chain (if flashes started after an overlay or menu) |
+| Ctrl+Shift+K | Put a marker in the log with the last second's state (frame rate, frame generation, Reflex limit, video memory), to find a moment you noticed when sending a log |
 
 ## Good starting points
 

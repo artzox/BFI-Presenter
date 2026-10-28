@@ -5,8 +5,8 @@
 #include <vector>
 #include <functional>
 
-#define MANAGER_VERSION "1.3.8"
-#define MANAGER_VERSION_W L"1.3.8"
+#define MANAGER_VERSION "1.3.9"
+#define MANAGER_VERSION_W L"1.3.9"
 
 namespace bfi {
 
@@ -162,6 +162,10 @@ std::wstring LogPath();
 // ----- GitHub releases
 struct RemoteRelease { std::string tag, dxUrl, vkUrl, notesUrl, mgrUrl, mgrVersion; bool ok = false; std::string error; };
 RemoteRelease FetchLatestRelease();
+// What's new: changelog entries for one part (tag "DX", "Vulkan", "Shader" or "Manager") newer than `from` and up
+// to `to` ("" = no upper limit), newest first, from a release's CHANGELOG.md. title: the entry's bold first line.
+struct ChangeItem { std::string version, title, text; };
+std::vector<ChangeItem> WhatsNew(const std::wstring &changelog, const char *tag, const std::string &from, const std::string &to);
 RemoteRelease ParseRelease(const std::string &json);           // blocking (call from a worker thread)
 std::string DownloadRelease(const RemoteRelease &r, Source &out,
                             const std::function<void(const std::string &)> &progress);

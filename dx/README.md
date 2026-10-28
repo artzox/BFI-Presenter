@@ -168,6 +168,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 | Ctrl+Shift+M | BFI ↔ Variable MPRT |
 | Ctrl+Shift+S | Rolling scan on / off |
 | Ctrl+Shift+R | Reload `BFIPresenter.ini` |
+| Ctrl+Shift+K | Marker in `ReShade.log` with the last second's state, to find a moment you noticed |
 
 ## Files the add-on writes
 

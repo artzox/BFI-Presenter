@@ -49,7 +49,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Cuphead | Working | Not tested | v0.73 | Later release on: \~5 ms less latency at 120 fps |
 | Obduction | Working | Not tested | v0.77 | Half refresh + just-in-time release; Lowest latency + Refresh is smoothest at 120 |
 | Hades II | Working | Not tested | v0.78 | GPU headroom for 120 fps (4K yes, 5K DSR no) |
-| Indiana Jones and the Great Circle | Partial (Vulkan) | Flashes persist with FG | VK 0.8.2 | Vulkan layer; GPU at its limit causes 10–20 flashes a minute |
+| Indiana Jones and the Great Circle | Partial (Vulkan) | Keep video memory under budget: lower Texture Pool Size | VK 1.0.24 | Vulkan layer; GPU at its limit causes 10–20 flashes a minute |
 | shadPS4 | Working (Vulkan) | — | VK 0.7 | Vulkan layer; BFIPresenter.ini next to the emulator's .exe |
 | Blasphemous | Working (DX11) | NVIDIA Smooth Motion must be off with the presenter; works with the BFI shader | v1.0.3 | Locked at 60 fps: Refresh rate + Lowest latency; Smooth Motion off in the NVIDIA app (with it on, the game closed and relaunched itself). Or the BFI shader at 120 Hz with Smooth Motion on |
 | Guacamelee! 2 | Working (DX11) | Not tested | v1.0.3 | Standard setup; works with Special K (crashed at start before v1.0.3) |
@@ -331,6 +331,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - To try: a lower Texture Pool Size (VRAM paging stalls the GPU at 16 GB), lower settings, Dark frame floor 0.1–0.15.
 - 1.0.11: with exclusive fullscreen for the presenter's swap chain (on by default) it stays steady, also after alt-tab, which used to bring the flashes back for good.
 - **v1.0.23: 2× frame generation + Refresh rate cap + automatic frame cap.** The layer caps frame generation with the game's Reflex frame limit: a steady 30 rendered / 60 presented, a new frame on every flash, about 55 ms from frame start to the GPU. 3× (20 rendered for 60) lagged badly and presented unevenly, so 3× stays at the Refresh cap (about 115 presented, frames dropped unevenly).
+- **v1.0.24: keep video memory under its budget.** At 4K with 2× frame generation on an RTX 5080 (16 GB) the game ran 150–250 MB over the budget Windows gives it. Every 20–90 s presentation slowed (late image returns), frame generation stopped presenting its generated frames, the Reflex frame limit went off and BFI paused and resumed (flicker); after checkpoint reloads it stayed that way until the swap chain was rebuilt. With **Texture Pool Size** lowered (low here, DLSS Performance) it stays about 300 MB under and the limit holds through loads and reloads; other settings can go up while the presenter's video memory warning stays off. 3 presenter buffers (each 4K buffer is about 33 MB).
 
 ### shadPS4
 
