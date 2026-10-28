@@ -3129,21 +3129,6 @@ static DWORD WINAPI PresenterThread(void *)
                     hzP / s.frames / fgFact >= 28.0)
                     want = (int)(1e6 * s.frames / hzP * fgFact + 0.5);
                 g_fgGameTid.store(gtid);
-                // Phase: when about half the frames reach a flash (both of a pair land in one strobe cycle), the
-                // rendered frame starts one refresh later; tried again after 2 s.
-                {
-                    static int lowSecs = 0, steps = 0;
-                    const double expect = hzP > 0.0 && s.frames > 0 ? hzP / s.frames : 0.0;
-                    if (want > 0 && expect > 0.0 && tot >= 0.9 * expect && relN < 0.85 * expect) lowSecs++;
-                    else lowSecs = 0;
-                    if (lowSecs >= 2)
-                    {
-                        lowSecs = 0; steps++;
-                        g_fgShiftUs.store((int)(1e6 / hzP));
-                        LOGI("BFI Presenter: frame limit for frame generation: %d of %.0f frames reached a flash -- starting frames one "
-                             "refresh later (step %d)", relN, expect, steps);
-                    }
-                }
                 const int was = g_fgPaceUs.exchange(want);
                 if ((was > 0) != (want > 0))
                 {
@@ -3638,7 +3623,73 @@ static DWORD WINAPI PresenterThread(void *)
                     // In Dead Space (Smooth) the wake-up chased that round and round (318 ms in 6 minutes).
                     const bool atSleepNoFg = sleepUs > 0 && locked && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
                     const bool holds = capFps > 0.0 && stNow.gameFps > 0.95 * capFps && stNow.gameFps < 1.05 * capFps;
-                    if (((s.reflexAlign && atSleepNoFg) || (fgOn && locked && s.pacingMode == 1)) && holds && !hitchPaused && t >= alignCoolT)
+                    // Frame generation without Reflex: the start time is chosen by trying it out. The controller below
+                    // hunted there: frames a pair apart wait a refresh more by design, so the 10th percentile it steers
+                    // by has no steady target (Riven: the wake-up moved 3 ms later every second, 89 -> 248 ms in two
+                    // minutes, and motion stuttered; in another run it settled at once). Instead, start times across
+                    // one strobe cycle are tried about 2 ms apart, 3 s each (1 s to settle, 2 s measured): the one
+                    // with every frame reaching a flash and the shortest release -> flash is kept. Tried again only
+                    // after 10 s in a row with under 90% of the frames reaching a flash, at most once a minute.
+                    static int swIdx = -1, swN = 0, swSecs = 0, swBad = 0, swShown = 0, swRelN = 0, swRep = 0;
+                    static double swPhase = 0.0, swStart = 0.0, swDoneT = -1.0, swRel = 0.0, swScore[16] = {}, swRelMs[16] = {};
+                    static int swShownK[16] = {};
+                    static bool swWasOn = false;
+                    if (fgOn && !swWasOn) { swDoneT = -1.0; swIdx = -1; swBad = 0; }
+                    swWasOn = fgOn;
+                    if (fgOn && locked && s.pacingMode == 1 && cyc > 0.0)
+                    {
+                        auto moveTo = [&](double ph)
+                        {
+                            const int d = (int)((ph - swPhase) * 1e6);
+                            if (d) { shiftUs.fetch_add(d); alignShiftTot += d * 1e-6; }
+                            swPhase += d * 1e-6;
+                        };
+                        const bool ok = holds && !hitchPaused;
+                        const double base = swPhase - std::fmod(swPhase, cyc);   // stay within the same cycle's worth of moves
+                        if (swIdx < 0 && ok && (swDoneT < 0.0 || (swBad >= 10 && t - swDoneT > 60.0)))
+                        {
+                            swN = std::max(4, std::min(16, (int)(cyc / 0.002 + 0.5)));
+                            swIdx = 0; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swBad = 0;
+                            swStart = base;
+                            moveTo(swStart);
+                            LOGI("BFI Presenter: frame limit for frame generation: trying %d start times across the strobe cycle (%.0f s)",
+                                 swN, swN * 3.0);
+                        }
+                        else if (swIdx >= 0)
+                        {
+                            if (!ok) { swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; }
+                            else if (++swSecs >= 2)
+                            {
+                                swShown += relN; swRel += relSum; swRelN += relN; swRep += stNow.frameRepeats;
+                                if (swSecs >= 3)
+                                {
+                                    const double relMs = swRelN ? swRel / swRelN : 1e3;
+                                    const bool full = swShown >= (int)(2.0 * capFps * 0.97) && swRep <= 2;
+                                    swScore[swIdx] = full ? relMs : 1e3 + (2.0 * capFps - swShown);
+                                    swRelMs[swIdx] = relMs; swShownK[swIdx] = swShown;
+                                    swIdx++; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0;
+                                    const double start = swStart;
+                                    if (swIdx < swN) moveTo(start + swIdx * cyc / swN);
+                                    else
+                                    {
+                                        int best = 0;
+                                        for (int k = 1; k < swN; k++) if (swScore[k] < swScore[best]) best = k;
+                                        moveTo(start + best * cyc / swN);
+                                        swIdx = -1; swDoneT = t;
+                                        char list[400]; int len = 0;
+                                        for (int k = 0; k < swN && len < (int)sizeof(list) - 32; k++)
+                                            len += snprintf(list + len, sizeof(list) - len, " %.1f:%d/%.0f", k * cyc / swN * 1000.0,
+                                                            swShownK[k], swRelMs[k]);
+                                        LOGI("BFI Presenter: frame limit for frame generation lined up with the flash: start %+.1f ms "
+                                             "in the cycle, %.1f ms from release to flash, %d of %.0f frames shown (start ms:shown/ms --%s)",
+                                             best * cyc / swN * 1000.0, swRelMs[best], swShownK[best], 2.0 * capFps, list);
+                                    }
+                                }
+                            }
+                        }
+                        else swBad = (ok && relN < (int)(0.9 * capFps)) ? swBad + 1 : 0;
+                    }
+                    if (s.reflexAlign && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
                     {
                         if (alignLastStep > 0.0 && p10 >= 0.0 && alignPrevP10 >= 0.0 && p10 - alignPrevP10 > 0.5 * cyc)
                         {
@@ -8287,7 +8338,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame generation in games without NVIDIA Reflex (e.g. XeSS frame generation through\n"
                                                               "OptiScaler): the presenter holds the game's own frames to one per (strobe cycle x\n"
                                                               "frame-generation factor) -- e.g. 30 rendered fps at 120 Hz with 2 frames and 2x -- so every\n"
-                                                              "flash shows the next frame, and lines the frame start up with the flash.\n"
+                                                              "flash shows the next frame; for about 25 s after it comes on it tries start times to find the\n"
+                                                              "quickest one that shows every frame.\n"
                                                               "Needs the Refresh rate cap; best with Lowest latency pacing. Turn off any frame limit in the\n"
                                                               "game or in OptiScaler (FramerateLimit = 0). On by default.");
                 if (s.fgLimitNoReflex && st.fgLimitUs > 0)
