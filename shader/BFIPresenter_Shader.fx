@@ -1,4 +1,4 @@
-// BFI Presenter shader v1.0.10 -- the BFI Presenter strobe as a ReShade effect.
+// BFI Presenter shader v1.0.21 -- the BFI Presenter strobe as a ReShade effect.
 // Copyright (C) 2026 artzox. SPDX-License-Identifier: GPL-3.0-or-later
 //
 // The same strobe as the BFI Presenter add-on (BFI with highlight roll-off,
