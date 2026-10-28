@@ -28,6 +28,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <sys/stat.h>
 #include <windows.h>
+#include <dxgi1_4.h>
 #define VK_USE_PLATFORM_WIN32_KHR
 #define BFI_EXPORT extern "C" __declspec(dllexport)
 #else
@@ -57,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.24-d4"
+#define BFI_VERSION "1.0.24-d5"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -1340,6 +1341,42 @@ static double g_lastRebuildT = -1.0e9;      // presentation recovery: when the g
 static double g_lastAutoRebuildT = -1.0e9;  // ... automatically
 static double g_rebuildGap = 20.0;          // automatic rebuilds at least this far apart (doubles while they don't help)
 static int    g_rebuildMisses = 0;          // automatic rebuilds in a row after which presentation slowed again within a minute
+
+// [diag] the game's video memory use against the budget Windows gives it (DXGI, the NVIDIA adapter), in MB.
+static bool VramMB(double &use, double &budget)
+{
+    static IDXGIAdapter3 *ad = nullptr; static bool tried = false;
+    if (!tried)
+    {
+        tried = true;
+        typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void **);
+        HMODULE h = LoadLibraryA("dxgi.dll");
+        PFN_CF1 cf = h ? (PFN_CF1)(void *)GetProcAddress(h, "CreateDXGIFactory1") : nullptr;
+        IDXGIFactory1 *fac = nullptr;
+        if (cf && SUCCEEDED(cf(__uuidof(IDXGIFactory1), (void **)&fac)) && fac)
+        {
+            IDXGIAdapter1 *a = nullptr; SIZE_T best = 0;
+            for (UINT k = 0; fac->EnumAdapters1(k, &a) == S_OK; k++)
+            {
+                DXGI_ADAPTER_DESC1 d; a->GetDesc1(&d);
+                IDXGIAdapter3 *a3 = nullptr;
+                if (d.DedicatedVideoMemory > best && SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter3), (void **)&a3)) && a3)
+                {
+                    if (ad) ad->Release();
+                    ad = a3; best = d.DedicatedVideoMemory;
+                }
+                a->Release();
+            }
+            fac->Release();
+        }
+    }
+    if (!ad) return false;
+    DXGI_QUERY_VIDEO_MEMORY_INFO mi = {};
+    if (FAILED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) return false;
+    use = mi.CurrentUsage / 1048576.0; budget = mi.Budget / 1048576.0;
+    return true;
+}
+
 static void PresenterThread(Swapchain *sc)
 {
     DeviceData *d = sc->d;
@@ -2253,17 +2290,6 @@ static void PresenterThread(Swapchain *sc)
                     slowWin = ((slowWin << 1) | (lastSlow >= 8 ? 1 : 0)) & 7;
                     if (fgRun >= 3 && g_vkFgFactor.load() != cand)
                     {
-                        // Indiana Jones: when presentation slows (after loads and checkpoint reloads), DLSS-G stops
-                        // presenting generated frames -- presents fall to the rendered count, also uncapped (55 for 55)
-                        // -- and stays that way until the swap chain is rebuilt. A drop from frame generation to 1x
-                        // while presentation is slow asks the game for one rebuild (at most once a minute).
-                        static double fgRecoverT = -1.0e9;
-                        if (g_vkFgFactor.load() > 1 && cand == 1 && slowWin && t - fgRecoverT > 60.0 && t - g_lastRebuildT > 20.0 && !rebuildReq)
-                        {
-                            fgRecoverT = t; rebuildReq = true;
-                            LOGI("BFI Presenter: frame generation stopped while presentation slowed -- rebuilding the swap chain to "
-                                 "bring it back (once a minute at most)");
-                        }
                         g_vkFgFactor.store(cand);
                         LOGI("BFI Presenter: frame generation %s (Reflex: %.0f presented, %ld rendered a second)",
                              cand > 1 ? "active" : "not active", fpsA, rend);
@@ -2313,15 +2339,18 @@ static void PresenterThread(Swapchain *sc)
                     {
                         static double diagT = 0.0;
                         const bool odd = fgWas && (want == 0 || cand != f || stallSec);
-                        if (odd || t - diagT >= 10.0)
+                        if (odd || t - diagT >= 5.0)
                         {
                             diagT = t;
+                            double vu = 0.0, vb2 = 0.0;
+                            char vram[64] = "";
+                            if (VramMB(vu, vb2)) snprintf(vram, sizeof(vram), ", VRAM %.0f of %.0f MB", vu, vb2);
                             LOGI("BFI Presenter: [diag] fg: %.0f presents/s, %ld sleeps/s%s%s%s, vote %dx (%d s), factor %dx, limit %d us%s, "
-                                 "frames ahead %d, %d slow image returns, refreshes %.0f/s",
+                                 "frames ahead %d, %d slow image returns, refreshes %.0f/s%s",
                                  fpsA, rend, sleeping ? "" : " (no sleep)", hitchPaused ? ", hitch paused" : "",
                                  stallSec ? ", stall (not counted)" : "", cand, fgRun, f, want,
                                  g_vkRfxBad.load() ? " (off for the session)" : "", (int)sc->maxAhead.load(), lastSlow,
-                                 g_status.refreshHz);
+                                 g_status.refreshHz, vram);
                         }
                     }
                 }
