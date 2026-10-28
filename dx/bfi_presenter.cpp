@@ -3492,7 +3492,11 @@ static DWORD WINAPI PresenterThread(void *)
                     else if (capByReflex && !reflexOk) capByReflex = false;
                     else if (!capByReflex && reflexOk && rfxUse) capByReflex = true;
                 }
-                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg))
+                // The frame limit for frame generation without Reflex holds the game itself: the presenter's own cap
+                // on top held frame generation's presents too, and the game's window stopped responding for
+                // seconds (The Callisto Protocol, Riven), so the cap stays at Refresh while that limit is in use.
+                const bool fgLimitOn = g_fgPaceUs.load() > 0;
+                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg) && !fgLimitOn)
                 {
                     const double refMs = 1000.0 / hzA;
                     if (capProbe)
@@ -3559,7 +3563,9 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 else
                 {
-                    if (autoCapDown && fg && s.autoCap && userCap == 1) LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation active, no Reflex)");
+                    if ((autoCapDown || capProbe) && (fg || fgLimitOn) && s.autoCap && userCap == 1)
+                        LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation without Reflex%s)",
+                             fgLimitOn ? " -- the frame limit for it holds the game" : "");
                     autoCapDown = capProbe = false; capDownSecs = capUpSecs = 0;
                 }
                 g_status.autoCapDown = autoCapDown ? 1 : 0;
@@ -8264,7 +8270,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 ImGui::SameLine();
                 if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
                 else if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: Reflex frame limit %.1f ms, one frame per strobe cycle)", st.rfxLimitUs / 1000.0);
-                else if (st.fgLimitUs > 0) ImGui::TextDisabled("(frame generation without Reflex: one presented frame per strobe cycle)");
+                else if (st.fgLimitUs > 0) ImGui::TextDisabled("(Refresh rate: the frame limit for frame generation without Reflex holds the game)");
                 else if (st.fgActive && !st.rfxGameUses) ImGui::TextDisabled("(frame generation without Reflex: Refresh rate)");
                 else ImGui::TextDisabled("%s", st.autoCapProbe ? "(trying Refresh rate)" :
                                                st.autoCapDown ? "(in use: one game frame per strobe cycle)" : "(in use: Refresh rate)");
