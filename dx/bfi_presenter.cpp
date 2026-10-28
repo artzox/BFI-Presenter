@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <atomic>
 #include <vector>
+#include <string>
 #include <cstdarg>
 #include <cmath>
 #include <cstdint>
@@ -88,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.24"
+#define BFI_ADDON_VERSION "1.0.25-f1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -491,6 +492,46 @@ static std::atomic<bool> g_glActive{false};       // an OpenGL game is managed
 static std::atomic<double> g_lastPresentT{0.0};   // presenter heartbeat
 static std::atomic<bool>   g_stallLogged{false};
 static std::atomic<int> g_stagedThisSecond{0};
+
+// [diag] Frame generation without Reflex: which layer the presenter sees. Counts per thread: ReShade's present event
+// (the game's Present above anything below ReShade), game frames taken in the swap-chain hook, and presents that pass
+// the hook on other swap chains.
+struct DiagCount { DWORD tid[6] = {}; long n[6] = {}; long other = 0; };
+static SRWLOCK g_diagLock = SRWLOCK_INIT;
+static DiagCount g_dgEvent, g_dgHook, g_dgPass;
+static void DiagAdd(DiagCount &c)
+{
+    const DWORD tid = GetCurrentThreadId();
+    AcquireSRWLockExclusive(&g_diagLock);
+    int k = 0;
+    while (k < 6 && c.tid[k] && c.tid[k] != tid) k++;
+    if (k < 6) { if (!c.tid[k]) c.tid[k] = tid; c.n[k]++; }
+    else c.other++;
+    ReleaseSRWLockExclusive(&g_diagLock);
+}
+static std::string DiagTake(DiagCount &c, double secs, long &total)
+{
+    AcquireSRWLockExclusive(&g_diagLock);
+    std::string o; total = c.other;
+    char b[64];
+    for (int k = 0; k < 6 && c.tid[k]; k++)
+    {
+        if (!c.n[k]) continue;
+        total += c.n[k];
+        snprintf(b, sizeof(b), " %lu:%.1f/s", (unsigned long)c.tid[k], c.n[k] / secs);
+        o += b;
+        c.n[k] = 0;
+    }
+    c.other = 0;
+    ReleaseSRWLockExclusive(&g_diagLock);
+    return o;
+}
+static void on_present_diag(reshade::api::command_queue *, reshade::api::swapchain *, const reshade::api::rect *,
+                            const reshade::api::rect *, uint32_t, const reshade::api::rect *)
+{
+    DiagAdd(g_dgEvent);
+}
+
 
 
 // The game's video memory use against the budget Windows gives it (DXGI, per process, the adapter with the most
@@ -3063,6 +3104,20 @@ static DWORD WINAPI PresenterThread(void *)
         else hitchPaused = false;
         if (t - secStart >= 1.0)
         {
+            {
+                static double diagT = 0.0;
+                if (diagT == 0.0) diagT = t;
+                else if (t - diagT >= 10.0)
+                {
+                    const double sp = t - diagT;
+                    long ne = 0, nh = 0, np = 0;
+                    const std::string se = DiagTake(g_dgEvent, sp, ne), sh = DiagTake(g_dgHook, sp, nh), sps = DiagTake(g_dgPass, sp, np);
+                    diagT = t;
+                    LOGI("BFI Presenter: [diag] last %.0f s: ReShade present events %.1f/s (by thread:%s), game frames in the swap-chain "
+                         "hook %.1f/s (by thread:%s), other swap chains' presents %.1f/s (by thread:%s); frame generation: %s",
+                         sp, ne / sp, se.c_str(), nh / sp, sh.c_str(), np / sp, sps.c_str(), g_fgSeen[0] ? g_fgSeen : "none");
+                }
+            }
             DXGI_FRAME_STATISTICS st = {};
             const bool sok = SUCCEEDED(ScStats(&st));
             int rep = 0;
@@ -4155,6 +4210,7 @@ static void GameReleased(UINT64 lastId)
 
 static HRESULT SubmitGameFrame()
 {
+    DiagAdd(g_dgHook);
     const DWORD tid = GetCurrentThreadId();
     const double enter = Now();
     FgCheckCaller();
@@ -4289,7 +4345,11 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT 
 {
     if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present(sc, sync, flags); ReleaseGameSlot(); return hr; }
-    if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST)) return o_Present(sc, sync, flags);
+    if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST))
+    {
+        if (!t_ownCall && !t_presenterThread && !(flags & DXGI_PRESENT_TEST)) DiagAdd(g_dgPass);
+        return o_Present(sc, sync, flags);
+    }
     return SubmitGameFrame();
 }
 
@@ -4297,7 +4357,11 @@ static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *sc, UINT sync, UIN
 {
     if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present1(sc, sync, flags, p); ReleaseGameSlot(); return hr; }
-    if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST)) return o_Present1(sc, sync, flags, p);
+    if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST))
+    {
+        if (!t_ownCall && !t_presenterThread && !(flags & DXGI_PRESENT_TEST)) DiagAdd(g_dgPass);
+        return o_Present1(sc, sync, flags, p);
+    }
     return SubmitGameFrame();
 }
 
@@ -8337,6 +8401,7 @@ static void UnregisterAll(HMODULE hModule)
     if (g_unregistered) return;
     g_unregistered = true;
     if (g_crashHandler) { RemoveVectoredExceptionHandler(g_crashHandler); g_crashHandler = nullptr; }
+    reshade::unregister_event<reshade::addon_event::present>(on_present_diag);
     reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
     reshade::unregister_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
     reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
@@ -8364,6 +8429,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
     reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
+    reshade::register_event<reshade::addon_event::present>(on_present_diag);
     RegisterDx9Events(true);
     reshade::register_overlay("BFI Presenter", draw_overlay);
     if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
@@ -8419,6 +8485,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
+        reshade::register_event<reshade::addon_event::present>(on_present_diag);
         RegisterDx9Events(true);
         reshade::register_overlay("BFI Presenter", draw_overlay);
         // DRED must be switched on before the game creates its device; a
