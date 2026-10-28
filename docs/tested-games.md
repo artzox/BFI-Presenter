@@ -124,7 +124,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Split Fiction | Standard setup |
 | Spyro Reignited Trilogy | Standard setup |
 | Stray | Standard setup |
-| The Callisto Protocol | Standard setup. XeSS frame generation through OptiScaler (v1.0.25): Refresh cap + Lowest latency, held to 30 rendered / 60 presented by the frame limit for frame generation without Reflex, about 29–35 ms from release to flash, 60 of 60 flashes. XeSS frame generation itself drops out now and then (the presenter then sees 1× and the automatic frame cap takes over until it is back) |
+| The Callisto Protocol | Standard setup, frame generation off: Refresh cap + automatic frame cap holds 60 of 60 with just-in-time release, about 25 ms from release to flash. XeSS frame generation through OptiScaler runs with the frame limit for frame generation without Reflex (v1.0.25: 30 rendered / 60 presented, about 29–35 ms), but bright lights flicker under BFI as in Returnal, and XeSS frame generation drops out now and then |
 | The Dark Pictures Anthology: Directive 8020 | Works with DLSS 5 and FG 2× (Refresh cap) |
 | The Elder Scrolls IV: Oblivion Remastered | Works with DLSS 5; frame generation off (artifacts). 2 frames per cycle at Half refresh + Smooth + Apply the cap with Reflex's frame limit (see the notes below) |
 | The Last of Us Part I | Works with DLSS 5. Needs `TypedBackBufferDesc=1` (the default; it crashed without it) |
