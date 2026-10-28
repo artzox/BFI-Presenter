@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.25-f4"
+#define BFI_ADDON_VERSION "1.0.25-f5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3652,8 +3652,12 @@ static DWORD WINAPI PresenterThread(void *)
                         p10 = alignSlack[alignN / 10];
                     }
                     // The limit has to be a whole number of strobe cycles, or its frames drift past the pick by design.
-                    const int sleepUs = g_sleepLimitUs.load();
-                    const double capFps = sleepUs > 0 ? 1e6 / sleepUs : 0.0;
+                    // Also for the frame-start sleep with frame generation without Reflex (test): one presented frame
+                    // per strobe cycle, moved through g_fgShiftUs.
+                    const bool fgOn = g_fgPaceUs.load() > 0;
+                    std::atomic<int> &shiftUs = fgOn ? g_fgShiftUs : g_sleepShiftUs;
+                    const int sleepUs = fgOn ? g_fgPaceUs.load() : g_sleepLimitUs.load();
+                    const double capFps = fgOn ? (hzL > 0.0 ? hzL / s.frames : 0.0) : sleepUs > 0 ? 1e6 / sleepUs : 0.0;
                     const double cyc = hzL > 0.0 ? s.frames / hzL : 0.0;
                     const double cycles = cyc > 0.0 && sleepUs > 0 ? sleepUs * 1e-6 / cyc : 0.0;
                     const bool locked = cycles >= 0.9 && fabs(cycles - std::floor(cycles + 0.5)) * cyc < 0.0003;
@@ -3662,14 +3666,14 @@ static DWORD WINAPI PresenterThread(void *)
                     // In Dead Space (Smooth) the wake-up chased that round and round (318 ms in 6 minutes).
                     const bool atSleepNoFg = sleepUs > 0 && locked && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
                     const bool holds = capFps > 0.0 && stNow.gameFps > 0.95 * capFps && stNow.gameFps < 1.05 * capFps;
-                    if (s.reflexAlign && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
+                    if (((s.reflexAlign && atSleepNoFg) || (fgOn && locked && s.pacingMode == 1)) && holds && !hitchPaused && t >= alignCoolT)
                     {
                         if (alignLastStep > 0.0 && p10 >= 0.0 && alignPrevP10 >= 0.0 && p10 - alignPrevP10 > 0.5 * cyc)
                         {
                             // Moved past the pick: the frames now wait a whole cycle more. Back to before that step, a
                             // little earlier, and a wider target.
                             const int back = (int)((alignLastStep + 0.002) * 1e6);
-                            g_sleepShiftUs.fetch_sub(back); alignShiftTot -= back * 1e-6;
+                            shiftUs.fetch_sub(back); alignShiftTot -= back * 1e-6;
                             alignTarget = std::min(0.005, alignTarget + 0.001);
                             alignCleanSecs = 0; alignCoolT = t + 2.0; alignLastStep = 0.0;
                             LOGI("BFI Presenter: Reflex frame limit alignment went past the pick (%.1f -> %.1f ms) -- moved back, "
@@ -3681,7 +3685,7 @@ static DWORD WINAPI PresenterThread(void *)
                         else if (stNow.frameRepeats >= 2 && (p10 < 0.0 || p10 < 0.003))
                         {
                             alignLastStep = 0.0;
-                            g_sleepShiftUs.fetch_sub(2000); alignShiftTot -= 0.002;
+                            shiftUs.fetch_sub(2000); alignShiftTot -= 0.002;
                             alignTarget = std::min(0.005, alignTarget + 0.001);
                             alignCleanSecs = 0; alignCoolT = t + 2.0;
                         }
@@ -3698,7 +3702,7 @@ static DWORD WINAPI PresenterThread(void *)
                             if (alignExcessSecs >= 2)
                             {
                                 const double step = std::min(0.003, 0.5 * excess);
-                                g_sleepShiftUs.fetch_add((int)(step * 1e6)); alignShiftTot += step; alignLastStep = step;
+                                shiftUs.fetch_add((int)(step * 1e6)); alignShiftTot += step; alignLastStep = step;
                             }
                             if (alignLastLog < 0.0 || t - alignLastLog > 30.0)
                             {
@@ -4285,19 +4289,23 @@ static void FgPaceAfterPresent()
     const int us = g_fgPaceUs.load();
     if (us <= 0 || GetCurrentThreadId() != g_fgGameTid.load()) return;
     static thread_local HANDLE timer = nullptr;
-    static double nextT = 0.0;
+    static double nextT = 0.0, phase = 0.0;   // phase: where on the vblank grid frames start (moved by the alignment)
     if (!timer) timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /*HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
     const double iv = us * 1e-6;
     const double now = Now();
     if (nextT <= 0.0 || now > nextT + iv || nextT - now > 2.0 * iv) nextT = now;   // start, a hitch, or a changed limit
     const int sh = g_fgShiftUs.exchange(0);
-    if (sh != 0) nextT += sh * 1e-6;
+    if (sh != 0) { nextT += sh * 1e-6; phase += sh * 1e-6; }
     // On the display's vblank grid (the last vblank the presenter saw): the interval is a whole number of refreshes,
     // so frame generation's two frames keep the same place against the flashes instead of drifting until both
     // land in one strobe cycle (Riven: then only 30 of 60 frames a second were shown).
     {
         const double tick = g_tickT.load(), per = g_lrPeriod.load();
-        if (tick > 0.0 && per > 0.0 && now - tick < 0.1) nextT = tick + std::floor((nextT - tick) / per + 0.5) * per;
+        if (tick > 0.0 && per > 0.0 && now - tick < 0.1)
+        {
+            const double ph = std::fmod(phase, per);
+            nextT = tick + ph + std::floor((nextT - tick - ph) / per + 0.5) * per;
+        }
     }
     while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
     SleepUntil(nextT, timer);
