@@ -3146,8 +3146,14 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 const int was = g_fgPaceUs.exchange(want);
                 if ((was > 0) != (want > 0))
-                    LOGI("BFI Presenter: frame limit for frame generation without Reflex %s (%d us per rendered frame, "
-                         "game thread %lu, %dx)", want > 0 ? "on" : "off", want, (unsigned long)gtid, fgFact);
+                {
+                    const char *why = want > 0 ? "" : !s.fgLimitNoReflex ? ": switched off" : fgFact <= 1 ? ": no frame generation" :
+                                      g_status.rfxGameUses ? ": the game reports Reflex" : !s.enabled ? ": BFI off" :
+                                      userCap != 1 ? ": needs the Refresh rate cap" : s.frames < 2 ? ": needs 2+ frames per cycle" :
+                                      ": under 28 rendered fps";
+                    LOGI("BFI Presenter: frame limit for frame generation without Reflex %s%s (%d us per rendered frame, "
+                         "game thread %lu, %dx)", want > 0 ? "on" : "off", why, want, (unsigned long)gtid, fgFact);
+                }
                 g_status.fgLimitUs = want;
             }
             DXGI_FRAME_STATISTICS st = {};
