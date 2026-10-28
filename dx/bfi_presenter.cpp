@@ -3632,7 +3632,9 @@ static DWORD WINAPI PresenterThread(void *)
                     // after 10 s in a row with under 90% of the frames reaching a flash or 6 ms slower, at most once
                     // a minute. Riven: 29 ms (start +8.3 ms in the cycle) against 34-45 ms at the other start times.
                     static int swIdx = -1, swN = 0, swSecs = 0, swBad = 0, swShown = 0, swRelN = 0, swRep = 0;
-                    static double swPhase = 0.0, swStart = 0.0, swDoneT = -1.0, swBestMs = 0.0, swRel = 0.0, swScore[16] = {}, swRelMs[16] = {};
+                    static double swPhase = 0.0, swStart = 0.0, swDoneT = -1.0, swBestMs = 0.0, swRel = 0.0, swScore[16] = {}, swRelMs[16] = {},
+                                  swSlack = 1.0, swSlackK[16] = {};
+                    static int swTight = 0;
                     static int swShownK[16] = {};
                     static bool swWasOn = false;
                     if (fgOn && !swWasOn) { swDoneT = -1.0; swIdx = -1; swBad = 0; }
@@ -3658,17 +3660,21 @@ static DWORD WINAPI PresenterThread(void *)
                         }
                         else if (swIdx >= 0)
                         {
-                            if (!ok) { swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; }
+                            if (!ok) { swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swSlack = 1.0; }
                             else if (++swSecs >= 2)
                             {
                                 swShown += relN; swRel += relSum; swRelN += relN; swRep += stNow.frameRepeats;
+                                if (p10 >= 0.0) swSlack = std::min(swSlack, p10);
                                 if (swSecs >= 3)
                                 {
                                     const double relMs = swRelN ? swRel / swRelN : 1e3;
                                     const bool full = swShown >= (int)(2.0 * capFps * 0.97) && swRep <= 2;
-                                    swScore[swIdx] = full ? relMs : 1e3 + (2.0 * capFps - swShown);
-                                    swRelMs[swIdx] = relMs; swShownK[swIdx] = swShown;
-                                    swIdx++; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0;
+                                    // Every frame shown, and frames ready at least 3 ms before their flash: the quickest start
+                                    // right at the edge lost frames as soon as the GPU work grew (Riven: 29 ms, then 40-50 ms
+                                    // with 53-58 of 60 shown while OptiScaler's denoiser went from 2.6 to 7 ms a frame).
+                                    swScore[swIdx] = !full ? 1e3 + (2.0 * capFps - swShown) : swSlack < 0.003 ? 100.0 + relMs : relMs;
+                                    swRelMs[swIdx] = relMs; swShownK[swIdx] = swShown; swSlackK[swIdx] = swSlack;
+                                    swIdx++; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swSlack = 1.0;
                                     const double start = swStart;
                                     if (swIdx < swN) moveTo(start + swIdx * cyc / swN);
                                     else
@@ -3679,10 +3685,10 @@ static DWORD WINAPI PresenterThread(void *)
                                         swIdx = -1; swDoneT = t; swBestMs = swRelMs[best];
                                         char list[400]; int len = 0;
                                         for (int k = 0; k < swN && len < (int)sizeof(list) - 32; k++)
-                                            len += snprintf(list + len, sizeof(list) - len, " %.1f:%d/%.0f", k * cyc / swN * 1000.0,
-                                                            swShownK[k], swRelMs[k]);
+                                            len += snprintf(list + len, sizeof(list) - len, " %.1f:%d/%.0f/%.1f", k * cyc / swN * 1000.0,
+                                                            swShownK[k], swRelMs[k], swSlackK[k] < 1.0 ? swSlackK[k] * 1000.0 : -1.0);
                                         LOGI("BFI Presenter: frame limit for frame generation lined up with the flash: start %+.1f ms "
-                                             "in the cycle, %.1f ms from release to flash, %d of %.0f frames shown (start ms:shown/ms --%s)",
+                                             "in the cycle, %.1f ms from release to flash, %d of %.0f frames shown (start ms:shown/ms/ready ms before the flash --%s)",
                                              best * cyc / swN * 1000.0, swRelMs[best], swShownK[best], 2.0 * capFps, list);
                                     }
                                 }
@@ -3690,7 +3696,18 @@ static DWORD WINAPI PresenterThread(void *)
                         }
                         // Held: tried again after 10 s in a row with under 90% of the frames shown, or 6 ms or more
                         // slower than the start time found.
-                        else swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + 6.0))) ? swBad + 1 : 0;
+                        else
+                        {
+                            swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + 6.0))) ? swBad + 1 : 0;
+                            // Held, frames repeating close to their flash (the GPU work grew): 2 ms earlier, once per 3 s.
+                            swTight = (ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.0015) ? swTight + 1 : 0;
+                            if (swTight >= 3)
+                            {
+                                swTight = 0;
+                                moveTo(swPhase - 0.002);
+                                LOGI("BFI Presenter: frame limit for frame generation: frames repeated close to their flash -- 2 ms earlier");
+                            }
+                        }
                     }
                     if (s.reflexAlign && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
                     {
