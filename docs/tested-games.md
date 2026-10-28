@@ -29,7 +29,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Shadow of the Tomb Raider | Working | Works (OptiScaler FSR 3.1 FG) | v0.2 | Standard setup |
 | Alan Wake 2 | Working | Works (2×, 3×); 3×: Refresh + automatic frame cap, or Half refresh + Apply the cap with Reflex's frame limit (v1.0.19) | v0.19 | Standard setup |
 | God of War Ragnarök | Working | Runs, but judders below 60 output fps | v0.24 | Standard setup; RTSS limiter off |
-| Riven (2023) | Working | Works (OptiScaler XeSS FG, limited to 60) | v0.13 | A steady 60 fps for smooth motion; with DLSS 5 at 4K, XeSS frame generation through OptiScaler limited to 60 (see the notes below) |
+| Riven (2023) | Working | Works (OptiScaler XeSS FG; Refresh + the presenter's frame limit since v1.0.25) | v0.13 | A steady 60 fps for smooth motion; with DLSS 5 at 4K, XeSS frame generation through OptiScaler (see the notes below) |
 | Onimusha | Working | Works (2×, 3×); with DLSS 5 (ShortFuse's injector or OptiScaler NR) and 2×: Refresh + automatic frame cap, 60 of 60 (v1.0.19) | v0.27 | Standard setup; see the notes below for DLSS 5 |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
 | Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency (Refresh + automatic frame cap also works) |
@@ -124,7 +124,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Split Fiction | Standard setup |
 | Spyro Reignited Trilogy | Standard setup |
 | Stray | Standard setup |
-| The Callisto Protocol | Standard setup |
+| The Callisto Protocol | Standard setup, frame generation off: Refresh cap + automatic frame cap holds 60 of 60 with just-in-time release, about 25 ms from release to flash. XeSS frame generation through OptiScaler runs with the frame limit for frame generation without Reflex (v1.0.25: 30 rendered / 60 presented, about 29–35 ms), but bright lights flicker under BFI as in Returnal, and XeSS frame generation drops out now and then |
 | The Dark Pictures Anthology: Directive 8020 | Works with DLSS 5 and FG 2× (Refresh cap) |
 | The Elder Scrolls IV: Oblivion Remastered | Works with DLSS 5; frame generation off (artifacts). 2 frames per cycle at Half refresh + Smooth + Apply the cap with Reflex's frame limit (see the notes below) |
 | The Last of Us Part I | Works with DLSS 5. Needs `TypedBackBufferDesc=1` (the default; it crashed without it) |
@@ -192,6 +192,10 @@ Also tested and working with the standard setup above. Their notes weren't recor
     r.NGX.DLSS.DilateMotionVectors=0
     ```
   - Presenter: **Refresh rate** cap with the **automatic frame cap off**, Frame pacing Lowest latency. The presenter's own Half cap held XeSS frame generation's presents and the game window stopped responding for seconds at a time; at 72 frame-generated fps without the limit, motion stuttered (12 frames a second dropped unevenly).
+- **v1.0.25: the presenter's frame limit instead of OptiScaler's.** Set `FramerateLimit = 0` in `OptiScaler.ini` (the rest as above) and keep **Frame limit for frame generation without Reflex** on (default) with the **Refresh rate** cap and **Lowest latency** pacing. The presenter recognises XeSS frame generation as 2× and holds the game to 30 rendered / 60 presented at 120 Hz, timed to the flash: 60 of 60 flashes in most seconds, about 38 ms from release to flash (about 43 ms with OptiScaler's limit). ReShade.log shows "frame generation without Reflex: 2x" and "frame limit for frame generation without Reflex on".
+  - Edit `OptiScaler.ini` only with the game closed: OptiScaler writes its settings back on exit. With `HighResMV = true` saved there, XeSS frame generation stopped generating ("motion vector and depth resource resolutions must match" in OptiScaler.log); keep `HighResMV = auto`.
+  - FSR frame generation through OptiScaler presents every frame from its own thread, so the presenter doesn't recognise it yet: keep `FramerateLimit = 60` for it. `ForceBorderless = true` in `OptiScaler.ini` also keeps the game from switching to fullscreen.
+  - The game crashes on exit in OptiScaler (`_nvngx.dll` through its `dxgi.dll`), also in Obduction; not the presenter.
 
 ### Onimusha
 
