@@ -3854,7 +3854,8 @@ static bool StopPresenter()
             const DWORD now = GetTickCount();
             if ((LONG)(until - now) <= 0)
             {
-                // Keep everything it may touch alive and leave it be.
+                // Keep everything it may touch alive and leave it be. Where it is stuck goes to the log first.
+                LogThreadStack(GetThreadId(g_thread), "presenter thread (not stopping)");
                 g_presenterStuck.store(true);
                 g_presenterFailed.store(true);
                 LOGE("BFI Presenter: presenter thread did not stop within 5 s -- BFI is off until the game restarts "
