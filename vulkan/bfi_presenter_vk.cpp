@@ -57,7 +57,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.23"
+#define BFI_VERSION "1.0.24-d3"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -1400,7 +1400,7 @@ static void PresenterThread(Swapchain *sc)
     int autoAhead = 1, missSecs = 0, spareSecs = 0;
     double fseRetryT = 0.0; int fseShown = -2;
     // presentation health: slow image returns per second, automatic rebuild
-    int slowCount = 0, slowRun = 0, goodRun = 0;
+    int slowCount = 0, slowRun = 0, goodRun = 0, lastSlow = 0; bool kMark = false;
     bool afterRebuild = Now() - g_lastRebuildT < 20.0, rebuildReq = false, kRebuild = false;
     double slowSecT = Now();
     // Uneven strobe cycles over the last 30 seconds (one count per second), so
@@ -2061,6 +2061,9 @@ static void PresenterThread(Swapchain *sc)
         // chain does: the game is asked to rebuild it (Ctrl+Shift+O by hand).
         if ((tFence - tAcq) > 0.002 || (tAcq - tVb) > 0.002) slowCount++;
         {
+            const bool mNow = KeyCombo('K');
+            if (mNow && !kMark) LOGI("BFI Presenter: [diag] ---- Ctrl+Shift+K marker ----");
+            kMark = mNow;
             const bool kNow = KeyCombo('O');
             // (held keys aren't taken again by the new swap chain's presenter right after a rebuild)
             if (kNow && !kRebuild && t - g_lastRebuildT > 1.0) { rebuildReq = true; LOGI("BFI Presenter: Ctrl+Shift+O -- rebuilding the swap chain"); }
@@ -2114,7 +2117,7 @@ static void PresenterThread(Swapchain *sc)
                     LOGI("BFI Presenter: automatic recovery -- waiting: the last rebuild was %.0f s ago (%.0f s apart)", t - g_lastRebuildT,
                          g_rebuildGap);
             }
-            slowCount = 0;
+            lastSlow = slowCount; slowCount = 0;
         }
         if (rebuildReq)
         {
@@ -2291,6 +2294,22 @@ static void PresenterThread(Swapchain *sc)
                     }
                     else badSecs = 0;
                     g_status.rfxLimitUs = g_vkSleepLimitUs.load();
+                    // [diag] the vote's inputs each second while a frame-generation DLL is loaded and the limit is off
+                    // or the vote disagrees; otherwise every 10 s.
+                    {
+                        static double diagT = 0.0;
+                        const bool odd = fgWas && (want == 0 || cand != f || stallSec);
+                        if (odd || t - diagT >= 10.0)
+                        {
+                            diagT = t;
+                            LOGI("BFI Presenter: [diag] fg: %.0f presents/s, %ld sleeps/s%s%s%s, vote %dx (%d s), factor %dx, limit %d us%s, "
+                                 "frames ahead %d, %d slow image returns, refreshes %.0f/s",
+                                 fpsA, rend, sleeping ? "" : " (no sleep)", hitchPaused ? ", hitch paused" : "",
+                                 stallSec ? ", stall (not counted)" : "", cand, fgRun, f, want,
+                                 g_vkRfxBad.load() ? " (off for the session)" : "", (int)sc->maxAhead.load(), lastSlow,
+                                 g_status.refreshHz);
+                        }
+                    }
                 }
                 bool down = sc->autoCapDown.load();
                 if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg)
