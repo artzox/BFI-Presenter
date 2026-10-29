@@ -8,7 +8,7 @@ x86_64-w64-mingw32-g++ -O2 -std=c++17 -shared -static \
     -I "$TP/reshade/include" -I "$TP/mingw-shim" \
     bfi_presenter.cpp -o BFIPresenter.addon64 \
     -ld3d12 -ldxgi -luser32 -ldxguid -lole32 -ladvapi32
-i686-w64-mingw32-g++ -O2 -std=c++17 -shared -static \
+i686-w64-mingw32-g++ -O2 -std=c++17 -msse2 -mfpmath=sse -shared -static \
     -I "$TP/reshade/include" -I "$TP/mingw-shim" \
     bfi_presenter.cpp -o BFIPresenter.addon32 \
     -ld3d12 -ldxgi -luser32 -ldxguid -lole32 -ladvapi32
