@@ -3251,6 +3251,8 @@ Game MotionTestGame()
     g.name = "BFI Motion Test";
     g.store = "Tool";
     g.root = MotionTestDir();
+    g.exes = { MotionTestExe() };   // the scan picks the exe; this entry is made outside it
+    g.exe = MotionTestExe();
     v.push_back(g);
     DetectAll(v);
     return v.empty() ? Game() : v[0];
