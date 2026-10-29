@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v1"
+#define BFI_VERSION "1.0.27-v2"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -265,6 +265,7 @@ struct Settings
     float peakNits = 1400.0f; // display peak (HDR ceiling)
     int   output   = -1;      // -1 auto, 0 SDR, 1 scRGB, 2 HDR10
     int   autoCap  = 1;       // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
+    int   fgDllCheck = 1;     // FrameGenDllCheck: a loaded frame generation DLL counts as frame generation (games without Reflex)
     int   gameCap  = 1;       // 0 off, 1 refresh rate, 2 half refresh, 3 quarter refresh,
                               // 4 one game frame per strobe cycle (refresh / Frames), 5 refresh / CapDivisor
     int   capDivisor = 3;    // cap 5: release the game every this many refreshes (1-8)
@@ -353,6 +354,7 @@ static void LoadSettings(Settings &s)
     s.pacingMode = KvInt(kv, "FramePacing", 1) ? 1 : 0;
     s.capJit = KvInt(kv, "CapJustInTime", 1) ? 1 : 0;
     s.autoCap = KvInt(kv, "AutoFrameCap", 1) ? 1 : 0;
+    s.fgDllCheck = KvInt(kv, "FrameGenDllCheck", 1) ? 1 : 0;
     s.laterRelease = KvInt(kv, "LaterRelease", 0) ? 1 : 0;
     s.laterReleaseMs = Clamp(KvFloat(kv, "LaterReleaseMarginMs", 1.5f), 0.5f, 5.0f);
     s.maxAhead = Clamp(KvInt(kv, "MaxFramesAhead", 1), 0, 3);
@@ -394,7 +396,7 @@ static void LoadSettings(Settings &s)
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
     I("RollingScan", s.rolling); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
-    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
+    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
@@ -2279,14 +2281,26 @@ static void PresenterThread(Swapchain *sc)
             {
                 const double hzA = vb.modeHz > 0.0 ? vb.modeHz : 0.0;
                 bool fg = false;
+                // A loaded frame generation DLL: games without Reflex give no other sign of frame generation. Some load
+                // one without using it (the Driveclub recomp: 60 presented, 60 rendered, frame generation off), so
+                // FrameGenDllCheck=0 turns this off, and games that call Reflex's sleep go by its frame counts instead.
+                const char *fgDll = nullptr;
 #ifdef _WIN32
                 for (const char *dll : { "nvngx_dlssg.dll", "sl.dlss_g.dll", "ffx_frameinterpolation_x64.dll", "libxess_fg.dll" })
-                    if (GetModuleHandleA(dll)) fg = true;
+                    if (!fgDll && GetModuleHandleA(dll)) fgDll = dll;
 #endif
-                if (fg != fgWas)
+                const bool reflexSleeps = Now() - g_vkSleepLastT.load() < 2.0;
+                if (fgDll && s.fgDllCheck && !reflexSleeps) fg = true;
+                if ((fgDll != nullptr) != fgWas)
                 {
-                    fgWas = fg;
-                    if (fg && s.autoCap) LOGI("BFI Presenter: frame generation DLL loaded -- the automatic frame cap stays at Refresh rate");
+                    fgWas = fgDll != nullptr;
+                    if (fgDll && s.autoCap)
+                    {
+                        if (!s.fgDllCheck) LOGI("BFI Presenter: frame generation DLL loaded (%s) -- not counted (FrameGenDllCheck=0)", fgDll);
+                        else if (reflexSleeps) LOGI("BFI Presenter: frame generation DLL loaded (%s) -- going by the game's Reflex frame counts", fgDll);
+                        else LOGI("BFI Presenter: frame generation DLL loaded (%s) -- the automatic frame cap stays at Refresh rate "
+                                  "(FrameGenDllCheck=0 in the ini if the game doesn't use it)", fgDll);
+                    }
                 }
                 const double fpsA = g_status.gameFps;
                 // Frame generation from the game's Reflex sleep calls (one per rendered frame): presents well above
