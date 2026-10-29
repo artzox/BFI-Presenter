@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e11"
+#define BFI_ADDON_VERSION "1.0.27-e12"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -129,6 +129,7 @@ struct Settings
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   reflexAlign = 0;    // Reflex frame limit at the sleep point lined up with the lit refresh's pick (test)
+    int   reflexAlignCoarse = 1; // ReflexAlignCoarse: frames ready far ahead of the pick are moved closer once (ReflexAlign off)
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap without Reflex holds the game before its next frame starts
@@ -270,6 +271,7 @@ static void LoadSettings(Settings &s)
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
     s.reflexAlign = IniInt("ReflexAlign", 0) ? 1 : 0;
+    s.reflexAlignCoarse = IniInt("ReflexAlignCoarse", 1) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
@@ -421,6 +423,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("AutoFrameCap", s.autoCap);
     IniWriteInt("CapWithReflex", s.capReflex);
     IniWriteInt("ReflexAlign", s.reflexAlign);
+    IniWriteInt("ReflexAlignCoarse", s.reflexAlignCoarse);
     IniWriteInt("FrameGenLimitWithoutReflex", s.fgLimitNoReflex);
     IniWriteInt("AutoCapAtFrameStart", s.autoCapFrameStart);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
@@ -3896,6 +3899,42 @@ static DWORD WINAPI PresenterThread(void *)
                         }
                     }
                     else { alignCleanSecs = 0; alignLastStep = 0.0; alignExcessSecs = 0; alignIdle = true; }
+                    // Coarse alignment (ReflexAlign off): each time the Reflex frame limit comes on, its frames land anywhere
+                    // in the strobe cycle. Ready 10-13 ms before the pick they only wait there (Dead Space: 29-33 ms from frame
+                    // start to flash, against 24-25 ms in stretches where they landed 1-5 ms before it). After 3 s in a row
+                    // with the 10th percentile above 7 ms the wake-up is moved later once, to 4 ms before the pick -- far
+                    // enough from it that varying frame times don't repeat frames (Spider-Man 2 with the fine alignment).
+                    // A frame repeated close to the pick soon after a move: 3 ms back and 2 ms more to spare (at most 8 ms).
+                    // Not within a minute of the "moving them earlier" nudge, at most once per 20 s.
+                    {
+                        static int coarseSecs = 0;
+                        static double coarseT = -1e9, coarseTarget = 0.004, coarseHoldT = -1e9;
+                        if (t < phaseUntil) coarseHoldT = t + 60.0;
+                        if (!s.reflexAlign && s.reflexAlignCoarse && atSleepNoFg && holds && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
+                        {
+                            if (t - coarseT < 10.0 && stNow.frameRepeats >= 2 && p10 < 0.002)
+                            {
+                                shiftUs.fetch_sub(3000); alignShiftTot -= 0.003;
+                                coarseTarget = std::min(0.008, coarseTarget + 0.002);
+                                coarseT = -1e9; coarseSecs = 0;
+                                LOGI("BFI Presenter: Reflex frame limit: frames repeated after moving them later -- 3 ms back, "
+                                     "%.0f ms to spare from now on", coarseTarget * 1000.0);
+                            }
+                            else
+                            {
+                                coarseSecs = (p10 > coarseTarget + 0.003 && stNow.frameRepeats == 0) ? coarseSecs + 1 : 0;
+                                if (coarseSecs >= 3 && t - coarseT >= 20.0 && t >= coarseHoldT)
+                                {
+                                    const double step = std::min(p10 - coarseTarget, 0.9 * cyc);
+                                    shiftUs.fetch_add((int)(step * 1e6)); alignShiftTot += step;
+                                    coarseT = t; coarseSecs = 0;
+                                    LOGI("BFI Presenter: Reflex frame limit: game frames ready %.1f ms before the lit refresh's pick "
+                                         "-- moving them %.1f ms later", p10 * 1000.0, step * 1000.0);
+                                }
+                            }
+                        }
+                        else coarseSecs = 0;
+                    }
                     EnterCriticalSection(&g_cfgLock);
                     g_status.alignSlackMs = p10 >= 0.0 ? p10 * 1000.0 : -1.0;
                     g_status.alignShiftMs = alignShiftTot * 1000.0;
@@ -8681,7 +8720,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                                   "before the lit refresh picks it, instead of waiting there for up to a whole strobe cycle.\n"
                                                                   "Needs Lowest latency pacing. Best in games with steady frame times (God of War Ragnarok: about\n"
                                                                   "7 ms less from release to flash); in games whose frame times vary it gains little and can\n"
-                                                                  "repeat a frame now and then (Spider-Man 2). Off by default.");
+                                                                  "repeat a frame now and then (Spider-Man 2). Off by default. With it off, frames ready more than\n"
+                                                                  "7 ms before the pick are still moved to 4 ms before it once (ReflexAlignCoarse=1 in the ini).");
                     if (s.reflexAlign)
                     {
                         ImGui::SameLine();
