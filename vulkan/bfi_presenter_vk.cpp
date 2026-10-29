@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v3"
+#define BFI_VERSION "1.0.27-v4"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -4870,11 +4870,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 if (s.autoCapFrameStart && down && !probe && !fgA)
                 {
                     int fst; double fsl; { std::lock_guard<std::mutex> l(g_cfgLock); fst = g_status.fsState; fsl = g_status.fsLeadMs; }
-                    ImGui::SameLine();
-                    if (fst == 1) ImGui::TextDisabled("(checking)");
-                    else if (fst == 2) ImGui::TextDisabled("(trying start times)");
-                    else if (fst == 3) ImGui::TextDisabled("(in use: released %.1f ms before the flash)", fsl);
-                    else if (fst == 4) ImGui::TextDisabled("(not needed: frames are ready just before the flash)");
+                    // SameLine only with a status to show: left pending, it put the next checkbox (just-in-time
+                    // release) on this line, over this one.
+                    char fsTxt[96] = "";
+                    if (fst == 1) snprintf(fsTxt, sizeof(fsTxt), "(checking)");
+                    else if (fst == 2) snprintf(fsTxt, sizeof(fsTxt), "(trying start times)");
+                    else if (fst == 3) snprintf(fsTxt, sizeof(fsTxt), "(in use: released %.1f ms before the flash)", fsl);
+                    else if (fst == 4) snprintf(fsTxt, sizeof(fsTxt), "(not needed: frames are ready just before the flash)");
+                    if (fsTxt[0]) { ImGui::SameLine(); ImGui::TextDisabled("%s", fsTxt); }
                 }
                 ImGui::Unindent(16.0f);
             }
