@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e3"
+#define BFI_ADDON_VERSION "1.0.27-e4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3564,7 +3564,7 @@ static DWORD WINAPI PresenterThread(void *)
                             capProbe = false; capDownSecs = capUpSecs = 0; capSwitchT = t;
                             if (probeGood >= 2)
                             {
-                                probeWait = 30.0;
+                                // probeWait is kept: it is reset only after a stay at Refresh rate of 30 s or more (below)
                                 LOGI("BFI Presenter: automatic frame cap: Refresh rate -- the game holds %.0f fps", fpsA);
                             }
                             else
@@ -3585,6 +3585,11 @@ static DWORD WINAPI PresenterThread(void *)
                             // next return waits longer.
                             if (t - capUpT < 30.0) stayMin = stayMin * 2.0 > 120.0 ? 120.0 : stayMin * 2.0;
                             else stayMin = 10.0;
+                            // The same for the try at Refresh rate without Reflex reports: a game that holds the refresh
+                            // rate only in lighter scenes went up and down every 30 s (Alan Wake: 120 fps for 3 s, then 96),
+                            // and each time the frame start was looked for again.
+                            if (t - capUpT < 30.0) probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
+                            else probeWait = 30.0;
                             autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames,
@@ -3701,7 +3706,21 @@ static DWORD WINAPI PresenterThread(void *)
                     static int swTight = 0;
                     static int swShownK[16] = {};
                     static bool swWasOn = false;
-                    if (fgOn && !swWasOn) { swDoneT = -1.0; swIdx = -1; swBad = 0; }
+                    // The automatic frame cap at the frame start keeps the start time it found while the cap goes up to
+                    // Refresh rate and back down (within 10 minutes): looking again each time showed its bad start
+                    // times every 30 s (Alan Wake: 30 of 60 frames for seconds at a time). Frame generation looks again.
+                    {
+                        static int swKind = 0; static double swOffT = -1e9;
+                        const int kindNow = g_fgPaceKind.load();
+                        if (!fgOn && swWasOn) swOffT = t;
+                        if (fgOn && !swWasOn)
+                        {
+                            const bool keep = kindNow == 2 && swKind == 2 && swIdx < 0 && swDoneT >= 0.0 && t - swOffT < 600.0;
+                            if (keep) { swBad = 0; swDoneT = t; LOGI("BFI Presenter: automatic frame cap at the frame start: start time kept from before"); }
+                            else { swDoneT = -1.0; swIdx = -1; swBad = 0; }
+                        }
+                        if (fgOn) swKind = kindNow;
+                    }
                     swWasOn = fgOn;
                     if (fgOn && locked && s.pacingMode == 1 && cyc > 0.0)
                     {
@@ -3737,7 +3756,10 @@ static DWORD WINAPI PresenterThread(void *)
                             {
                                 swShown += relN; swRel += relSum; swRelN += relN; swRep += stNow.frameRepeats;
                                 if (p10 >= 0.0) swSlack = std::min(swSlack, p10);
-                                if (swSecs >= settle + 1)
+                                // The automatic frame cap at the frame start: a start time that loses frames in its first
+                                // measured second is left at once (it showed for 3 s each before).
+                                const bool dropEarly = g_fgPaceKind.load() == 2 && swSecs == settle && relN < (int)(0.9 * capFps);
+                                if (swSecs >= settle + 1 || dropEarly)
                                 {
                                     const double relMs = swRelN ? swRel / swRelN : 1e3;
                                     const bool full = swShown >= (int)(2.0 * capFps * 0.97) && swRep <= 2;
