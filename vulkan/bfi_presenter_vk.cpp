@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v7"
+#define BFI_VERSION "1.0.27-v8"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -2334,7 +2334,10 @@ static void PresenterThread(Swapchain *sc)
                     const long rend = g_vkSleepSec.exchange(0);
                     const bool sleeping = Now() - g_vkSleepLastT.load() < 2.0 && rend > 0;
                     int cand = 1;
-                    if (sleeping && fpsA > 1.5 * rend) cand = std::max(2, std::min(4, (int)(fpsA / rend + 0.5)));
+                    // Only with a frame generation DLL loaded: RPCS3 calls its Reflex sleep once per emulated frame and
+                    // presents each frame twice (God of War Collection: 120 presented, 60 slept), which looks the same, and
+                    // the limit for frame generation then held it to 30 game frames a second.
+                    if (sleeping && fpsA > 1.5 * rend && fgDll) cand = std::max(2, std::min(4, (int)(fpsA / rend + 0.5)));
                     // A second with far fewer presents than rendered frames is a stall or a rebuilt swap chain (its first
                     // second: 3 presented, 34 rendered), not frame generation switching off: it doesn't count. It switched
                     // the limit off after every rebuild in Indiana Jones.
