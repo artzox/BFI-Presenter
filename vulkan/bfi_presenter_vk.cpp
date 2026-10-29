@@ -2299,7 +2299,7 @@ static void PresenterThread(Swapchain *sc)
                 const double hzA = vb.modeHz > 0.0 ? vb.modeHz : 0.0;
                 bool fg = false;
                 // A loaded frame generation DLL: games without Reflex give no other sign of frame generation. Some load
-                // one without using it (the Driveclub recomp: 60 presented, 60 rendered, frame generation off), so
+                // one without using it (DriveClub-PC: 60 presented, 60 rendered, frame generation off), so
                 // FrameGenDllCheck=0 turns this off, and games that call Reflex's sleep go by its frame counts instead.
                 const char *fgDll = nullptr;
 #ifdef _WIN32
@@ -2495,7 +2495,7 @@ static void PresenterThread(Swapchain *sc)
                 // 8 of them, 1 s to settle and 2 s measured each (one that loses frames in its first measured second is
                 // left at once): kept is the one with every frame shown and the shortest release -> flash, with 3 ms
                 // to spare first. Looked for only when frames wait at least 3 ms for the pick at the usual release
-                // (3 s checked first): games that pace themselves on a clock of their own (the Driveclub recomp:
+                // (3 s checked first): games that pace themselves on a clock of their own (DriveClub-PC:
                 // frames ready 0-1.5 ms before the pick, 6-12 ms from frame to flash) gain nothing and are left as
                 // they are, and a start time no quicker than the usual release by 1 ms isn't used either. Only while
                 // the game holds the cap; looked for again after 5 s of lost or 6 ms slower frames (at most every

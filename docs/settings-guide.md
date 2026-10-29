@@ -193,7 +193,7 @@ Why the limit is applied at the start of the frame (the game's Reflex sleep, or 
 
 **Hold at the frame start** · `AutoCapAtFrameStart` · default: on · games without Reflex (or with **Presenter's own cap without frame generation**), Lowest latency pacing\
 When the automatic frame cap steps down to one game frame per strobe cycle, the game is held right after its present, before it reads input for the next frame, instead of its finished frame waiting at the present. The moment it is let go matters: let go too early, the finished frame waits for its flash; too late, it misses it. So the presenter tries 8 start times across one strobe cycle (about 24 seconds) and keeps the one where every frame is shown soonest, with about 3 ms to spare. It keeps that start time while the cap tries Refresh and comes back, and looks again after a few seconds of lost frames. It looks only while the game holds the cap, not in scenes too heavy for it. Results from frame start to flash at 60 of 120 Hz (v1.0.27): Tomb Raider about 19 ms against 25 ms with the old cap, Obduction 23 against 25, No Rest for the Wicked 19 against 23, Resident Evil 4 about 27 against about 30.\
-**Vulkan:** the layer already held the game before its next frame, at the refresh before the lit one. Now it tries start times the same way when frames wait 3 ms or more for their flash, and keeps one only if it is at least 1 ms quicker (P.T.: 19 ms from release to flash against 25 ms). Games that pace themselves gain less (about 4 ms in the Driveclub recomp).\
+**Vulkan:** the layer already held the game before its next frame, at the refresh before the lit one. Now it tries start times the same way when frames wait 3 ms or more for their flash, and keeps one only if it is at least 1 ms quicker (P.T.: 19 ms from release to flash against 25 ms). Games that pace themselves gain less (about 4 ms in DriveClub-PC).\
 *When to change it:* leave on. The overlay shows the search and the start time in use.
 
 **Frame pacing** · `FramePacing` · default: Lowest latency (new ini files)
@@ -321,7 +321,7 @@ For SDR games and emulators with Windows HDR on: the picture is sent as HDR so t
 *When to change it:* set SDR white to taste; set highlights to 0 for a faithful SDR look.
 
 **Frame generation DLL counts** · `FrameGenDllCheck` · default: on\
-Games without NVIDIA Reflex don't tell the layer when frame generation is on, so a loaded frame-generation DLL (DLSS-G, FSR or XeSS frame generation) counts as on, and the automatic frame cap stays at Refresh. Some games and add-ons load one without using it (the RenoDX DLSS add-on loads DLSS-G's; the Driveclub recomp). `BFIPresenterVK.log` names the DLL.\
+Games without NVIDIA Reflex don't tell the layer when frame generation is on, so a loaded frame-generation DLL (DLSS-G, FSR or XeSS frame generation) counts as on, and the automatic frame cap stays at Refresh. Some games and add-ons load one without using it (the RenoDX DLSS add-on loads DLSS-G's; DriveClub-PC). `BFIPresenterVK.log` names the DLL.\
 *When to change it:* set to 0 (in the ini) for a game where the log names a frame-generation DLL but frame generation is off, so the automatic frame cap works. Leave it on wherever you do use frame generation.
 
 Without ReShade, edit `BFIPresenter.ini` and save: Vulkan games pick up the change within a second.
