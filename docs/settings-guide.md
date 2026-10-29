@@ -164,10 +164,32 @@ Limits how fast the game runs so it stays in step with the flashing.
 
 *When to change it:* leave it at Refresh and let the automatic frame cap (below) step down when the game can't keep up. Pick Half yourself if you'd rather it stays at 60 fps. With frame generation (DLSS FG, FSR FG, Lossless Scaling) use Refresh with the automatic frame cap: in Reflex games it steps down with Reflex's frame limit, quicker than Half refresh since v1.0.19 even when the output is only about the strobe rate (Alan Wake 2 with 3×: about 42 ms from frame start to the GPU against about 140 ms). Without Reflex, when the output is only about the strobe rate (e.g. 60 at 120 Hz: 2× at about 30 rendered fps, 3× at about 20), Half refresh + Smooth shows every generated frame.
 
-**Automatic frame cap** · `AutoFrameCap` · default: on\
-Works with the Refresh rate cap. When the game can't hold the refresh rate (e.g. 90 fps at 120 Hz), some images would be shown twice and others skipped, which judders. So BFI Presenter steps down to one game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames per cycle): every flash shows the next image. It goes back to Refresh when the game has headroom again: games with NVIDIA Reflex report how long their frames take; for the others it tries Refresh for about 3 seconds, after 30 s, then 60 s, then every 2 minutes while the game still can't hold it.\
-In DirectX games with NVIDIA Reflex (every DLSS frame-generation game) it steps down with Reflex's frame limit instead, one presented frame per strobe cycle (e.g. 60 at 120 Hz), with frame generation or without: the game and its generated frames are paced at the start of each frame, and every flash gets the next one. Tick **Presenter's own cap without frame generation** (`AutoCapOwnWithoutFg=1`) to use the presenter's cap with just-in-time release while frame generation is off; it then follows frame generation being switched on and off. With frame generation it then tries Refresh only every 5 minutes. The presenter applies the limit itself, in the game's own Reflex sleep call at the start of each frame (since v1.0.19): the driver's limit counts the presenter's own presents, and some games collapsed under it to about 7 fps (The Witcher 3, Returnal, Pragmata). Games that call their Reflex sleep more than once per frame (DLSS 5 injectors with frame generation in Onimusha) keep the driver's limit. If a game still falls far below the limit, the presenter stops using it for the rest of the session and caps with its own cap. Without Reflex, frame generation keeps it at Refresh; the DirectX add-on limits it with **Frame limit for frame generation without Reflex** instead (below). In the Vulkan layer (v1.0.23) frame generation in games with Reflex steps down the same way, with the limit applied in the game's Reflex sleep, but only while that leaves about 30 rendered fps or more: 2× at 120 Hz (30 rendered, 60 presented) is capped, 3× (20 rendered) stays at Refresh, where it lagged and presented unevenly (Indiana Jones). Without Reflex frame generation keeps it at Refresh, so aim for a final fps (generated frames included) close to your refresh rate.\
+**Automatic frame cap** · `AutoFrameCap` · default: on · needs the Refresh rate cap\
+When the game can't hold the refresh rate (e.g. 90 fps at 120 Hz), some images are shown twice and others skipped, which judders. The automatic frame cap then steps down to one game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames per cycle), so every flash shows the next image, and goes back to Refresh once the game has headroom again.
+
+How it caps depends on the game:
+
+- **No Reflex, no frame generation:** the presenter's own cap, with just-in-time release.
+- **DirectX with NVIDIA Reflex** (every DLSS frame-generation game): Reflex's frame limit, one presented frame per strobe cycle (e.g. 60 at 120 Hz), with frame generation or without. The game and its generated frames are paced at the start of each frame. Tick **Presenter's own cap without frame generation** (`AutoCapOwnWithoutFg=1`) to use the presenter's cap while frame generation is off; it follows frame generation being switched on and off.
+- **DirectX, frame generation without Reflex** (e.g. XeSS frame generation through OptiScaler): stays at Refresh; **Frame limit for frame generation without Reflex** (below) limits it instead (v1.0.25).
+- **Vulkan with Reflex and frame generation** (v1.0.23): Reflex's frame limit as in DirectX, but only while that leaves about 30 rendered fps or more: 2× at 120 Hz (30 rendered, 60 presented) is capped, 3× (20 rendered) stays at Refresh, where it lagged and presented unevenly (Indiana Jones).
+- **Vulkan, frame generation without Reflex:** stays at Refresh, so aim for a final fps (generated frames included) close to your refresh rate.
+
+Back to Refresh:
+
+- **Games with Reflex** report how long their frames take; the cap goes back up once those fit well within a refresh for 10 seconds.
+- **Other games:** it tries Refresh for about 3 seconds, after 30 s, then 60 s, then every 2 minutes while the game still can't hold it.
+- **With frame generation** under Reflex's limit it tries only every 5 minutes, since each try is a visible stutter.
+
+Reflex's limit is applied by the presenter in the game's own Reflex sleep call (since v1.0.19), because the driver's limit counts the presenter's own presents and some games collapsed under it to about 7 fps (The Witcher 3, Returnal, Pragmata). Games that call their Reflex sleep more than once per frame (DLSS 5 injectors with frame generation in Onimusha) keep the driver's limit. If a game still falls far below the limit, the presenter drops it for the rest of the session and uses its own cap.\
 *When to change it:* leave on. Turn off if you'd rather keep 120 fps with some judder when the game dips.
+
+Why the limit is applied at the start of the frame (the game's Reflex sleep, or right after its own present without Reflex) and not at the present:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/frame-limit-fg-dark.png">
+  <img src="img/frame-limit-fg-light.png" alt="2x frame generation at 120 Hz, limited to 30 rendered / 60 presented: limited at the start of the frame, input to the lit image takes about 38 ms (draw, frame generation's wait for the next real frame, wait for the flash); limited at the present, frames also wait in queues behind earlier frames, about 105 ms. Like a kitchen that starts each dish only when a waiter will be ready, instead of cooking on order and letting dishes sit under the heat lamp." width="760">
+</picture>
 
 **Frame pacing** · `FramePacing` · default: Lowest latency (new ini files)
 - **Lowest latency** always shows the newest image: quickest response.
