@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e7"
+#define BFI_ADDON_VERSION "1.0.27-e8"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -510,6 +510,10 @@ static ThreadCount g_presCount;
 // swap chain, frame generation behind it). FSR frame generation presents every frame from its own thread to the
 // real swap chain, so only here are the game's frames still apart from the generated ones.
 static ThreadCount g_outerCount;
+// Game frames per present thread, every API, for the automatic frame cap at the frame start: it holds the thread that
+// presented most in the last second (Obduction, Unreal Engine: thread 52480 presented at start, 50748 in game, and the
+// hold stayed on the first -- 60-65 fps, held at the present by frames ahead instead, ~34 ms frame age against ~20).
+static ThreadCount g_feCount;
 static void **g_outerVtbl = nullptr;
 // 1 = the game's frames are counted on FSR frame generation's swap chain (its own timings below); XeSS frame generation
 // and anything else keep the hook on the real swap chain and the timings tested with it (Riven).
@@ -3155,6 +3159,15 @@ static DWORD WINAPI PresenterThread(void *)
                 tot += g_presCount.other; g_presCount.other = 0;
                 ReleaseSRWLockExclusive(&g_presCountLock);
                 if (outerN > 0) { gt = outerN; gtid = outerTid; }
+                long feN = 0; DWORD feTid = 0;
+                AcquireSRWLockExclusive(&g_presCountLock);
+                for (int k = 0; k < 6 && g_feCount.tid[k]; k++)
+                {
+                    if (g_feCount.n[k] > feN) { feN = g_feCount.n[k]; feTid = g_feCount.tid[k]; }
+                    g_feCount.n[k] = 0;
+                }
+                g_feCount.other = 0;
+                ReleaseSRWLockExclusive(&g_presCountLock);
                 g_fgOuterFsr.store(outerN > 0 ? 1 : 0);
                 int cnd = 1;
                 if (g_fgSeen[0] && gt > 0 && tot >= 1.5 * gt) cnd = std::max(2, std::min(4, (int)((double)tot / gt + 0.5)));
@@ -3174,7 +3187,7 @@ static DWORD WINAPI PresenterThread(void *)
                 // present, at one game frame per strobe cycle, instead of holding the finished frame at the present.
                 int feWant = 0;
                 if (want == 0 && s.autoCapFrameStart && s.autoCap && userCap == 1 && autoCapDown && !capByReflex && !fgWas &&
-                    fgFact <= 1 && s.enabled && s.frames >= 2 && s.pacingMode == 1 && hzP > 0.0 && gtid != 0)
+                    fgFact <= 1 && s.enabled && s.frames >= 2 && s.pacingMode == 1 && hzP > 0.0 && feTid != 0)
                     feWant = (int)(1e6 * s.frames / hzP + 0.5);
                 {
                     static int feWas = 0;
@@ -3182,13 +3195,21 @@ static DWORD WINAPI PresenterThread(void *)
                     {
                         const char *why = feWant > 0 ? "" : !s.autoCapFrameStart ? ": switched off" : !autoCapDown ? ": the cap is at Refresh rate" :
                                           capByReflex ? ": Reflex's frame limit holds the game" : (fgWas || fgFact > 1) ? ": frame generation" :
-                                          s.pacingMode != 1 ? ": needs Lowest latency pacing" : gtid == 0 ? ": the game's present thread isn't known" : ": BFI off or cap changed";
+                                          s.pacingMode != 1 ? ": needs Lowest latency pacing" : feTid == 0 ? ": the game's present thread isn't known" : ": BFI off or cap changed";
                         LOGI("BFI Presenter: automatic frame cap at the frame start %s%s (%d us per game frame, game thread %lu)",
-                             feWant > 0 ? "on" : "off", why, feWant, (unsigned long)gtid);
+                             feWant > 0 ? "on" : "off", why, feWant, (unsigned long)feTid);
+                    }
+                    else if (feWant > 0 && want == 0)
+                    {
+                        static DWORD feTidWas = 0;
+                        if (feTidWas && feTid != feTidWas)
+                            LOGI("BFI Presenter: automatic frame cap at the frame start: the game now presents from thread %lu (was %lu)",
+                                 (unsigned long)feTid, (unsigned long)feTidWas);
+                        feTidWas = feTid;
                     }
                     feWas = feWant;
                 }
-                g_fgGameTid.store(gtid);
+                g_fgGameTid.store(want == 0 && feWant > 0 ? feTid : gtid);
                 g_fgPaceKind.store(want > 0 ? 1 : feWant > 0 ? 2 : 0);
                 g_fgPaceUs.store(want > 0 ? want : feWant);
                 g_status.feLimitUs = feWant;
@@ -4488,6 +4509,7 @@ static void FgPaceAfterPresent()
 static HRESULT SubmitGameFrame()
 {
     CountPresent();
+    CountTo(g_feCount);
     const DWORD tid = GetCurrentThreadId();
     const double enter = Now();
     FgCheckCaller();
@@ -4619,8 +4641,10 @@ static bool StuckPassThrough(void *sc)
 }
 
 // DX11 games: the game's present thread, for the pacing after its present (FgPaceAfterPresent).
+static void CountTo(ThreadCount &c);
 static void NoteGameThread11()
 {
+    CountTo(g_feCount);
     const DWORD tid = GetCurrentThreadId();
     if (g_presentThreads[0] == tid) return;
     EnterCriticalSection(&g_submitLock);
