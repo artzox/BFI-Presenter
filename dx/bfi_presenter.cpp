@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.26-o2"
+#define BFI_ADDON_VERSION "1.0.26-o3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -507,6 +507,9 @@ static ThreadCount g_presCount;
 // real swap chain, so only here are the game's frames still apart from the generated ones.
 static ThreadCount g_outerCount;
 static void **g_outerVtbl = nullptr;
+// 1 = the game's frames are counted on FSR frame generation's swap chain (its own timings below); XeSS frame generation
+// and anything else keep the hook on the real swap chain and the timings tested with it (Riven).
+static std::atomic<int> g_fgOuterFsr{0};
 // Frame generation without Reflex (FrameGenLimitWithoutReflex): the game's own presents (its first present thread) are paced after they
 // return, one rendered frame per (strobe cycle x frame-generation factor) -- a frame-start sleep where Reflex would
 // sleep; frame generation's presents (its own thread) pass. 0 = off.
@@ -3142,6 +3145,7 @@ static DWORD WINAPI PresenterThread(void *)
                 tot += g_presCount.other; g_presCount.other = 0;
                 ReleaseSRWLockExclusive(&g_presCountLock);
                 if (outerN > 0) { gt = outerN; gtid = outerTid; }
+                g_fgOuterFsr.store(outerN > 0 ? 1 : 0);
                 int cnd = 1;
                 if (g_fgSeen[0] && gt > 0 && tot >= 1.5 * gt) cnd = std::max(2, std::min(4, (int)((double)tot / gt + 0.5)));
                 fgRun = cnd == fgCand ? fgRun + 1 : 1; fgCand = cnd;
@@ -3657,8 +3661,8 @@ static DWORD WINAPI PresenterThread(void *)
                     // minutes, and motion stuttered; in another run it settled at once). Instead, start times across
                     // one strobe cycle are tried about 2 ms apart, 3 s each (1 s to settle, 2 s measured): the one
                     // with every frame reaching a flash and the shortest release -> flash is kept. Tried again only
-                    // after 5 s in a row with under 90% of the frames reaching a flash or 6 ms slower, at most every
-                    // 20 s. Riven: 29 ms (start +8.3 ms in the cycle) against 34-45 ms at the other start times.
+                    // after 10 s in a row with under 90% of the frames reaching a flash or 6 ms slower, at most once
+                    // a minute (FSR: 5 s, every 20 s, see below). Riven: 29 ms (start +8.3 ms in the cycle) against 34-45 ms at the other start times.
                     static int swIdx = -1, swN = 0, swSecs = 0, swBad = 0, swShown = 0, swRelN = 0, swRep = 0;
                     static double swPhase = 0.0, swStart = 0.0, swDoneT = -1.0, swBestMs = 0.0, swRel = 0.0, swScore[16] = {}, swRelMs[16] = {},
                                   swSlack = 1.0, swSlackK[16] = {};
@@ -3669,6 +3673,13 @@ static DWORD WINAPI PresenterThread(void *)
                     swWasOn = fgOn;
                     if (fgOn && locked && s.pacingMode == 1 && cyc > 0.0)
                     {
+                        // FSR frame generation paces its own output and follows a moved frame start with a lag, and the
+                        // start times that work moved between searches (Riven): 2 s to settle per start time, 8 ms to
+                        // spare preferred, no 2 ms steps while held (they walked it into the bad start times), looked
+                        // for again after 5 s of lost frames (every 20 s at most). XeSS frame generation keeps the
+                        // timings tested with it.
+                        const bool fsr = g_fgOuterFsr.load() != 0;
+                        const int settle = fsr ? 3 : 2;
                         auto moveTo = [&](double ph)
                         {
                             const int d = (int)((ph - swPhase) * 1e6);
@@ -3677,23 +3688,23 @@ static DWORD WINAPI PresenterThread(void *)
                         };
                         const bool ok = holds && !hitchPaused;
                         const double base = swPhase - std::fmod(swPhase, cyc);   // stay within the same cycle's worth of moves
-                        if (swIdx < 0 && ok && (swDoneT < 0.0 || (swBad >= 5 && t - swDoneT > 20.0)))
+                        if (swIdx < 0 && ok && (swDoneT < 0.0 || (fsr ? (swBad >= 5 && t - swDoneT > 20.0) : (swBad >= 10 && t - swDoneT > 60.0))))
                         {
                             swN = std::max(4, std::min(16, (int)(cyc / 0.002 + 0.5)));
                             swIdx = 0; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swBad = 0;
                             swStart = base;
                             moveTo(swStart);
                             LOGI("BFI Presenter: frame limit for frame generation: trying %d start times across the strobe cycle (%.0f s)",
-                                 swN, swN * 3.0);
+                                 swN, swN * (settle + 1.0));
                         }
                         else if (swIdx >= 0)
                         {
                             if (!ok) { swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swSlack = 1.0; }
-                            else if (++swSecs >= 2)
+                            else if (++swSecs >= settle)
                             {
                                 swShown += relN; swRel += relSum; swRelN += relN; swRep += stNow.frameRepeats;
                                 if (p10 >= 0.0) swSlack = std::min(swSlack, p10);
-                                if (swSecs >= 3)
+                                if (swSecs >= settle + 1)
                                 {
                                     const double relMs = swRelN ? swRel / swRelN : 1e3;
                                     const bool full = swShown >= (int)(2.0 * capFps * 0.97) && swRep <= 2;
@@ -3704,8 +3715,9 @@ static DWORD WINAPI PresenterThread(void *)
                                     // frame with 4.6 ms to spare lost half of them a minute later (30 of 60 shown: the generated
                                     // frames, finished on the GPU later than the game's, missed the pick). So 8 ms to spare first,
                                     // then 3 ms, then any start time that showed every frame.
-                                    swScore[swIdx] = !full ? 1e3 + (2.0 * capFps - swShown) : swSlack >= 0.008 ? relMs :
-                                                     swSlack >= 0.003 ? 50.0 + relMs : 100.0 + relMs;
+                                    swScore[swIdx] = !full ? 1e3 + (2.0 * capFps - swShown) :
+                                                     fsr ? (swSlack >= 0.008 ? relMs : swSlack >= 0.003 ? 50.0 + relMs : 100.0 + relMs)
+                                                         : (swSlack < 0.003 ? 100.0 + relMs : relMs);
                                     swRelMs[swIdx] = relMs; swShownK[swIdx] = swShown; swSlackK[swIdx] = swSlack;
                                     swIdx++; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swSlack = 1.0;
                                     const double start = swStart;
@@ -3720,20 +3732,20 @@ static DWORD WINAPI PresenterThread(void *)
                                         for (int k = 0; k < swN && len < (int)sizeof(list) - 32; k++)
                                             len += snprintf(list + len, sizeof(list) - len, " %.1f:%d/%.0f/%.1f", k * cyc / swN * 1000.0,
                                                             swShownK[k], swRelMs[k], swSlackK[k] < 1.0 ? swSlackK[k] * 1000.0 : -1.0);
-                                        LOGI("BFI Presenter: frame limit for frame generation lined up with the flash: start %+.1f ms "
+                                        LOGI("BFI Presenter: frame limit for frame generation%s lined up with the flash: start %+.1f ms "
                                              "in the cycle, %.1f ms from release to flash, %d of %.0f frames shown (start ms:shown/ms/ready ms before the flash --%s)",
-                                             best * cyc / swN * 1000.0, swRelMs[best], swShownK[best], 2.0 * capFps, list);
+                                             fsr ? " (FSR)" : "", best * cyc / swN * 1000.0, swRelMs[best], swShownK[best], 2.0 * capFps, list);
                                     }
                                 }
                             }
                         }
-                        // Held: tried again after 5 s in a row with under 90% of the frames shown, or 6 ms or more
+                        // Held: tried again after 10 s (FSR 5 s) in a row with under 90% of the frames shown, or 6 ms or more
                         // slower than the start time found.
                         else
                         {
                             swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + 6.0))) ? swBad + 1 : 0;
                             // Held, frames repeating close to their flash (the GPU work grew): 2 ms earlier, once per 3 s.
-                            swTight = (ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.0015) ? swTight + 1 : 0;
+                            swTight = (!fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.0015) ? swTight + 1 : 0;
                             if (swTight >= 3)
                             {
                                 swTight = 0;
@@ -5633,11 +5645,22 @@ static void OuterCheck(void *obj)
         return;
     }
     if (g_outerVtbl) { LOGW("BFI Presenter: another outer swap chain type (%s) -- not hooked", mod); return; }
+    {
+        char l[64]; size_t i = 0;
+        for (; mod[i] && i < sizeof(l) - 1; i++) l[i] = (char)tolower((unsigned char)mod[i]);
+        l[i] = 0;
+        if (!strstr(l, "fidelityfx") && !strstr(l, "ffx"))
+        {
+            LOGI("BFI Presenter: the game presents to a wrapper swap chain (%s) -- not FSR frame generation, so the game's "
+                 "presents are counted on the real swap chain as before", mod);
+            return;
+        }
+    }
     PatchSlot(vt, VT_Present,  (void *)&hk_OuterPresent,  (void **)&o_OuterPresent);
     PatchSlot(vt, VT_Present1, (void *)&hk_OuterPresent1, (void **)&o_OuterPresent1);
     g_outerVtbl = vt;
-    LOGI("BFI Presenter: the game presents to a wrapper swap chain (%s) -- its presents are counted there, for frame "
-         "generation that presents from a thread of its own (FSR)", mod);
+    LOGI("BFI Presenter: the game presents to FSR frame generation's swap chain (%s) -- its presents are counted there "
+         "(FSR presents every frame from a thread of its own)", mod);
 }
 typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSC)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSCHwnd)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *,
