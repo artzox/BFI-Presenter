@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e9"
+#define BFI_ADDON_VERSION "1.0.27-e10"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3763,7 +3763,10 @@ static DWORD WINAPI PresenterThread(void *)
                             if (d) { shiftUs.fetch_add(d); alignShiftTot += d * 1e-6; }
                             swPhase += d * 1e-6;
                         };
-                        const bool ok = holds && !hitchPaused;
+                        // The automatic frame cap at the frame start: only while the game holds the cap. Below it (a scene
+                        // too heavy for 60) every start time loses frames and a search only shows its bad ones (Days Gone:
+                        // four searches in four minutes, each started in a scene at 55-59 fps).
+                        const bool ok = holds && !hitchPaused && (g_fgPaceKind.load() != 2 || stNow.gameFps >= 0.98 * capFps);
                         const double base = swPhase - std::fmod(swPhase, cyc);   // stay within the same cycle's worth of moves
                         // The automatic frame cap at the frame start looks again as soon as FSR does: when a heavier
                         // scene makes frames miss the pick they were timed for, each waits a whole cycle more (Obduction:
