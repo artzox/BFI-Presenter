@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v2"
+#define BFI_VERSION "1.0.27-v3"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -265,6 +265,7 @@ struct Settings
     float peakNits = 1400.0f; // display peak (HDR ceiling)
     int   output   = -1;      // -1 auto, 0 SDR, 1 scRGB, 2 HDR10
     int   autoCap  = 1;       // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
+    int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap times the game's frame start with a search across the strobe cycle
     int   fgDllCheck = 1;     // FrameGenDllCheck: a loaded frame generation DLL counts as frame generation (games without Reflex)
     int   gameCap  = 1;       // 0 off, 1 refresh rate, 2 half refresh, 3 quarter refresh,
                               // 4 one game frame per strobe cycle (refresh / Frames), 5 refresh / CapDivisor
@@ -355,6 +356,7 @@ static void LoadSettings(Settings &s)
     s.capJit = KvInt(kv, "CapJustInTime", 1) ? 1 : 0;
     s.autoCap = KvInt(kv, "AutoFrameCap", 1) ? 1 : 0;
     s.fgDllCheck = KvInt(kv, "FrameGenDllCheck", 1) ? 1 : 0;
+    s.autoCapFrameStart = KvInt(kv, "AutoCapAtFrameStart", 1) ? 1 : 0;
     s.laterRelease = KvInt(kv, "LaterRelease", 0) ? 1 : 0;
     s.laterReleaseMs = Clamp(KvFloat(kv, "LaterReleaseMarginMs", 1.5f), 0.5f, 5.0f);
     s.maxAhead = Clamp(KvInt(kv, "MaxFramesAhead", 1), 0, 3);
@@ -396,7 +398,7 @@ static void LoadSettings(Settings &s)
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
     I("RollingScan", s.rolling); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
-    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
+    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
@@ -440,6 +442,8 @@ struct Status
     int    aheadInUse = 1;
     int    autoCapDown = 0;                 // automatic frame cap: one game frame per strobe cycle in use
     int    autoCapProbe = 0;                // automatic frame cap: trying the Refresh rate again
+    int    fsState = 0;                     // frame start timing: 0 off, 1 checking, 2 searching, 3 in use, 4 not needed
+    double fsLeadMs = 0.0;                  // frame start timing: release this long before the lit refresh
     int    fgActive = 0;                    // a frame-generation DLL is loaded (the automatic cap stays at Refresh)
     int    rfxLimitUs = 0;                  // Reflex frame limit at the game's sleep (frame generation), per rendered frame
     double rawAvg = -1.0, litAvg = -1.0, ceilInUse = 0.0;
@@ -767,6 +771,9 @@ struct Swapchain
     std::atomic<double> period{1.0 / 120.0};
     std::atomic<bool>   lrAllowed{false};
     std::atomic<double> lrLead{0.0};                    // release this long before the target refresh (0 = as before)
+    std::atomic<bool>   fsCtl{false};                   // automatic frame cap: the frame start timing is in charge (no just-in-time release)
+    std::atomic<bool>   fsOn{false};                    // ... and releases the game fsLead before the lit refresh
+    std::atomic<double> fsLead{0.0};
     std::atomic<double> lrWindow{1.0 / 120.0};          // time between releases at the current cap
     std::atomic<float>  lrBaseMs{1.5f};
     uint64_t            jitTarget = 0;                  // tick of the lit refresh the last frame was released for
@@ -1432,6 +1439,14 @@ static void PresenterThread(Swapchain *sc)
     uint32_t acqIdx = 0;
     int secFrameRepeats = 0, secFrameSkips = 0, extraCycles = 0, secReused = 0;
     int secRepU = 0, secSkipU = 0;      // strobe cycles short of / ahead of the expected step (DX12 add-on v0.78)
+    // Frame start timing (automatic frame cap): new game frames lit this second, their release -> flash, and how long
+    // each was ready before the pick.
+    int secRelN = 0, secReadyN = 0;
+    double secRelSum = 0.0, secReady[256];
+    int fsState = 0, fsSecs = 0, fsIdx = 0, fsN = 8, fsBad = 0, fsTight = 0, fsBaseN = 0, fsShown = 0, fsRelN = 0, fsRep = 0;
+    double fsLeadCur = 0.0, fsStart = 0.0, fsBestMs = 0.0, fsDoneT = -1.0, fsDeclT = -1e9, fsOffT = -1e9, fsKeptLead = -1.0,
+           fsBaseRel = 0.0, fsBaseP10 = 1.0, fsRel = 0.0, fsSlack = 1.0, fsScore[16] = {}, fsRelK[16] = {}, fsSlackK[16] = {};
+    int fsShownK[16] = {};
     double llStep = 0.0;                // recent game frames per strobe cycle
     // Queue one refresh ahead: one extra refresh is presented right after a
     // vblank ("prime"), so the display always has the next refresh queued and
@@ -1472,7 +1487,7 @@ static void PresenterThread(Swapchain *sc)
     // strobe cycle while the game can't hold the refresh rate. Back to Refresh after a
     // short try that holds the refresh rate (tries 30 s, 60 s, then every 120 s).
     int capDownSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
-    double capSwitchT = -100.0, probeWait = 30.0;
+    double capSwitchT = -100.0, probeWait = 30.0, capUpT = -100.0;
     bool capProbe = false, fgWas = false;
     bool kb = false, km = false, kr = false, krs = false;
     FILE *logf = nullptr;
@@ -1581,7 +1596,7 @@ static void PresenterThread(Swapchain *sc)
             sc->period.store(1.0 / hz);
             sc->lrWindow.store(per / hz);
             sc->lrBaseMs.store(s.laterReleaseMs);
-            if (!primeIter) sc->lrAllowed.store((capOk || llOk) && vblank);
+            if (!primeIter) sc->lrAllowed.store((capOk || llOk) && vblank && !sc->fsCtl.load());
         }
         if (qa && qaSkipNext && vblank)
         {
@@ -2081,6 +2096,8 @@ static void PresenterThread(Swapchain *sc)
 
         const double t = Now();
         const double relFlashMs = (pickNewG && pickRelG > 0.0 && t > pickRelG && t - pickRelG < 0.5) ? (t - pickRelG) * 1000.0 : -1.0;
+        if (relFlashMs > 0.0) { secRelSum += relFlashMs; secRelN++; }
+        if (pickNewG && pickReadyMs > 0.0 && secReadyN < 256) secReady[secReadyN++] = pickReadyMs;
         secPresents++;
         ageSum += (t - pickTime) * 1000.0;
         if (t - lastT > 1.5 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
@@ -2421,13 +2438,17 @@ static void PresenterThread(Swapchain *sc)
                             capProbe = false; capDownSecs = 0; capSwitchT = t;
                             if (probeGood >= 2)
                             {
-                                probeWait = 30.0;
+                                // probeWait is kept: it is reset only after a stay at Refresh rate of 30 s or more (below)
+                                capUpT = t;
                                 LOGI("BFI Presenter: automatic frame cap: Refresh rate -- the game holds %.0f fps", fpsA);
                             }
                             else
                             {
                                 down = true;
                                 probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
+                                // Far from the refresh rate (under 80%): each try is seconds of uneven frames (P.T. at 72 of
+                                // 120: 5 s with every eighth frame skipped), so the next one waits 5 minutes (as the DX add-on).
+                                if (fpsA < 0.8 * hzA) probeWait = 300.0;
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
                             }
@@ -2438,6 +2459,11 @@ static void PresenterThread(Swapchain *sc)
                         capDownSecs = (!hitchPaused && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;
                         if (capDownSecs >= 3 && t - capSwitchT > 3.0)
                         {
+                            // Down again soon after going back up: the game is close to the limit, so the next try waits
+                            // longer; well under the refresh rate, the first try waits a minute (as the DX add-on).
+                            if (t - capUpT < 30.0) probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
+                            else probeWait = 30.0;
+                            if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;
                             down = true; capDownSecs = 0; capSwitchT = t;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames, fpsA, hzA);
@@ -2457,6 +2483,149 @@ static void PresenterThread(Swapchain *sc)
                 g_status.autoCapDown = down ? 1 : 0;
                 g_status.autoCapProbe = capProbe ? 1 : 0;
                 g_status.fgActive = fg ? 1 : 0;
+                // Frame start timing (AutoCapAtFrameStart): while the automatic frame cap holds the game to one frame per
+                // strobe cycle, the game is held in its present -- before it starts the next frame -- and released at
+                // the refresh before the lit one. A frame that takes 13 ms then waits 9-12 ms for its flash (P.T.: 25 ms
+                // from release to flash). As the DX add-on, start times across the strobe cycle are tried instead,
+                // 8 of them, 1 s to settle and 2 s measured each (one that loses frames in its first measured second is
+                // left at once): kept is the one with every frame shown and the shortest release -> flash, with 3 ms
+                // to spare first. Looked for only when frames wait at least 3 ms for the pick at the usual release
+                // (3 s checked first): games that pace themselves on a clock of their own (the Driveclub recomp:
+                // frames ready 0-1.5 ms before the pick, 6-12 ms from frame to flash) gain nothing and are left as
+                // they are, and a start time no quicker than the usual release by 1 ms isn't used either. Only while
+                // the game holds the cap; looked for again after 5 s of lost or 6 ms slower frames (at most every
+                // 20 s); 2 ms earlier after 3 s of frames repeated with under 1.5 ms to spare. The start time found
+                // is kept while the cap tries Refresh rate and comes back down (within 10 minutes).
+                {
+                    const double hzF = hzA > 0.0 ? hzA : 0.0;
+                    const double capFps = hzF > 0.0 ? hzF / s.frames : 0.0;
+                    const double cyc = hzF > 0.0 ? s.frames / hzF : 0.0;
+                    const bool want = s.autoCapFrameStart && s.autoCap && userCap == 1 && down && !capProbe && !fg && s.enabled &&
+                                      s.frames >= 2 && s.pacingMode == 1 && s.pacing && cyc > 0.0 && g_vkSleepLimitUs.load() == 0;
+                    double p10 = -1.0;
+                    if (secReadyN >= 10) { std::sort(secReady, secReady + secReadyN); p10 = secReady[secReadyN / 10] * 0.001; }
+                    const double relMs = secRelN ? secRelSum / secRelN : 0.0;
+                    const bool ok = !hitchPaused && fpsA >= 0.98 * capFps && fpsA < 1.05 * capFps;
+                    auto setLead = [&](double lead, bool on) { fsLeadCur = lead; sc->fsLead.store(lead); sc->fsOn.store(on); };
+                    if (!want)
+                    {
+                        if (fsState != 0)
+                        {
+                            fsOffT = t;
+                            fsKeptLead = (fsState == 3) ? fsLeadCur : -1.0;
+                            if (fsState == 4) fsKeptLead = -2.0;      // not needed: stays so when the cap comes back down
+                        }
+                        fsState = 0; sc->fsOn.store(false); sc->fsCtl.store(false);
+                    }
+                    else if (fsState == 0)
+                    {
+                        sc->fsCtl.store(true);
+                        fsSecs = fsBaseN = 0; fsBaseRel = 0.0; fsBaseP10 = 1.0; fsBad = fsTight = 0;
+                        if (fsKeptLead > 0.0 && t - fsOffT < 600.0)
+                        {
+                            setLead(fsKeptLead, true); fsState = 3; fsDoneT = t;
+                            LOGI("BFI Presenter: automatic frame cap at the frame start: start time kept from before (released %.1f ms before the flash)",
+                                 fsLeadCur * 1000.0);
+                        }
+                        else if (fsKeptLead == -2.0 && t - fsOffT < 600.0) { fsState = 4; fsDeclT = t; sc->fsCtl.store(false); }
+                        else { fsState = 1; sc->fsOn.store(false); }
+                    }
+                    else if (fsState == 1)
+                    {
+                        // The usual release (the refresh before the lit one): how long frames wait for their pick.
+                        if (ok && secRelN > 0 && ++fsSecs >= 2)
+                        {
+                            fsBaseRel += relMs; fsBaseN++;
+                            if (p10 >= 0.0) fsBaseP10 = std::min(fsBaseP10, p10);
+                        }
+                        if (fsBaseN >= 3)
+                        {
+                            fsBaseRel /= fsBaseN;
+                            if (fsBaseP10 < 0.003)
+                            {
+                                fsState = 4; fsDeclT = t; sc->fsCtl.store(false);
+                                LOGI("BFI Presenter: automatic frame cap at the frame start: not needed -- game frames are ready %.1f ms "
+                                     "before the pick at the usual release (%.1f ms from release to flash)", fsBaseP10 * 1000.0, fsBaseRel);
+                            }
+                            else
+                            {
+                                fsState = 2; fsIdx = 0; fsSecs = 0; fsShown = fsRelN = fsRep = 0; fsRel = 0.0; fsSlack = 1.0;
+                                fsN = std::max(4, std::min(16, (int)(cyc / 0.002 + 0.5)));
+                                fsStart = 0.002;
+                                setLead(fsStart, true);
+                                LOGI("BFI Presenter: automatic frame cap at the frame start: frames wait %.1f ms for the pick at the usual "
+                                     "release (%.1f ms from release to flash) -- trying %d start times across the strobe cycle (%d s)",
+                                     fsBaseP10 * 1000.0, fsBaseRel, fsN, fsN * 3);
+                            }
+                        }
+                    }
+                    else if (fsState == 2)
+                    {
+                        if (!ok) { fsSecs = 0; fsShown = fsRelN = fsRep = 0; fsRel = 0.0; fsSlack = 1.0; }
+                        else if (++fsSecs >= 2)
+                        {
+                            fsShown += secRelN; fsRel += secRelSum; fsRelN += secRelN; fsRep += secRepU;
+                            if (p10 >= 0.0) fsSlack = std::min(fsSlack, p10);
+                            const bool dropEarly = fsSecs == 2 && secRelN < (int)(0.9 * capFps);
+                            if (fsSecs >= 3 || dropEarly)
+                            {
+                                const double rk = fsRelN ? fsRel / fsRelN : 1e3;
+                                const bool full = fsShown >= (int)(2.0 * capFps * 0.97) && fsRep <= 2;
+                                fsScore[fsIdx] = !full ? 1e3 + (2.0 * capFps - fsShown) : (fsSlack < 0.003 ? 100.0 + rk : rk);
+                                fsRelK[fsIdx] = rk; fsShownK[fsIdx] = fsShown; fsSlackK[fsIdx] = fsSlack;
+                                fsIdx++; fsSecs = 0; fsShown = fsRelN = fsRep = 0; fsRel = 0.0; fsSlack = 1.0;
+                                if (fsIdx < fsN) setLead(fsStart + fsIdx * cyc / fsN, true);
+                                else
+                                {
+                                    int best = 0;
+                                    for (int k = 1; k < fsN; k++) if (fsScore[k] < fsScore[best]) best = k;
+                                    char list[400]; int len = 0;
+                                    for (int k = 0; k < fsN && len < (int)sizeof(list) - 32; k++)
+                                        len += snprintf(list + len, sizeof(list) - len, " %.1f:%d/%.0f/%.1f", (fsStart + k * cyc / fsN) * 1000.0,
+                                                        fsShownK[k], fsRelK[k], fsSlackK[k] < 1.0 ? fsSlackK[k] * 1000.0 : -1.0);
+                                    fsDoneT = t; fsBad = fsTight = 0;
+                                    if (fsScore[best] >= 1e3 || fsRelK[best] > fsBaseRel - 1.0)
+                                    {
+                                        fsState = 4; fsDeclT = t; sc->fsOn.store(false); sc->fsCtl.store(false);
+                                        LOGI("BFI Presenter: automatic frame cap at the frame start: no start time quicker than the usual release "
+                                             "(%.1f ms from release to flash) -- left as it was (released ms before the flash:shown/ms/ready ms before the pick --%s)",
+                                             fsBaseRel, list);
+                                    }
+                                    else
+                                    {
+                                        fsState = 3; fsBestMs = fsRelK[best];
+                                        setLead(fsStart + best * cyc / fsN, true);
+                                        LOGI("BFI Presenter: automatic frame cap at the frame start lined up with the flash: released %.1f ms "
+                                             "before it, %.1f ms from release to flash against %.1f ms at the usual release, %d of %.0f frames shown "
+                                             "(released ms before the flash:shown/ms/ready ms before the pick --%s)",
+                                             fsLeadCur * 1000.0, fsBestMs, fsBaseRel, fsShownK[best], 2.0 * capFps, list);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else if (fsState == 3)
+                    {
+                        fsBad = (ok && (secRelN < (int)(0.9 * capFps) || (secRelN > 0 && relMs > fsBestMs + 6.0))) ? fsBad + 1 : 0;
+                        fsTight = (ok && secRepU >= 2 && p10 >= 0.0 && p10 < 0.0015) ? fsTight + 1 : 0;
+                        if (fsTight >= 3)
+                        {
+                            fsTight = 0;
+                            setLead(fsLeadCur + 0.002, true);
+                            LOGI("BFI Presenter: automatic frame cap at the frame start: frames repeated close to their flash -- 2 ms earlier");
+                        }
+                        if (fsBad >= 5 && t - fsDoneT > 20.0) { fsState = 1; fsSecs = fsBaseN = 0; fsBaseRel = 0.0; fsBaseP10 = 1.0; sc->fsOn.store(false);
+                            LOGI("BFI Presenter: automatic frame cap at the frame start: frames lost or slower for 5 s -- looking again"); }
+                    }
+                    else if (fsState == 4)
+                    {
+                        // Not needed / no gain: checked again after 5 minutes.
+                        if (t - fsDeclT > 300.0) { fsState = 1; fsSecs = fsBaseN = 0; fsBaseRel = 0.0; fsBaseP10 = 1.0; sc->fsCtl.store(true); sc->fsOn.store(false); }
+                    }
+                    g_status.fsState = fsState;
+                    g_status.fsLeadMs = sc->fsOn.load() ? fsLeadCur * 1000.0 : 0.0;
+                }
+                secRelN = secReadyN = 0; secRelSum = 0.0;
             }
             secFrameRepeats = secFrameSkips = secReused = 0;
             secRepU = secSkipU = 0;
@@ -2524,7 +2693,8 @@ static void LrWatchThread(Swapchain *sc)
     double builds[128] = {}, sorted[128];
     int nb = 0, wb = 0, state = 0, misses = 0, frames = 0, clean = 0, good = 0;
     int limitMissSecs = 0, limitMisses = 0, limitFitSecs = 0, limitTrips = 0; bool limitOff = false;   // just-in-time release switched off at its limit
-    double margin = sc->lrBaseMs.load() * 0.001, est = 0.0, secT = Now(), lastWindow = 0.0;
+    double margin = sc->lrBaseMs.load() * 0.001, est = 0.0, secT = Now(), lastWindow = 0.0, graceUntil = 0.0;
+    bool wasAllowed = false;
     while (sc->lrRun.load())
     {
         const uint64_t staged = sc->lrStaged.load();
@@ -2566,7 +2736,13 @@ static void LrWatchThread(Swapchain *sc)
         const bool allowed = sc->lrAllowed.load();
         const double window = sc->lrWindow.load(), base = sc->lrBaseMs.load() * 0.001;
         const bool capMode = window > 1.5 * sc->period.load();      // Half / Quarter cap
-        if (std::fabs(window - lastWindow) > 1e-4) { lastWindow = window; if (state != 0) { state = 0; nb = wb = 0; margin = base; } }
+        if (std::fabs(window - lastWindow) > 1e-4) { lastWindow = window; graceUntil = now + 5.0; if (state != 0) { state = 0; nb = wb = 0; margin = base; } }
+        // A few seconds after the cap changes (the automatic frame cap stepping down or trying Refresh rate) the game
+        // is still settling: frames missed then don't count. They switched just-in-time release off for good within
+        // 2-3 s of each change (P.T.: 3 of 57 and 9 of 60 missed, then every frame on time with 9-12 ms to spare).
+        if (allowed && !wasAllowed) graceUntil = now + 5.0;
+        wasAllowed = allowed;
+        if (now < graceUntil) misses = 0;
         if (margin < base) margin = base;
         if (nb >= 30)
         {
@@ -2709,6 +2885,18 @@ static bool CapWaitJit(Swapchain *sc, uint64_t per, int frames, double lead)
 static void CapWait(Swapchain *sc, uint64_t per)
 {
     const double waitStart = Now();
+    // Automatic frame cap, frame start timing: the game is released a set time before the lit refresh, the time
+    // found by trying start times across the strobe cycle (the presenter's per-second block).
+    if (per >= 2 && sc->fsOn.load())
+    {
+        const int fr = sc->strobeFrames.load();
+        if (fr >= 2 && per % (uint64_t)fr == 0 && CapWaitJit(sc, per, fr, sc->fsLead.load()))
+        {
+            sc->capWaitUs.fetch_add((long long)((Now() - waitStart) * 1e6));
+            sc->capWaits.fetch_add(1);
+            return;
+        }
+    }
     if (per >= 2 && sc->lrAllowed.load())
     {
         const int fr = sc->strobeFrames.load();
@@ -4667,6 +4855,23 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
                 else if (rfxUs > 0) ImGui::TextDisabled("(in use: one presented frame per strobe cycle, Reflex frame limit %.1f ms per rendered frame)", rfxUs / 1000.0);
                 else ImGui::TextDisabled("%s", fgA ? "(Refresh rate: frame generation)" : probe ? "(trying Refresh rate)" : down ? "(in use: one game frame per strobe cycle)" : "(in use: Refresh rate)");
+                ImGui::Indent(16.0f);
+                bool fs = s.autoCapFrameStart != 0;
+                if (ImGui::Checkbox("Time the frame start", &fs)) s.autoCapFrameStart = fs ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("While the automatic frame cap holds one game frame per strobe cycle: start times across the\n"
+                                                              "strobe cycle are tried (about 24 s) and the one with every frame shown and the shortest\n"
+                                                              "time from release to flash is kept, so finished frames don't wait for their flash. Not used\n"
+                                                              "where frames are already ready just before the flash (games that pace themselves).");
+                if (s.autoCapFrameStart && down && !probe && !fgA)
+                {
+                    int fst; double fsl; { std::lock_guard<std::mutex> l(g_cfgLock); fst = g_status.fsState; fsl = g_status.fsLeadMs; }
+                    ImGui::SameLine();
+                    if (fst == 1) ImGui::TextDisabled("(checking)");
+                    else if (fst == 2) ImGui::TextDisabled("(trying start times)");
+                    else if (fst == 3) ImGui::TextDisabled("(in use: released %.1f ms before the flash)", fsl);
+                    else if (fst == 4) ImGui::TextDisabled("(not needed: frames are ready just before the flash)");
+                }
+                ImGui::Unindent(16.0f);
             }
         }
         bool cj = s.capJit != 0;
