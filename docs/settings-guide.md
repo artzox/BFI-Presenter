@@ -184,6 +184,13 @@ Back to Refresh:
 Reflex's limit is applied by the presenter in the game's own Reflex sleep call (since v1.0.19), because the driver's limit counts the presenter's own presents and some games collapsed under it to about 7 fps (The Witcher 3, Returnal, Pragmata). Games that call their Reflex sleep more than once per frame (DLSS 5 injectors with frame generation in Onimusha) keep the driver's limit. If a game still falls far below the limit, the presenter drops it for the rest of the session and uses its own cap.\
 *When to change it:* leave on. Turn off if you'd rather keep 120 fps with some judder when the game dips.
 
+Why the limit is applied at the start of the frame (the game's Reflex sleep, or right after its own present without Reflex) and not at the present:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/frame-limit-fg-dark.png">
+  <img src="img/frame-limit-fg-light.png" alt="2x frame generation at 120 Hz, limited to 30 rendered / 60 presented: limited at the start of the frame, input to the lit image takes about 38 ms (draw, frame generation's wait for the next real frame, wait for the flash); limited at the present, frames also wait in queues behind earlier frames, about 105 ms. Like a kitchen that starts each dish only when a waiter will be ready, instead of cooking on order and letting dishes sit under the heat lamp." width="760">
+</picture>
+
 **Frame pacing** · `FramePacing` · default: Lowest latency (new ini files)
 - **Lowest latency** always shows the newest image: quickest response.
 - **Smooth** holds one finished image in reserve so every image is shown once, in order, even if one arrives a little late: about one refresh more delay.
