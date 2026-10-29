@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e1"
+#define BFI_ADDON_VERSION "1.0.27-e2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -4583,9 +4583,36 @@ static bool StuckPassThrough(void *sc)
            (sc == (void *)g_sc || sc == (void *)g_sc11);
 }
 
+// DX11 games: the game's present thread, for the pacing after its present (FgPaceAfterPresent).
+static void NoteGameThread11()
+{
+    const DWORD tid = GetCurrentThreadId();
+    if (g_presentThreads[0] == tid) return;
+    EnterCriticalSection(&g_submitLock);
+    for (DWORD &t : g_presentThreads)
+    {
+        if (t == tid) break;
+        if (t == 0)
+        {
+            t = tid;
+            LOGI("BFI Presenter: game frames presented from thread %lu (DX11)", (unsigned long)tid);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_submitLock);
+}
+
+static HRESULT Present11Paced(IDXGISwapChain *sc, UINT sync, UINT flags)
+{
+    NoteGameThread11();
+    const HRESULT hr = SubmitGameFrame11(sc, sync, flags);
+    FgPaceAfterPresent();
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT flags)
 {
-    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
+    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return Present11Paced(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present(sc, sync, flags); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST))
         return o_Present(sc, sync, flags);
@@ -4596,7 +4623,7 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT 
 
 static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p)
 {
-    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
+    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return Present11Paced(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present1(sc, sync, flags, p); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST))
         return o_Present1(sc, sync, flags, p);
@@ -7290,7 +7317,7 @@ static std::atomic<bool> g_9firstLogged{false};
 // and hand it to the DX11 core, which copies it into the staging ring on the
 // add-on's own D3D11 device. The game's own Present is skipped.
 template <class ShowOwn>
-static HRESULT SubmitGameFrame9(ShowOwn showOwn)
+static HRESULT SubmitGameFrame9Core(ShowOwn showOwn)
 {
     struct Depth { Depth() { t_in9Present++; } ~Depth() { t_in9Present--; } } depth;
     return SubmitFrame11Core(
@@ -7322,6 +7349,14 @@ static HRESULT SubmitGameFrame9(ShowOwn showOwn)
             return g_t9.t11;
         },
         showOwn);
+}
+template <class ShowOwn>
+static HRESULT SubmitGameFrame9(ShowOwn showOwn)
+{
+    NoteGameThread11();
+    const HRESULT hr = SubmitGameFrame9Core(showOwn);
+    FgPaceAfterPresent();   // after the frame is handed over (the automatic frame cap at the frame start)
+    return hr;
 }
 static std::atomic<uint32_t> g_9hits{0}, g_9owned{0}, g_9rsPresents{0};
 static void Dx9LogHit(const char *which, void *obj, void *expect)
