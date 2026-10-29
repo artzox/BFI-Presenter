@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e8"
+#define BFI_ADDON_VERSION "1.0.27-e9"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3765,7 +3765,11 @@ static DWORD WINAPI PresenterThread(void *)
                         };
                         const bool ok = holds && !hitchPaused;
                         const double base = swPhase - std::fmod(swPhase, cyc);   // stay within the same cycle's worth of moves
-                        if (swIdx < 0 && ok && (swDoneT < 0.0 || (fsr ? (swBad >= 5 && t - swDoneT > 20.0) : (swBad >= 10 && t - swDoneT > 60.0))))
+                        // The automatic frame cap at the frame start looks again as soon as FSR does: when a heavier
+                        // scene makes frames miss the pick they were timed for, each waits a whole cycle more (Obduction:
+                        // 23 ms from release to flash, then 40 ms for the 20 s the next search was still held back).
+                        const bool quick = fsr || g_fgPaceKind.load() == 2;
+                        if (swIdx < 0 && ok && (swDoneT < 0.0 || (quick ? (swBad >= 5 && t - swDoneT > 20.0) : (swBad >= 10 && t - swDoneT > 60.0))))
                         {
                             swN = std::max(4, std::min(16, (int)(cyc / 0.002 + 0.5)));
                             swIdx = 0; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swBad = 0;
