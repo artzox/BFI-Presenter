@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.26"
+#define BFI_VERSION "1.0.27-v1"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -770,6 +770,10 @@ struct Swapchain
     uint64_t            jitTarget = 0;                  // tick of the lit refresh the last frame was released for
     double              lrRelT[kLr] = {}, lrDeadline[kLr] = {};
     uint64_t            lrRelId[kLr] = {};
+    // Release -> flash for every frame (the timing log): when the game's present returned (it then starts its next
+    // frame), and when that frame's copy finished on the GPU (how long it was ready before its lit pick).
+    double              gRelT[kLr] = {}, gDoneT[kLr] = {};
+    uint64_t            gRelId[kLr] = {}, gDoneId[kLr] = {};
     int                 lrSlot[kLr] = {};
     std::atomic<uint64_t> lrStaged{0};
     std::thread         lrThread;
@@ -1532,7 +1536,8 @@ static void PresenterThread(Swapchain *sc)
             {
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,bfi,method,frames,gain,floor,rolloff,"
                               "pacing,cap,ahead,vblank,wait_vblank_ms,acquire_ms,wait_gpu_ms,submit_ms,present_ms,reused,"
-                              "hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,queue_ahead,smooth_catchup\n");
+                              "hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,queue_ahead,smooth_catchup,"
+                              "release_to_flash_ms,ready_before_pick_ms\n");
                 LOGI("BFI Presenter: timing log started: %s", path.c_str());
             }
         }
@@ -1618,6 +1623,8 @@ static void PresenterThread(Swapchain *sc)
         int pick = -1;
         uint64_t pickId = 0;
         double pickTime = 0.0;
+        bool pickNewG = false;
+        double pickRelG = 0.0, pickReadyMs = -1.0;
         uint64_t pickPresentId = 0;
         {
             std::lock_guard<std::mutex> l(sc->lock);
@@ -1667,6 +1674,10 @@ static void PresenterThread(Swapchain *sc)
             {
                 pickId = sc->stageId[pick];
                 pickTime = sc->stageTime[pick];
+                // A new frame at the lit pick: when it was released, and how long it was ready (copy done) before now.
+                pickNewG = cycleStart && pickId != lastShownId;
+                pickRelG = (pickNewG && sc->gRelId[pickId % kLr] == pickId) ? sc->gRelT[pickId % kLr] : 0.0;
+                pickReadyMs = pickNewG ? (sc->gDoneId[pickId % kLr] == pickId ? (Now() - sc->gDoneT[pickId % kLr]) * 1000.0 : 0.0) : -1.0;
                 pickPresentId = sc->stagePresentId[pick];
                 sc->presCurSlot = pick;
                 if (cycleStart)
@@ -2067,6 +2078,7 @@ static void PresenterThread(Swapchain *sc)
         }
 
         const double t = Now();
+        const double relFlashMs = (pickNewG && pickRelG > 0.0 && t > pickRelG && t - pickRelG < 0.5) ? (t - pickRelG) * 1000.0 : -1.0;
         secPresents++;
         ageSum += (t - pickTime) * 1000.0;
         if (t - lastT > 1.5 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
@@ -2443,12 +2455,13 @@ static void PresenterThread(Swapchain *sc)
                 std::lock_guard<std::mutex> l(g_cfgLock);
                 lrSt = g_status.lrState; lrE = g_status.lrEst; lrM = g_status.lrMargin;
             }
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d\n",
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f\n",
                     t * 1000.0, (unsigned long long)presents, c.slot, (unsigned long long)pickId, (t - pickTime) * 1000.0,
                     (t - lastT) * 1000.0, s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     sc->maxAhead.load(), vblank ? 1 : 0, (tVb - tLoop0) * 1000.0, (tAcq - tVb) * 1000.0, (tFence - tAcq) * 1000.0,
                     (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, reuse ? 1 : 0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f,
-                    litAvg, rawAvg, lrSt, sc->lrLead.load() * 1000.0, lrE, lrM, qa ? (primeIter ? 2 : qaPrimed ? 1 : 0) : -1, s.smoothCatchUp);
+                    litAvg, rawAvg, lrSt, sc->lrLead.load() * 1000.0, lrE, lrM, qa ? (primeIter ? 2 : qaPrimed ? 1 : 0) : -1, s.smoothCatchUp,
+                    relFlashMs, pickReadyMs);
             if ((presents % 120) == 0) fflush(logf);
         }
         lastT = t;
@@ -2523,7 +2536,7 @@ static void LrWatchThread(Swapchain *sc)
                     else done = sc->copyDone[slot] || (sc->copySubmitted[slot] && d->GetFenceStatus(dev, sc->copyFence[slot]) == VK_SUCCESS);
                 }
                 if (gone) break;
-                if (done) { fin = Now(); break; }
+                if (done) { fin = Now(); sc->gDoneT[id % kLr] = fin; sc->gDoneId[id % kLr] = id; break; }
                 SleepShort(0.00025);
             }
             if (fin > 0.0 && sc->lrRelId[k] == id)
@@ -3755,6 +3768,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_QueuePresentKHR(VkQueue queue, const V
         {
             if (pi->pResults) pi->pResults[others[k]] = res[k];
             merge(res[k]);
+        }
+    }
+    // The game's thread goes on to its next frame now: release -> flash is measured from here (timing log). The
+    // threads that present are logged once each (emulators present from a GPU thread of their own).
+    for (uint32_t i : ours)
+    {
+        Swapchain *sc = GetSC(pi->pSwapchains[i]);
+        if (!sc) continue;
+        const uint64_t next = sc->frameId + 1;
+        sc->gRelT[next % kLr] = Now();
+        sc->gRelId[next % kLr] = next;
+    }
+    {
+        static DWORD seen[4] = {};
+        const DWORD tid = GetCurrentThreadId();
+        for (DWORD &t : seen)
+        {
+            if (t == tid) break;
+            if (t == 0) { t = tid; LOGI("BFI Presenter: game frames presented from thread %lu", (unsigned long)tid); break; }
         }
     }
     return worst;
