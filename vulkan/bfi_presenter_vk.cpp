@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v6"
+#define BFI_VERSION "1.0.27-v7"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -4449,15 +4449,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_SetLatencySleepModeNV(VkDevice device,
     if (!d || !d->SetLatencySleepModeNV) return VK_ERROR_DEVICE_LOST;
     const int mode = info ? (int)info->lowLatencyMode : 0, boost = info ? (int)info->lowLatencyBoost : 0;
     const int us = info ? (int)info->minimumIntervalUs : 0;
-    const bool ch1 = g_vkLlMode.exchange(mode) != mode, ch2 = g_vkLlBoost.exchange(boost) != boost, ch3 = g_vkLlMinUs.exchange(us) != us;
+    const bool ch1 = g_vkLlMode.exchange(mode) != mode, ch2 = g_vkLlBoost.exchange(boost) != boost;
+    g_vkLlMinUs.store(us);
+    // Logged when the mode changes or the limit moves by a quarter or more: RPCS3 sets it every frame, a microsecond
+    // or two apart each time (2,200 log lines in 80 s).
+    static int loggedUs = -1;
+    const bool ch3 = loggedUs < 0 || (us == 0) != (loggedUs == 0) || std::abs(us - loggedUs) * 4 > std::max(loggedUs, 1);
     if (ch1 || ch2 || ch3)
-        LOGI("BFI Presenter: game Reflex (Vulkan): low latency %s%s, frame limit %d us", mode ? "on" : "off", boost ? " + Boost" : "", us);
+    {
+        loggedUs = us;
+        LOGI("BFI Presenter: game Reflex (Vulkan): low latency %s%s, frame limit %d us%s", mode ? "on" : "off", boost ? " + Boost" : "", us,
+             us > 0 && g_active ? " -- taken out of the driver" : "");
+    }
     // The driver's limit counts the presenter's presents (it collapsed DX games to ~7 fps): taken out.
     if (info && info->minimumIntervalUs > 0 && g_active)
     {
         VkLatencySleepModeInfoNV m = *info;
         m.minimumIntervalUs = 0;
-        LOGI("BFI Presenter: game Reflex (Vulkan): its frame limit (%u us) taken out of the driver", info->minimumIntervalUs);
         return d->SetLatencySleepModeNV(device, sc, &m);
     }
     return d->SetLatencySleepModeNV(device, sc, info);
