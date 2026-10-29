@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v9"
+#define BFI_VERSION "1.0.27-v10"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -1445,6 +1445,7 @@ static void PresenterThread(Swapchain *sc)
     // each was ready before the pick.
     int secRelN = 0, secReadyN = 0;
     double secRelSum = 0.0, secReady[256];
+    int fsAheadSeen = 0;   // frames ahead the frame-start check/search began at
     int fsState = 0, fsSecs = 0, fsIdx = 0, fsN = 8, fsBad = 0, fsTight = 0, fsBaseN = 0, fsShown = 0, fsRelN = 0, fsRep = 0;
     double fsLeadCur = 0.0, fsStart = 0.0, fsBestMs = 0.0, fsDoneT = -1.0, fsDeclT = -1e9, fsOffT = -1e9, fsKeptLead = -1.0,
            fsBaseRel = 0.0, fsBaseP10 = 1.0, fsRel = 0.0, fsSlack = 1.0, fsScore[16] = {}, fsRelK[16] = {}, fsSlackK[16] = {};
@@ -2265,12 +2266,12 @@ static void PresenterThread(Swapchain *sc)
             if (s.autoAhead && s.maxAhead != 0)
             {
                 repSum -= repWin[repIdx];
-                repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
+                repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && fsState != 2 && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading) or while the frame-start search tries start times
                 repSum += repWin[repIdx];
                 repIdx = (repIdx + 1) % 30;
                 if (autoAhead == 1)
                 {
-                    missSecs = (secRepU >= 2 && s.gameCap >= 1) ? missSecs + 1 : 0;
+                    missSecs = (secRepU >= 2 && s.gameCap >= 1 && fsState != 2) ? missSecs + 1 : 0;
                     if (missSecs >= 3 || repSum >= 6)
                     {
                         if (missSecs < 3)
@@ -2564,6 +2565,18 @@ static void PresenterThread(Swapchain *sc)
                         fsFpsSum *= 0.5; fsFpsN /= 2;      // a sliding half-weight window
                     }
                     auto setLead = [&](double lead, bool on) { fsLeadCur = lead; sc->fsLead.store(lead); sc->fsOn.store(on); };
+                    // Frames ahead changed while checking or searching: the times measured so far are for the other
+                    // setting (shadPS4: a start time measured across the change looked 15 ms better than it was), so the
+                    // check starts again.
+                    {
+                        const int aheadNow = sc->maxAhead.load();
+                        if ((fsState == 1 || fsState == 2) && fsAheadSeen != 0 && aheadNow != fsAheadSeen)
+                        {
+                            LOGI("BFI Presenter: automatic frame cap at the frame start: frames ahead changed to %d -- checking again", aheadNow);
+                            fsState = 1; fsSecs = fsBaseN = 0; fsBaseRel = 0.0; fsBaseP10 = 1.0; sc->fsOn.store(false);
+                        }
+                        fsAheadSeen = (fsState == 1 || fsState == 2) ? aheadNow : 0;
+                    }
                     if (want && drifting && fsState != 0 && fsState != 5)
                     {
                         fsState = 5; sc->fsOn.store(false); sc->fsCtl.store(false);
