@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e10"
+#define BFI_ADDON_VERSION "1.0.27-e11"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3716,7 +3716,11 @@ static DWORD WINAPI PresenterThread(void *)
                     // Lowest-latency pacing only: Smooth shows the oldest waiting frame, so with two waiting a late frame
                     // just leaves the older one to be shown -- no repeat -- and the wait jumps a whole cycle instead.
                     // In Dead Space (Smooth) the wake-up chased that round and round (318 ms in 6 minutes).
-                    const bool atSleepNoFg = sleepUs > 0 && locked && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
+                    // Not with the presenter's own pacing after the present (frame generation without Reflex, the frame
+                    // cap at the frame start): its start-time search steers that, and the alignment steering it as well
+                    // made the start jump 3-5 ms every few seconds (Resident Evil 4 with ReflexAlign on: 33-36 ms from
+                    // release to flash every 4-5 s between 22-25 ms).
+                    const bool atSleepNoFg = sleepUs > 0 && !fgOn && locked && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
                     const bool holds = capFps > 0.0 && stNow.gameFps > 0.95 * capFps && stNow.gameFps < 1.05 * capFps;
                     // Frame generation without Reflex: the start time is chosen by trying it out. The controller below
                     // hunted there: frames a pair apart wait a refresh more by design, so the 10th percentile it steers
