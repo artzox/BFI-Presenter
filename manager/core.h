@@ -5,8 +5,8 @@
 #include <vector>
 #include <functional>
 
-#define MANAGER_VERSION "1.3.9"
-#define MANAGER_VERSION_W L"1.3.9"
+#define MANAGER_VERSION "1.3.10"
+#define MANAGER_VERSION_W L"1.3.10"
 
 namespace bfi {
 
@@ -160,7 +160,7 @@ std::wstring BackupDir();
 std::wstring LogPath();
 
 // ----- GitHub releases
-struct RemoteRelease { std::string tag, dxUrl, vkUrl, notesUrl, mgrUrl, mgrVersion; bool ok = false; std::string error; };
+struct RemoteRelease { std::string tag, dxUrl, vkUrl, notesUrl, mgrUrl, mgrVersion, toolsUrl, toolsVersion; bool ok = false; std::string error; };
 RemoteRelease FetchLatestRelease();
 // What's new: changelog entries for one part (tag "DX", "Vulkan", "Shader" or "Manager") newer than `from` and up
 // to `to` ("" = no upper limit), newest first, from a release's CHANGELOG.md. title: the entry's bold first line.
@@ -173,6 +173,18 @@ Source CachedRelease();                        // newest release already downloa
 // Downloads the Manager zip of r and puts its exe in place of the running one (which is renamed to .old).
 // "" = done: start the new exe and quit.
 std::string UpdateManagerExe(const RemoteRelease &r, const std::function<void(const std::string &)> &progress);
+// ----- Tools (motion test, log analyzer), kept in %LOCALAPPDATA%\BFIPresenter\tools.
+// The motion test sits in a folder of its own (BFIMotionTest), which the game list shows as "BFI Motion Test" so
+// ReShade and BFI Presenter install there like in a game; updates replace only the exe.
+std::wstring ToolsDir();
+std::wstring MotionTestDir();
+std::wstring MotionTestExe();
+std::wstring LogAnalyzerHtml();
+std::string CachedToolsVersion();               // "" = not downloaded
+// Downloads the tools zip when it is newer than the copy here (r's, or the newest release that has one; r may be
+// empty). Blocking. "" = the tools are here and current (or GitHub couldn't be asked and a copy is here).
+std::string EnsureTools(const RemoteRelease &r, const std::function<void(const std::string &)> &progress, std::string *note);
+Game MotionTestGame();                          // detected; root empty if the motion test isn't downloaded
 void CleanupOldManagerExe();                   // removes the .old exe left by an update
 
 // ----- ReShade (the add-on build from reshade.me)

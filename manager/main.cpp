@@ -152,6 +152,11 @@ struct App {
     bool mgrDone = false;              // guarded by lock: a Manager update finished
     std::string mgrErr;                // guarded by lock
     bool restart = false;              // start the updated Manager and quit
+    bool toolsDone = false;            // guarded by lock: a tools download finished
+    int  toolsWhich = 0;               // 1 motion test, 2 log analyzer
+    std::string toolsErr, toolsNote;   // guarded by lock
+    Game toolsGame;                    // guarded by lock: the motion test, detected
+    std::string toolsVer = "?";        // the tools here ("?" = not read yet, "" = none)
 
     // UI
     char search[128] = {};
@@ -455,6 +460,33 @@ static void StartManagerUpdate()
     });
 }
 
+// Motion test / log analyzer: downloaded (or updated) on first use from the newest release with a tools zip.
+static void StartTool(int which)
+{
+    if (g_app.busy) return;
+    JoinWorker();
+    g_app.busy = true;
+    RemoteRelease rr;
+    {
+        std::lock_guard<std::mutex> l(g_app.lock);
+        rr = g_app.remote;
+        g_app.busyText = which == 1 ? "Getting the motion test..." : "Getting the log analyzer...";
+    }
+    g_app.worker = std::thread([rr, which] {
+        std::string note;
+        std::string e = EnsureTools(rr, SetBusy, &note);
+        Game g;
+        if (e.empty() && which == 1) g = MotionTestGame();
+        std::lock_guard<std::mutex> l(g_app.lock);
+        g_app.toolsErr = e;
+        g_app.toolsNote = note;
+        g_app.toolsWhich = which;
+        g_app.toolsGame = g;
+        g_app.toolsDone = true;
+        g_app.busy = false;
+    });
+}
+
 static void PollWorker()
 {
     std::lock_guard<std::mutex> l(g_app.lock);
@@ -490,6 +522,42 @@ static void PollWorker()
                      });
         }
         g_app.rsPending.clear();
+    }
+    if (g_app.toolsDone)
+    {
+        g_app.toolsDone = false;
+        g_app.toolsVer = "?";
+        if (!g_app.toolsErr.empty()) g_app.SetMsg(g_app.toolsErr, true);
+        else if (g_app.toolsWhich == 2)
+        {
+            ShellExecuteW(nullptr, L"open", LogAnalyzerHtml().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            g_app.SetMsg((g_app.toolsNote.empty() ? "" : g_app.toolsNote + " ") +
+                         "Log analyzer opened in your browser: drop a session's CSV files and ReShade.log on it.", false);
+        }
+        else if (!g_app.toolsGame.root.empty())
+        {
+            // In the game list like a game, so ReShade and BFI Presenter install there the usual way.
+            const Game &mt = g_app.toolsGame;
+            int at = -1;
+            for (int i = 0; i < (int)g_app.games.size(); i++)
+                if (Lower(g_app.games[i].root) == Lower(mt.root)) { g_app.games[i] = mt; at = i; }
+            if (at < 0) { g_app.games.push_back(mt); at = (int)g_app.games.size() - 1; SaveGameList(g_app.games); }
+            const Game &g = g_app.games[at];
+            if (!g.reshade || g.addonVersion.empty())
+            {
+                g_app.sel = at;
+                g_app.SetMsg((g_app.toolsNote.empty() ? "" : g_app.toolsNote + " ") +
+                             "BFI Motion Test is in the game list (selected): install ReShade and BFI Presenter for it there, "
+                             "then click Motion test again.", false);
+            }
+            else
+            {
+                ShellExecuteW(nullptr, L"open", MotionTestExe().c_str(), nullptr, MotionTestDir().c_str(), SW_SHOWNORMAL);
+                g_app.SetMsg((g_app.toolsNote.empty() ? "" : g_app.toolsNote + " ") +
+                             "Motion test started: F for borderless fullscreen, the presenter's settings in the ReShade overlay.", false);
+            }
+        }
+        else g_app.SetMsg("The motion test isn't in the tools that were downloaded.", true);
     }
     if (g_app.mgrDone)
     {
@@ -948,6 +1016,27 @@ static void DrawTop(HWND hwnd)
     if (g_app.vk.installed && !g_app.vk.machine && !g_app.vk.elevatedWhy.empty())
         WarnWrapped("%s: per-user Vulkan layers don't load in games run as administrator. Use All users.",
                     CapFirst(g_app.vk.elevatedWhy).c_str());
+
+    // Tools
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(kGrey, "Tools");
+    ImGui::SameLine(ImGui::CalcTextSize("Vulkan layer").x + ImGui::GetFontSize() * 1.5f);
+    ImGui::BeginDisabled(g_app.busy);
+    if (ImGui::Button("Motion test")) StartTool(1);
+    Tooltip("Moving test patterns (inspired by Blur Busters' TestUFO) as a program BFI Presenter hooks like a game: judge\n"
+            "sharpness, cadence and strobe settings on the same picture on every display. Downloaded on first use (and\n"
+            "updated when a release brings a new one); it appears in the game list as BFI Motion Test for installing\n"
+            "ReShade and BFI Presenter there.");
+    ImGui::SameLine();
+    if (ImGui::Button("Log analyzer")) StartTool(2);
+    Tooltip("An offline page that charts a session from the presenter's timing logs (the CSV files) and ReShade.log:\n"
+            "frame pacing, repeats and skips, the frame cap, frame generation. Downloaded on first use; opens in your browser.");
+    ImGui::EndDisabled();
+    {
+        if (g_app.toolsVer == "?") g_app.toolsVer = CachedToolsVersion();
+        const std::string &tv = g_app.toolsVer;
+        if (!tv.empty() && tv != "0") { ImGui::SameLine(); ImGui::TextColored(kGrey, "(v%s)", tv.c_str()); }
+    }
 
     ImGui::Separator();
 
