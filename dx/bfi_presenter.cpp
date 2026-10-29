@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e4"
+#define BFI_ADDON_VERSION "1.0.27-e5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3174,7 +3174,7 @@ static DWORD WINAPI PresenterThread(void *)
                 // present, at one game frame per strobe cycle, instead of holding the finished frame at the present.
                 int feWant = 0;
                 if (want == 0 && s.autoCapFrameStart && s.autoCap && userCap == 1 && autoCapDown && !capByReflex && !fgWas &&
-                    fgFact <= 1 && s.enabled && s.frames >= 2 && s.pacingMode == 1 && hzP > 0.0)
+                    fgFact <= 1 && s.enabled && s.frames >= 2 && s.pacingMode == 1 && hzP > 0.0 && gtid != 0)
                     feWant = (int)(1e6 * s.frames / hzP + 0.5);
                 {
                     static int feWas = 0;
@@ -3182,7 +3182,7 @@ static DWORD WINAPI PresenterThread(void *)
                     {
                         const char *why = feWant > 0 ? "" : !s.autoCapFrameStart ? ": switched off" : !autoCapDown ? ": the cap is at Refresh rate" :
                                           capByReflex ? ": Reflex's frame limit holds the game" : (fgWas || fgFact > 1) ? ": frame generation" :
-                                          s.pacingMode != 1 ? ": needs Lowest latency pacing" : ": BFI off or cap changed";
+                                          s.pacingMode != 1 ? ": needs Lowest latency pacing" : gtid == 0 ? ": the game's present thread isn't known" : ": BFI off or cap changed";
                         LOGI("BFI Presenter: automatic frame cap at the frame start %s%s (%d us per game frame, game thread %lu)",
                              feWant > 0 ? "on" : "off", why, feWant, (unsigned long)gtid);
                     }
@@ -7985,6 +7985,10 @@ static void on_reshade_present_gl(reshade::api::effect_runtime *runtime)
             return g_gl.tex;
         },
         []() -> HRESULT { return S_OK; });                         // the game's own SwapBuffers follows anyway
+    // The automatic frame cap at the frame start: the game's thread is held here, right before its own SwapBuffers
+    // (with swap interval 0 that returns at once).
+    NoteGameThread11();
+    FgPaceAfterPresent();
 }
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
