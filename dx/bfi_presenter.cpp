@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.25"
+#define BFI_ADDON_VERSION "1.0.26"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -502,12 +502,30 @@ static std::atomic<int> g_stagedThisSecond{0};
 struct ThreadCount { DWORD tid[6] = {}; long n[6] = {}; long other = 0; };
 static SRWLOCK g_presCountLock = SRWLOCK_INIT;
 static ThreadCount g_presCount;
+// The game's own presents on the swap chain it holds, when that is a wrapper over the real one (OptiScaler's
+// swap chain, frame generation behind it). FSR frame generation presents every frame from its own thread to the
+// real swap chain, so only here are the game's frames still apart from the generated ones.
+static ThreadCount g_outerCount;
+static void **g_outerVtbl = nullptr;
+// 1 = the game's frames are counted on FSR frame generation's swap chain (its own timings below); XeSS frame generation
+// and anything else keep the hook on the real swap chain and the timings tested with it (Riven).
+static std::atomic<int> g_fgOuterFsr{0};
 // Frame generation without Reflex (FrameGenLimitWithoutReflex): the game's own presents (its first present thread) are paced after they
 // return, one rendered frame per (strobe cycle x frame-generation factor) -- a frame-start sleep where Reflex would
 // sleep; frame generation's presents (its own thread) pass. 0 = off.
 static std::atomic<int>   g_fgPaceUs{0};
 static std::atomic<DWORD> g_fgGameTid{0};
 static std::atomic<int>   g_fgShiftUs{0};     // phase step requested by the presenter (one refresh)
+static void CountTo(ThreadCount &c)
+{
+    const DWORD tid = GetCurrentThreadId();
+    AcquireSRWLockExclusive(&g_presCountLock);
+    int k = 0;
+    while (k < 6 && c.tid[k] && c.tid[k] != tid) k++;
+    if (k < 6) { if (!c.tid[k]) c.tid[k] = tid; c.n[k]++; }
+    else c.other++;
+    ReleaseSRWLockExclusive(&g_presCountLock);
+}
 static void CountPresent()
 {
     const DWORD tid = GetCurrentThreadId();
@@ -593,6 +611,8 @@ static PFN_Present        o_Present = nullptr;
 static PFN_GetBuffer      o_GetBuffer = nullptr;
 static PFN_ResizeBuffers  o_ResizeBuffers = nullptr;
 static PFN_Present1       o_Present1 = nullptr;
+static PFN_Present        o_OuterPresent = nullptr;    // the game-facing (outer) swap chain, see hk_OuterPresent
+static PFN_Present1       o_OuterPresent1 = nullptr;
 static PFN_GetCBBI        o_GetCBBI = nullptr;
 static PFN_ResizeBuffers1 o_ResizeBuffers1 = nullptr;
 static PFN_SetMFL         o_SetMFL = nullptr;
@@ -749,6 +769,8 @@ template <class T> struct TlsVar
 #endif
 BFI_TLS(bool, t_presenterThread);   // calls made on the presenter thread
 BFI_TLS(int, t_ownCall);
+BFI_TLS(int, t_inOuter);            // inside the game-facing (outer) swap chain's Present
+BFI_TLS(int, t_scCreateDepth);      // nested CreateSwapChain* calls through the factory hook (outermost = 1)
 struct OwnCall { OwnCall() { t_ownCall++; } ~OwnCall() { t_ownCall--; } };
 static HRESULT OwnPresent();
 static std::atomic<bool>      g_needRebind{false};        // move presentation to g_presQueue on the first frame
@@ -3104,8 +3126,16 @@ static DWORD WINAPI PresenterThread(void *)
                 // Frame generation without Reflex: the game's thread (its first present thread) against all presents.
                 static int fgCand = 1, fgRun = 0, fgFact = 1;
                 long tot = 0, gt = 0;
-                const DWORD gtid = g_presentThreads[0];
+                DWORD gtid = g_presentThreads[0];
                 AcquireSRWLockExclusive(&g_presCountLock);
+                // The outer swap chain's presents (the game's own frames), from its busiest thread.
+                long outerN = 0; DWORD outerTid = 0;
+                for (int k = 0; k < 6 && g_outerCount.tid[k]; k++)
+                {
+                    if (g_outerCount.n[k] > outerN) { outerN = g_outerCount.n[k]; outerTid = g_outerCount.tid[k]; }
+                    g_outerCount.n[k] = 0;
+                }
+                g_outerCount.other = 0;
                 for (int k = 0; k < 6 && g_presCount.tid[k]; k++)
                 {
                     tot += g_presCount.n[k];
@@ -3114,14 +3144,16 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 tot += g_presCount.other; g_presCount.other = 0;
                 ReleaseSRWLockExclusive(&g_presCountLock);
+                if (outerN > 0) { gt = outerN; gtid = outerTid; }
+                g_fgOuterFsr.store(outerN > 0 ? 1 : 0);
                 int cnd = 1;
                 if (g_fgSeen[0] && gt > 0 && tot >= 1.5 * gt) cnd = std::max(2, std::min(4, (int)((double)tot / gt + 0.5)));
                 fgRun = cnd == fgCand ? fgRun + 1 : 1; fgCand = cnd;
                 if (fgRun >= 3 && fgFact != cnd)
                 {
                     fgFact = cnd;
-                    LOGI("BFI Presenter: frame generation without Reflex: %dx (%ld presents a second, %ld from the game's thread %lu)",
-                         fgFact, tot, gt, (unsigned long)gtid);
+                    LOGI("BFI Presenter: frame generation without Reflex: %dx (%ld presents a second, %ld from the game's thread %lu%s)",
+                         fgFact, tot, gt, (unsigned long)gtid, outerN > 0 ? ", counted on the outer swap chain" : "");
                 }
                 const double hzP = modeHz > 0.0 ? modeHz : peakHz;
                 int want = 0;
@@ -3630,7 +3662,7 @@ static DWORD WINAPI PresenterThread(void *)
                     // one strobe cycle are tried about 2 ms apart, 3 s each (1 s to settle, 2 s measured): the one
                     // with every frame reaching a flash and the shortest release -> flash is kept. Tried again only
                     // after 10 s in a row with under 90% of the frames reaching a flash or 6 ms slower, at most once
-                    // a minute. Riven: 29 ms (start +8.3 ms in the cycle) against 34-45 ms at the other start times.
+                    // a minute (FSR: 5 s, every 20 s, see below). Riven: 29 ms (start +8.3 ms in the cycle) against 34-45 ms at the other start times.
                     static int swIdx = -1, swN = 0, swSecs = 0, swBad = 0, swShown = 0, swRelN = 0, swRep = 0;
                     static double swPhase = 0.0, swStart = 0.0, swDoneT = -1.0, swBestMs = 0.0, swRel = 0.0, swScore[16] = {}, swRelMs[16] = {},
                                   swSlack = 1.0, swSlackK[16] = {};
@@ -3641,6 +3673,13 @@ static DWORD WINAPI PresenterThread(void *)
                     swWasOn = fgOn;
                     if (fgOn && locked && s.pacingMode == 1 && cyc > 0.0)
                     {
+                        // FSR frame generation paces its own output and follows a moved frame start with a lag, and the
+                        // start times that work moved between searches (Riven): 2 s to settle per start time, 8 ms to
+                        // spare preferred, no 2 ms steps while held (they walked it into the bad start times), looked
+                        // for again after 5 s of lost frames (every 20 s at most). XeSS frame generation keeps the
+                        // timings tested with it.
+                        const bool fsr = g_fgOuterFsr.load() != 0;
+                        const int settle = fsr ? 3 : 2;
                         auto moveTo = [&](double ph)
                         {
                             const int d = (int)((ph - swPhase) * 1e6);
@@ -3649,30 +3688,36 @@ static DWORD WINAPI PresenterThread(void *)
                         };
                         const bool ok = holds && !hitchPaused;
                         const double base = swPhase - std::fmod(swPhase, cyc);   // stay within the same cycle's worth of moves
-                        if (swIdx < 0 && ok && (swDoneT < 0.0 || (swBad >= 10 && t - swDoneT > 60.0)))
+                        if (swIdx < 0 && ok && (swDoneT < 0.0 || (fsr ? (swBad >= 5 && t - swDoneT > 20.0) : (swBad >= 10 && t - swDoneT > 60.0))))
                         {
                             swN = std::max(4, std::min(16, (int)(cyc / 0.002 + 0.5)));
                             swIdx = 0; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swBad = 0;
                             swStart = base;
                             moveTo(swStart);
                             LOGI("BFI Presenter: frame limit for frame generation: trying %d start times across the strobe cycle (%.0f s)",
-                                 swN, swN * 3.0);
+                                 swN, swN * (settle + 1.0));
                         }
                         else if (swIdx >= 0)
                         {
                             if (!ok) { swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swSlack = 1.0; }
-                            else if (++swSecs >= 2)
+                            else if (++swSecs >= settle)
                             {
                                 swShown += relN; swRel += relSum; swRelN += relN; swRep += stNow.frameRepeats;
                                 if (p10 >= 0.0) swSlack = std::min(swSlack, p10);
-                                if (swSecs >= 3)
+                                if (swSecs >= settle + 1)
                                 {
                                     const double relMs = swRelN ? swRel / swRelN : 1e3;
                                     const bool full = swShown >= (int)(2.0 * capFps * 0.97) && swRep <= 2;
                                     // Every frame shown, and frames ready at least 3 ms before their flash: the quickest start
                                     // right at the edge lost frames as soon as the GPU work grew (Riven: 29 ms, then 40-50 ms
                                     // with 53-58 of 60 shown while OptiScaler's denoiser went from 2.6 to 7 ms a frame).
-                                    swScore[swIdx] = !full ? 1e3 + (2.0 * capFps - swShown) : swSlack < 0.003 ? 100.0 + relMs : relMs;
+                                    // FSR frame generation (Riven): next to start times that lost frames, one that had shown every
+                                    // frame with 4.6 ms to spare lost half of them a minute later (30 of 60 shown: the generated
+                                    // frames, finished on the GPU later than the game's, missed the pick). So 8 ms to spare first,
+                                    // then 3 ms, then any start time that showed every frame.
+                                    swScore[swIdx] = !full ? 1e3 + (2.0 * capFps - swShown) :
+                                                     fsr ? (swSlack >= 0.008 ? relMs : swSlack >= 0.003 ? 50.0 + relMs : 100.0 + relMs)
+                                                         : (swSlack < 0.003 ? 100.0 + relMs : relMs);
                                     swRelMs[swIdx] = relMs; swShownK[swIdx] = swShown; swSlackK[swIdx] = swSlack;
                                     swIdx++; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swSlack = 1.0;
                                     const double start = swStart;
@@ -3687,20 +3732,20 @@ static DWORD WINAPI PresenterThread(void *)
                                         for (int k = 0; k < swN && len < (int)sizeof(list) - 32; k++)
                                             len += snprintf(list + len, sizeof(list) - len, " %.1f:%d/%.0f/%.1f", k * cyc / swN * 1000.0,
                                                             swShownK[k], swRelMs[k], swSlackK[k] < 1.0 ? swSlackK[k] * 1000.0 : -1.0);
-                                        LOGI("BFI Presenter: frame limit for frame generation lined up with the flash: start %+.1f ms "
+                                        LOGI("BFI Presenter: frame limit for frame generation%s lined up with the flash: start %+.1f ms "
                                              "in the cycle, %.1f ms from release to flash, %d of %.0f frames shown (start ms:shown/ms/ready ms before the flash --%s)",
-                                             best * cyc / swN * 1000.0, swRelMs[best], swShownK[best], 2.0 * capFps, list);
+                                             fsr ? " (FSR)" : "", best * cyc / swN * 1000.0, swRelMs[best], swShownK[best], 2.0 * capFps, list);
                                     }
                                 }
                             }
                         }
-                        // Held: tried again after 10 s in a row with under 90% of the frames shown, or 6 ms or more
+                        // Held: tried again after 10 s (FSR 5 s) in a row with under 90% of the frames shown, or 6 ms or more
                         // slower than the start time found.
                         else
                         {
                             swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + 6.0))) ? swBad + 1 : 0;
                             // Held, frames repeating close to their flash (the GPU work grew): 2 ms earlier, once per 3 s.
-                            swTight = (ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.0015) ? swTight + 1 : 0;
+                            swTight = (!fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.0015) ? swTight + 1 : 0;
                             if (swTight >= 3)
                             {
                                 swTight = 0;
@@ -4330,6 +4375,7 @@ static void GameReleased(UINT64 lastId)
 
 static void FgPaceAfterPresent()
 {
+    if (t_inOuter) return;   // the outer swap chain's Present paces, after it returns
     const int us = g_fgPaceUs.load();
     if (us <= 0 || GetCurrentThreadId() != g_fgGameTid.load()) return;
     static thread_local HANDLE timer = nullptr;
@@ -5550,6 +5596,175 @@ static bool InstallHooks(IDXGISwapChain3 *sc)
     return true;
 }
 
+// ---------------------------------------------------------------- outer (game-facing) swap chain
+// OptiScaler hands the game a wrapper swap chain; with FSR frame generation behind it every real present comes
+// from FSR's own thread, so the presenter's hook on the real swap chain can't tell the game's frames apart and
+// can't hold the game where it starts a frame. The wrapper's Present is still called by the game, once per
+// rendered frame: counted there, and the frame limit for frame generation without Reflex sleeps right after it.
+// Found by hooking the factory the game gets (through its own dxgi.dll import) before it creates its swap chain.
+static HRESULT STDMETHODCALLTYPE hk_OuterPresent(IDXGISwapChain *sc, UINT sync, UINT flags)
+{
+    if (flags & DXGI_PRESENT_TEST) return o_OuterPresent(sc, sync, flags);
+    CountTo(g_outerCount);
+    t_inOuter++;
+    const HRESULT hr = o_OuterPresent(sc, sync, flags);
+    t_inOuter--;
+    FgPaceAfterPresent();
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hk_OuterPresent1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p)
+{
+    if (flags & DXGI_PRESENT_TEST) return o_OuterPresent1(sc, sync, flags, p);
+    CountTo(g_outerCount);
+    t_inOuter++;
+    const HRESULT hr = o_OuterPresent1(sc, sync, flags, p);
+    t_inOuter--;
+    FgPaceAfterPresent();
+    return hr;
+}
+static void OuterCheck(void *obj)
+{
+    if (!obj) return;
+    void **vt = *(void ***)obj;
+    if (vt == g_hookedVtbl || vt == g_outerVtbl) return;
+    // DXGI's own swap chain (no wrapper): the hook on the real swap chain already sees the game's presents.
+    static HMODULE sysDxgi = nullptr;
+    if (!sysDxgi)
+    {
+        wchar_t path[MAX_PATH];
+        const UINT n = GetSystemDirectoryW(path, MAX_PATH);
+        if (n && n < MAX_PATH - 12) { wcscat(path, L"\\dxgi.dll"); sysDxgi = GetModuleHandleW(path); }
+    }
+    HMODULE m = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)vt[VT_Present], &m);
+    char mod[64];
+    ModuleOf(vt[VT_Present], mod, sizeof(mod));
+    if (!m || m == sysDxgi)
+    {
+        LOGI("BFI Presenter: the game's swap chain is DXGI's own (%s) -- no outer swap chain to hook", mod);
+        return;
+    }
+    if (g_outerVtbl) { LOGW("BFI Presenter: another outer swap chain type (%s) -- not hooked", mod); return; }
+    {
+        char l[64]; size_t i = 0;
+        for (; mod[i] && i < sizeof(l) - 1; i++) l[i] = (char)tolower((unsigned char)mod[i]);
+        l[i] = 0;
+        if (!strstr(l, "fidelityfx") && !strstr(l, "ffx"))
+        {
+            LOGI("BFI Presenter: the game presents to a wrapper swap chain (%s) -- not FSR frame generation, so the game's "
+                 "presents are counted on the real swap chain as before", mod);
+            return;
+        }
+    }
+    PatchSlot(vt, VT_Present,  (void *)&hk_OuterPresent,  (void **)&o_OuterPresent);
+    PatchSlot(vt, VT_Present1, (void *)&hk_OuterPresent1, (void **)&o_OuterPresent1);
+    g_outerVtbl = vt;
+    LOGI("BFI Presenter: the game presents to FSR frame generation's swap chain (%s) -- its presents are counted there "
+         "(FSR presents every frame from a thread of its own)", mod);
+}
+typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSC)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSCHwnd)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *,
+                                                        const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSCCore)(IDXGIFactory2 *, IUnknown *, IUnknown *, const DXGI_SWAP_CHAIN_DESC1 *,
+                                                        IDXGIOutput *, IDXGISwapChain1 **);
+static PFN_FCreateSC     o_FCreateSC = nullptr;
+static PFN_FCreateSCHwnd o_FCreateSCHwnd = nullptr;
+static PFN_FCreateSCCore o_FCreateSCCore = nullptr;
+static HRESULT STDMETHODCALLTYPE hk_FCreateSC(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out)
+{
+    // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
+    // same factory methods, and the game gets the object the outermost call returns.
+    t_scCreateDepth++;
+    const HRESULT hr = o_FCreateSC(f, dev, d, out);
+    const int depth = t_scCreateDepth--;
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hk_FCreateSCHwnd(IDXGIFactory2 *f, IUnknown *dev, HWND w, const DXGI_SWAP_CHAIN_DESC1 *d,
+                                                  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs, IDXGIOutput *o, IDXGISwapChain1 **out)
+{
+    // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
+    // same factory methods, and the game gets the object the outermost call returns.
+    t_scCreateDepth++;
+    const HRESULT hr = o_FCreateSCHwnd(f, dev, w, d, fs, o, out);
+    const int depth = t_scCreateDepth--;
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hk_FCreateSCCore(IDXGIFactory2 *f, IUnknown *dev, IUnknown *win, const DXGI_SWAP_CHAIN_DESC1 *d,
+                                                  IDXGIOutput *o, IDXGISwapChain1 **out)
+{
+    // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
+    // same factory methods, and the game gets the object the outermost call returns.
+    t_scCreateDepth++;
+    const HRESULT hr = o_FCreateSCCore(f, dev, win, d, o, out);
+    const int depth = t_scCreateDepth--;
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    return hr;
+}
+// The function the game itself imports from dxgi.dll (its own import table): with OptiScaler that is
+// OptiScaler's dxgi.dll, so the factory made here is the kind the game gets.
+static void *GameDxgiImport(const char *fn)
+{
+    BYTE *base = (BYTE *)GetModuleHandleW(nullptr);
+    if (!base) return nullptr;
+    auto *dos = (IMAGE_DOS_HEADER *)base;
+    auto *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    const IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return nullptr;
+    for (auto *imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); imp->Name; imp++)
+    {
+        if (_stricmp((const char *)(base + imp->Name), "dxgi.dll") != 0) continue;
+        auto *names = (IMAGE_THUNK_DATA *)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        auto *addrs = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; names++, addrs++)
+        {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            auto *ibn = (IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData);
+            if (strcmp((const char *)ibn->Name, fn) == 0) return (void *)addrs->u1.Function;
+        }
+    }
+    return nullptr;
+}
+static void InstallOuterFactoryHook()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    if (!GetPrivateProfileIntA("BFI", "HookOuterSwapChain", 1, g_iniPath)) { LOGI("BFI Presenter: outer swap chain hook off (ini)"); return; }
+    typedef HRESULT (WINAPI *PFN_CF2)(UINT, REFIID, void **);
+    typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void **);
+    const char *from = "the game's import";
+    PFN_CF2 cf2 = (PFN_CF2)GameDxgiImport("CreateDXGIFactory2");
+    PFN_CF1 cf1 = (PFN_CF1)GameDxgiImport("CreateDXGIFactory1");
+    if (!cf2 && !cf1)
+    {
+        from = "dxgi.dll";
+        HMODULE d = GetModuleHandleA("dxgi.dll");
+        if (d) { cf2 = (PFN_CF2)GetProcAddress(d, "CreateDXGIFactory2"); cf1 = (PFN_CF1)GetProcAddress(d, "CreateDXGIFactory1"); }
+    }
+    IDXGIFactory2 *f = nullptr;
+    {
+        OwnCall own;
+        if (cf2) cf2(0, __uuidof(IDXGIFactory2), (void **)&f);
+        if (!f && cf1) cf1(__uuidof(IDXGIFactory2), (void **)&f);
+    }
+    if (!f) { LOGW("BFI Presenter: outer swap chain hook: no DXGI factory"); return; }
+    void **vt = *(void ***)f;
+    char mod[64];
+    ModuleOf(vt[15], mod, sizeof(mod));
+    PatchSlot(vt, 10, (void *)&hk_FCreateSC,     (void **)&o_FCreateSC);
+    PatchSlot(vt, 15, (void *)&hk_FCreateSCHwnd, (void **)&o_FCreateSCHwnd);
+    PatchSlot(vt, 16, (void *)&hk_FCreateSCCore, (void **)&o_FCreateSCCore);
+    f->Release();
+    LOGI("BFI Presenter: outer swap chain hook on the game's DXGI factory (from %s, CreateSwapChainForHwnd in %s)", from, mod);
+}
+static void on_init_device_outer(reshade::api::device *dev)
+{
+    if (dev && (dev->get_api() == reshade::api::device_api::d3d12 || dev->get_api() == reshade::api::device_api::d3d11))
+        InstallOuterFactoryHook();
+}
+
 static HRESULT STDMETHODCALLTYPE hk_SetFS(IDXGISwapChain *sc, BOOL fs, IDXGIOutput *target);
 static HRESULT STDMETHODCALLTYPE hk_GetFSt(IDXGISwapChain *sc, BOOL *fs, IDXGIOutput **target);
 static HRESULT STDMETHODCALLTYPE hk_SetCS1(IDXGISwapChain3 *sc, DXGI_COLOR_SPACE_TYPE cs);
@@ -5642,6 +5857,7 @@ static void DetectFrameGen()
         { "amd_fidelityfx_dx12.dll",            "AMD FidelityFX (FSR 3.1 / FSR FG)" },
         { "ffx_frameinterpolation_x64.dll",     "FSR 3.0 frame interpolation" },
         { "libxess_fg.dll",                     "XeSS Frame Generation" },
+        { "amd_fidelityfx_framegeneration_dx12.dll", "FSR Frame Generation" },
     };
     g_fgSeen[0] = '\0';
     for (const auto &e : k)
@@ -8578,6 +8794,7 @@ static void UnregisterAll(HMODULE hModule)
     if (g_unregistered) return;
     g_unregistered = true;
     if (g_crashHandler) { RemoveVectoredExceptionHandler(g_crashHandler); g_crashHandler = nullptr; }
+    reshade::unregister_event<reshade::addon_event::init_device>(on_init_device_outer);
     reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
     reshade::unregister_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
     reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
@@ -8601,6 +8818,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     if (!g_unregistered) return true;                  // first load: DllMain registered already
     if (!reshade::register_addon(addon_module)) return false;
     g_unregistered = false;
+    reshade::register_event<reshade::addon_event::init_device>(on_init_device_outer);
     reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
     reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
     reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
@@ -8656,7 +8874,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         InitializeCriticalSection(&g_submitLock);
         g_tickEvent      = CreateEventA(nullptr, FALSE, FALSE, nullptr);
         g_gameFenceEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-        reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
+        reshade::register_event<reshade::addon_event::init_device>(on_init_device_outer);
+    reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
