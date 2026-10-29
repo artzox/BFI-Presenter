@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e13"
+#define BFI_ADDON_VERSION "1.0.27-e14"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -1854,6 +1854,60 @@ static bool InImage(DWORD64 addr)
     return addr && VirtualQuery((const void *)(uintptr_t)addr, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.Type == MEM_IMAGE;
 }
 
+#ifdef _WIN64
+// True when the stack from rsp up is committed, readable memory; top is where
+// that memory ends (the stack's base for a real stack). A thread's stack walk
+// only reads between rsp and its base, so a context pointing anywhere else (a
+// thread that exited and freed its stack, a corrupt frame) stops the walk
+// instead of faulting: the watchdog once crashed a UE4 game reading a stack
+// that was no longer there.
+static bool StackReadable(DWORD64 rsp, DWORD64 &top)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!rsp || (rsp & 7) || VirtualQuery((const void *)(uintptr_t)rsp, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+    if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return false;
+    top = (DWORD64)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    return rsp + 8 <= top;
+}
+
+// x64 stack walk with the unwind tables, kept to readable stack memory: each
+// frame must sit higher on the stack than the one before (a walk that goes
+// round in circles or jumps off the stack stops there).
+static int UnwindStack(CONTEXT ctx, DWORD64 *frames, int max)
+{
+    int nf = 0;
+    DWORD64 top = 0;
+    if (ctx.Rip < 0x10000 && StackReadable(ctx.Rsp, top))
+    {
+        // Call through a null (or tiny) pointer: the caller's return address
+        // is on top of the stack.
+        frames[nf++] = ctx.Rip;
+        ctx.Rip = *(DWORD64 *)ctx.Rsp;
+        ctx.Rsp += 8;
+    }
+    for (; nf < max && ctx.Rip; nf++)
+    {
+        frames[nf] = ctx.Rip;
+        if (!InImage(ctx.Rip)) { nf++; break; }               // JIT code: don't ask the runtime to unwind
+        if (!StackReadable(ctx.Rsp, top)) { nf++; break; }
+        const DWORD64 rsp = ctx.Rsp;
+        DWORD64 base = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
+        if (!fn) { ctx.Rip = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; }
+        else
+        {
+            PVOID hd = nullptr;
+            DWORD64 est = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &hd, &est, nullptr);
+        }
+        if (ctx.Rsp <= rsp || ctx.Rsp > top) { nf++; break; }
+    }
+    return nf;
+}
+#endif
+
 #ifndef _WIN64
 // 32-bit builds: follow the EBP frame chain (no unwind tables on x86). Frames
 // of code built without frame pointers are skipped; good enough for a log.
@@ -1885,6 +1939,8 @@ static void LogThreadStack(DWORD tid, const char *who)
     if (!th) return;
     DWORD64 frames[32];
     int nf = 0;
+    DWORD code = 0;
+    if (!GetExitCodeThread(th, &code) || code != STILL_ACTIVE) { CloseHandle(th); return; }   // gone: its stack may be freed
     if (SuspendThread(th) != (DWORD)-1)
     {
         CONTEXT ctx = {};
@@ -1894,17 +1950,7 @@ static void LogThreadStack(DWORD tid, const char *who)
 #ifndef _WIN64
             nf = WalkFramePointers(ctx, frames, 32);
 #else
-            for (; nf < 32 && ctx.Rip; nf++)
-            {
-                frames[nf] = ctx.Rip;
-                if (!InImage(ctx.Rip)) { nf++; break; }       // JIT code: don't ask the runtime to unwind
-                DWORD64 base = 0;
-                PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
-                if (!fn) { ctx.Rip = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; continue; }
-                PVOID hd = nullptr;
-                DWORD64 est = 0;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &hd, &est, nullptr);
-            }
+            nf = UnwindStack(ctx, frames, 32);
 #endif
         }
         ResumeThread(th);
@@ -1962,29 +2008,7 @@ static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
 #ifndef _WIN64
     nf = WalkFramePointers(ctx, frames, 24);
 #else
-    if (ctx.Rip < 0x10000 && !IsBadReadPtr((const void *)ctx.Rsp, 8))
-    {
-        // Call through a null (or tiny) pointer: the caller's return address
-        // is on top of the stack.
-        frames[nf++] = ctx.Rip;
-        ctx.Rip = *(DWORD64 *)ctx.Rsp;
-        ctx.Rsp += 8;
-    }
-    for (; nf < 24 && ctx.Rip; nf++)
-    {
-        frames[nf] = ctx.Rip;
-        if (!InImage(ctx.Rip)) { nf++; break; }               // JIT code: don't ask the runtime to unwind
-        DWORD64 base = 0;
-        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
-        if (!fn)
-        {
-            if (IsBadReadPtr((const void *)ctx.Rsp, 8)) { nf++; break; }
-            ctx.Rip = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; continue;
-        }
-        PVOID hd = nullptr;
-        DWORD64 est = 0;
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &hd, &est, nullptr);
-    }
+    nf = UnwindStack(ctx, frames, 24);
 #endif
     char line[2048];
     SYSTEMTIME lt;
