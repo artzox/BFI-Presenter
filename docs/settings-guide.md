@@ -169,16 +169,16 @@ When the game can't hold the refresh rate (e.g. 90 fps at 120 Hz), some images a
 
 How it caps depends on the game:
 
-- **No Reflex, no frame generation:** the presenter's own cap, with just-in-time release.
+- **No Reflex, no frame generation:** the presenter's own cap. The game is held right after its present, before it starts its next frame, at a start time tried out across the strobe cycle (**Hold at the frame start**, below).
 - **DirectX with NVIDIA Reflex** (every DLSS frame-generation game): Reflex's frame limit, one presented frame per strobe cycle (e.g. 60 at 120 Hz), with frame generation or without. The game and its generated frames are paced at the start of each frame. Tick **Presenter's own cap without frame generation** (`AutoCapOwnWithoutFg=1`) to use the presenter's cap while frame generation is off; it follows frame generation being switched on and off.
 - **DirectX, frame generation without Reflex** (e.g. XeSS frame generation through OptiScaler): stays at Refresh; **Frame limit for frame generation without Reflex** (below) limits it instead (v1.0.25).
 - **Vulkan with Reflex and frame generation** (v1.0.23): Reflex's frame limit as in DirectX, but only while that leaves about 30 rendered fps or more: 2× at 120 Hz (30 rendered, 60 presented) is capped, 3× (20 rendered) stays at Refresh, where it lagged and presented unevenly (Indiana Jones).
-- **Vulkan, frame generation without Reflex:** stays at Refresh, so aim for a final fps (generated frames included) close to your refresh rate.
+- **Vulkan, frame generation without Reflex:** stays at Refresh, so aim for a final fps (generated frames included) close to your refresh rate. The layer recognises it by its loaded DLL; for games that load one without using it, see `FrameGenDllCheck` under Vulkan only.
 
 Back to Refresh:
 
 - **Games with Reflex** report how long their frames take; the cap goes back up once those fit well within a refresh for 10 seconds.
-- **Other games:** it tries Refresh for about 3 seconds, after 30 s, then 60 s, then every 2 minutes while the game still can't hold it.
+- **Other games:** it tries Refresh for about 3 seconds, after 30 s, then 60 s, then every 2 minutes while the game still can't hold it. A game well under the refresh rate (under 80%, e.g. 80 fps at 120 Hz) waits a minute before its first try and 5 minutes after a failed one, since each try is a few seconds of uneven frames; a game that drops back within 30 s of a successful try waits twice as long next time (v1.0.27).
 - **With frame generation** under Reflex's limit it tries only every 5 minutes, since each try is a visible stutter.
 
 Reflex's limit is applied by the presenter in the game's own Reflex sleep call (since v1.0.19), because the driver's limit counts the presenter's own presents and some games collapsed under it to about 7 fps (The Witcher 3, Returnal, Pragmata). Games that call their Reflex sleep more than once per frame (DLSS 5 injectors with frame generation in Onimusha) keep the driver's limit. If a game still falls far below the limit, the presenter drops it for the rest of the session and uses its own cap.\
@@ -190,6 +190,11 @@ Why the limit is applied at the start of the frame (the game's Reflex sleep, or 
   <source media="(prefers-color-scheme: dark)" srcset="img/frame-limit-fg-dark.png">
   <img src="img/frame-limit-fg-light.png" alt="2x frame generation at 120 Hz, limited to 30 rendered / 60 presented: limited at the start of the frame, input to the lit image takes about 38 ms (draw, frame generation's wait for the next real frame, wait for the flash); limited at the present, frames also wait in queues behind earlier frames, about 105 ms. Like a kitchen that starts each dish only when a waiter will be ready, instead of cooking on order and letting dishes sit under the heat lamp." width="760">
 </picture>
+
+**Hold at the frame start** · `AutoCapAtFrameStart` · default: on · games without Reflex (or with **Presenter's own cap without frame generation**), Lowest latency pacing\
+When the automatic frame cap steps down to one game frame per strobe cycle, the game is held right after its present, before it reads input for the next frame, instead of its finished frame waiting at the present. The moment it is let go matters: let go too early, the finished frame waits for its flash; too late, it misses it. So the presenter tries 8 start times across one strobe cycle (about 24 seconds) and keeps the one where every frame is shown soonest, with about 3 ms to spare. It keeps that start time while the cap tries Refresh and comes back, and looks again after a few seconds of lost frames. It looks only while the game holds the cap, not in scenes too heavy for it. Results from frame start to flash at 60 of 120 Hz (v1.0.27): Tomb Raider about 19 ms against 25 ms with the old cap, Obduction 23 against 25, No Rest for the Wicked 19 against 23, Resident Evil 4 about 27 against about 30.\
+**Vulkan:** the layer already held the game before its next frame, at the refresh before the lit one. Now it tries start times the same way when frames wait 3 ms or more for their flash, and keeps one only if it is at least 1 ms quicker (P.T.: 19 ms from release to flash against 25 ms). Games that pace themselves gain less (about 4 ms in the Driveclub recomp).\
+*When to change it:* leave on. The overlay shows the search and the start time in use.
 
 **Frame pacing** · `FramePacing` · default: Lowest latency (new ini files)
 - **Lowest latency** always shows the newest image: quickest response.
@@ -212,11 +217,12 @@ It costs latency: about 10–20 ms more than just-in-time release (Silent Hill 2
 
 **Line Reflex's frame limit up with the flash** · `ReflexAlign` · default: off · DirectX games with NVIDIA Reflex, Lowest latency pacing, no frame generation\
 Reflex's frame limit starts each game frame on its own clock, so a finished frame can wait up to a whole strobe cycle before the lit refresh shows it, and how long depends on the launch. With this on, BFI Presenter measures that wait and moves the start of each frame until frames are ready about 2 ms before their flash; if frames start missing it, it backs off. God of War Ragnarok: about 31 ms from release to flash every launch, against 31–44 ms depending on the launch. In games whose frame times vary a lot it gains little and can repeat a frame now and then (Spider-Man 2: 1.5 ms quicker, more repeats; Dead Space: no change).\
-*When to change it:* turn on for Reflex games with steady frame times that hold the cap. The overlay shows how long frames wait before their flash.
+*When to change it:* turn on for Reflex games with steady frame times that hold the cap. The overlay shows how long frames wait before their flash.\
+With it off, a coarser version runs by default (`ReflexAlignCoarse=1`, v1.0.27): when frames are ready more than 8 ms before their flash for 3 seconds, the start of each frame is moved later once, to about 5 ms before it. It acts again whenever the game's own timing drifts (each time Reflex's limit comes on, after hitches, as the GPU load changes), and backs off if frames start repeating. Dead Space: the lit frame's age went from a median 26.5 to 23.8 ms, with no more dropped frames.
 
 **Frame limit for frame generation without Reflex** · `FrameGenLimitWithoutReflex` · default: on · DirectX games with frame generation but no NVIDIA Reflex, Refresh rate cap\
 Frame generation in games without Reflex (e.g. XeSS frame generation through OptiScaler) gets no frame limit from the game, so it renders as fast as it can and the flashes get generated and real frames unevenly. With this on, BFI Presenter holds the game's own frames to one per strobe cycle × the frame-generation factor (e.g. 30 rendered and 60 presented at 120 Hz with 2 frames and 2×), right after each of its presents, and picks the moment each frame starts: for about 25 seconds after it comes on it tries start times across one strobe cycle and keeps the one where every frame reaches a flash soonest. It recognises frame generation because the generated frames are presented from a thread of their own; it is used only while that leaves about 28 rendered fps or more. Riven with XeSS frame generation: 60 of 60 flashes, about 38 ms from release to flash. FSR frame generation through OptiScaler presents every frame from a thread of its own; since v1.0.26 the presenter counts the game's frames on FSR's swap chain instead, where the game still presents once per rendered frame (`HookOuterSwapChain`, on by default). The Callisto Protocol with FSR: 60 of 60 flashes, about 28–34 ms; in Riven FSR's own timing moves against the flashes now and then (55 of 60 on average, against 46 with OptiScaler's 60 fps limit), and XeSS frame generation is steadier there.\
-*When to change it:* leave on, with Lowest latency pacing, and turn off any frame limit in the game or in OptiScaler (`FramerateLimit = 0`). The overlay shows the time per rendered frame while it is in use.
+*When to change it:* leave on, with Lowest latency pacing, and turn off any frame limit in the game or in OptiScaler (`FramerateLimit = 0`). The limit only helps when the game renders at least the limit with frame generation on (e.g. 30 fps at 120 Hz with 2 frames and 2×); below it, frames are lost either way. The overlay shows the time per rendered frame while it is in use.
 
 **Later release** and **margin** · `LaterRelease`, `LaterReleaseMarginMs` · default: off, 1.5 ms\
 The same trick for the Refresh cap with Lowest latency: the game starts each frame as late as safely possible, which cuts up to about 5 ms of input delay in light games. The margin is the safety gap it keeps (it grows by itself if frames start arriving late).\
@@ -313,6 +319,10 @@ Some things can still put Windows into that slower mode, and it stays there afte
 **SDR to HDR**, **SDR white**, **SDR highlights** · `SdrToHdr`, `SdrWhiteNits`, `SdrHighlightNits`, `SdrHighlightKnee` · default: on, 200, 800, 0.65\
 For SDR games and emulators with Windows HDR on: the picture is sent as HDR so the lit flash has room to get brighter and BFI doesn't make the image dim. SDR white is how bright normal white looks (match Windows' "SDR content brightness"). Highlights optionally stretches the brightest parts toward a real HDR look.\
 *When to change it:* set SDR white to taste; set highlights to 0 for a faithful SDR look.
+
+**Frame generation DLL counts** · `FrameGenDllCheck` · default: on\
+Games without NVIDIA Reflex don't tell the layer when frame generation is on, so a loaded frame-generation DLL (DLSS-G, FSR or XeSS frame generation) counts as on, and the automatic frame cap stays at Refresh. Some games and add-ons load one without using it (the RenoDX DLSS add-on loads DLSS-G's; the Driveclub recomp). `BFIPresenterVK.log` names the DLL.\
+*When to change it:* set to 0 (in the ini) for a game where the log names a frame-generation DLL but frame generation is off, so the automatic frame cap works. Leave it on wherever you do use frame generation.
 
 Without ReShade, edit `BFIPresenter.ini` and save: Vulkan games pick up the change within a second.
 
