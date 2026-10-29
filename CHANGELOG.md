@@ -7,6 +7,10 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Unreleased] (Manager 1.3.11)
+
+- **[Manager]** The Motion test and Log analyzer tooltips wrap normally (they had line breaks in the middle of sentences). The "Motion test started" message goes away when the motion test closes, and the "Log analyzer opened" message after 15 seconds (the browser tab can't be watched).
+
 ## [1.0.26] — 2026-10-29 (Manager 1.3.10)
 
 - **[DX] FSR frame generation through OptiScaler: the frame limit for frame generation without Reflex works with it too.** FSR presents every frame, the game's and the generated ones, from a thread of its own, so the presenter couldn't tell the game's frames apart and FSR read as no frame generation. The game still presents to FSR's swap chain once per rendered frame: the presenter now finds that swap chain (by hooking the DXGI factory the game itself uses, before the game creates its swap chain), counts the game's presents there and holds the game right after each of them. Only for FSR frame generation's swap chain; XeSS frame generation and everything else keep the hook on the real swap chain and the timings tested with them. FSR follows a moved frame start with a lag, so its start-time search gives each start time 2 s to settle, prefers 8 ms to spare, makes no 2 ms steps while held, and looks again after 5 s of lost frames (at most every 20 s). The Callisto Protocol (FSR frame generation with OptiScaler's Async on and HUD fix off): 60 of 60 flashes, about 28–34 ms from release to flash. Riven: 55 of 60 flashes on average, 59–60 in 45% of seconds, against 46 and 20% with OptiScaler's 60 fps limit (FSR's own timing moves against the flashes there now and then; XeSS frame generation is steadier in Riven). `HookOuterSwapChain=0` in the ini turns the hook off.

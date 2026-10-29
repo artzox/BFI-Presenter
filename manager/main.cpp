@@ -186,6 +186,13 @@ struct App {
     std::string riskVer;                   // ReShade version
     bool openRisk = false;
 
+    // the motion test started from the Tools row: its message is cleared when it closes
+    HANDLE motionProc = nullptr;
+    std::string motionMsg;
+    // a message that goes away by itself (the log analyzer's: the browser tab can't be watched)
+    std::string tempMsg;
+    ULONGLONG tempMsgUntil = 0;
+
     void SetMsg(const std::string &m, bool err) { msg = m; msgErr = err; needAdmin = false; }
 };
 
@@ -523,6 +530,20 @@ static void PollWorker()
         }
         g_app.rsPending.clear();
     }
+    if (g_app.tempMsgUntil && GetTickCount64() >= g_app.tempMsgUntil)
+    {
+        if (g_app.msg == g_app.tempMsg) g_app.SetMsg("", false);
+        g_app.tempMsg.clear();
+        g_app.tempMsgUntil = 0;
+    }
+    // The motion test closed: its instructions no longer apply (a newer message stays).
+    if (g_app.motionProc && WaitForSingleObject(g_app.motionProc, 0) == WAIT_OBJECT_0)
+    {
+        CloseHandle(g_app.motionProc);
+        g_app.motionProc = nullptr;
+        if (g_app.msg == g_app.motionMsg) g_app.SetMsg("", false);
+        g_app.motionMsg.clear();
+    }
     if (g_app.toolsDone)
     {
         g_app.toolsDone = false;
@@ -533,6 +554,8 @@ static void PollWorker()
             ShellExecuteW(nullptr, L"open", LogAnalyzerHtml().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             g_app.SetMsg((g_app.toolsNote.empty() ? "" : g_app.toolsNote + " ") +
                          "Log analyzer opened in your browser: drop a session's CSV files and ReShade.log on it.", false);
+            g_app.tempMsg = g_app.msg;
+            g_app.tempMsgUntil = GetTickCount64() + 15000;
         }
         else if (!g_app.toolsGame.root.empty())
         {
@@ -552,9 +575,22 @@ static void PollWorker()
             }
             else
             {
-                ShellExecuteW(nullptr, L"open", MotionTestExe().c_str(), nullptr, MotionTestDir().c_str(), SW_SHOWNORMAL);
-                g_app.SetMsg((g_app.toolsNote.empty() ? "" : g_app.toolsNote + " ") +
-                             "Motion test started: F for borderless fullscreen, the presenter's settings in the ReShade overlay.", false);
+                const std::wstring exe = MotionTestExe(), dir = MotionTestDir();
+                SHELLEXECUTEINFOW se = { sizeof(se) };
+                se.fMask = SEE_MASK_NOCLOSEPROCESS;
+                se.lpVerb = L"open";
+                se.lpFile = exe.c_str();
+                se.lpDirectory = dir.c_str();
+                se.nShow = SW_SHOWNORMAL;
+                if (ShellExecuteExW(&se))
+                {
+                    if (g_app.motionProc) CloseHandle(g_app.motionProc);
+                    g_app.motionProc = se.hProcess;
+                    g_app.SetMsg((g_app.toolsNote.empty() ? "" : g_app.toolsNote + " ") +
+                                 "Motion test started: F for borderless fullscreen, the presenter's settings in the ReShade overlay.", false);
+                    g_app.motionMsg = g_app.msg;
+                }
+                else g_app.SetMsg("The motion test didn't start (error " + std::to_string(GetLastError()) + ").", true);
             }
         }
         else g_app.SetMsg("The motion test isn't in the tools that were downloaded.", true);
@@ -1023,13 +1059,13 @@ static void DrawTop(HWND hwnd)
     ImGui::SameLine(ImGui::CalcTextSize("Vulkan layer").x + ImGui::GetFontSize() * 1.5f);
     ImGui::BeginDisabled(g_app.busy);
     if (ImGui::Button("Motion test")) StartTool(1);
-    Tooltip("Moving test patterns (inspired by Blur Busters' TestUFO) as a program BFI Presenter hooks like a game: judge\n"
-            "sharpness, cadence and strobe settings on the same picture on every display. Downloaded on first use (and\n"
-            "updated when a release brings a new one); it appears in the game list as BFI Motion Test for installing\n"
-            "ReShade and BFI Presenter there.");
+    Tooltip("Moving test patterns (inspired by Blur Busters' TestUFO) as a program BFI Presenter hooks like a game: judge "
+            "sharpness, cadence and strobe settings on the same picture on every display.\n\n"
+            "Downloaded on first use and updated when a release brings a new one. It appears in the game list as "
+            "BFI Motion Test, for installing ReShade and BFI Presenter there.");
     ImGui::SameLine();
     if (ImGui::Button("Log analyzer")) StartTool(2);
-    Tooltip("An offline page that charts a session from the presenter's timing logs (the CSV files) and ReShade.log:\n"
+    Tooltip("An offline page that charts a session from the presenter's timing logs (the CSV files) and ReShade.log: "
             "frame pacing, repeats and skips, the frame cap, frame generation. Downloaded on first use; opens in your browser.");
     ImGui::EndDisabled();
     {
@@ -1043,7 +1079,7 @@ static void DrawTop(HWND hwnd)
     // Toolbar
     ImGui::BeginDisabled(g_app.busy);
     if (ImGui::Button("Rescan")) StartScan(true);
-    Tooltip("Searches the selected libraries again (new or removed games). Games already known are checked again quickly.\n"
+    Tooltip("Searches the selected libraries again (new or removed games). Games already known are checked again quickly. "
             "Connecting a drive (an external disk with a Steam library) starts a rescan by itself.");
     ImGui::SameLine();
     if (ImGui::Button("Libraries...")) g_app.showLibraries = true;
