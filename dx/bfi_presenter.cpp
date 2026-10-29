@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e12"
+#define BFI_ADDON_VERSION "1.0.27-e13"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3902,15 +3902,19 @@ static DWORD WINAPI PresenterThread(void *)
                     // Coarse alignment (ReflexAlign off): each time the Reflex frame limit comes on, its frames land anywhere
                     // in the strobe cycle. Ready 10-13 ms before the pick they only wait there (Dead Space: 29-33 ms from frame
                     // start to flash, against 24-25 ms in stretches where they landed 1-5 ms before it). After 3 s in a row
-                    // with the 10th percentile above 7 ms the wake-up is moved later once, to 4 ms before the pick -- far
+                    // with the 10th percentile above 8 ms the wake-up is moved later once, to 5 ms before the pick -- far
                     // enough from it that varying frame times don't repeat frames (Spider-Man 2 with the fine alignment).
                     // A frame repeated close to the pick soon after a move: 3 ms back and 2 ms more to spare (at most 8 ms).
-                    // Not within a minute of the "moving them earlier" nudge, at most once per 20 s.
+                    // The frames' readiness also moves with the scene's GPU load (Dead Space: 3-4 ms either way within a minute), so
+                    // 5 ms to spare. Not within 20 s of the "moving them earlier" nudge, at most once per 20 s.
                     {
                         static int coarseSecs = 0;
-                        static double coarseT = -1e9, coarseTarget = 0.004, coarseHoldT = -1e9;
-                        if (t < phaseUntil) coarseHoldT = t + 60.0;
-                        if (!s.reflexAlign && s.reflexAlignCoarse && atSleepNoFg && holds && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
+                        static double coarseT = -1e9, coarseTarget = 0.005, coarseHoldT = -1e9;
+                        // The nudge moves the frames ~9 ms earlier itself: no step of this one on top of it (Dead Space,
+                        // both in the same second: 40 of 60 frames shown for 3 s, until the next nudge).
+                        const bool nudging = t < phaseUntil;
+                        if (nudging) coarseHoldT = t + 20.0;
+                        if (!nudging && !s.reflexAlign && s.reflexAlignCoarse && atSleepNoFg && holds && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
                         {
                             if (t - coarseT < 10.0 && stNow.frameRepeats >= 2 && p10 < 0.002)
                             {
@@ -8721,7 +8725,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                                   "Needs Lowest latency pacing. Best in games with steady frame times (God of War Ragnarok: about\n"
                                                                   "7 ms less from release to flash); in games whose frame times vary it gains little and can\n"
                                                                   "repeat a frame now and then (Spider-Man 2). Off by default. With it off, frames ready more than\n"
-                                                                  "7 ms before the pick are still moved to 4 ms before it once (ReflexAlignCoarse=1 in the ini).");
+                                                                  "8 ms before the pick are still moved to 5 ms before it once (ReflexAlignCoarse=1 in the ini).");
                     if (s.reflexAlign)
                     {
                         ImGui::SameLine();
