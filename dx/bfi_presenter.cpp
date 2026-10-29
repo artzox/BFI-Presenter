@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.26-o1"
+#define BFI_ADDON_VERSION "1.0.26-o2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3657,8 +3657,8 @@ static DWORD WINAPI PresenterThread(void *)
                     // minutes, and motion stuttered; in another run it settled at once). Instead, start times across
                     // one strobe cycle are tried about 2 ms apart, 3 s each (1 s to settle, 2 s measured): the one
                     // with every frame reaching a flash and the shortest release -> flash is kept. Tried again only
-                    // after 10 s in a row with under 90% of the frames reaching a flash or 6 ms slower, at most once
-                    // a minute. Riven: 29 ms (start +8.3 ms in the cycle) against 34-45 ms at the other start times.
+                    // after 5 s in a row with under 90% of the frames reaching a flash or 6 ms slower, at most every
+                    // 20 s. Riven: 29 ms (start +8.3 ms in the cycle) against 34-45 ms at the other start times.
                     static int swIdx = -1, swN = 0, swSecs = 0, swBad = 0, swShown = 0, swRelN = 0, swRep = 0;
                     static double swPhase = 0.0, swStart = 0.0, swDoneT = -1.0, swBestMs = 0.0, swRel = 0.0, swScore[16] = {}, swRelMs[16] = {},
                                   swSlack = 1.0, swSlackK[16] = {};
@@ -3677,7 +3677,7 @@ static DWORD WINAPI PresenterThread(void *)
                         };
                         const bool ok = holds && !hitchPaused;
                         const double base = swPhase - std::fmod(swPhase, cyc);   // stay within the same cycle's worth of moves
-                        if (swIdx < 0 && ok && (swDoneT < 0.0 || (swBad >= 10 && t - swDoneT > 60.0)))
+                        if (swIdx < 0 && ok && (swDoneT < 0.0 || (swBad >= 5 && t - swDoneT > 20.0)))
                         {
                             swN = std::max(4, std::min(16, (int)(cyc / 0.002 + 0.5)));
                             swIdx = 0; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swBad = 0;
@@ -3700,7 +3700,12 @@ static DWORD WINAPI PresenterThread(void *)
                                     // Every frame shown, and frames ready at least 3 ms before their flash: the quickest start
                                     // right at the edge lost frames as soon as the GPU work grew (Riven: 29 ms, then 40-50 ms
                                     // with 53-58 of 60 shown while OptiScaler's denoiser went from 2.6 to 7 ms a frame).
-                                    swScore[swIdx] = !full ? 1e3 + (2.0 * capFps - swShown) : swSlack < 0.003 ? 100.0 + relMs : relMs;
+                                    // FSR frame generation (Riven): next to start times that lost frames, one that had shown every
+                                    // frame with 4.6 ms to spare lost half of them a minute later (30 of 60 shown: the generated
+                                    // frames, finished on the GPU later than the game's, missed the pick). So 8 ms to spare first,
+                                    // then 3 ms, then any start time that showed every frame.
+                                    swScore[swIdx] = !full ? 1e3 + (2.0 * capFps - swShown) : swSlack >= 0.008 ? relMs :
+                                                     swSlack >= 0.003 ? 50.0 + relMs : 100.0 + relMs;
                                     swRelMs[swIdx] = relMs; swShownK[swIdx] = swShown; swSlackK[swIdx] = swSlack;
                                     swIdx++; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swSlack = 1.0;
                                     const double start = swStart;
@@ -3722,7 +3727,7 @@ static DWORD WINAPI PresenterThread(void *)
                                 }
                             }
                         }
-                        // Held: tried again after 10 s in a row with under 90% of the frames shown, or 6 ms or more
+                        // Held: tried again after 5 s in a row with under 90% of the frames shown, or 6 ms or more
                         // slower than the start time found.
                         else
                         {
