@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v5"
+#define BFI_VERSION "1.0.27-v6"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -2523,11 +2523,15 @@ static void PresenterThread(Swapchain *sc)
                     // and then is short of the strobe's rate too, but isn't sliding.
                     const double gapMax = sc->gapMaxUs.exchange(0) * 1e-6;
                     if (want && ok && gapMax > 0.0 && gapMax < 1.5 * cyc) { fsFpsSum += fpsA; fsFpsN++; }
-                    if (!want) { fsFpsSum = 0.0; fsFpsN = 0; }
+                    // Kept through the cap's tries at Refresh rate (the game's rate doesn't change with them); reset when
+                    // the cap goes back up to Refresh rate for good or the settings rule the timing out.
+                    if (!want && !capProbe && !down) { fsFpsSum = 0.0; fsFpsN = 0; }
                     if (fsFpsN >= 30)
                     {
                         const double avg = fsFpsSum / fsFpsN, ratio = capFps > 0.0 ? avg / capFps : 1.0;
-                        drifting = ratio > 0.99 && ratio < 0.9993;
+                        // Hysteresis: once sliding, it takes 0.9998 to count as in step again (59.95 against 60.00 is 0.99917,
+                        // and the measured average went back and forth across 0.9993: "not needed" twice in 30 s).
+                        drifting = ratio > 0.99 && ratio < (fsState == 5 ? 0.9998 : 0.9993);
                         if (drifting && !fsDriftLogged)
                         {
                             fsDriftLogged = true;
@@ -2546,7 +2550,7 @@ static void PresenterThread(Swapchain *sc)
                     if (want && fsState == 5)
                     {
                         // Left while the game runs slower than the strobe; looked at again if it comes up to the strobe's rate.
-                        if (fsFpsN >= 15 && fsFpsSum / fsFpsN >= 0.9993 * capFps) { fsState = 1; fsSecs = fsBaseN = 0; fsBaseRel = 0.0; fsBaseP10 = 1.0; sc->fsCtl.store(true); }
+                        if (fsFpsN >= 15 && fsFpsSum / fsFpsN >= 0.9998 * capFps) { fsState = 1; fsSecs = fsBaseN = 0; fsBaseRel = 0.0; fsBaseP10 = 1.0; sc->fsCtl.store(true); }
                     }
                     else if (!want)
                     {
@@ -2555,6 +2559,7 @@ static void PresenterThread(Swapchain *sc)
                             fsOffT = t;
                             fsKeptLead = (fsState == 3) ? fsLeadCur : -1.0;
                             if (fsState == 4) fsKeptLead = -2.0;      // not needed: stays so when the cap comes back down
+                            if (fsState == 5) fsKeptLead = -3.0;      // sliding: the same
                         }
                         fsState = 0; sc->fsOn.store(false); sc->fsCtl.store(false);
                     }
@@ -2569,6 +2574,7 @@ static void PresenterThread(Swapchain *sc)
                                  fsLeadCur * 1000.0);
                         }
                         else if (fsKeptLead == -2.0 && t - fsOffT < 600.0) { fsState = 4; fsDeclT = t; sc->fsCtl.store(false); }
+                        else if (fsKeptLead == -3.0 && t - fsOffT < 600.0) { fsState = 5; sc->fsCtl.store(false); }
                         else { fsState = 1; sc->fsOn.store(false); }
                     }
                     else if (fsState == 1)
