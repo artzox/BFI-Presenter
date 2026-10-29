@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v8"
+#define BFI_VERSION "1.0.27-v9"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -2327,6 +2327,12 @@ static void PresenterThread(Swapchain *sc)
                     }
                 }
                 const double fpsA = g_status.gameFps;
+                // Each frame presented twice (RPCS3: one Reflex sleep per emulated frame, two presents, no frame
+                // generation DLL). The automatic frame cap counted the presents: below 120 while loading, it stepped down
+                // to 60 presents, i.e. 30 game frames shown in pairs, until its next try at Refresh rate a minute later
+                // (God of War Collection). With the presents doubled the game's own rate decides, so it stays at Refresh.
+                static int dupRun = 0;
+                bool dupPresents = false;
                 // Frame generation from the game's Reflex sleep calls (one per rendered frame): presents well above
                 // them. Changed after 3 seconds in a row agree.
                 {
@@ -2338,6 +2344,18 @@ static void PresenterThread(Swapchain *sc)
                     // presents each frame twice (God of War Collection: 120 presented, 60 slept), which looks the same, and
                     // the limit for frame generation then held it to 30 game frames a second.
                     if (sleeping && fpsA > 1.5 * rend && fgDll) cand = std::max(2, std::min(4, (int)(fpsA / rend + 0.5)));
+                    {
+                        const bool d = sleeping && rend > 0 && fpsA > 1.7 * rend && fpsA < 2.3 * rend && !fgDll;
+                        dupRun = d ? std::min(dupRun + 1, 10) : std::max(dupRun - 1, 0);
+                        static bool dupLogged = false;
+                        dupPresents = dupRun >= 3;
+                        if (dupPresents && !dupLogged)
+                        {
+                            dupLogged = true;
+                            LOGI("BFI Presenter: the game presents each frame twice (%.0f presents, %ld Reflex sleeps a second) -- "
+                                 "the automatic frame cap goes by its frames and stays at Refresh rate", fpsA, rend);
+                        }
+                    }
                     // A second with far fewer presents than rendered frames is a stall or a rebuilt swap chain (its first
                     // second: 3 presented, 34 rendered), not frame generation switching off: it doesn't count. It switched
                     // the limit off after every rebuild in Indiana Jones.
@@ -2437,7 +2455,7 @@ static void PresenterThread(Swapchain *sc)
                     }
                 }
                 bool down = sc->autoCapDown.load();
-                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg)
+                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg && !dupPresents)
                 {
                     if (capProbe)
                     {
