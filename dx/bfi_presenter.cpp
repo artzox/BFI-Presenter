@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e5"
+#define BFI_ADDON_VERSION "1.0.27-e6"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -4470,6 +4470,14 @@ static void FgPaceAfterPresent()
     while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
     SleepUntil(nextT, timer);
     nextT += iv;
+    // The automatic frame cap at the frame start: the game's next frame starts now, so release -> flash is measured
+    // from here (from the return of its Present it counted the hold too: Soul Reaver showed 34.7 ms where frame start
+    // -> flash was about 21 ms, and the start-time search preferred the shorter holds).
+    if (g_fgPaceKind.load() == 2)
+    {
+        const UINT64 next = g_frameId + 1;
+        if (g_relId[next % kRel] == next) g_relT[next % kRel] = Now();
+    }
 }
 
 static HRESULT SubmitGameFrame()
