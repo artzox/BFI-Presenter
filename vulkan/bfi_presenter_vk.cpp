@@ -1488,7 +1488,7 @@ static void PresenterThread(Swapchain *sc)
     // short try that holds the refresh rate (tries 30 s, 60 s, then every 120 s).
     int capDownSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
     double capSwitchT = -100.0, probeWait = 30.0, capUpT = -100.0;
-    bool capProbe = false, fgWas = false;
+    bool capProbe = false, fgWas = false, rfxFgKnown = false;   // rfxFgKnown: the Reflex frame counts have agreed for 3 s
     bool kb = false, km = false, kr = false, krs = false;
     FILE *logf = nullptr;
     double monitorCheckT = Now();
@@ -2307,7 +2307,11 @@ static void PresenterThread(Swapchain *sc)
                     if (!fgDll && GetModuleHandleA(dll)) fgDll = dll;
 #endif
                 const bool reflexSleeps = Now() - g_vkSleepLastT.load() < 2.0;
-                if (fgDll && s.fgDllCheck && !reflexSleeps) fg = true;
+                // With Reflex, the DLL still counts until its frame counts have agreed for 3 s: from the start the
+                // automatic frame cap would otherwise see frame generation's presents as a game short of the refresh
+                // rate and step down for a moment (Indiana Jones, frame generation 2x).
+                if (!reflexSleeps) rfxFgKnown = false;
+                if (fgDll && s.fgDllCheck && (!reflexSleeps || !rfxFgKnown)) fg = true;
                 if ((fgDll != nullptr) != fgWas)
                 {
                     fgWas = fgDll != nullptr;
@@ -2340,6 +2344,7 @@ static void PresenterThread(Swapchain *sc)
                     // Slowed presentation in the last 3 seconds (slow image returns).
                     static int slowWin = 0;
                     slowWin = ((slowWin << 1) | (lastSlow >= 8 ? 1 : 0)) & 7;
+                    if (fgRun >= 3 && sleeping) rfxFgKnown = true;
                     if (fgRun >= 3 && g_vkFgFactor.load() != cand)
                     {
                         g_vkFgFactor.store(cand);
