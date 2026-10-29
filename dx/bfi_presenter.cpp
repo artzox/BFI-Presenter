@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e6"
+#define BFI_ADDON_VERSION "1.0.27-e7"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3571,6 +3571,10 @@ static DWORD WINAPI PresenterThread(void *)
                             {
                                 autoCapDown = true;
                                 probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
+                                // Far from the refresh rate (under 80%): each try is seconds of uneven frames and the
+                                // longest delay (Soul Reaver at 64 of 120: 53 ms from release to flash for 4 s), so the
+                                // next one waits 5 minutes.
+                                if (fpsA < 0.8 * hzA) probeWait = 300.0;
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
                             }
@@ -3590,6 +3594,7 @@ static DWORD WINAPI PresenterThread(void *)
                             // and each time the frame start was looked for again.
                             if (t - capUpT < 30.0) probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
                             else probeWait = 30.0;
+                            if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;   // well under the refresh rate: first try after a minute
                             autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames,
