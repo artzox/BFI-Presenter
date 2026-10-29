@@ -2253,6 +2253,7 @@ std::vector<Game> FindGames(const ScanOptions &opt, const std::function<void(con
     if (opt.xbox) FindXbox(out, seen);
     if (opt.bnet) FindBattleNet(out, seen);
     for (auto &f : opt.folders) FindInFolder(f, out, seen);
+    if (Exists(MotionTestExe())) AddGame(out, seen, "BFI Motion Test", "Tool", MotionTestDir());
     if (opt.skipVr)
     {
         const size_t before = out.size();
@@ -2881,6 +2882,12 @@ RemoteRelease ParseRelease(const std::string &body)
             const size_t v = l.rfind("-v");
             if (v != std::string::npos) rr.mgrVersion = u.substr(v + 2, u.size() - 4 - (v + 2));
         }
+        else if (l.find("bfipresenter-tools") != std::string::npos)
+        {
+            rr.toolsUrl = u;
+            const size_t v = l.rfind("-v");
+            if (v != std::string::npos) rr.toolsVersion = u.substr(v + 2, u.size() - 4 - (v + 2));
+        }
         else if (l.find("bfipresenter-dx") != std::string::npos) rr.dxUrl = u;
         else if (l.find("vulkan") != std::string::npos) rr.vkUrl = u;
     }
@@ -3150,6 +3157,105 @@ std::string UpdateManagerExe(const RemoteRelease &r, const std::function<void(co
         return "Couldn't copy the new Manager (error " + std::to_string(ce) + "). The new version is in " + U8(DirOf(neu)) + ".";
     }
     return {};
+}
+
+// ---------------------------------------------------------------- tools
+std::wstring ToolsDir()
+{
+    std::wstring d = Join(DataDir(), L"tools");
+    CreateDirectoryW(d.c_str(), nullptr);
+    return d;
+}
+std::wstring MotionTestDir() { return Join(ToolsDir(), L"BFIMotionTest"); }
+std::wstring MotionTestExe() { return Join(MotionTestDir(), L"BFIMotionTest.exe"); }
+std::wstring LogAnalyzerHtml() { return Join(ToolsDir(), L"BFIPresenter-LogAnalyzer.html"); }
+std::string CachedToolsVersion()
+{
+    if (!Exists(MotionTestExe()) && !Exists(LogAnalyzerHtml())) return {};
+    std::string v = ReadText(Join(ToolsDir(), L"version.txt"));
+    while (!v.empty() && (v.back() == '\n' || v.back() == '\r' || v.back() == ' ')) v.pop_back();
+    return v.empty() ? "0" : v;
+}
+// The tools zip isn't in every release (only when the tools change): the newest release that has one.
+static bool FindToolsAsset(std::string &url, std::string &ver, std::string &err)
+{
+    std::string body;
+    if (!HttpGet(L"https://api.github.com/repos/artzox/BFI-Presenter/releases?per_page=20", body, err)) return false;
+    for (size_t p = 0; (p = body.find("\"browser_download_url\"", p)) != std::string::npos; p += 10)
+    {
+        std::string u = JsonString(body.substr(p), "browser_download_url"), l = LowerA(u);
+        if (l.size() < 4 || l.compare(l.size() - 4, 4, ".zip") != 0 || l.find("bfipresenter-tools") == std::string::npos) continue;
+        url = u;
+        const size_t v = l.rfind("-v");
+        if (v != std::string::npos) ver = u.substr(v + 2, u.size() - 4 - (v + 2));
+        return true;      // releases come newest first
+    }
+    err = "No release on GitHub has a tools zip.";
+    return false;
+}
+std::string EnsureTools(const RemoteRelease &r, const std::function<void(const std::string &)> &progress, std::string *note)
+{
+    const std::string have = CachedToolsVersion();
+    std::string url = r.toolsUrl, ver = r.toolsVersion, err;
+    if (url.empty())
+    {
+        if (progress) progress("Checking GitHub for the tools...");
+        if (!FindToolsAsset(url, ver, err))
+        {
+            if (!have.empty()) { if (note) *note = "Couldn't check GitHub for newer tools; using the copy here."; return {}; }
+            return "Couldn't get the tools: " + err;
+        }
+    }
+    if (!have.empty() && !ver.empty() && CompareVersions(have, ver) >= 0) return {};
+    const std::string name = url.substr(url.find_last_of('/') + 1);
+    if (progress) progress("Downloading " + name);
+    std::string body;
+    if (!HttpGet(W(url), body, err, [&](size_t got, size_t total) {
+            if (progress && total) progress("Downloading " + name + " (" + std::to_string(got * 100 / total) + " %)");
+        }))
+    {
+        if (!have.empty()) { if (note) *note = "Download of the new tools failed (" + err + "); using the copy here."; return {}; }
+        return "Download of " + name + " failed: " + err;
+    }
+    std::wstring dl = Join(ToolsDir(), L"download");
+    CreateDirectoryW(dl.c_str(), nullptr);
+    dl = Join(dl, W(ver.empty() ? std::string("latest") : ver));
+    CreateDirectoryW(dl.c_str(), nullptr);
+    const std::wstring zip = Join(dl, W(name));
+    std::ofstream(fs::path(zip), std::ios::binary).write(body.data(), (std::streamsize)body.size());
+    if (progress) progress("Unpacking " + name);
+    std::string e = Extract(zip, dl);
+    if (!e.empty()) return e;
+    const std::wstring exe = FindFileBelow(dl, L"BFIMotionTest.exe", 2), html = FindFileBelow(dl, L"BFIPresenter-LogAnalyzer.html", 2);
+    if (exe.empty() && html.empty()) return "The tools zip has neither the motion test nor the log analyzer.";
+    CreateDirectoryW(MotionTestDir().c_str(), nullptr);
+    std::string failed;
+    auto put = [&](const std::wstring &from, const std::wstring &to) {
+        if (!from.empty() && !CopyFileW(from.c_str(), to.c_str(), FALSE)) failed += (failed.empty() ? "" : ", ") + U8(NameOf(to));
+    };
+    put(exe, MotionTestExe());
+    if (!exe.empty()) put(Join(DirOf(exe), L"MotionTest_README.md"), Join(MotionTestDir(), L"MotionTest_README.md"));
+    put(html, LogAnalyzerHtml());
+    if (!html.empty()) put(Join(DirOf(html), L"LogAnalyzer_README.md"), Join(ToolsDir(), L"LogAnalyzer_README.md"));
+    if (!failed.empty())
+        return "Couldn't replace " + failed + " (is the motion test still running?). Close it and try again.";
+    std::ofstream(fs::path(Join(ToolsDir(), L"version.txt")), std::ios::binary) << ver;
+    if (note) *note = have.empty() ? "Tools " + ver + " downloaded." : "Tools updated to " + ver + ".";
+    return {};
+}
+Game MotionTestGame()
+{
+    std::vector<Game> v;
+    if (!Exists(MotionTestExe())) return Game();
+    Game g;
+    g.name = "BFI Motion Test";
+    g.store = "Tool";
+    g.root = MotionTestDir();
+    g.exes = { MotionTestExe() };   // the scan picks the exe; this entry is made outside it
+    g.exe = MotionTestExe();
+    v.push_back(g);
+    DetectAll(v);
+    return v.empty() ? Game() : v[0];
 }
 
 Source CachedRelease()
