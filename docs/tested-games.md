@@ -51,6 +51,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Hades II | Working | Not tested | v0.78 | GPU headroom for 120 fps (4K yes, 5K DSR no) |
 | Indiana Jones and the Great Circle | Working (Vulkan) | 2× with the automatic frame cap (Reflex limit); 3× stays at Refresh | VK 1.0.24 | Keep video memory below the budget: lower Texture Pool Size (otherwise swap-chain rebuilds, Reflex limit lost, flicker) |
 | DriveClub-PC | Working (Vulkan) | Not used | VK 1.0.27 | `FrameGenDllCheck=0` (it loads DLSS-G's DLL without using it); Refresh + automatic frame cap: the game holds 60 by itself, 298 of 299 flashes with the next frame, 6–12 ms frame age, about 25 ms from release to flash with the frame start timed |
+| P.T.-PC | Working (Vulkan) | Not used | VK 1.0.27 | `FrameGenDllCheck=0` (the RenoDX DLSS add-on loads DLSS-G's DLL); Refresh + automatic frame cap: at 75–85 fps it steps down to 60, 60 of 60 flashes, about 19 ms from release to flash with the frame start timed (25 ms before) |
 | shadPS4 | Working (Vulkan) | — | VK 0.7 | Vulkan layer; BFIPresenter.ini next to the emulator's .exe |
 | Blasphemous | Working (DX11) | NVIDIA Smooth Motion must be off with the presenter; works with the BFI shader | v1.0.3 | Locked at 60 fps: Refresh rate + Lowest latency; Smooth Motion off in the NVIDIA app (with it on, the game closed and relaunched itself). Or the BFI shader at 120 Hz with Smooth Motion on |
 | Guacamelee! 2 | Working (DX11) | Not tested | v1.0.3 | Standard setup; works with Special K (crashed at start before v1.0.3) |

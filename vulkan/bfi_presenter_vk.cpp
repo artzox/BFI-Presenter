@@ -2451,7 +2451,7 @@ static void PresenterThread(Swapchain *sc)
                             {
                                 down = true;
                                 probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
-                                // Far from the refresh rate (under 80%): each try is seconds of uneven frames (P.T. at 72 of
+                                // Far from the refresh rate (under 80%): each try is seconds of uneven frames (P.T.-PC at 72 of
                                 // 120: 5 s with every eighth frame skipped), so the next one waits 5 minutes (as the DX add-on).
                                 if (fpsA < 0.8 * hzA) probeWait = 300.0;
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
@@ -2490,7 +2490,7 @@ static void PresenterThread(Swapchain *sc)
                 g_status.fgActive = fg ? 1 : 0;
                 // Frame start timing (AutoCapAtFrameStart): while the automatic frame cap holds the game to one frame per
                 // strobe cycle, the game is held in its present -- before it starts the next frame -- and released at
-                // the refresh before the lit one. A frame that takes 13 ms then waits 9-12 ms for its flash (P.T.: 25 ms
+                // the refresh before the lit one. A frame that takes 13 ms then waits 9-12 ms for its flash (P.T.-PC: 25 ms
                 // from release to flash). As the DX add-on, start times across the strobe cycle are tried instead,
                 // 8 of them, 1 s to settle and 2 s measured each (one that loses frames in its first measured second is
                 // left at once): kept is the one with every frame shown and the shortest release -> flash, with 3 ms
@@ -2744,7 +2744,7 @@ static void LrWatchThread(Swapchain *sc)
         if (std::fabs(window - lastWindow) > 1e-4) { lastWindow = window; graceUntil = now + 5.0; if (state != 0) { state = 0; nb = wb = 0; margin = base; } }
         // A few seconds after the cap changes (the automatic frame cap stepping down or trying Refresh rate) the game
         // is still settling: frames missed then don't count. They switched just-in-time release off for good within
-        // 2-3 s of each change (P.T.: 3 of 57 and 9 of 60 missed, then every frame on time with 9-12 ms to spare).
+        // 2-3 s of each change (P.T.-PC: 3 of 57 and 9 of 60 missed, then every frame on time with 9-12 ms to spare).
         if (allowed && !wasAllowed) graceUntil = now + 5.0;
         wasAllowed = allowed;
         if (now < graceUntil) misses = 0;
