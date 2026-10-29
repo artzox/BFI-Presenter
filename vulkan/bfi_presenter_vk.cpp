@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v4"
+#define BFI_VERSION "1.0.27-v5"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -774,6 +774,8 @@ struct Swapchain
     std::atomic<bool>   fsCtl{false};                   // automatic frame cap: the frame start timing is in charge (no just-in-time release)
     std::atomic<bool>   fsOn{false};                    // ... and releases the game fsLead before the lit refresh
     std::atomic<double> fsLead{0.0};
+    std::atomic<long long> gapMaxUs{0};                 // longest gap between the game's frames this second (frame start timing)
+    double              lastStageT = 0.0;               // when the last game frame was staged (submitLock)
     std::atomic<double> lrWindow{1.0 / 120.0};          // time between releases at the current cap
     std::atomic<float>  lrBaseMs{1.5f};
     uint64_t            jitTarget = 0;                  // tick of the lit refresh the last frame was released for
@@ -1447,6 +1449,7 @@ static void PresenterThread(Swapchain *sc)
     double fsLeadCur = 0.0, fsStart = 0.0, fsBestMs = 0.0, fsDoneT = -1.0, fsDeclT = -1e9, fsOffT = -1e9, fsKeptLead = -1.0,
            fsBaseRel = 0.0, fsBaseP10 = 1.0, fsRel = 0.0, fsSlack = 1.0, fsScore[16] = {}, fsRelK[16] = {}, fsSlackK[16] = {};
     int fsShownK[16] = {};
+    double fsFpsSum = 0.0; int fsFpsN = 0; bool fsDriftLogged = false;   // the game's rate against the strobe's, over 30 s
     double llStep = 0.0;                // recent game frames per strobe cycle
     // Queue one refresh ahead: one extra refresh is presented right after a
     // vblank ("prime"), so the display always has the next refresh queued and
@@ -2511,8 +2514,41 @@ static void PresenterThread(Swapchain *sc)
                     if (secReadyN >= 10) { std::sort(secReady, secReady + secReadyN); p10 = secReady[secReadyN / 10] * 0.001; }
                     const double relMs = secRelN ? secRelSum / secRelN : 0.0;
                     const bool ok = !hitchPaused && fpsA >= 0.98 * capFps && fpsA < 1.05 * capFps;
+                    // A game a little slower than the strobe (PCSX2: PS2 NTSC games at 59.94 fps against 60): its frames slide
+                    // through the strobe cycle, a repeated flash every ~17 s, and the frame age swings 3-14 ms in between.
+                    // No start time holds there (the searches measured each start at another point of the slide), so it is
+                    // left at the usual release, with a hint: a display mode at the game's rate x frames per cycle (119.88 Hz).
+                    bool drifting = false;
+                    // Only seconds without a dropped frame (no gap of 1.5 strobe cycles): a game that just loses a frame now
+                    // and then is short of the strobe's rate too, but isn't sliding.
+                    const double gapMax = sc->gapMaxUs.exchange(0) * 1e-6;
+                    if (want && ok && gapMax > 0.0 && gapMax < 1.5 * cyc) { fsFpsSum += fpsA; fsFpsN++; }
+                    if (!want) { fsFpsSum = 0.0; fsFpsN = 0; }
+                    if (fsFpsN >= 30)
+                    {
+                        const double avg = fsFpsSum / fsFpsN, ratio = capFps > 0.0 ? avg / capFps : 1.0;
+                        drifting = ratio > 0.99 && ratio < 0.9993;
+                        if (drifting && !fsDriftLogged)
+                        {
+                            fsDriftLogged = true;
+                            LOGI("BFI Presenter: the game runs at %.2f fps against the strobe's %.2f -- its frames slide through the strobe "
+                                 "cycle (a repeated flash about every %.0f s); the frame start is left at the usual release. A display mode "
+                                 "of %.2f Hz would match it (e.g. 119.88 Hz for a 59.94 fps game with 2 frames per cycle)",
+                                 avg, capFps, 1.0 / std::max(1e-3, capFps - avg), avg * s.frames);
+                        }
+                        fsFpsSum *= 0.5; fsFpsN /= 2;      // a sliding half-weight window
+                    }
                     auto setLead = [&](double lead, bool on) { fsLeadCur = lead; sc->fsLead.store(lead); sc->fsOn.store(on); };
-                    if (!want)
+                    if (want && drifting && fsState != 0 && fsState != 5)
+                    {
+                        fsState = 5; sc->fsOn.store(false); sc->fsCtl.store(false);
+                    }
+                    if (want && fsState == 5)
+                    {
+                        // Left while the game runs slower than the strobe; looked at again if it comes up to the strobe's rate.
+                        if (fsFpsN >= 15 && fsFpsSum / fsFpsN >= 0.9993 * capFps) { fsState = 1; fsSecs = fsBaseN = 0; fsBaseRel = 0.0; fsBaseP10 = 1.0; sc->fsCtl.store(true); }
+                    }
+                    else if (!want)
                     {
                         if (fsState != 0)
                         {
@@ -3230,6 +3266,16 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
         sc->recentSlot[id % 8] = slot;
         sc->virtPending[imageIndex] = true;
         sc->lrSlot[id % kLr] = slot;
+    }
+    {
+        const double nowT = Now();
+        if (sc->lastStageT > 0.0)
+        {
+            const long long g = (long long)((nowT - sc->lastStageT) * 1e6);
+            long long cur = sc->gapMaxUs.load();
+            while (g > cur && !sc->gapMaxUs.compare_exchange_weak(cur, g)) {}
+        }
+        sc->lastStageT = nowT;
     }
     sc->lrStaged.store(id);
     sc->lrCv.notify_one();
@@ -4877,6 +4923,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                     else if (fst == 2) snprintf(fsTxt, sizeof(fsTxt), "(trying start times)");
                     else if (fst == 3) snprintf(fsTxt, sizeof(fsTxt), "(in use: released %.1f ms before the flash)", fsl);
                     else if (fst == 4) snprintf(fsTxt, sizeof(fsTxt), "(not needed: frames are ready just before the flash)");
+                    else if (fst == 5) snprintf(fsTxt, sizeof(fsTxt), "(not used: the game runs a little slower than the strobe -- see the log)");
                     if (fsTxt[0]) { ImGui::SameLine(); ImGui::TextDisabled("%s", fsTxt); }
                 }
                 ImGui::Unindent(16.0f);
