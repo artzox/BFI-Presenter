@@ -5,8 +5,8 @@
 #include <vector>
 #include <functional>
 
-#define MANAGER_VERSION "1.3.11"
-#define MANAGER_VERSION_W L"1.3.11"
+#define MANAGER_VERSION "1.3.12"
+#define MANAGER_VERSION_W L"1.3.12"
 
 namespace bfi {
 
@@ -184,6 +184,9 @@ std::string CachedToolsVersion();               // "" = not downloaded
 // Downloads the tools zip when it is newer than the copy here (r's, or the newest release that has one; r may be
 // empty). Blocking. "" = the tools are here and current (or GitHub couldn't be asked and a copy is here).
 std::string EnsureTools(const RemoteRelease &r, const std::function<void(const std::string &)> &progress, std::string *note);
+// The settings guide PDF (BFIPresenter-Settings-Guide.pdf) of the newest release that has one, downloaded when that
+// release is newer than the copy here. Blocking. "" = *pdf is the file to open (the copy here if GitHub can't be asked).
+std::string EnsureGuide(const std::function<void(const std::string &)> &progress, std::wstring *pdf, std::string *note);
 Game MotionTestGame();                          // detected; root empty if the motion test isn't downloaded
 void CleanupOldManagerExe();                   // removes the .old exe left by an update
 
