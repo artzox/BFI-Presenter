@@ -7,7 +7,7 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [Unreleased]
+## [1.0.27] — 2026-10-30
 
 **The biggest latency update so far.** When the automatic frame cap holds a game to one frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames per cycle), the game used to finish its frame and then wait for the flash with your input already read. 1.0.27 holds the game *before* it starts the frame instead, and finds by testing the moment to let it go so the frame is finished just before its flash. That moment is then remembered per game.
 
