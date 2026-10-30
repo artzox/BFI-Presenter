@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v15"
+#define BFI_VERSION "1.0.27-v16"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -2781,7 +2781,10 @@ static void PresenterThread(Swapchain *sc)
                     // Only seconds without a dropped frame (no gap of 1.5 strobe cycles): a game that just loses a frame now
                     // and then is short of the strobe's rate too, but isn't sliding.
                     const double gapMax = sc->gapMaxUs.exchange(0) * 1e-6;
-                    if (want && ok && gapMax > 0.0 && gapMax < 1.5 * cyc) { fsFpsSum += fpsA; fsFpsN++; }
+                    // No frame over 1.15 cycles either: a sliding game's frames are all the same length (16.68 ms at 59.94), while
+                    // a game with some slower frames in a second averages under 60 too -- DriveClub-PC read as 59.63 fps
+                    // "sliding" with 18-24 ms frames now and then, and no repeated flashes.
+                    if (want && ok && gapMax > 0.0 && gapMax < 1.15 * cyc) { fsFpsSum += fpsA; fsFpsN++; }
                     // Kept through the cap's tries at Refresh rate (the game's rate doesn't change with them); reset when
                     // the cap goes back up to Refresh rate for good or the settings rule the timing out.
                     if (!want && !capProbe && !down) { fsFpsSum = 0.0; fsFpsN = 0; }
