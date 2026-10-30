@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e27"
+#define BFI_ADDON_VERSION "1.0.27-e28"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -9036,10 +9036,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
             static const char *kCapNames[] = { "no cap", "Refresh rate", "Half refresh", "Quarter refresh", "one game frame per strobe cycle", "Custom cap" };
             char use[320];
             int n = 0;
-            if (s.gameCap == 1 && s.autoCap)
+            if (s.gameCap == 1 && st.fgLimitUs > 0)   // works with the automatic frame cap on or off
+                n = snprintf(use, sizeof(use), "frame limit for frame generation (%.1f ms per rendered frame)", st.fgLimitUs / 1000.0);
+            else if (s.gameCap == 1 && s.autoCap)
             {
-                if (st.fgLimitUs > 0)        n = snprintf(use, sizeof(use), "frame limit for frame generation (%.1f ms per rendered frame)", st.fgLimitUs / 1000.0);
-                else if (st.autoCapProbe)    n = snprintf(use, sizeof(use), "automatic cap: trying Refresh rate");
+                if (st.autoCapProbe)    n = snprintf(use, sizeof(use), "automatic cap: trying Refresh rate");
                 else if (st.autoCapDown && st.rfxLimitUs > 0) n = snprintf(use, sizeof(use), "automatic cap: one game frame per strobe cycle (Reflex frame limit)");
                 else if (st.autoCapDown && st.feLimitUs > 0)  n = snprintf(use, sizeof(use), "automatic cap: one game frame per strobe cycle, held at the frame start");
                 else if (st.autoCapDown)     n = snprintf(use, sizeof(use), "automatic cap: one game frame per strobe cycle");
@@ -9106,6 +9107,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "Reflex reports, or a short try every 30 to 120 s).\n"
                                                           "In games with NVIDIA Reflex (every DLSS frame-generation game) it uses Reflex's own frame limit\n"
                                                           "for this, which also paces frame generation. Frame generation without Reflex: see the frame limit below.");
+            if (!s.autoCap && s.gameCap == 1 && st.fgLimitUs > 0)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(not needed now: the frame limit for frame generation below holds the game -- used when frame generation stops)");
+            }
             if (s.autoCap && s.gameCap == 1)
             {
                 ImGui::SameLine();
