@@ -250,7 +250,11 @@ function analyse(s){
       // With Reflex's frame limit the driver sets the game's rate: count cadence against that period.
       let per=r.cap_period>0?r.cap_period:capPeriod(r.cap_set,frames);
       if(rl && hz>0) per=Math.max(1,Math.round(r.reflex_limit_us*hz/1e6));
-      const key=[r.cap_set,per,r.pacing,r.fg_active?1:0,rl?1:0].join("|");
+      // 1.0.27 hold at the frame start: the automatic cap is down (auto_cap=1) but the presenter itself stays at
+      // Refresh (cap_period 1) and holds the game before its next frame -- one game frame per strobe cycle.
+      const hold=!rl && !r.fg_active && r.cap_set===1 && r.auto_cap===1 && per<=1 ? 1 : 0;
+      if(hold) per=frames;
+      const key=[r.cap_set,per,r.pacing,r.fg_active?1:0,rl?1:0,hold].join("|");
       secRows.push({t:r.time_s,key,r,per,rl});
     }
   }
@@ -271,7 +275,7 @@ function analyse(s){
       const sr=keyAt(b.time_ms);
       let key, per;
       if(sr){ if(sr.r.game_fps<3) continue; key=sr.key; per=sr.per; }
-      else { per=capPeriod(a.cap,a.frames); key=[a.cap,per,a.pacing,-1,-1].join("|"); }
+      else { per=capPeriod(a.cap,a.frames); key=[a.cap,per,a.pacing,-1,-1,0].join("|"); }
       const st=litStats[key]||(litStats[key]={n:0,rep:0,skip:0,off:0,per,frames:a.frames,secs:0,runFrames:0,runOff:0,run:0,last:null});
       st.n++; st.secs+=dt/1000;
       if(b.release_to_flash_ms>0){st.r2fSum=(st.r2fSum||0)+b.release_to_flash_ms; st.r2fN=(st.r2fN||0)+1;}
@@ -295,7 +299,7 @@ function analyse(s){
     for(const k in litStats){ const sg=pushSeg(k); sg.secs=Math.round(litStats[k].secs); }
   }
   for(const key in segs){
-    const sg=segs[key]; const [cap,per,pac,fg,rl]=key.split("|").map(Number);
+    const sg=segs[key]; const [cap,per,pac,fg,rl,hold]=key.split("|").map(Number);
     const rows=sg.rows;
     const m=(c,f=v=>v>=0)=>mean(rows.map(r=>r[c]).filter(f));
     const presented=rows.length?m("game_fps"):NaN;
@@ -314,7 +318,8 @@ function analyse(s){
     const ls=litStats[key];
     const rep = ls&&ls.n? ls.rep/ls.n*100 : NaN, skip= ls&&ls.n? ls.skip/ls.n*100 : NaN;
     const uneven = ls&&ls.n? ls.off/ls.n*100 : (isNaN(shown)?NaN:Math.max(0,(1-shown/ideal)*100));
-    sg.m={cap,per,pac,fg,rl,ready,presented,rendered,shown,ideal,r2f,s2p,i2f:(s2p>0&&r2f>0)?s2p+r2f:NaN,submit,gpu,autoCap,jitLimit,rep,skip,uneven,target:per>0?hz/per:hz};
+    const startMs=hold&&rows.length?m("align_shift_ms",v=>v>0):NaN;
+    sg.m={cap,per,pac,fg,rl,hold,startMs,ready,presented,rendered,shown,ideal,r2f,s2p,i2f:(s2p>0&&r2f>0)?s2p+r2f:NaN,submit,gpu,autoCap,jitLimit,rep,skip,uneven,target:per>0?hz/per:hz};
     sg.label=modeLabel(sg.m,hz,frames);
     out.segments.push(sg);
   }
@@ -342,7 +347,8 @@ function analyse(s){
 function modeLabel(m,hz,frames){
   let name=CAP_NAMES[m.cap]||("Cap "+m.cap);
   const parts=[];
-  if(m.cap===1 && m.per>1) parts.push((m.rl===1?"Reflex limit":"auto cap")+" → "+Math.round(hz/m.per)+" fps");
+  if(m.hold===1) parts.push("auto cap → "+Math.round(hz/m.per)+" fps, held at the frame start"+(m.startMs>0?" +"+m.startMs.toFixed(1)+" ms into the cycle":""));
+  else if(m.cap===1 && m.per>1) parts.push((m.rl===1?"Reflex limit":"auto cap")+" → "+Math.round(hz/m.per)+" fps"+(m.rl===1?"":", held at the present"));
   else if(m.rl===1) parts.push("Reflex frame limit");
   return {main:name+(m.pac in PACING?" + "+PACING[m.pac]:""), sub:[(m.fg===1?"frame generation on":m.fg===0?"frame generation off":null),...parts].filter(Boolean).join(" · ")};
 }
@@ -402,6 +408,15 @@ function findings(out,hz,frames){
     if(ev.some(e=>/staying at 2 for this session/.test(e.text))) add("info","Automatic frames ahead settled at 2: the game missed strobe cycles at 1 frame ahead, including right after trying 1 again. Normal for games close to the cap.");
     const vb=ev.map(e=>e.text.match(/vblank pacing on .*?\(([\d.]+) Hz/)).filter(Boolean).pop();
     if(vb) out.facts.modeHz=+vb[1];
+  }
+  {
+    // Hold at the frame start against the cap held at the present, when both ran long enough in this session.
+    const segOk=s=>s.secs>=8 && s.m.r2f>0;
+    const hs=out.segments.filter(s=>s.m.hold===1 && segOk(s)).sort((a,b)=>b.secs-a.secs)[0];
+    const ps=out.segments.filter(s=>s.m.cap===1 && s.m.per>1 && !s.m.rl && !s.m.hold && s.m.fg!==1 && segOk(s)).sort((a,b)=>b.secs-a.secs)[0];
+    if(hs && ps){ const d=ps.m.r2f-hs.m.r2f;
+      add(d>=1?"good":"info",`Held at the frame start: ${f1(hs.m.r2f)} ms from release to flash, against ${f1(ps.m.r2f)} ms with the cap held at the present (${d>=0?f1(d)+" ms quicker":f1(-d)+" ms slower"}).`); }
+    else if(hs) add("info",`The automatic cap held the game at the frame start (one game frame per strobe cycle)${hs.m.startMs>0?", started "+f1(hs.m.startMs)+" ms into the strobe cycle":""}: ${f1(hs.m.r2f)} ms from release to flash.`);
   }
   if(out.facts.game && out.facts.game.presP99>3) add("warn",`Time inside the presenter's Present reached ${f1(out.facts.game.presP99)} ms (99th percentile). Normally it is well under 1 ms.`);
   if(!out.segments.length) add("info","No per-second data in these files. Add the matching _reflex_ or _log_ CSV.");
