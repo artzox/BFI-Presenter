@@ -153,9 +153,10 @@ struct App {
     std::string mgrErr;                // guarded by lock
     bool restart = false;              // start the updated Manager and quit
     bool toolsDone = false;            // guarded by lock: a tools download finished
-    int  toolsWhich = 0;               // 1 motion test, 2 log analyzer
+    int  toolsWhich = 0;               // 1 motion test, 2 log analyzer, 3 settings guide
     std::string toolsErr, toolsNote;   // guarded by lock
     Game toolsGame;                    // guarded by lock: the motion test, detected
+    std::wstring toolsPdf;             // guarded by lock: the settings guide to open
     std::string toolsVer = "?";        // the tools here ("?" = not read yet, "" = none)
 
     // UI
@@ -477,11 +478,12 @@ static void StartTool(int which)
     {
         std::lock_guard<std::mutex> l(g_app.lock);
         rr = g_app.remote;
-        g_app.busyText = which == 1 ? "Getting the motion test..." : "Getting the log analyzer...";
+        g_app.busyText = which == 1 ? "Getting the motion test..." : which == 2 ? "Getting the log analyzer..." : "Getting the settings guide...";
     }
     g_app.worker = std::thread([rr, which] {
         std::string note;
-        std::string e = EnsureTools(rr, SetBusy, &note);
+        std::wstring pdf;
+        std::string e = which == 3 ? EnsureGuide(SetBusy, &pdf, &note) : EnsureTools(rr, SetBusy, &note);
         Game g;
         if (e.empty() && which == 1) g = MotionTestGame();
         std::lock_guard<std::mutex> l(g_app.lock);
@@ -489,6 +491,7 @@ static void StartTool(int which)
         g_app.toolsNote = note;
         g_app.toolsWhich = which;
         g_app.toolsGame = g;
+        g_app.toolsPdf = pdf;
         g_app.toolsDone = true;
         g_app.busy = false;
     });
@@ -549,6 +552,14 @@ static void PollWorker()
         g_app.toolsDone = false;
         g_app.toolsVer = "?";
         if (!g_app.toolsErr.empty()) g_app.SetMsg(g_app.toolsErr, true);
+        else if (g_app.toolsWhich == 3)
+        {
+            if ((INT_PTR)ShellExecuteW(nullptr, L"open", g_app.toolsPdf.c_str(), nullptr, nullptr, SW_SHOWNORMAL) > 32)
+                g_app.SetMsg((g_app.toolsNote.empty() ? "" : g_app.toolsNote + " ") + "Settings guide opened.", false);
+            else g_app.SetMsg("Couldn't open the settings guide: no PDF viewer is set up? It is at " + U8(g_app.toolsPdf) + ".", true);
+            g_app.tempMsg = g_app.msg;
+            g_app.tempMsgUntil = GetTickCount64() + 15000;
+        }
         else if (g_app.toolsWhich == 2)
         {
             ShellExecuteW(nullptr, L"open", LogAnalyzerHtml().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -1067,6 +1078,10 @@ static void DrawTop(HWND hwnd)
     if (ImGui::Button("Log analyzer")) StartTool(2);
     Tooltip("An offline page that charts a session from the presenter's timing logs (the CSV files) and ReShade.log: "
             "frame pacing, repeats and skips, the frame cap, frame generation. Downloaded on first use; opens in your browser.");
+    ImGui::SameLine();
+    if (ImGui::Button("Settings guide")) StartTool(3);
+    Tooltip("Every setting in plain words, with recommended starting points per game type (PDF). Downloaded from the "
+            "newest release on first use and when a release brings a new one; opens in your PDF viewer.");
     ImGui::EndDisabled();
     {
         if (g_app.toolsVer == "?") g_app.toolsVer = CachedToolsVersion();

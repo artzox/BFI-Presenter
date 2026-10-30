@@ -3243,6 +3243,57 @@ std::string EnsureTools(const RemoteRelease &r, const std::function<void(const s
     if (note) *note = have.empty() ? "Tools " + ver + " downloaded." : "Tools updated to " + ver + ".";
     return {};
 }
+// ---------------------------------------------------------------- Settings guide PDF
+std::string EnsureGuide(const std::function<void(const std::string &)> &progress, std::wstring *pdf, std::string *note)
+{
+    CreateDirectoryW(ToolsDir().c_str(), nullptr);
+    const std::wstring path = Join(ToolsDir(), L"BFIPresenter-Settings-Guide.pdf"), verFile = Join(ToolsDir(), L"guide_version.txt");
+    std::string have = Exists(path) ? ReadText(verFile) : std::string();
+    while (!have.empty() && (have.back() == '\n' || have.back() == '\r' || have.back() == ' ')) have.pop_back();
+    if (pdf) *pdf = path;
+    if (progress) progress("Checking GitHub for the settings guide...");
+    std::string body, err, url, ver;
+    if (HttpGet(L"https://api.github.com/repos/artzox/BFI-Presenter/releases?per_page=20", body, err))
+    {
+        for (size_t p = 0; (p = body.find("\"browser_download_url\"", p)) != std::string::npos; p += 10)
+        {
+            std::string u = JsonString(body.substr(p), "browser_download_url"), l = LowerA(u);
+            if (l.size() < 4 || l.compare(l.size() - 4, 4, ".pdf") != 0 || l.find("settings-guide") == std::string::npos) continue;
+            url = u;
+            const size_t t = body.rfind("\"tag_name\"", p);     // the release's tag comes before its assets
+            ver = t == std::string::npos ? std::string("latest") : JsonString(body.substr(t), "tag_name");
+            break;        // releases come newest first
+        }
+        if (url.empty()) err = "no release on GitHub has the settings guide";
+    }
+    if (url.empty())
+    {
+        if (!have.empty()) { if (note) *note = "Couldn't check GitHub for a newer settings guide; opening the copy here."; return {}; }
+        return "Couldn't get the settings guide: " + err + ".";
+    }
+    if (!have.empty() && (have == ver || CompareVersions(have, ver) >= 0)) return {};
+    if (progress) progress("Downloading the settings guide");
+    std::string pdfBody;
+    if (!HttpGet(W(url), pdfBody, err, [&](size_t got, size_t total) {
+            if (progress && total) progress("Downloading the settings guide (" + std::to_string(got * 100 / total) + " %)");
+        }) || pdfBody.size() < 1000 || pdfBody.compare(0, 4, "%PDF") != 0)
+    {
+        if (!have.empty()) { if (note) *note = "Download of the new settings guide failed; opening the copy here."; return {}; }
+        return "Download of the settings guide failed" + (err.empty() ? std::string(".") : ": " + err + ".");
+    }
+    const std::wstring tmp = path + L".tmp";
+    { std::ofstream(fs::path(tmp), std::ios::binary).write(pdfBody.data(), (std::streamsize)pdfBody.size()); }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+    {
+        DeleteFileW(tmp.c_str());
+        if (!have.empty()) { if (note) *note = "Couldn't replace the settings guide (is it open in a PDF viewer?); opening the copy here."; return {}; }
+        return "Couldn't save the settings guide (error " + std::to_string(GetLastError()) + ").";
+    }
+    std::ofstream(fs::path(verFile), std::ios::binary) << ver;
+    if (note) *note = have.empty() ? "" : "Settings guide updated to " + ver + ".";
+    return {};
+}
+
 Game MotionTestGame()
 {
     std::vector<Game> v;
