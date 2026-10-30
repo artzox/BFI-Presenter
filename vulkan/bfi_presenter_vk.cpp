@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v17"
+#define BFI_VERSION "1.0.27-v18"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -5280,7 +5280,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                     if (fst == 1) snprintf(fsTxt, sizeof(fsTxt), "(checking)");
                     else if (fst == 2) snprintf(fsTxt, sizeof(fsTxt), "(trying start times)");
                     else if (fst == 3) snprintf(fsTxt, sizeof(fsTxt), "(in use: released %.1f ms before the flash)", fsl);
-                    else if (fst == 4) snprintf(fsTxt, sizeof(fsTxt), "(not needed: frames are ready just before the flash)");
+                    else if (fst == 4) snprintf(fsTxt, sizeof(fsTxt), "(not needed: left at the usual release -- the log says why)");
                     else if (fst == 5) snprintf(fsTxt, sizeof(fsTxt), "(not used: the game runs a little slower than the strobe -- see the log)");
                     if (fsTxt[0]) { ImGui::SameLine(); ImGui::TextDisabled("%s", fsTxt); }
                 }
