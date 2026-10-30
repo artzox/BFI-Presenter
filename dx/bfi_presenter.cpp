@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e21"
+#define BFI_ADDON_VERSION "1.0.27-e22"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -1799,6 +1799,32 @@ static bool Compile(PFN_D3DCompile compile, const char *entry, const char *targe
     return true;
 }
 
+// The display mode's exact refresh rate: EnumDisplaySettings gives whole numbers, so 119.88 Hz read as 119 (a strobe
+// cycle of 16.81 ms against the real 16.68 ms: the frame-start search, drift detection and learned data used the wrong
+// cycle). The active display path has it as a fraction (119880/1000). Falls back to the whole number.
+static double ExactRefreshHz(const wchar_t *gdiName, double fallback)
+{
+    UINT32 np = 0, nm = 0;
+    if (!gdiName || GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || !np) return fallback;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(np);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nm);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), nullptr) != ERROR_SUCCESS) return fallback;
+    for (UINT32 i = 0; i < np; i++)
+    {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME sn = {};
+        sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        sn.header.size = sizeof(sn);
+        sn.header.adapterId = paths[i].sourceInfo.adapterId;
+        sn.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS || wcscmp(sn.viewGdiDeviceName, gdiName) != 0) continue;
+        const DISPLAYCONFIG_RATIONAL r = paths[i].targetInfo.refreshRate;
+        if (r.Denominator == 0 || r.Numerator == 0) break;
+        const double hz = (double)r.Numerator / r.Denominator;
+        return (fallback <= 0.0 || fabs(hz - fallback) < 1.0) ? hz : fallback;
+    }
+    return fallback;
+}
+
 // ---------------------------------------------------------------- presenter thread
 static int ResolveOutput(const Settings &s)
 {
@@ -2618,7 +2644,7 @@ static DWORD WINAPI PresenterThread(void *)
         DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
         if (SUCCEEDED(output->GetDesc(&od)) && EnumDisplaySettingsW(od.DeviceName, ENUM_CURRENT_SETTINGS, &dm)
             && dm.dmDisplayFrequency > 1)
-            modeHz = (double)dm.dmDisplayFrequency;
+            modeHz = ExactRefreshHz(od.DeviceName, (double)dm.dmDisplayFrequency);
     }
 
     if (!ok)
