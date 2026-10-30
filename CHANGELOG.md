@@ -7,11 +7,7 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [Unreleased] (Manager 1.3.12)
-
-- **[Manager] Settings guide button.** The **Tools** row has a **Settings guide** button: it downloads the settings guide PDF from the newest release on first use (and again when a release brings a newer one) and opens it in your PDF viewer. Without a connection it opens the copy already downloaded.
-
-## [1.0.27] — 2026-10-30
+## [1.0.27] — 2026-10-30 (Manager 1.3.12)
 
 **The biggest latency update so far.** When the automatic frame cap holds a game to one frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames per cycle), the game used to finish its frame and then wait for the flash with your input already read. 1.0.27 holds the game *before* it starts the frame instead, and finds by testing the moment to let it go so the frame is finished just before its flash. That moment is then remembered per game.
 
@@ -32,6 +28,7 @@ All of this is on by default.
 - **[Both] 32-bit games:** timing is now precise (it moved in 64 ms steps on Direct3D 9's game thread; Alan Wake's cap didn't hold).
 - **[DX] Obduction-style streaming stalls** no longer restart the frame-start search.
 - **[Vulkan] `FrameGenDllCheck=0`** ignores a frame-generation DLL that a game loads but doesn't use (DriveClub-PC, P.T.-PC with RenoDX); the log names the DLL. RPCS3's doubled presents are no longer taken for frame generation.
+- **[Manager] Settings guide button:** a new button in the **Tools** row downloads the settings guide PDF from the newest release on first use (and again when a release brings a newer one) and opens it in your PDF viewer. Without a connection it opens the copy already downloaded.
 - **[Docs]** Settings guide (online, PDF, Markdown) follows the new layout, with a diagram of the frame-start hold. The log analyzer reports the frame-start result, remembered data and games slower than the strobe, reads the Vulkan logs, and tells the frame-start hold apart from the old cap.
 
 ## [1.0.26] — 2026-10-29 (Manager 1.3.11)
