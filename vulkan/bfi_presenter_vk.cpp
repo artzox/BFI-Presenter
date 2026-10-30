@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v11"
+#define BFI_VERSION "1.0.27-v12"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -1420,6 +1420,8 @@ static LearnRec    g_learnRead;         // what the file had for it
 static int         g_learnGen = 0;      // bumped each time the section is read
 static LearnRec    g_learnOut;          // to be written to it
 static bool        g_learnDirty = false;
+// "Forget this game" in the overlay: the helper thread deletes the game's section, the presenter starts over.
+static std::atomic<bool> g_learnForgetFile{false}, g_learnForgetNow{false};
 
 static void LearnPost(const LearnRec &r)
 {
@@ -1473,8 +1475,9 @@ static std::string LearnKeyFor(const char *exe, HWND wnd)
 static void LearnTick(const char *path, const char *exe, HWND wnd)
 {
     const std::string key = LearnKeyFor(exe, wnd);
+    const bool forget = g_learnForgetFile.exchange(false);
     AcquireSRWLockExclusive(&g_learnLock);
-    const bool dirty = g_learnDirty;
+    const bool dirty = g_learnDirty && !forget;
     const LearnRec out = g_learnOut;
     const std::string cur = g_learnKey;
     g_learnDirty = false;
@@ -1489,6 +1492,14 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
         snprintf(b, sizeof(b), "%ld", (long)std::lround(out.bestMs * 1000.0)); WritePrivateProfileStringA(sec, "ReleaseToFlashUs", b, path);
         snprintf(b, sizeof(b), "%ld", (long)std::lround(out.hz * 1000.0));     WritePrivateProfileStringA(sec, "RefreshMilliHz", b, path);
         snprintf(b, sizeof(b), "%d", out.frames);                             WritePrivateProfileStringA(sec, "Frames", b, path);
+    }
+    if (forget && !cur.empty())
+    {
+        WritePrivateProfileStringA(cur.c_str(), nullptr, nullptr, path);     // the whole section
+        AcquireSRWLockExclusive(&g_learnLock);
+        g_learnRead = LearnRec();
+        g_learnGen++;
+        ReleaseSRWLockExclusive(&g_learnLock);
     }
     if (key == cur) return;
     LearnRec r;
@@ -1521,6 +1532,7 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
 struct LearnRec { int down = -1; double fsMs = 0.0, bestMs = 0.0, hz = 0.0; int frames = 0; };
 static void LearnPost(const LearnRec &) {}
 static int LearnFetch(int, LearnRec &) { return 0; }
+static std::atomic<bool> g_learnForgetFile{false}, g_learnForgetNow{false};
 #endif
 
 static void PresenterThread(Swapchain *sc)
@@ -2591,6 +2603,16 @@ static void PresenterThread(Swapchain *sc)
                 }
                 bool down = sc->autoCapDown.load();
                 const bool capOn = s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg && !dupPresents;
+                // "Forget this game": the cap and the frame start start over (the section is deleted on the helper thread).
+                if (g_learnForgetNow.exchange(false))
+                {
+                    learnMine = LearnRec(); learnMine.hz = hzA; learnMine.frames = s.frames;
+                    learnSavedDown = -1; learnApply = false;
+                    if (down || capProbe) { down = capProbe = false; capDownSecs = 0; capSwitchT = t; probeWait = 30.0; }
+                    fsKeptLead = -1.0; fsOffT = -1e9;
+                    if (fsState != 0) { fsState = 0; sc->fsOn.store(false); sc->fsCtl.store(false); }
+                    LOGI("BFI Presenter: remembered data for this game cleared -- the automatic frame cap starts over");
+                }
                 if (s.learnPerGame)
                 {
                     const int g = LearnFetch(learnGen, learnRead);
@@ -5194,7 +5216,15 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("What the automatic frame cap finds for a game (one game frame per strobe cycle, the frame\n"
                                                               "start time) is kept in BFIPresenter_learned.ini, and the next session starts from it instead\n"
                                                               "of finding it again. Each game of an emulator is kept apart (by its window title). Still\n"
-                                                              "checked as usual: tries at Refresh rate, a new search after lost frames. Delete the file to forget.");
+                                                              "checked as usual: tries at Refresh rate, a new search after lost frames.");
+                if (s.learnPerGame)
+                {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Forget this game")) { g_learnForgetFile.store(true); g_learnForgetNow.store(true); }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Deletes what was remembered for this game and starts over now: the cap goes back to\n"
+                                                                  "Refresh rate and steps down again if needed, and the frame start is searched for again.\n"
+                                                                  "E.g. after changing the game's graphics settings or the display mode.");
+                }
                 ImGui::Unindent(16.0f);
             }
         }
