@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e25"
+#define BFI_ADDON_VERSION "1.0.27-e26"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -9120,11 +9120,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::Indent(16.0f);
             ImGui::BeginDisabled(!s.autoCap);
             bool aco = s.autoCapOwn != 0;
+            ImGui::BeginDisabled(!st.rfxGameUses);   // only a choice in Reflex games: without Reflex the presenter's own cap is the only one
             if (ImGui::Checkbox("Presenter's own cap without frame generation", &aco)) s.autoCapOwn = aco ? 1 : 0;
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Games with Reflex. Off (default): the cap steps down with Reflex's frame limit, with frame\n"
                                                           "generation or without.\n"
                                                           "On: the presenter's own cap (held at the frame start, below) while frame generation is off;\n"
                                                           "Reflex's frame limit while it is on. Follows frame generation being switched on and off.");
+            ImGui::EndDisabled();
+            if (!st.rfxGameUses) { ImGui::SameLine(); ImGui::TextDisabled("(no Reflex in this game: the presenter's own cap is used anyway)"); }
             bool fe = s.autoCapFrameStart != 0;
             ImGui::BeginDisabled(rfxPaces);
             if (ImGui::Checkbox("Hold at the frame start", &fe)) s.autoCapFrameStart = fe ? 1 : 0;
