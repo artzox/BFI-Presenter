@@ -35,7 +35,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency (Refresh + automatic frame cap also works) |
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
 | Pragmata | Working | Refresh cap + automatic frame cap with FG 2× or 3× (60 of 60), or Half refresh + Apply the cap with Reflex's frame limit | v1.0.19 | To start BFI (also with FG), change the resolution once or switch the display mode to windowed and back to borderless; don't use ShortFuse's DLSS 5 add-on (even set to off it breaks frame generation's pacing) |
-| Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps |
+| Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps. Refresh + automatic frame cap with **Presenter's own cap without frame generation** (`AutoCapOwnWithoutFg=1`): held at the frame start, a steady 27 ms from frame start to flash, 60 of 60 (v1.0.27); its Reflex limit shows frames in pairs |
 | Control | Working | Works (2×, 3×, 4× with the [Control-FG](https://github.com/Frooglemcdoo/Control-FG) mod, also with DLSS 5); Refresh cap | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54 |
 | Marvel's Spider-Man 2 | Working | Works in borderless (the game's "Fullscreen"), not in exclusive fullscreen; Refresh + automatic frame cap (v1.0.20) | v1.0.16 | Recommended without FG and ray tracing, in exclusive fullscreen (BFI starts with the game); with FG: borderless and change resolution once to start BFI |
 | Sifu | Working (DX11) | Not tested | — | Borderless window |
@@ -50,6 +50,9 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Obduction | Working | Not tested | v0.77 | Half refresh + just-in-time release; Lowest latency + Refresh is smoothest at 120 |
 | Hades II | Working | Not tested | v0.78 | GPU headroom for 120 fps (4K yes, 5K DSR no) |
 | Indiana Jones and the Great Circle | Working (Vulkan) | 2× with the automatic frame cap (Reflex limit); 3× stays at Refresh | VK 1.0.24 | Keep video memory below the budget: lower Texture Pool Size (otherwise swap-chain rebuilds, Reflex limit lost, flicker) |
+| DriveClub-PC | Working (Vulkan) | Not used | VK 1.0.27 | `FrameGenDllCheck=0` (it loads DLSS-G's DLL without using it); Refresh + automatic frame cap: the game holds 60 by itself, 298 of 299 flashes with the next frame, 6–12 ms frame age, about 25 ms from release to flash with the frame start timed |
+| P.T.-PC | Working (Vulkan) | Not used | VK 1.0.27 | `FrameGenDllCheck=0` (the RenoDX DLSS add-on loads DLSS-G's DLL); Refresh + automatic frame cap: at 75–85 fps it steps down to 60, 60 of 60 flashes, about 19 ms from release to flash with the frame start timed (25 ms before) |
+| PCSX2 | Working (Vulkan) | — | VK 1.0.27 | Vulkan layer; NTSC games run at 59.94 fps: set the display to 119.88 Hz (at 120 Hz a flash repeats about every 17 s; PCSX2's VSync and Sync to Host Refresh don't change that). With [NirCmd](https://www.nirsoft.net/utils/nircmd.html) in a batch file: `nircmd setdisplay 3840 2160 32 119`, start PCSX2, then `nircmd setdisplay 3840 2160 32 120` |
 | shadPS4 | Working (Vulkan) | — | VK 0.7 | Vulkan layer; BFIPresenter.ini next to the emulator's .exe |
 | Blasphemous | Working (DX11) | NVIDIA Smooth Motion must be off with the presenter; works with the BFI shader | v1.0.3 | Locked at 60 fps: Refresh rate + Lowest latency; Smooth Motion off in the NVIDIA app (with it on, the game closed and relaunched itself). Or the BFI shader at 120 Hz with Smooth Motion on |
 | Guacamelee! 2 | Working (DX11) | Not tested | v1.0.3 | Standard setup; works with Special K (crashed at start before v1.0.3) |
@@ -60,7 +63,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Wreckfest | Working (DX11) | Not tested | v1.0.3 | `DX11GamePresent=1` in `BFIPresenter.ini`: without it the game slowed to 5 fps within a minute |
 | Silt | Working (DX11) | Not tested | v1.0.3 | Locked 120 fps, so the CRT shader's decay is the simpler choice. For the presenter, rename the Epic Online Services overlay `EOSOVH-Win64-Shipping.dll` (outside the game folder; `ReShade.log` names its path), else it crashes at start |
 | The Rogue Prince of Persia | Working (DX11) | Not tested | v1.0.3 | Borderless (windowed) fullscreen, not exclusive fullscreen: leaving exclusive fullscreen hung or crashed the presenter |
-| Alan Wake | Working (DX9, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+ (not DXVK: flickered); runs windowed |
+| Alan Wake | Working (DX9, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+ (not DXVK: flickered); runs windowed. The frame caps hold since v1.0.27 (the 32-bit timing fix) |
 | Lara Croft and the Guardian of Light | Working (DX9, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+; runs windowed |
 | BAJA: Edge of Control HD | Working (DX11, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32` with the 32-bit ReShade |
 | Twelve Minutes | Working (DX11, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32` with the 32-bit ReShade for DirectX 11 -- not through DXVK (flickered) |
@@ -95,7 +98,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Cocoon | Standard setup |
 | Crash Bandicoot N. Sane Trilogy | Standard setup |
 | Days Gone | Standard setup |
-| Dead Space (2023) | Standard setup; Frame pacing Lowest latency (about 37 ms from release to flash against about 44 ms with Smooth, v1.0.22) |
+| Dead Space (2023) | Standard setup; Frame pacing Lowest latency (about 37 ms from release to flash against about 44 ms with Smooth, v1.0.22). Refresh + automatic frame cap with Reflex's limit is the quickest: about 24 ms from frame start to flash against about 37 ms with the presenter's cap (v1.0.27) |
 | Dishonored 2 | Standard setup |
 | FAR: Lone Sails | Standard setup |
 | GRIS | Standard setup |

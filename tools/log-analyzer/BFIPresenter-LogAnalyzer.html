@@ -100,7 +100,7 @@ footer{color:var(--ink-3);font-size:12.5px;max-width:80ch}
   <header class="head">
     <div style="display:flex;flex-direction:column;gap:6px;min-width:0">
       <h1>BFI Presenter Log Analyzer</h1>
-      <p class="lede">Drop the timing logs from a session (<code>BFIPresenter_log_…csv</code>, <code>_reflex_…csv</code>, <code>_game_…csv</code>) together with <code>ReShade.log</code>. Each setting you tried becomes a row: how evenly new frames hit the flashes, the latency, and what to try next. Files are read in this browser only and never uploaded.</p>
+      <p class="lede">Drop the timing logs from a session (<code>BFIPresenter_log_…csv</code>, <code>_reflex_…csv</code>, <code>_game_…csv</code>; Vulkan games: <code>BFIPresenterVK_log_…csv</code>) together with <code>ReShade.log</code> (Vulkan games: also <code>BFIPresenterVK.log</code>). Each setting you tried becomes a row: how evenly new frames hit the flashes, the latency, and what to try next. Files are read in this browser only and never uploaded.</p>
     </div>
   </header>
 
@@ -153,6 +153,7 @@ function kindOf(name,text){
   if(/_reflex_\d{8}_\d{6}/.test(n)) return "reflex";
   if(/_game_\d{8}_\d{6}/.test(n)) return "game";
   if(/bfipresenter_log_\d{8}_\d{6}/.test(n)) return "log";
+  if(/^bfi presenter \(vulkan layer\)/i.test(text.slice(0,80))) return "vklog";
   if(n.endsWith(".log")||/reshade/.test(n)) return "rslog";
   const h=text.slice(0,200);
   if(h.startsWith("time_s,game_fps")) return "reflex";
@@ -160,6 +161,22 @@ function kindOf(name,text){
   if(h.startsWith("time_ms,present,slot")) return "log";
   if(/\| INFO  \|/.test(h)) return "rslog";
   return null;
+}
+// BFIPresenterVK.log (the Vulkan layer's own log): "  12.345 INFO  BFI Presenter: ..." with seconds since the layer
+// started. The "timing log started: ..._<date>_<time>.csv" line ties those seconds to the clock; without one the events
+// keep their own seconds and go with the only session.
+function parseVkLog(text){
+  const ev=[]; let exe=null, version=null, off=null;
+  const lines=text.split(/\r?\n/);
+  const h=lines[0].match(/Vulkan layer\) v(\S+) -- (.+)$/); if(h){version=h[1]; exe=h[2].trim();}
+  for(const line of lines){
+    const m=line.match(/^\s*(\d+\.\d+)\s+(\w+)\s+BFI Presenter: (.*)$/); if(!m) continue;
+    const rel=+m[1], t=m[3];
+    if(off===null){const st=t.match(/timing log started: .*?(\d{8})_(\d{6})/); if(st){const w=st[2]; off=(+w.slice(0,2))*3600+(+w.slice(2,4))*60+(+w.slice(4,6))-rel;}}
+    ev.push({rel,level:m[2],text:t});
+  }
+  for(const e of ev) e.sec=off===null?e.rel:e.rel+off;
+  return {ev,exe,version,vk:true,clocked:off!==null};
 }
 function parseRsLog(text){
   const ev=[]; let exe=null, version=null;
@@ -185,6 +202,7 @@ function buildSessions(files){
   for(const f of files){
     const k=kindOf(f.name,f.text); if(!k) continue;
     if(k==="rslog"){logs.push({name:f.name,...parseRsLog(f.text)});continue;}
+    if(k==="vklog"){logs.push({name:f.name,...parseVkLog(f.text)});continue;}
     const p=parseCSV(f.text); if(!p.rows.length) continue;
     const tcol=k==="reflex"?"time_s":"time_ms", mul=k==="reflex"?1000:1;
     const t0=p.rows[0][tcol]*mul, t1=p.rows[p.rows.length-1][tcol]*mul;
@@ -205,6 +223,7 @@ function buildSessions(files){
     const st=s.stamp;
     let rs=logs.find(l=>l.ev.some(e=>st && e.text.includes("timing log started") && e.text.includes(st)));
     if(!rs && st){const w=stampSec(st); rs=logs.find(l=>l.ev.length && l.ev[0].sec<=w+5 && l.ev[l.ev.length-1].sec>=w-5);}
+    if(!rs && sessions.length===1) rs=logs.find(l=>l.vk && !l.clocked);
     s.rs=rs||null;
   }
   sessions.sort((a,b)=>(a.stamp||"").localeCompare(b.stamp||""));
@@ -231,7 +250,11 @@ function analyse(s){
       // With Reflex's frame limit the driver sets the game's rate: count cadence against that period.
       let per=r.cap_period>0?r.cap_period:capPeriod(r.cap_set,frames);
       if(rl && hz>0) per=Math.max(1,Math.round(r.reflex_limit_us*hz/1e6));
-      const key=[r.cap_set,per,r.pacing,r.fg_active?1:0,rl?1:0].join("|");
+      // 1.0.27 hold at the frame start: the automatic cap is down (auto_cap=1) but the presenter itself stays at
+      // Refresh (cap_period 1) and holds the game before its next frame -- one game frame per strobe cycle.
+      const hold=!rl && !r.fg_active && r.cap_set===1 && r.auto_cap===1 && per<=1 ? 1 : 0;
+      if(hold) per=frames;
+      const key=[r.cap_set,per,r.pacing,r.fg_active?1:0,rl?1:0,hold].join("|");
       secRows.push({t:r.time_s,key,r,per,rl});
     }
   }
@@ -252,9 +275,11 @@ function analyse(s){
       const sr=keyAt(b.time_ms);
       let key, per;
       if(sr){ if(sr.r.game_fps<3) continue; key=sr.key; per=sr.per; }
-      else { per=capPeriod(a.cap,a.frames); key=[a.cap,per,a.pacing,-1,-1].join("|"); }
+      else { per=capPeriod(a.cap,a.frames); key=[a.cap,per,a.pacing,-1,-1,0].join("|"); }
       const st=litStats[key]||(litStats[key]={n:0,rep:0,skip:0,off:0,per,frames:a.frames,secs:0,runFrames:0,runOff:0,run:0,last:null});
       st.n++; st.secs+=dt/1000;
+      if(b.release_to_flash_ms>0){st.r2fSum=(st.r2fSum||0)+b.release_to_flash_ms; st.r2fN=(st.r2fN||0)+1;}
+      if(b.ready_before_pick_ms>=0){st.rdy=st.rdy||[]; st.rdy.push(b.ready_before_pick_ms);}
       const d=b.frame_id-a.frame_id;
       const E=per>0?a.frames/per:0;
       if(E>=1){ const e=Math.round(E); if(d!==e) st.off++; if(d===0) st.rep++; else if(d>e) st.skip++; }
@@ -274,14 +299,17 @@ function analyse(s){
     for(const k in litStats){ const sg=pushSeg(k); sg.secs=Math.round(litStats[k].secs); }
   }
   for(const key in segs){
-    const sg=segs[key]; const [cap,per,pac,fg,rl]=key.split("|").map(Number);
+    const sg=segs[key]; const [cap,per,pac,fg,rl,hold]=key.split("|").map(Number);
     const rows=sg.rows;
     const m=(c,f=v=>v>=0)=>mean(rows.map(r=>r[c]).filter(f));
     const presented=rows.length?m("game_fps"):NaN;
     const rendered=rows.length?m("rendered_fps",v=>v>0):NaN;
     const shown=rows.length?m("frames_shown"):NaN;
     const ideal = per>0 ? (per<=frames ? strobe : hz/per) : strobe;
-    const r2f=rows.length?m("release_to_flash_ms",v=>v>0):NaN;
+    const ls0=litStats[key];
+    let r2f=rows.length?m("release_to_flash_ms",v=>v>0):NaN;
+    if(isNaN(r2f) && ls0 && ls0.r2fN) r2f=ls0.r2fSum/ls0.r2fN;
+    const ready=ls0&&ls0.rdy&&ls0.rdy.length?pct(ls0.rdy,.5):NaN;
     const s2p=rows.length?m("rfx_sim_to_present_ms",v=>v>0):NaN;
     const submit=rows.length?m("rfx_submit_ms",v=>v>=0&&v<1000):NaN;
     const gpu=rows.length?m("rfx_gpu_active_ms",v=>v>=0&&v<1000):NaN;
@@ -290,7 +318,8 @@ function analyse(s){
     const ls=litStats[key];
     const rep = ls&&ls.n? ls.rep/ls.n*100 : NaN, skip= ls&&ls.n? ls.skip/ls.n*100 : NaN;
     const uneven = ls&&ls.n? ls.off/ls.n*100 : (isNaN(shown)?NaN:Math.max(0,(1-shown/ideal)*100));
-    sg.m={cap,per,pac,fg,rl,presented,rendered,shown,ideal,r2f,s2p,i2f:(s2p>0&&r2f>0)?s2p+r2f:NaN,submit,gpu,autoCap,jitLimit,rep,skip,uneven,target:per>0?hz/per:hz};
+    const startMs=hold&&rows.length?m("align_shift_ms",v=>v>0):NaN;
+    sg.m={cap,per,pac,fg,rl,hold,startMs,ready,presented,rendered,shown,ideal,r2f,s2p,i2f:(s2p>0&&r2f>0)?s2p+r2f:NaN,submit,gpu,autoCap,jitLimit,rep,skip,uneven,target:per>0?hz/per:hz};
     sg.label=modeLabel(sg.m,hz,frames);
     out.segments.push(sg);
   }
@@ -301,14 +330,14 @@ function analyse(s){
   // timeline
   if(R){ const t0=R[0].time_s; out.timeline=secRows.map(sr=>({x:sr.t-t0,fps:sr.r.game_fps,shown:sr.r.frames_shown,key:sr.key})); }
   // game-side frame times
-  if(G){ const o=G.map(r=>r.outside_ms).filter(v=>v>0&&v<2000), t=G.map(r=>r.total_ms).filter(v=>v>=0);
+  if(G){ const o=G.map(r=>r.outside_ms).filter(v=>v>0&&v<2000), t=G.map(r=>r.total_ms-(r.cap_ms>0?r.cap_ms:0)-(r.ahead_ms>0?r.ahead_ms:0)).filter(v=>v>=0);   // the frame cap's wait is intended, not presenter time
     out.facts.game={p50:pct(o,.5),p90:pct(o,.9),p99:pct(o,.99),pres:mean(t),presP99:pct(t,.99)}; }
   // ReShade.log events in this session's window
   if(s.rs){
     out.facts.exe=s.rs.exe; out.facts.version=s.rs.version;
     const w=stampSec(s.stamp); const dur=(s.t1-s.t0)/1000;
     const inWin=e=> w==null || (e.sec>=w-120 && e.sec<=w+dur+5);
-    const keep=/automatic frame cap|frame generation (active|not active)|Reflex frame limit|fell to|hitch guard: BFI paused|just-in-time release (off|at its limit)|WATCHDOG|swap chain recreated|waiting for the game's first resize|BFI starts|not elevated|frame limiter|presents\/s|collapsed|game frame cap with Reflex/;
+    const keep=/automatic frame cap|frame start|learned for this game|remembered data|automatic frames ahead|slower than the strobe|against the strobe|vblank pacing|frame generation (active|not active)|Reflex frame limit|fell to|hitch guard: BFI paused|just-in-time release (off|at its limit)|WATCHDOG|swap chain recreated|waiting for the game's first resize|BFI starts|not elevated|frame limiter|presents\/s|collapsed|game frame cap with Reflex/;
     for(const e of s.rs.ev) if(inWin(e) && keep.test(e.text)) out.events.push(e);
     out.allEv=s.rs.ev;
   }
@@ -318,8 +347,9 @@ function analyse(s){
 function modeLabel(m,hz,frames){
   let name=CAP_NAMES[m.cap]||("Cap "+m.cap);
   const parts=[];
-  if(m.cap===1 && m.per>1) parts.push((m.rl?"Reflex limit":"auto cap")+" → "+Math.round(hz/m.per)+" fps");
-  else if(m.rl) parts.push("Reflex frame limit");
+  if(m.hold===1) parts.push("auto cap → "+Math.round(hz/m.per)+" fps, held at the frame start"+(m.startMs>0?" +"+m.startMs.toFixed(1)+" ms into the cycle":""));
+  else if(m.cap===1 && m.per>1) parts.push((m.rl===1?"Reflex limit":"auto cap")+" → "+Math.round(hz/m.per)+" fps"+(m.rl===1?"":", held at the present"));
+  else if(m.rl===1) parts.push("Reflex frame limit");
   return {main:name+(m.pac in PACING?" + "+PACING[m.pac]:""), sub:[(m.fg===1?"frame generation on":m.fg===0?"frame generation off":null),...parts].filter(Boolean).join(" · ")};
 }
 function f0(v){return isNaN(v)?"–":Math.round(v).toString()}
@@ -353,6 +383,41 @@ function findings(out,hz,frames){
   const hp=ev.filter(e=>/hitch guard: BFI paused/.test(e.text)).length;
   if(hp>=10) add("info",`The hitch guard paused BFI ${hp} times (stalls, loading or missed refreshes). Many pauses in play point at a GPU or video memory at its limit.`);
   if(has(/waiting for the game's first resize|swap chain recreated by the game/) && !has(/BFI starts/)) add("warn","BFI never started: the game didn't resize its swap chain. Change the resolution (or display mode) once in the game's settings.");
+  // 1.0.27: the automatic frame cap at the frame start, remembered per game, and games slower than the strobe.
+  {
+    const learned=ev.filter(e=>/learned for this game in an earlier session/.test(e.text));
+    if(learned.length){const capL=learned.some(e=>/strobe cycle \(/.test(e.text)&&/automatic frame cap:/.test(e.text)), fsL=learned.some(e=>/frame start/.test(e.text));
+      add("good",`Started from what was remembered for this game (${[capL?"the cap":null,fsL?"the frame start":null].filter(Boolean).join(" and ")}), so there was no warm-up. "Forget this game" in the overlay starts it over, e.g. after changing graphics settings.`);}
+    const lined=ev.filter(e=>/frame start lined up with the flash/.test(e.text));
+    const last=lined[lined.length-1];
+    if(last){
+      const vk=last.text.match(/released ([\d.]+) ms before it, ([\d.]+) ms from release to flash against ([\d.]+) ms/);
+      const dx=last.text.match(/start ([+-]?[\d.]+) ms in the cycle, ([\d.]+) ms from release to flash/);
+      if(vk) add("good",`Frame start timed: the game is released ${vk[1]} ms before its flash, ${vk[2]} ms from release to flash against ${vk[3]} ms at the usual release (${f1(vk[3]-vk[2])} ms quicker).`);
+      else if(dx) add("good",`Frame start timed: the game is held before it starts each frame and released ${dx[1]} ms into the strobe cycle, ${dx[2]} ms from release to flash.`);
+    }
+    const notNeeded=ev.filter(e=>/frame start: not needed/.test(e.text)).pop();
+    if(notNeeded){
+      if(/times its frames itself/.test(notNeeded.text)) add("info","The frame start wasn't timed: this game (or emulator) times its frames itself, so releasing it earlier would only make it wait inside. Left at the usual release, which is right for it.");
+      else add("info","The frame start wasn't timed: frames were already ready just before their flash at the usual release, so there was nothing to gain.");
+    }
+    const searches=ev.filter(e=>/frame start: (frames lost or slower|trying \d+ start times)/.test(e.text)).length;
+    if(searches>=3) add("warn",`The frame start was searched for ${searches} times in this session: frames kept being lost at the start time in use. Stalls in the game (loading, streaming) cause this; if it happens in steady play, the game may be close to the cap.`);
+    const drift=ev.map(e=>e.text.match(/the game runs at ([\d.]+) fps against the strobe's ([\d.]+).*?about every (\d+) s.*?A display mode of ([\d.]+) Hz/)).filter(Boolean).pop();
+    if(drift) add("warn",`The game runs at ${drift[1]} fps, a little slower than the ${drift[2]} fps strobe: its frames slide through the strobe cycle and one flash repeats about every ${drift[3]} s. A display mode of ${drift[4]} Hz matches it (e.g. 119.88 Hz for 59.94 fps emulated games; NirCmd can switch it when the game starts). Some games just run slow and can be left alone.`);
+    if(ev.some(e=>/staying at 2 for this session/.test(e.text))) add("info","Automatic frames ahead settled at 2: the game missed strobe cycles at 1 frame ahead, including right after trying 1 again. Normal for games close to the cap.");
+    const vb=ev.map(e=>e.text.match(/vblank pacing on .*?\(([\d.]+) Hz/)).filter(Boolean).pop();
+    if(vb) out.facts.modeHz=+vb[1];
+  }
+  {
+    // Hold at the frame start against the cap held at the present, when both ran long enough in this session.
+    const segOk=s=>s.secs>=8 && s.m.r2f>0;
+    const hs=out.segments.filter(s=>s.m.hold===1 && segOk(s)).sort((a,b)=>b.secs-a.secs)[0];
+    const ps=out.segments.filter(s=>s.m.cap===1 && s.m.per>1 && !s.m.rl && !s.m.hold && s.m.fg!==1 && segOk(s)).sort((a,b)=>b.secs-a.secs)[0];
+    if(hs && ps){ const d=ps.m.r2f-hs.m.r2f;
+      add(d>=1?"good":"info",`Held at the frame start: ${f1(hs.m.r2f)} ms from release to flash, against ${f1(ps.m.r2f)} ms with the cap held at the present (${d>=0?f1(d)+" ms quicker":f1(-d)+" ms slower"}).`); }
+    else if(hs) add("info",`The automatic cap held the game at the frame start (one game frame per strobe cycle)${hs.m.startMs>0?", started "+f1(hs.m.startMs)+" ms into the strobe cycle":""}: ${f1(hs.m.r2f)} ms from release to flash.`);
+  }
   if(out.facts.game && out.facts.game.presP99>3) add("warn",`Time inside the presenter's Present reached ${f1(out.facts.game.presP99)} ms (99th percentile). Normally it is well under 1 ms.`);
   if(!out.segments.length) add("info","No per-second data in these files. Add the matching _reflex_ or _log_ CSV.");
   if(!F.length && out.best) add("good","Nothing stands out: the presenter kept its cadence in every setting tried.");

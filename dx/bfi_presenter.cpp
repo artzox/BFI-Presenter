@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.26"
+#define BFI_ADDON_VERSION "1.0.27"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -129,8 +129,11 @@ struct Settings
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   reflexAlign = 0;    // Reflex frame limit at the sleep point lined up with the lit refresh's pick (test)
+    int   reflexAlignCoarse = 1; // ReflexAlignCoarse: frames ready far ahead of the pick are moved closer once (ReflexAlign off)
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
+    int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
+    int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap without Reflex holds the game before its next frame starts
     int   fgLimitNoReflex = 1; // FrameGenLimitWithoutReflex: frame generation without Reflex limited to one presented frame per strobe cycle
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
@@ -269,8 +272,11 @@ static void LoadSettings(Settings &s)
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
     s.reflexAlign = IniInt("ReflexAlign", 0) ? 1 : 0;
+    s.reflexAlignCoarse = IniInt("ReflexAlignCoarse", 1) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
+    s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
+    s.learnPerGame = IniInt("LearnPerGame", 1) ? 1 : 0;
     s.autoCapOwn = IniInt("AutoCapOwnWithoutFg", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
@@ -419,7 +425,10 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("AutoFrameCap", s.autoCap);
     IniWriteInt("CapWithReflex", s.capReflex);
     IniWriteInt("ReflexAlign", s.reflexAlign);
+    IniWriteInt("ReflexAlignCoarse", s.reflexAlignCoarse);
     IniWriteInt("FrameGenLimitWithoutReflex", s.fgLimitNoReflex);
+    IniWriteInt("AutoCapAtFrameStart", s.autoCapFrameStart);
+    IniWriteInt("LearnPerGame", s.learnPerGame);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
     IniWriteInt("GameFrameStatistics", s.virtualStats);
@@ -470,6 +479,7 @@ struct Status
     int    lrMisses = 0;
     int    aheadInUse = 1;
     int    fgLimitUs = 0;                       // frame limit for frame generation without Reflex: per rendered frame (0 = off)
+    int    feLimitUs = 0;                       // automatic frame cap held at the frame start (no Reflex, no frame generation; 0 = off)
     int    autoCapDown = 0;                     // automatic frame cap: one game frame per strobe cycle in use
     int    autoCapProbe = 0;                    // automatic frame cap: trying the Refresh rate again
     int    fgActive = 0;                        // frame generation looks active (presented well above rendered frames)
@@ -506,6 +516,10 @@ static ThreadCount g_presCount;
 // swap chain, frame generation behind it). FSR frame generation presents every frame from its own thread to the
 // real swap chain, so only here are the game's frames still apart from the generated ones.
 static ThreadCount g_outerCount;
+// Game frames per present thread, every API, for the automatic frame cap at the frame start: it holds the thread that
+// presented most in the last second (Obduction, Unreal Engine: thread 52480 presented at start, 50748 in game, and the
+// hold stayed on the first -- 60-65 fps, held at the present by frames ahead instead, ~34 ms frame age against ~20).
+static ThreadCount g_feCount;
 static void **g_outerVtbl = nullptr;
 // 1 = the game's frames are counted on FSR frame generation's swap chain (its own timings below); XeSS frame generation
 // and anything else keep the hook on the real swap chain and the timings tested with it (Riven).
@@ -514,6 +528,11 @@ static std::atomic<int> g_fgOuterFsr{0};
 // return, one rendered frame per (strobe cycle x frame-generation factor) -- a frame-start sleep where Reflex would
 // sleep; frame generation's presents (its own thread) pass. 0 = off.
 static std::atomic<int>   g_fgPaceUs{0};
+// What g_fgPaceUs paces: 1 = frame generation without Reflex; 2 = the automatic frame cap at one game frame per strobe
+// cycle without Reflex or frame generation, held before the game's next frame starts instead of at its present
+// (God of War Ragnarok at 60 of 120 Hz: about 65 ms from frame start to flash held at the present, about 33 ms with
+// Reflex's limit at the frame start).
+static std::atomic<int>   g_fgPaceKind{0};
 static std::atomic<DWORD> g_fgGameTid{0};
 static std::atomic<int>   g_fgShiftUs{0};     // phase step requested by the presenter (one refresh)
 static void CountTo(ThreadCount &c)
@@ -702,6 +721,11 @@ static std::atomic<HWND>      g_watchHwnd{nullptr};    // game window the watchd
 static std::atomic<DWORD>     g_uiTid{0};              // DX11: thread that owns the presenter's child window
 static IDXGISwapChain3       *g_sc = nullptr;    // managed real swap chain (not AddRef'd)
 static reshade::api::swapchain *g_rsSwapchain = nullptr;
+// The game swap chain's colour space (reshade::api::color_space), read on the game's threads and kept here for the
+// presenter thread: asking the swap chain from the presenter thread blocked on DXGI's lock while the game destroyed it
+// at exit, and the game then waited the 5 s for the presenter to stop (Obduction). -1 = not read yet.
+static std::atomic<int> g_rsCs{-1};
+static void ReadRsColorSpace() { if (g_rsSwapchain) g_rsCs.store((int)g_rsSwapchain->get_color_space()); }
 static std::atomic<bool>      g_active{false};   // hooks redirect for g_sc
 static ID3D12Device          *g_device = nullptr;
 static ID3D12CommandQueue    *g_gameQueue = nullptr;
@@ -1775,6 +1799,32 @@ static bool Compile(PFN_D3DCompile compile, const char *entry, const char *targe
     return true;
 }
 
+// The display mode's exact refresh rate: EnumDisplaySettings gives whole numbers, so 119.88 Hz read as 119 (a strobe
+// cycle of 16.81 ms against the real 16.68 ms: the frame-start search, drift detection and learned data used the wrong
+// cycle). The active display path has it as a fraction (119880/1000). Falls back to the whole number.
+static double ExactRefreshHz(const wchar_t *gdiName, double fallback)
+{
+    UINT32 np = 0, nm = 0;
+    if (!gdiName || GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || !np) return fallback;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(np);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nm);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), nullptr) != ERROR_SUCCESS) return fallback;
+    for (UINT32 i = 0; i < np; i++)
+    {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME sn = {};
+        sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        sn.header.size = sizeof(sn);
+        sn.header.adapterId = paths[i].sourceInfo.adapterId;
+        sn.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS || wcscmp(sn.viewGdiDeviceName, gdiName) != 0) continue;
+        const DISPLAYCONFIG_RATIONAL r = paths[i].targetInfo.refreshRate;
+        if (r.Denominator == 0 || r.Numerator == 0) break;
+        const double hz = (double)r.Numerator / r.Denominator;
+        return (fallback <= 0.0 || fabs(hz - fallback) < 1.0) ? hz : fallback;
+    }
+    return fallback;
+}
+
 // ---------------------------------------------------------------- presenter thread
 static int ResolveOutput(const Settings &s)
 {
@@ -1784,14 +1834,11 @@ static int ResolveOutput(const Settings &s)
     // (RenoDX) leave the reported space at sRGB some or all of the time;
     // reading that as SDR clipped every highlight above SDR white.
     if (g_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) return 1;
-    if (g_rsSwapchain)
+    switch ((reshade::api::color_space)g_rsCs.load())
     {
-        switch (g_rsSwapchain->get_color_space())
-        {
-        case reshade::api::color_space::extended_srgb_linear: return 1;
-        case reshade::api::color_space::hdr10_st2084:         return 2;
-        default: break;
-        }
+    case reshade::api::color_space::extended_srgb_linear: return 1;
+    case reshade::api::color_space::hdr10_st2084:         return 2;
+    default: break;
     }
     return (g_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 1 : 0;
 }
@@ -1838,6 +1885,60 @@ static bool InImage(DWORD64 addr)
     return addr && VirtualQuery((const void *)(uintptr_t)addr, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.Type == MEM_IMAGE;
 }
 
+#ifdef _WIN64
+// True when the stack from rsp up is committed, readable memory; top is where
+// that memory ends (the stack's base for a real stack). A thread's stack walk
+// only reads between rsp and its base, so a context pointing anywhere else (a
+// thread that exited and freed its stack, a corrupt frame) stops the walk
+// instead of faulting: the watchdog once crashed a UE4 game reading a stack
+// that was no longer there.
+static bool StackReadable(DWORD64 rsp, DWORD64 &top)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!rsp || (rsp & 7) || VirtualQuery((const void *)(uintptr_t)rsp, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+    if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return false;
+    top = (DWORD64)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    return rsp + 8 <= top;
+}
+
+// x64 stack walk with the unwind tables, kept to readable stack memory: each
+// frame must sit higher on the stack than the one before (a walk that goes
+// round in circles or jumps off the stack stops there).
+static int UnwindStack(CONTEXT ctx, DWORD64 *frames, int max)
+{
+    int nf = 0;
+    DWORD64 top = 0;
+    if (ctx.Rip < 0x10000 && StackReadable(ctx.Rsp, top))
+    {
+        // Call through a null (or tiny) pointer: the caller's return address
+        // is on top of the stack.
+        frames[nf++] = ctx.Rip;
+        ctx.Rip = *(DWORD64 *)ctx.Rsp;
+        ctx.Rsp += 8;
+    }
+    for (; nf < max && ctx.Rip; nf++)
+    {
+        frames[nf] = ctx.Rip;
+        if (!InImage(ctx.Rip)) { nf++; break; }               // JIT code: don't ask the runtime to unwind
+        if (!StackReadable(ctx.Rsp, top)) { nf++; break; }
+        const DWORD64 rsp = ctx.Rsp;
+        DWORD64 base = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
+        if (!fn) { ctx.Rip = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; }
+        else
+        {
+            PVOID hd = nullptr;
+            DWORD64 est = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &hd, &est, nullptr);
+        }
+        if (ctx.Rsp <= rsp || ctx.Rsp > top) { nf++; break; }
+    }
+    return nf;
+}
+#endif
+
 #ifndef _WIN64
 // 32-bit builds: follow the EBP frame chain (no unwind tables on x86). Frames
 // of code built without frame pointers are skipped; good enough for a log.
@@ -1869,6 +1970,8 @@ static void LogThreadStack(DWORD tid, const char *who)
     if (!th) return;
     DWORD64 frames[32];
     int nf = 0;
+    DWORD code = 0;
+    if (!GetExitCodeThread(th, &code) || code != STILL_ACTIVE) { CloseHandle(th); return; }   // gone: its stack may be freed
     if (SuspendThread(th) != (DWORD)-1)
     {
         CONTEXT ctx = {};
@@ -1878,17 +1981,7 @@ static void LogThreadStack(DWORD tid, const char *who)
 #ifndef _WIN64
             nf = WalkFramePointers(ctx, frames, 32);
 #else
-            for (; nf < 32 && ctx.Rip; nf++)
-            {
-                frames[nf] = ctx.Rip;
-                if (!InImage(ctx.Rip)) { nf++; break; }       // JIT code: don't ask the runtime to unwind
-                DWORD64 base = 0;
-                PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
-                if (!fn) { ctx.Rip = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; continue; }
-                PVOID hd = nullptr;
-                DWORD64 est = 0;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &hd, &est, nullptr);
-            }
+            nf = UnwindStack(ctx, frames, 32);
 #endif
         }
         ResumeThread(th);
@@ -1946,29 +2039,7 @@ static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
 #ifndef _WIN64
     nf = WalkFramePointers(ctx, frames, 24);
 #else
-    if (ctx.Rip < 0x10000 && !IsBadReadPtr((const void *)ctx.Rsp, 8))
-    {
-        // Call through a null (or tiny) pointer: the caller's return address
-        // is on top of the stack.
-        frames[nf++] = ctx.Rip;
-        ctx.Rip = *(DWORD64 *)ctx.Rsp;
-        ctx.Rsp += 8;
-    }
-    for (; nf < 24 && ctx.Rip; nf++)
-    {
-        frames[nf] = ctx.Rip;
-        if (!InImage(ctx.Rip)) { nf++; break; }               // JIT code: don't ask the runtime to unwind
-        DWORD64 base = 0;
-        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
-        if (!fn)
-        {
-            if (IsBadReadPtr((const void *)ctx.Rsp, 8)) { nf++; break; }
-            ctx.Rip = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; continue;
-        }
-        PVOID hd = nullptr;
-        DWORD64 est = 0;
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &hd, &est, nullptr);
-    }
+    nf = UnwindStack(ctx, frames, 24);
 #endif
     char line[2048];
     SYSTEMTIME lt;
@@ -2006,15 +2077,191 @@ static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// ---------------------------------------------------------------- learned per game
+// LearnPerGame: what the automatic frame cap finds for a game -- one game frame per strobe cycle or the Refresh rate,
+// and the frame start time -- is kept in BFIPresenter_learned.ini next to BFIPresenter.ini, one section per game, and
+// the next session starts from it instead of finding it again (seconds of uneven frames before the cap steps down,
+// about 27 s for the frame start). The section is the executable and the window title without digits, so each game
+// of an emulator gets its own and fps counters or version numbers in a title don't make new ones. Used only at the same
+// refresh rate and frames per strobe cycle; what is learned is still checked as usual (tries at Refresh rate, a new
+// search after lost frames) and saved again when it changes. The file and the window title are read on a helper
+// thread: file access on the presenter's thread could miss a refresh, and GetWindowText waits on a hung window.
+struct LearnRec
+{
+    int    down = -1;       // 1 = one game frame per strobe cycle, 0 = Refresh rate, -1 = not known
+    double fsMs = 0.0;      // frame start: > 0 the start time found (ms), -2 not needed, -3 the game runs slower than the strobe, 0 not known
+    double bestMs = 0.0;    // release -> flash at that start time
+    double hz = 0.0;        // the refresh rate and frames per strobe cycle it was learned at
+    int    frames = 0;
+};
+static SRWLOCK     g_learnLock = SRWLOCK_INIT;
+static std::string g_learnKey;          // section in use ("" = none read yet)
+static LearnRec    g_learnRead;         // what the file had for it
+static int         g_learnGen = 0;      // bumped each time the section is read
+static LearnRec    g_learnOut;          // to be written to it
+static bool        g_learnDirty = false;
+// "Forget this game" in the overlay: the helper thread deletes the game's section, the presenter starts over.
+static std::atomic<bool> g_learnForgetFile{false}, g_learnForgetNow{false};
+
+static void LearnPost(const LearnRec &r)
+{
+    AcquireSRWLockExclusive(&g_learnLock);
+    g_learnOut = r;
+    g_learnDirty = true;
+    ReleaseSRWLockExclusive(&g_learnLock);
+}
+
+// The section read last, if newer than seenGen; returns its generation.
+static int LearnFetch(int seenGen, LearnRec &r)
+{
+    AcquireSRWLockShared(&g_learnLock);
+    const int g = g_learnGen;
+    if (g != seenGen) r = g_learnRead;
+    ReleaseSRWLockShared(&g_learnLock);
+    return g;
+}
+
+static std::string LearnKeyFor(const char *exe, HWND wnd)
+{
+    typedef int (WINAPI *PFN_InternalGetWindowText)(HWND, LPWSTR, int);
+    static PFN_InternalGetWindowText igwt =
+        (PFN_InternalGetWindowText)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "InternalGetWindowText");
+    char title[512] = "";
+    if (wnd)
+    {
+        wchar_t w[256] = L"";
+        int n = igwt ? igwt(wnd, w, 256) : 0;
+        // Fallback (InternalGetWindowText missing or empty): WM_GETTEXT, given up on a hung window.
+        DWORD_PTR got = 0;
+        if (n <= 0 && SendMessageTimeoutW(wnd, WM_GETTEXT, 256, (LPARAM)w, SMTO_ABORTIFHUNG | SMTO_BLOCK, 200, &got)) n = (int)got;
+        if (n > 0) { w[255] = 0; WideCharToMultiByte(CP_UTF8, 0, w, -1, title, sizeof(title), nullptr, nullptr); }
+    }
+    std::string t;
+    for (const unsigned char *p = (const unsigned char *)title; *p; p++)
+    {
+        const unsigned char ch = *p;
+        if (ch >= 0x80 || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '\'' || ch == '&' || ch == '-') t += (char)ch;
+        else if (!t.empty() && t.back() != ' ') t += ' ';
+    }
+    while (!t.empty() && (t.back() == ' ' || t.back() == '-')) t.pop_back();
+    // Short runs of a-f left from a build hash once its digits are gone (shadPS4: "WIP main 4d5a..." -> "d a") change with
+    // every build of the emulator: dropped, so its games keep their sections across updates.
+    {
+        std::string out, tok;
+        auto flush = [&]()
+        {
+            bool hex = !tok.empty() && tok.size() <= 3;
+            for (char c : tok) if (c < 'a' || c > 'f') { hex = false; break; }
+            if (!tok.empty() && !hex) { if (!out.empty()) out += ' '; out += tok; }
+            tok.clear();
+        };
+        for (char c : t) { if (c == ' ') flush(); else tok += c; }
+        flush();
+        t = out;
+    }
+    if (t.size() > 100) t.resize(100);
+    std::string k = exe;
+    if (!t.empty()) k += " - " + t;
+    return k;
+}
+
+// Helper thread, every 2 s: writes what the presenter posted, then reads the section again when the game (its window
+// title) changed.
+static void LearnTick(const char *path, const char *exe, HWND wnd)
+{
+    const std::string key = LearnKeyFor(exe, wnd);
+    const bool forget = g_learnForgetFile.exchange(false);
+    AcquireSRWLockExclusive(&g_learnLock);
+    const bool dirty = g_learnDirty && !forget;
+    const LearnRec out = g_learnOut;
+    const std::string cur = g_learnKey;
+    g_learnDirty = false;
+    ReleaseSRWLockExclusive(&g_learnLock);
+    char b[64];
+    if (dirty && !cur.empty())
+    {
+        const char *sec = cur.c_str();
+        // Whole numbers (us, mHz): a game that sets its own locale reads "120.000" as 120 thousand or 120.
+        snprintf(b, sizeof(b), "%d", out.down);                               WritePrivateProfileStringA(sec, "OneFramePerCycle", b, path);
+        snprintf(b, sizeof(b), "%ld", (long)std::lround(out.fsMs * 1000.0));   WritePrivateProfileStringA(sec, "FrameStartUs", b, path);
+        snprintf(b, sizeof(b), "%ld", (long)std::lround(out.bestMs * 1000.0)); WritePrivateProfileStringA(sec, "ReleaseToFlashUs", b, path);
+        snprintf(b, sizeof(b), "%ld", (long)std::lround(out.hz * 1000.0));     WritePrivateProfileStringA(sec, "RefreshMilliHz", b, path);
+        snprintf(b, sizeof(b), "%d", out.frames);                             WritePrivateProfileStringA(sec, "Frames", b, path);
+    }
+    if (forget && !cur.empty())
+    {
+        WritePrivateProfileStringA(cur.c_str(), nullptr, nullptr, path);     // the whole section
+        AcquireSRWLockExclusive(&g_learnLock);
+        g_learnRead = LearnRec();
+        g_learnGen++;
+        ReleaseSRWLockExclusive(&g_learnLock);
+    }
+    if (key == cur) return;
+    LearnRec r;
+    const char *sec = key.c_str();
+    // GetPrivateProfileInt returns 0 for negative values: read as text.
+    auto get = [&](const char *name, long def) -> long
+    {
+        char v[32];
+        GetPrivateProfileStringA(sec, name, "", v, sizeof(v), path);
+        char *end = nullptr;
+        const long x = strtol(v, &end, 10);
+        return end && end != v ? x : def;
+    };
+    r.frames = (int)get("Frames", 0);
+    if (r.frames > 0)
+    {
+        r.down   = (int)get("OneFramePerCycle", -1);
+        r.fsMs   = get("FrameStartUs", 0) / 1000.0;
+        r.bestMs = get("ReleaseToFlashUs", 0) / 1000.0;
+        r.hz     = get("RefreshMilliHz", 0) / 1000.0;
+    }
+    AcquireSRWLockExclusive(&g_learnLock);
+    g_learnKey = key;
+    g_learnRead = r;
+    g_learnGen++;
+    g_learnDirty = false;     // posted for the previous game: the presenter posts again for this one
+    ReleaseSRWLockExclusive(&g_learnLock);
+}
+
+// Last time the watchdog saw the game's window not responding (Windows' 5 s test): the frame-start search and its
+// held start time don't count lost frames then or for 10 s after (Obduction: streaming stalls set off two searches in a
+// minute, both finding the start time already in use).
+static std::atomic<double> g_windowHungT{-1e9};
+
 static DWORD WINAPI WatchdogThread(void *)
 {
     int lastPres = -1, lastGame = -1;
     double lastPresT = 0.0, lastGameT = 0.0;
+    int learnTicks = 0;
+    char exe[MAX_PATH] = "";
+    {
+        char full[MAX_PATH] = "";
+        GetModuleFileNameA(nullptr, full, MAX_PATH);
+        const char *b = strrchr(full, '\\');
+        strncpy(exe, b ? b + 1 : full, MAX_PATH - 1);
+    }
     for (;;)
     {
         Sleep(500);
         DrainInfoQueue();
         const double t = Now();
+        // Learned per game: written and read here, every 2 s, once the game has a window.
+        if (++learnTicks % 4 == 0 && g_iniPath[0])
+        {
+            EnterCriticalSection(&g_cfgLock);
+            const bool on = g_shared.learnPerGame && g_shared.autoCap;
+            LeaveCriticalSection(&g_cfgLock);
+            HWND gw = g_watchHwnd.load();
+            if (on && gw)
+            {
+                char path[MAX_PATH];
+                strncpy(path, g_iniPath, MAX_PATH - 1); path[MAX_PATH - 1] = 0;
+                if (char *sl = strrchr(path, '\\')) sl[1] = 0; else path[0] = 0;
+                strncat(path, "BFIPresenter_learned.ini", MAX_PATH - strlen(path) - 1);
+                LearnTick(path, exe, GetAncestor(gw, GA_ROOT));
+            }
+        }
         if (g_running.load())
         {
             const int st = g_presStage.load();
@@ -2042,6 +2289,7 @@ static DWORD WINAPI WatchdogThread(void *)
             static bool hungLogged = false;
             HWND gw = g_watchHwnd.load();
             const bool hung = gw && IsWindow(gw) && IsHungAppWindow(gw);
+            if (hung) g_windowHungT.store(Now());
             if (hung && !hungLogged)
             {
                 hungLogged = true;
@@ -2191,6 +2439,7 @@ static IUnknown *ReflexOwnDevice();
 // For the rest of the process: no limit from the presenter, and the game's own limit is
 // taken out too (kept across swap chain changes, which recreate the presenter's state).
 static std::atomic<bool> g_rfxLimitBad{false};
+static std::atomic<int>  g_fgFactNoRfx{1};       // frame generation factor seen from present counts (the overlay greys its limit at 1)
 static int ReflexGameLimitUs();
 
 // Frame generation that presents its own frames (DLSS-G, FSR 3 FG, XeSS FG): its
@@ -2411,7 +2660,7 @@ static DWORD WINAPI PresenterThread(void *)
         DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
         if (SUCCEEDED(output->GetDesc(&od)) && EnumDisplaySettingsW(od.DeviceName, ENUM_CURRENT_SETTINGS, &dm)
             && dm.dmDisplayFrequency > 1)
-            modeHz = (double)dm.dmDisplayFrequency;
+            modeHz = ExactRefreshHz(od.DeviceName, (double)dm.dmDisplayFrequency);
     }
 
     if (!ok)
@@ -2478,6 +2727,18 @@ static DWORD WINAPI PresenterThread(void *)
     int    rcBadSecs = 0;
     int    rfxBadSecs = 0, gameLimBadSecs = 0;   // seconds collapsed under our Reflex limit / the game's own
     double fpsGoodT = -100.0;     // last second the game held at least half the strobe rate
+    // Learned per game (LearnPerGame): read on the watchdog thread, applied after 5 s with the automatic cap in use
+    // (so frame generation and Reflex are known first).
+    LearnRec learnRead, learnMine;
+    // A remembered one-frame-per-strobe-cycle cap waiting to be applied: the game runs at the Refresh cap meanwhile and
+    // misses strobe cycles, which aren't counted toward frames ahead (Shadow of the Tomb Raider: frames ahead went to 2
+    // a second before the remembered cap came on).
+    bool learnHoldAhead = false;
+    // The frame-start search is trying start times (some lose frames on purpose): not counted toward frames ahead,
+    // as in the Vulkan layer (Shadow of the Tomb Raider went to 2 during one and stayed there for the session).
+    bool swSearching = false;
+    int    learnGen = 0, learnWarm = 0, learnSavedDown = -1;
+    bool   learnApply = false, learnSwNow = false, learnSwReset = false;
     double fpsAtDown = 0.0;       // game fps when the automatic frame cap stepped down   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
     int    fgVotes = 0;           // seconds in a row the counts said the frame-generation state changed
     double fpsPrevSec = -1.0;
@@ -2569,7 +2830,8 @@ static DWORD WINAPI PresenterThread(void *)
         if (!s.enabled) s.frames = 1;
         userCap = s.gameCap;
         // one game frame per strobe cycle (games with Reflex: Reflex's frame limit does it instead, see below)
-        if (s.autoCap && userCap == 1 && autoCapDown && !capByReflex && s.frames >= 2) s.gameCap = 4;
+        // (held at the frame start instead, without Reflex or frame generation: the presenter stays at Refresh rate)
+        if (s.autoCap && userCap == 1 && autoCapDown && !capByReflex && s.frames >= 2 && g_fgPaceKind.load() != 2) s.gameCap = 4;
         // Cap applied with Reflex's frame limit (see the per-second block): the presenter itself then
         // takes every frame, like at Refresh, and the driver paces the game.
         statPer = CapPeriod(s.gameCap, s.frames, s.capDivisor);
@@ -2591,7 +2853,8 @@ static DWORD WINAPI PresenterThread(void *)
         {
             const int per = std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
             const bool capOk = s.capJit && per >= 2 && s.frames >= 2 && per % s.frames == 0;
-            const bool llOk  = s.laterRelease && s.pacingMode == 1 && per == 1 && s.gameCap >= 1;
+            const bool llOk  = s.laterRelease && s.pacingMode == 1 && per == 1 && s.gameCap >= 1 && g_fgPaceKind.load() != 2 &&
+                                 !(autoCapDown && capByReflex);
             g_lrAllowed.store((capOk || llOk) && s.pacing && !vsyncOverridden && output);
             g_lrWindow.store(per / (modeHz > 0.0 ? modeHz : 120.0));
         }
@@ -2760,7 +3023,7 @@ static DWORD WINAPI PresenterThread(void *)
             // generated frame and the game's frame together (0.4 ms apart, Riven). When both are ready at one
             // flash, Lowest latency showed only the newer -- 30 of 60 frames a second. Show the generated one now
             // and the game's frame at the next flash.
-            if (cycleStart && g_fgPaceUs.load() > 0 && unseen == 2 && oldestNew >= 0 && oldestNewId + 1 == newestId &&
+            if (cycleStart && g_fgPaceUs.load() > 0 && g_fgPaceKind.load() == 1 && unseen == 2 && oldestNew >= 0 && oldestNewId + 1 == newestId &&
                 std::fabs(g_stageTime[newest] - g_stageTime[oldestNew]) < 0.004)
                 pick = oldestNew;
         }
@@ -3145,6 +3408,15 @@ static DWORD WINAPI PresenterThread(void *)
                 tot += g_presCount.other; g_presCount.other = 0;
                 ReleaseSRWLockExclusive(&g_presCountLock);
                 if (outerN > 0) { gt = outerN; gtid = outerTid; }
+                long feN = 0; DWORD feTid = 0;
+                AcquireSRWLockExclusive(&g_presCountLock);
+                for (int k = 0; k < 6 && g_feCount.tid[k]; k++)
+                {
+                    if (g_feCount.n[k] > feN) { feN = g_feCount.n[k]; feTid = g_feCount.tid[k]; }
+                    g_feCount.n[k] = 0;
+                }
+                g_feCount.other = 0;
+                ReleaseSRWLockExclusive(&g_presCountLock);
                 g_fgOuterFsr.store(outerN > 0 ? 1 : 0);
                 int cnd = 1;
                 if (g_fgSeen[0] && gt > 0 && tot >= 1.5 * gt) cnd = std::max(2, std::min(4, (int)((double)tot / gt + 0.5)));
@@ -3155,13 +3427,44 @@ static DWORD WINAPI PresenterThread(void *)
                     LOGI("BFI Presenter: frame generation without Reflex: %dx (%ld presents a second, %ld from the game's thread %lu%s)",
                          fgFact, tot, gt, (unsigned long)gtid, outerN > 0 ? ", counted on the outer swap chain" : "");
                 }
+                g_fgFactNoRfx.store(fgFact);
                 const double hzP = modeHz > 0.0 ? modeHz : peakHz;
                 int want = 0;
                 if (s.fgLimitNoReflex && fgFact > 1 && !g_status.rfxGameUses && s.enabled && s.frames >= 2 && userCap == 1 && hzP > 0.0 &&
                     hzP / s.frames / fgFact >= 28.0)
                     want = (int)(1e6 * s.frames / hzP * fgFact + 0.5);
-                g_fgGameTid.store(gtid);
-                const int was = g_fgPaceUs.exchange(want);
+                // The automatic frame cap without Reflex and without frame generation: the same pacing after the game's
+                // present, at one game frame per strobe cycle, instead of holding the finished frame at the present.
+                int feWant = 0;
+                if (want == 0 && s.autoCapFrameStart && s.autoCap && userCap == 1 && autoCapDown && !capByReflex && !fgWas &&
+                    fgFact <= 1 && s.enabled && s.frames >= 2 && s.pacingMode == 1 && hzP > 0.0 && feTid != 0)
+                    feWant = (int)(1e6 * s.frames / hzP + 0.5);
+                {
+                    static int feWas = 0;
+                    if ((feWas > 0) != (feWant > 0))
+                    {
+                        const char *why = feWant > 0 ? "" : !s.autoCapFrameStart ? ": switched off" : !autoCapDown ? ": the cap is at Refresh rate" :
+                                          capByReflex ? ": Reflex's frame limit holds the game" : (fgWas || fgFact > 1) ? ": frame generation" :
+                                          s.pacingMode != 1 ? ": needs Lowest latency pacing" : feTid == 0 ? ": the game's present thread isn't known" : ": BFI off or cap changed";
+                        LOGI("BFI Presenter: automatic frame cap at the frame start %s%s (%d us per game frame, game thread %lu)",
+                             feWant > 0 ? "on" : "off", why, feWant, (unsigned long)feTid);
+                    }
+                    else if (feWant > 0 && want == 0)
+                    {
+                        static DWORD feTidWas = 0;
+                        if (feTidWas && feTid != feTidWas)
+                            LOGI("BFI Presenter: automatic frame cap at the frame start: the game now presents from thread %lu (was %lu)",
+                                 (unsigned long)feTid, (unsigned long)feTidWas);
+                        feTidWas = feTid;
+                    }
+                    feWas = feWant;
+                }
+                g_fgGameTid.store(want == 0 && feWant > 0 ? feTid : gtid);
+                g_fgPaceKind.store(want > 0 ? 1 : feWant > 0 ? 2 : 0);
+                g_fgPaceUs.store(want > 0 ? want : feWant);
+                g_status.feLimitUs = feWant;
+                static int fgWasOn = 0;
+                const int was = fgWasOn; fgWasOn = want;
                 if ((was > 0) != (want > 0))
                 {
                     const char *why = want > 0 ? "" : !s.fgLimitNoReflex ? ": switched off" : fgFact <= 1 ? ": no frame generation" :
@@ -3331,12 +3634,15 @@ static DWORD WINAPI PresenterThread(void *)
                 if (s.autoAhead && s.maxAhead != 0)
                 {
                     repSum -= repWin[repIdx];
-                    repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
+                    // Not in the first 8 s after the cap changes (the switch itself and the frame-start hold coming on make uneven
+                    // cycles: Shadow of the Tomb Raider went to 2 frames ahead 6 s after the remembered cap came on, for good).
+                    const bool aheadCount = !hitchPaused && !learnHoldAhead && !swSearching && t - capSwitchT > 8.0;
+                    repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && aheadCount && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
                     repSum += repWin[repIdx];
                     repIdx = (repIdx + 1) % 30;
                     if (autoAhead == 1)
                     {
-                        missSecs = (secRepU >= 2 && s.gameCap >= 1) ? missSecs + 1 : 0;
+                        missSecs = (secRepU >= 2 && s.gameCap >= 1 && aheadCount) ? missSecs + 1 : 0;
                         if (missSecs >= 3 || repSum >= 6)
                         {
                             if (missSecs < 3)
@@ -3518,8 +3824,47 @@ static DWORD WINAPI PresenterThread(void *)
                 // The frame limit for frame generation without Reflex holds the game itself: the presenter's own cap
                 // on top held frame generation's presents too, and the game's window stopped responding for
                 // seconds (The Callisto Protocol, Riven), so the cap stays at Refresh while that limit is in use.
-                const bool fgLimitOn = g_fgPaceUs.load() > 0;
-                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg) && !fgLimitOn)
+                const bool fgLimitOn = g_fgPaceUs.load() > 0 && g_fgPaceKind.load() == 1;
+                const bool capOn = s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg) && !fgLimitOn;
+                // "Forget this game": the cap and the frame start start over (the section is deleted on the watchdog thread).
+                if (g_learnForgetNow.exchange(false))
+                {
+                    learnMine = LearnRec(); learnMine.hz = hzA; learnMine.frames = s.frames;
+                    learnSavedDown = -1; learnApply = false; learnSwNow = false; learnSwReset = true;
+                    if (autoCapDown || capProbe) { autoCapDown = capProbe = false; capDownSecs = capUpSecs = 0; capSwitchT = t; probeWait = 30.0; }
+                    LOGI("BFI Presenter: remembered data for this game cleared -- the automatic frame cap starts over");
+                }
+                learnHoldAhead = false;
+                if (s.learnPerGame)
+                {
+                    const int g = LearnFetch(learnGen, learnRead);
+                    if (g != learnGen)
+                    {
+                        // A game (window title) read: start from what it learned once its refresh rate is known.
+                        learnGen = g; learnApply = true; learnSavedDown = -1; learnMine = LearnRec();
+                    }
+                    learnWarm = capOn ? learnWarm + 1 : 0;
+                    learnHoldAhead = learnApply && capOn && learnRead.down == 1 && learnRead.frames == s.frames && fabs(learnRead.hz - hzA) < 0.05;
+                    if (learnApply && capOn && learnWarm >= 5)
+                    {
+                        learnApply = false; learnHoldAhead = false;
+                        if (learnRead.frames == s.frames && fabs(learnRead.hz - hzA) < 0.05)
+                        {
+                            learnMine = learnRead;
+                            learnSavedDown = learnRead.down;
+                            if (learnRead.down == 1 && !autoCapDown && !capProbe)
+                            {
+                                autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
+                                probeWait = 60.0;
+                                LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- learned for this "
+                                     "game in an earlier session", hzA / s.frames, capByReflex ? "Reflex frame limit" : "the presenter's cap");
+                            }
+                        }
+                        learnMine.hz = hzA; learnMine.frames = s.frames;
+                        learnSwNow = true;    // a frame-start search already running (the cap stepped down by itself first): learned start instead
+                    }
+                }
+                if (capOn)
                 {
                     const double refMs = 1000.0 / hzA;
                     if (capProbe)
@@ -3532,13 +3877,17 @@ static DWORD WINAPI PresenterThread(void *)
                             capProbe = false; capDownSecs = capUpSecs = 0; capSwitchT = t;
                             if (probeGood >= 2)
                             {
-                                probeWait = 30.0;
+                                // probeWait is kept: it is reset only after a stay at Refresh rate of 30 s or more (below)
                                 LOGI("BFI Presenter: automatic frame cap: Refresh rate -- the game holds %.0f fps", fpsA);
                             }
                             else
                             {
                                 autoCapDown = true;
                                 probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
+                                // Far from the refresh rate (under 80%): each try is seconds of uneven frames and the
+                                // longest delay (Soul Reaver at 64 of 120: 53 ms from release to flash for 4 s), so the
+                                // next one waits 5 minutes.
+                                if (fpsA < 0.8 * hzA) probeWait = 300.0;
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
                             }
@@ -3553,6 +3902,12 @@ static DWORD WINAPI PresenterThread(void *)
                             // next return waits longer.
                             if (t - capUpT < 30.0) stayMin = stayMin * 2.0 > 120.0 ? 120.0 : stayMin * 2.0;
                             else stayMin = 10.0;
+                            // The same for the try at Refresh rate without Reflex reports: a game that holds the refresh
+                            // rate only in lighter scenes went up and down every 30 s (Alan Wake: 120 fps for 3 s, then 96),
+                            // and each time the frame start was looked for again.
+                            if (t - capUpT < 30.0) probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
+                            else probeWait = 30.0;
+                            if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;   // well under the refresh rate: first try after a minute
                             autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames,
@@ -3590,6 +3945,13 @@ static DWORD WINAPI PresenterThread(void *)
                         LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation without Reflex%s)",
                              fgLimitOn ? " -- the frame limit for it holds the game" : "");
                     autoCapDown = capProbe = false; capDownSecs = capUpSecs = 0;
+                }
+                // Learned per game: the cap's state once it has stayed 30 s (a try at Refresh rate that fails isn't a change).
+                if (s.learnPerGame && learnMine.frames > 0 && capOn && !capProbe && t - capSwitchT > 30.0 && (autoCapDown ? 1 : 0) != learnSavedDown)
+                {
+                    learnSavedDown = autoCapDown ? 1 : 0;
+                    learnMine.down = learnSavedDown;
+                    LearnPost(learnMine);
                 }
                 g_status.autoCapDown = autoCapDown ? 1 : 0;
                 g_status.autoCapProbe = capProbe ? 1 : 0;
@@ -3653,7 +4015,11 @@ static DWORD WINAPI PresenterThread(void *)
                     // Lowest-latency pacing only: Smooth shows the oldest waiting frame, so with two waiting a late frame
                     // just leaves the older one to be shown -- no repeat -- and the wait jumps a whole cycle instead.
                     // In Dead Space (Smooth) the wake-up chased that round and round (318 ms in 6 minutes).
-                    const bool atSleepNoFg = sleepUs > 0 && locked && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
+                    // Not with the presenter's own pacing after the present (frame generation without Reflex, the frame
+                    // cap at the frame start): its start-time search steers that, and the alignment steering it as well
+                    // made the start jump 3-5 ms every few seconds (Resident Evil 4 with ReflexAlign on: 33-36 ms from
+                    // release to flash every 4-5 s between 22-25 ms).
+                    const bool atSleepNoFg = sleepUs > 0 && !fgOn && locked && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
                     const bool holds = capFps > 0.0 && stNow.gameFps > 0.95 * capFps && stNow.gameFps < 1.05 * capFps;
                     // Frame generation without Reflex: the start time is chosen by trying it out. The controller below
                     // hunted there: frames a pair apart wait a refresh more by design, so the 10th percentile it steers
@@ -3669,8 +4035,44 @@ static DWORD WINAPI PresenterThread(void *)
                     static int swTight = 0;
                     static int swShownK[16] = {};
                     static bool swWasOn = false;
-                    if (fgOn && !swWasOn) { swDoneT = -1.0; swIdx = -1; swBad = 0; }
+                    // The automatic frame cap at the frame start keeps the start time it found while the cap goes up to
+                    // Refresh rate and back down (within 10 minutes): looking again each time showed its bad start
+                    // times every 30 s (Alan Wake: 30 of 60 frames for seconds at a time). Frame generation looks again.
+                    {
+                        // Learned for this game in an earlier session (LearnPerGame): its place in the strobe cycle.
+                        const bool learnSwOk = s.learnPerGame && learnMine.frames > 0 && learnMine.fsMs > 0.0 && cyc > 0.0 &&
+                                               learnMine.fsMs < cyc * 1000.0;
+                        auto learnSwUse = [&]()
+                        {
+                            double ph = std::fmod(swPhase, cyc);
+                            if (ph < 0.0) ph += cyc;
+                            const int d = (int)((learnMine.fsMs * 0.001 - ph) * 1e6);
+                            if (d) { shiftUs.fetch_add(d); alignShiftTot += d * 1e-6; swPhase += d * 1e-6; }
+                            swIdx = -1; swBad = 0; swDoneT = t;
+                            swBestMs = learnMine.bestMs > 0.0 ? learnMine.bestMs : 1e3;
+                            LOGI("BFI Presenter: automatic frame cap at the frame start: start time learned for this game in an earlier session "
+                                 "(start %+.1f ms in the cycle, %.1f ms from release to flash)", learnMine.fsMs, learnMine.bestMs);
+                        };
+                        static int swKind = 0; static double swOffT = -1e9;
+                        const int kindNow = g_fgPaceKind.load();
+                        if (!fgOn && swWasOn) swOffT = t;
+                        if (fgOn && !swWasOn)
+                        {
+                            const bool keep = kindNow == 2 && swKind == 2 && swIdx < 0 && swDoneT >= 0.0 && t - swOffT < 600.0;
+                            if (keep) { swBad = 0; swDoneT = t; LOGI("BFI Presenter: automatic frame cap at the frame start: start time kept from before"); }
+                            else if (kindNow == 2 && learnSwOk) learnSwUse();
+                            else { swDoneT = -1.0; swIdx = -1; swBad = 0; }
+                        }
+                        if (learnSwReset) { learnSwReset = false; swDoneT = -1.0; swIdx = -1; swBad = 0; }
+                        if (learnSwNow)
+                        {
+                            learnSwNow = false;
+                            if (fgOn && kindNow == 2 && swIdx >= 0 && learnSwOk) learnSwUse();
+                        }
+                        if (fgOn) swKind = kindNow;
+                    }
                     swWasOn = fgOn;
+                    swSearching = fgOn && swIdx >= 0 && g_fgPaceKind.load() == 2;
                     if (fgOn && locked && s.pacingMode == 1 && cyc > 0.0)
                     {
                         // FSR frame generation paces its own output and follows a moved frame start with a lag, and the
@@ -3680,21 +4082,39 @@ static DWORD WINAPI PresenterThread(void *)
                         // timings tested with it.
                         const bool fsr = g_fgOuterFsr.load() != 0;
                         const int settle = fsr ? 3 : 2;
+                        // Learned per game: the frame start's place in the strobe cycle (the automatic frame cap only).
+                        auto learnSw = [&]()
+                        {
+                            if (!s.learnPerGame || learnMine.frames <= 0 || g_fgPaceKind.load() != 2) return;
+                            double ph = std::fmod(swPhase, cyc);
+                            if (ph < 0.0) ph += cyc;
+                            learnMine.fsMs = ph * 1000.0; learnMine.bestMs = swBestMs;
+                            LearnPost(learnMine);
+                        };
                         auto moveTo = [&](double ph)
                         {
                             const int d = (int)((ph - swPhase) * 1e6);
                             if (d) { shiftUs.fetch_add(d); alignShiftTot += d * 1e-6; }
                             swPhase += d * 1e-6;
                         };
-                        const bool ok = holds && !hitchPaused;
+                        // The automatic frame cap at the frame start: only while the game holds the cap. Below it (a scene
+                        // too heavy for 60) every start time loses frames and a search only shows its bad ones (Days Gone:
+                        // four searches in four minutes, each started in a scene at 55-59 fps).
+                        const bool ok = holds && !hitchPaused && (g_fgPaceKind.load() != 2 || stNow.gameFps >= 0.98 * capFps) &&
+                                        t - g_windowHungT.load() > 10.0;
                         const double base = swPhase - std::fmod(swPhase, cyc);   // stay within the same cycle's worth of moves
-                        if (swIdx < 0 && ok && (swDoneT < 0.0 || (fsr ? (swBad >= 5 && t - swDoneT > 20.0) : (swBad >= 10 && t - swDoneT > 60.0))))
+                        // The automatic frame cap at the frame start looks again as soon as FSR does: when a heavier
+                        // scene makes frames miss the pick they were timed for, each waits a whole cycle more (Obduction:
+                        // 23 ms from release to flash, then 40 ms for the 20 s the next search was still held back).
+                        const bool quick = fsr || g_fgPaceKind.load() == 2;
+                        if (swIdx < 0 && ok && (swDoneT < 0.0 || (quick ? (swBad >= 5 && t - swDoneT > 20.0) : (swBad >= 10 && t - swDoneT > 60.0))))
                         {
                             swN = std::max(4, std::min(16, (int)(cyc / 0.002 + 0.5)));
                             swIdx = 0; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swBad = 0;
                             swStart = base;
                             moveTo(swStart);
-                            LOGI("BFI Presenter: frame limit for frame generation: trying %d start times across the strobe cycle (%.0f s)",
+                            LOGI("BFI Presenter: %s: trying %d start times across the strobe cycle (%.0f s)",
+                                 g_fgPaceKind.load() == 2 ? "automatic frame cap at the frame start" : "frame limit for frame generation",
                                  swN, swN * (settle + 1.0));
                         }
                         else if (swIdx >= 0)
@@ -3704,7 +4124,10 @@ static DWORD WINAPI PresenterThread(void *)
                             {
                                 swShown += relN; swRel += relSum; swRelN += relN; swRep += stNow.frameRepeats;
                                 if (p10 >= 0.0) swSlack = std::min(swSlack, p10);
-                                if (swSecs >= settle + 1)
+                                // The automatic frame cap at the frame start: a start time that loses frames in its first
+                                // measured second is left at once (it showed for 3 s each before).
+                                const bool dropEarly = g_fgPaceKind.load() == 2 && swSecs == settle && relN < (int)(0.9 * capFps);
+                                if (swSecs >= settle + 1 || dropEarly)
                                 {
                                     const double relMs = swRelN ? swRel / swRelN : 1e3;
                                     const bool full = swShown >= (int)(2.0 * capFps * 0.97) && swRep <= 2;
@@ -3728,12 +4151,14 @@ static DWORD WINAPI PresenterThread(void *)
                                         for (int k = 1; k < swN; k++) if (swScore[k] < swScore[best]) best = k;
                                         moveTo(start + best * cyc / swN);
                                         swIdx = -1; swDoneT = t; swBestMs = swRelMs[best];
+                                        learnSw();
                                         char list[400]; int len = 0;
                                         for (int k = 0; k < swN && len < (int)sizeof(list) - 32; k++)
                                             len += snprintf(list + len, sizeof(list) - len, " %.1f:%d/%.0f/%.1f", k * cyc / swN * 1000.0,
                                                             swShownK[k], swRelMs[k], swSlackK[k] < 1.0 ? swSlackK[k] * 1000.0 : -1.0);
-                                        LOGI("BFI Presenter: frame limit for frame generation%s lined up with the flash: start %+.1f ms "
+                                        LOGI("BFI Presenter: %s%s lined up with the flash: start %+.1f ms "
                                              "in the cycle, %.1f ms from release to flash, %d of %.0f frames shown (start ms:shown/ms/ready ms before the flash --%s)",
+                                             g_fgPaceKind.load() == 2 ? "automatic frame cap at the frame start" : "frame limit for frame generation",
                                              fsr ? " (FSR)" : "", best * cyc / swN * 1000.0, swRelMs[best], swShownK[best], 2.0 * capFps, list);
                                     }
                                 }
@@ -3750,7 +4175,9 @@ static DWORD WINAPI PresenterThread(void *)
                             {
                                 swTight = 0;
                                 moveTo(swPhase - 0.002);
-                                LOGI("BFI Presenter: frame limit for frame generation: frames repeated close to their flash -- 2 ms earlier");
+                                learnSw();
+                                LOGI("BFI Presenter: %s: frames repeated close to their flash -- 2 ms earlier",
+                                     g_fgPaceKind.load() == 2 ? "automatic frame cap at the frame start" : "frame limit for frame generation");
                             }
                         }
                     }
@@ -3802,6 +4229,46 @@ static DWORD WINAPI PresenterThread(void *)
                         }
                     }
                     else { alignCleanSecs = 0; alignLastStep = 0.0; alignExcessSecs = 0; alignIdle = true; }
+                    // Coarse alignment (ReflexAlign off): each time the Reflex frame limit comes on, its frames land anywhere
+                    // in the strobe cycle. Ready 10-13 ms before the pick they only wait there (Dead Space: 29-33 ms from frame
+                    // start to flash, against 24-25 ms in stretches where they landed 1-5 ms before it). After 3 s in a row
+                    // with the 10th percentile above 8 ms the wake-up is moved later once, to 5 ms before the pick -- far
+                    // enough from it that varying frame times don't repeat frames (Spider-Man 2 with the fine alignment).
+                    // A frame repeated close to the pick soon after a move: 3 ms back and 2 ms more to spare (at most 8 ms).
+                    // The frames' readiness also moves with the scene's GPU load (Dead Space: 3-4 ms either way within a minute), so
+                    // 5 ms to spare. Not within 20 s of the "moving them earlier" nudge, at most once per 20 s.
+                    {
+                        static int coarseSecs = 0;
+                        static double coarseT = -1e9, coarseTarget = 0.005, coarseHoldT = -1e9;
+                        // The nudge moves the frames ~9 ms earlier itself: no step of this one on top of it (Dead Space,
+                        // both in the same second: 40 of 60 frames shown for 3 s, until the next nudge).
+                        const bool nudging = t < phaseUntil;
+                        if (nudging) coarseHoldT = t + 20.0;
+                        if (!nudging && !s.reflexAlign && s.reflexAlignCoarse && atSleepNoFg && holds && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
+                        {
+                            if (t - coarseT < 10.0 && stNow.frameRepeats >= 2 && p10 < 0.002)
+                            {
+                                shiftUs.fetch_sub(3000); alignShiftTot -= 0.003;
+                                coarseTarget = std::min(0.008, coarseTarget + 0.002);
+                                coarseT = -1e9; coarseSecs = 0;
+                                LOGI("BFI Presenter: Reflex frame limit: frames repeated after moving them later -- 3 ms back, "
+                                     "%.0f ms to spare from now on", coarseTarget * 1000.0);
+                            }
+                            else
+                            {
+                                coarseSecs = (p10 > coarseTarget + 0.003 && stNow.frameRepeats == 0) ? coarseSecs + 1 : 0;
+                                if (coarseSecs >= 3 && t - coarseT >= 20.0 && t >= coarseHoldT)
+                                {
+                                    const double step = std::min(p10 - coarseTarget, 0.9 * cyc);
+                                    shiftUs.fetch_add((int)(step * 1e6)); alignShiftTot += step;
+                                    coarseT = t; coarseSecs = 0;
+                                    LOGI("BFI Presenter: Reflex frame limit: game frames ready %.1f ms before the lit refresh's pick "
+                                         "-- moving them %.1f ms later", p10 * 1000.0, step * 1000.0);
+                                }
+                            }
+                        }
+                        else coarseSecs = 0;
+                    }
                     EnterCriticalSection(&g_cfgLock);
                     g_status.alignSlackMs = p10 >= 0.0 ? p10 * 1000.0 : -1.0;
                     g_status.alignShiftMs = alignShiftTot * 1000.0;
@@ -4294,6 +4761,7 @@ static HRESULT SubmitGameFrameLocked()
     g_cur = (g_cur + 1) % g_bufCount;
     g_stagedThisSecond.fetch_add(1);
     if (!g_firstStaged.exchange(true)) LOGI("BFI Presenter: first game frame received");
+    if ((g_frameId & 31) == 1) ReadRsColorSpace();     // for the presenter thread (see g_rsCs)
     if (g_gameFence->GetCompletedValue() == UINT64_MAX) DumpDeviceRemoved(g_device, "game Present");
 
     // VSync-like cap: at most one game frame per display refresh.
@@ -4410,14 +4878,31 @@ static void FgPaceAfterPresent()
             nextT = cycStart + ph + std::floor((nextT - cycStart - ph) / cyc + 0.5) * cyc;
         }
     }
+    const double held0 = Now();
     while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
     SleepUntil(nextT, timer);
     nextT += iv;
+    // The automatic frame cap at the frame start: the game waits here instead of in the presenter's cap, so this is its
+    // spare time for automatic frames ahead (counted only in the cap before, about 0 here: it stayed at 2 for good).
+    if (g_fgPaceKind.load() == 2)
+    {
+        g_capWaitUs.fetch_add((long long)((Now() - held0) * 1e6));
+        g_capWaits.fetch_add(1);
+    }
+    // The automatic frame cap at the frame start: the game's next frame starts now, so release -> flash is measured
+    // from here (from the return of its Present it counted the hold too: Soul Reaver showed 34.7 ms where frame start
+    // -> flash was about 21 ms, and the start-time search preferred the shorter holds).
+    if (g_fgPaceKind.load() == 2)
+    {
+        const UINT64 next = g_frameId + 1;
+        if (g_relId[next % kRel] == next) g_relT[next % kRel] = Now();
+    }
 }
 
 static HRESULT SubmitGameFrame()
 {
     CountPresent();
+    CountTo(g_feCount);
     const DWORD tid = GetCurrentThreadId();
     const double enter = Now();
     FgCheckCaller();
@@ -4548,9 +5033,38 @@ static bool StuckPassThrough(void *sc)
            (sc == (void *)g_sc || sc == (void *)g_sc11);
 }
 
+// DX11 games: the game's present thread, for the pacing after its present (FgPaceAfterPresent).
+static void CountTo(ThreadCount &c);
+static void NoteGameThread11()
+{
+    CountTo(g_feCount);
+    const DWORD tid = GetCurrentThreadId();
+    if (g_presentThreads[0] == tid) return;
+    EnterCriticalSection(&g_submitLock);
+    for (DWORD &t : g_presentThreads)
+    {
+        if (t == tid) break;
+        if (t == 0)
+        {
+            t = tid;
+            LOGI("BFI Presenter: game frames presented from thread %lu (DX11)", (unsigned long)tid);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_submitLock);
+}
+
+static HRESULT Present11Paced(IDXGISwapChain *sc, UINT sync, UINT flags)
+{
+    NoteGameThread11();
+    const HRESULT hr = SubmitGameFrame11(sc, sync, flags);
+    FgPaceAfterPresent();
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT flags)
 {
-    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
+    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return Present11Paced(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present(sc, sync, flags); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST))
         return o_Present(sc, sync, flags);
@@ -4561,7 +5075,7 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT 
 
 static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p)
 {
-    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return SubmitGameFrame11(sc, sync, flags);
+    if (!t_ownCall && IsGame11(sc) && !(flags & DXGI_PRESENT_TEST)) return Present11Paced(sc, sync, flags);
     if (StuckPassThrough(sc)) { const HRESULT hr = o_Present1(sc, sync, flags, p); ReleaseGameSlot(); return hr; }
     if (t_ownCall || !IsManaged(sc) || (flags & DXGI_PRESENT_TEST))
         return o_Present1(sc, sync, flags, p);
@@ -5824,6 +6338,7 @@ static void ReleaseAll()
     g_device = nullptr;
     g_sc = nullptr;
     g_rsSwapchain = nullptr;
+    g_rsCs.store(-1);
 }
 
 
@@ -6301,6 +6816,7 @@ static void ReleaseDx11()
     g_dx11.store(false);
     g_device = nullptr;                // g_dev12own and g_presQueue stay for the next swap chain
     g_rsSwapchain = nullptr;
+    g_rsCs.store(-1);
     g_ownPresentQueue = false;
     g_cs11.store(-1);
     g_fsWanted = FALSE;
@@ -6576,6 +7092,7 @@ static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 
     g_sc11 = sc3;
     g_desc11 = d;
     g_rsSwapchain = swapchain;
+    ReadRsColorSpace();
     g_dx11.store(true);
     g_ownPresentQueue = true;
     g_gameQueue = nullptr;
@@ -6697,6 +7214,7 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
     g_stageNext = (s + 1) % kStage;
     g_stagedThisSecond.fetch_add(1);
     if (!g_firstStaged.exchange(true)) LOGI("BFI Presenter: DX11: first game frame received");
+    if ((g_frameId & 31) == 1) ReadRsColorSpace();     // for the presenter thread (see g_rsCs)
 
     // Latency limit and frame cap, as for DX12 games.
     const int ahead = g_maxAhead.load();
@@ -7255,7 +7773,7 @@ static std::atomic<bool> g_9firstLogged{false};
 // and hand it to the DX11 core, which copies it into the staging ring on the
 // add-on's own D3D11 device. The game's own Present is skipped.
 template <class ShowOwn>
-static HRESULT SubmitGameFrame9(ShowOwn showOwn)
+static HRESULT SubmitGameFrame9Core(ShowOwn showOwn)
 {
     struct Depth { Depth() { t_in9Present++; } ~Depth() { t_in9Present--; } } depth;
     return SubmitFrame11Core(
@@ -7287,6 +7805,14 @@ static HRESULT SubmitGameFrame9(ShowOwn showOwn)
             return g_t9.t11;
         },
         showOwn);
+}
+template <class ShowOwn>
+static HRESULT SubmitGameFrame9(ShowOwn showOwn)
+{
+    NoteGameThread11();
+    const HRESULT hr = SubmitGameFrame9Core(showOwn);
+    FgPaceAfterPresent();   // after the frame is handed over (the automatic frame cap at the frame start)
+    return hr;
 }
 static std::atomic<uint32_t> g_9hits{0}, g_9owned{0}, g_9rsPresents{0};
 static void Dx9LogHit(const char *which, void *obj, void *expect)
@@ -7893,6 +8419,10 @@ static void on_reshade_present_gl(reshade::api::effect_runtime *runtime)
             return g_gl.tex;
         },
         []() -> HRESULT { return S_OK; });                         // the game's own SwapBuffers follows anyway
+    // The automatic frame cap at the frame start: the game's thread is held here, right before its own SwapBuffers
+    // (with swap interval 0 that returns at once).
+    NoteGameThread11();
+    FgPaceAfterPresent();
 }
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
@@ -8066,6 +8596,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     LOGI("BFI Presenter: init 3/6 -- hooks in place");
     g_sc = sc3;
     g_rsSwapchain = swapchain;
+    ReadRsColorSpace();
     g_lastPresentT.store(0.0);
     g_stallLogged.store(false);
     g_firstStaged.store(false);
@@ -8495,139 +9026,224 @@ static void draw_overlay(reshade::api::effect_runtime *)
     }
 
     // ================================================================ 3. frame pacing and latency
+    // Grouped by the cap: the cap first, then what applies at the Refresh rate cap, then what applies below it,
+    // then what applies to every cap. Options that don't apply to the cap in use are greyed out with the reason.
     if (ImGui::CollapsingHeader("Frame pacing and latency", ImGuiTreeNodeFlags_DefaultOpen))
     {
+        const int per = CapPeriod(s.gameCap, s.frames, s.capDivisor);
+        // What is in effect right now, in one line.
+        {
+            static const char *kCapNames[] = { "no cap", "Refresh rate", "Half refresh", "Quarter refresh", "one game frame per strobe cycle", "Custom cap" };
+            char use[320];
+            int n = 0;
+            if (s.gameCap == 1 && st.fgLimitUs > 0)   // works with the automatic frame cap on or off
+                n = snprintf(use, sizeof(use), "frame limit for frame generation (%.1f ms per rendered frame)", st.fgLimitUs / 1000.0);
+            else if (s.gameCap == 1 && s.autoCap)
+            {
+                if (st.autoCapProbe)    n = snprintf(use, sizeof(use), "automatic cap: trying Refresh rate");
+                else if (st.autoCapDown && st.rfxLimitUs > 0) n = snprintf(use, sizeof(use), "automatic cap: one game frame per strobe cycle (Reflex frame limit)");
+                else if (st.autoCapDown && st.feLimitUs > 0)  n = snprintf(use, sizeof(use), "automatic cap: one game frame per strobe cycle, held at the frame start");
+                else if (st.autoCapDown)     n = snprintf(use, sizeof(use), "automatic cap: one game frame per strobe cycle");
+                else                         n = snprintf(use, sizeof(use), "Refresh rate (automatic cap ready)");
+            }
+            else n = snprintf(use, sizeof(use), "%s", kCapNames[(s.gameCap >= 0 && s.gameCap <= 5) ? s.gameCap : 0]);
+            if (n > 0 && n < (int)sizeof(use))
+                n += snprintf(use + n, sizeof(use) - n, ", %s pacing, %d frame%s ahead", s.pacingMode == 1 ? "lowest latency" : "smooth",
+                              st.aheadInUse, st.aheadInUse == 1 ? "" : "s");
+            if (st.relFlashMs >= 0.0 && n > 0 && n < (int)sizeof(use)) snprintf(use + n, sizeof(use) - n, ", release -> flash %.1f ms", st.relFlashMs);
+            // The game stays below the cap in use: something outside the presenter limits it (its graphics settings,
+            // its own fps limit, video memory). Shown after 5 s, so a short dip or a cap switch doesn't trigger it.
+            double capFps = 0.0;
+            if (st.refreshHz > 1.0 && !st.fgActive && !st.hitchPaused && !st.autoCapProbe)
+            {
+                if (s.gameCap == 1 && s.autoCap && st.autoCapDown) capFps = st.refreshHz / std::max(1, s.frames);
+                else if (per >= 2) capFps = st.refreshHz / per;
+            }
+            static double belowT = -1.0;
+            const double tNow = Now();
+            const bool below = capFps > 0.0 && st.gameFps > 1.0 && st.gameFps < 0.9 * capFps;
+            if (!below) belowT = -1.0; else if (belowT < 0.0) belowT = tNow;
+            if (below && tNow - belowT >= 5.0)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+                ImGui::TextWrapped("In use: %s", use);
+                ImGui::TextWrapped("The game runs at %.0f fps, below the %.0f fps cap: something outside BFI Presenter limits it "
+                                   "(its graphics settings, its own fps limit, video memory). Lower the game's settings, or choose "
+                                   "a lower cap (e.g. Quarter refresh for a steady 30 fps at 120 Hz).", st.gameFps, capFps);
+                ImGui::PopStyleColor(1);
+            }
+            else ImGui::TextWrapped("In use: %s", use);
+        }
         ImGui::Combo("Game frame cap", &s.gameCap, "Off\0Refresh rate\0Half refresh (one game frame per lit + dark pair)\0Quarter refresh (one game frame per two lit + dark pairs)\0One game frame per strobe cycle (refresh / Frames)\0Custom (refresh / divisor)\0");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it.\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI, and the best choice when the game can't hold 120. With frame generation use Refresh rate:\nHalf throws away half the generated frames.\nOne game frame per strobe cycle: refresh / Frames per cycle -- 60 fps at 360 Hz with 6 frames,\n90 fps at 360 Hz with 4, 80 fps at 240 Hz with 3.\nCustom: the game gets a new frame every N refreshes.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it; with the automatic frame cap below it also\nsteps down to one game frame per strobe cycle when the game can't (the usual choice).\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI. With frame generation use Refresh rate: Half throws away half the generated frames.\nOne game frame per strobe cycle: refresh / Frames per cycle -- 60 fps at 360 Hz with 6 frames,\n90 fps at 360 Hz with 4, 80 fps at 240 Hz with 3.\nCustom: the game gets a new frame every N refreshes.");
         if (s.gameCap == 5)
         {
             ImGui::Indent(16.0f);
             ImGui::SliderInt("Refreshes per game frame", &s.capDivisor, 1, 8);
             ImGui::Unindent(16.0f);
         }
+        if (per >= 1)
         {
-            const int per = CapPeriod(s.gameCap, s.frames, s.capDivisor);
-            if (per >= 1)
-            {
-                const double hz = st.refreshHz > 1.0 ? st.refreshHz : 0.0;
-                if (hz > 0.0) ImGui::Text("Cap: %.0f fps (a new game frame every %d refresh%s)", hz / per, per, per == 1 ? "" : "es");
-                if (per >= 2)
-                {
-                    bool cr = s.capReflex != 0;
-                    if (ImGui::Checkbox("Apply the cap with Reflex's frame limit (irregular frame delivery only)", &cr)) s.capReflex = cr ? 1 : 0;
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Half / Quarter cap in games with NVIDIA Reflex: the cap is applied by Reflex's own frame limit,\n"
-                                                                  "like a game's own Reflex fps limit, instead of the presenter releasing the game just in time.\n"
-                                                                  "Only for games whose frames still arrive irregularly at Half or Quarter -- just-in-time release\n"
-                                                                  "keeps switching itself off and motion stutters (The Midnight Walk: 1.7%% of flashes off-cadence\n"
-                                                                  "with it, 15.6%% without).\n"
-                                                                  "Adds latency compared with just-in-time release (about 10-20 ms: Silent Hill 2 34 ms against\n"
-                                                                  "25 ms) and is no smoother where just-in-time release works. Off by default.");
-                    if (s.capReflex)
-                    {
-                        ImGui::SameLine();
-                        if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: %.1f ms)", st.rfxLimitUs / 1000.0);
-                        else ImGui::TextDisabled("(not in use: no Reflex in this game)");
-                    }
-                }
-                {
-                    bool ra = s.reflexAlign != 0;
-                    if (ImGui::Checkbox("Line Reflex's frame limit up with the flash", &ra)) s.reflexAlign = ra ? 1 : 0;
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Games with Reflex, capped with Reflex's frame limit (e.g. the automatic frame cap) and without frame\n"
-                                                                  "generation: the presenter moves the moment the game starts each frame so the frame is ready just\n"
-                                                                  "before the lit refresh picks it, instead of waiting there for up to a whole strobe cycle.\n"
-                                                                  "Needs Lowest latency pacing. Best in games with steady frame times (God of War Ragnarok: about\n"
-                                                                  "7 ms less from release to flash); in games whose frame times vary it gains little and can\n"
-                                                                  "repeat a frame now and then (Spider-Man 2). Off by default.");
-                    if (s.reflexAlign)
-                    {
-                        ImGui::SameLine();
-                        if (st.alignSlackMs >= 0.0) ImGui::TextDisabled("(frames ready %.1f ms before the pick, moved %+.1f ms)", st.alignSlackMs, st.alignShiftMs);
-                        else ImGui::TextDisabled(s.pacingMode == 0 ? "(not in use: needs Lowest latency pacing)" : "(not in use)");
-                    }
-                }
-                if (per >= 2 && st.fgActive && st.rfxLimitUs <= 0)
-                    ImGui::TextColored(kAmber, "Frame generation with a cap below the refresh rate: half its frames never reach the screen\n"
-                                       "and latency doubles. Use Refresh rate.");
-                if (per >= 2 && per % s.frames != 0)
-                    ImGui::TextColored(kAmber, "%d refreshes per game frame doesn't fit %d frames per cycle: some game frames start\n"
-                                       "on a dark refresh and motion judders. Use a multiple of %d.", per, s.frames, s.frames);
-            }
+            const double hz = st.refreshHz > 1.0 ? st.refreshHz : 0.0;
+            if (hz > 0.0) ImGui::TextDisabled("Cap: %.0f fps (a new game frame every %d refresh%s)", hz / per, per, per == 1 ? "" : "es");
+            if (per >= 2 && st.fgActive && st.rfxLimitUs <= 0)
+                ImGui::TextColored(kAmber, "Frame generation with a cap below the refresh rate: half its frames never reach the screen\n"
+                                   "and latency doubles. Use Refresh rate.");
+            if (per >= 2 && per % s.frames != 0)
+                ImGui::TextColored(kAmber, "%d refreshes per game frame doesn't fit %d frames per cycle: some game frames start\n"
+                                   "on a dark refresh and motion judders. Use a multiple of %d.", per, s.frames, s.frames);
         }
+
+        // ---------------------------------------------------------- at the Refresh rate cap
+        ImGui::Spacing();
+        ImGui::SeparatorText("At the Refresh rate cap");
+        ImGui::BeginDisabled(s.gameCap != 1);
         {
             bool ac = s.autoCap != 0;
             if (ImGui::Checkbox("Automatic frame cap", &ac)) s.autoCap = ac ? 1 : 0;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the Refresh rate cap: while the game can't hold the refresh rate, the cap drops to one\n"
-                                                          "game frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames), so every flash shows the\n"
-                                                          "next frame instead of frames dropped unevenly (judder). Back to Refresh rate when the game's\n"
-                                                          "frames fit a refresh again (its Reflex reports, or a short try every 30 to 120 s).\n"
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("While the game can't hold the refresh rate, the cap drops to one game frame per strobe cycle\n"
+                                                          "(e.g. 60 fps at 120 Hz with 2 frames), so every flash shows the next frame instead of frames\n"
+                                                          "dropped unevenly (judder). Back to Refresh rate when the game's frames fit a refresh again (its\n"
+                                                          "Reflex reports, or a short try every 30 to 120 s).\n"
                                                           "In games with NVIDIA Reflex (every DLSS frame-generation game) it uses Reflex's own frame limit\n"
                                                           "for this, which also paces frame generation. Frame generation without Reflex: see the frame limit below.");
-            if (s.autoCap)
+            if (!s.autoCap && s.gameCap == 1 && st.fgLimitUs > 0)
             {
-                bool aco = s.autoCapOwn != 0;
-                ImGui::Indent(16.0f);
-                if (ImGui::Checkbox("Presenter's own cap without frame generation", &aco)) s.autoCapOwn = aco ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off (default): in games with Reflex, the cap steps down with Reflex's frame limit, with\n"
-                                                              "frame generation or without.\n"
-                                                              "On: the presenter's own cap with just-in-time release while frame generation is off\n"
-                                                              "(each frame timed to its flash); Reflex's frame limit while it is on. Follows frame\n"
-                                                              "generation being switched on and off.");
-                ImGui::Unindent(16.0f);
                 ImGui::SameLine();
-                if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
-                else if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: Reflex frame limit %.1f ms, one frame per strobe cycle)", st.rfxLimitUs / 1000.0);
-                else if (st.fgLimitUs > 0) ImGui::TextDisabled("(Refresh rate: the frame limit for frame generation without Reflex holds the game)");
+                ImGui::TextDisabled("(not needed now: the frame limit for frame generation below holds the game -- used when frame generation stops)");
+            }
+            if (s.autoCap && s.gameCap == 1)
+            {
+                ImGui::SameLine();
+                if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: Reflex frame limit %.1f ms)", st.rfxLimitUs / 1000.0);
+                else if (st.fgLimitUs > 0) ImGui::TextDisabled("(at Refresh rate: the frame limit for frame generation holds the game)");
+                else if (st.feLimitUs > 0) ImGui::TextDisabled("(in use: one game frame per strobe cycle, held at the frame start)");
                 else if (st.fgActive && !st.rfxGameUses) ImGui::TextDisabled("(frame generation without Reflex: Refresh rate)");
                 else ImGui::TextDisabled("%s", st.autoCapProbe ? "(trying Refresh rate)" :
-                                               st.autoCapDown ? "(in use: one game frame per strobe cycle)" : "(in use: Refresh rate)");
+                                               st.autoCapDown ? "(in use: one game frame per strobe cycle)" : "(at Refresh rate)");
             }
+            // In a Reflex game the cap steps down with Reflex's frame limit (unless the presenter's own cap is chosen
+            // and frame generation is off): the presenter's own limiter is then idle, so what only tunes it is greyed out.
+            const bool rfxPaces = st.rfxGameUses && (!s.autoCapOwn || st.fgActive);
+            ImGui::Indent(16.0f);
+            ImGui::BeginDisabled(!s.autoCap);
+            bool aco = s.autoCapOwn != 0;
+            ImGui::BeginDisabled(!st.rfxGameUses);   // only a choice in Reflex games: without Reflex the presenter's own cap is the only one
+            if (ImGui::Checkbox("Presenter's own cap without frame generation", &aco)) s.autoCapOwn = aco ? 1 : 0;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Games with Reflex. Off (default): the cap steps down with Reflex's frame limit, with frame\n"
+                                                          "generation or without.\n"
+                                                          "On: the presenter's own cap (held at the frame start, below) while frame generation is off;\n"
+                                                          "Reflex's frame limit while it is on. Follows frame generation being switched on and off.");
+            ImGui::EndDisabled();
+            if (!st.rfxGameUses) { ImGui::SameLine(); ImGui::TextDisabled("(no Reflex in this game: the presenter's own cap is used anyway)"); }
+            bool fe = s.autoCapFrameStart != 0;
+            ImGui::BeginDisabled(rfxPaces);
+            if (ImGui::Checkbox("Hold at the frame start", &fe)) s.autoCapFrameStart = fe ? 1 : 0;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Games without Reflex or frame generation (or with the presenter's own cap above): when the\n"
+                                                          "cap steps down to one game frame per strobe cycle, the game is held before it starts its\n"
+                                                          "next frame, like Reflex's limit, instead of its finished frame waiting at the present.\n"
+                                                          "It reads your input later, so less delay to the flash. For about 25 s it tries start\n"
+                                                          "times across the strobe cycle and keeps the quickest that shows every frame.\n"
+                                                          "Needs Lowest latency pacing.");
+            ImGui::EndDisabled();
+            if (rfxPaces) { ImGui::SameLine(); ImGui::TextDisabled(st.fgActive ? "(not used: Reflex's frame limit paces frame generation)" :
+                                                                   "(not used: Reflex's frame limit paces this game -- tick the presenter's own cap above to use it)"); }
+            else if (s.autoCap && s.autoCapFrameStart && s.pacingMode != 1) { ImGui::SameLine(); ImGui::TextColored(kAmber, "needs Lowest latency pacing"); }
+            bool lp = s.learnPerGame != 0;
+            if (ImGui::Checkbox("Remember per game", &lp)) s.learnPerGame = lp ? 1 : 0;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("What the automatic frame cap finds for a game (one game frame per strobe cycle, the frame\n"
+                                                          "start time) is kept in BFIPresenter_learned.ini, and the next session starts from it instead\n"
+                                                          "of finding it again. Still checked as usual: tries at Refresh rate, a new search after lost\n"
+                                                          "frames. Once you've settled on a game's settings, press Forget this game once.");
+            if (s.learnPerGame)
             {
-                bool fl = s.fgLimitNoReflex != 0;
-                if (ImGui::Checkbox("Frame limit for frame generation without Reflex", &fl)) s.fgLimitNoReflex = fl ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame generation in games without NVIDIA Reflex (e.g. XeSS frame generation through\n"
-                                                              "OptiScaler): the presenter holds the game's own frames to one per (strobe cycle x\n"
-                                                              "frame-generation factor) -- e.g. 30 rendered fps at 120 Hz with 2 frames and 2x -- so every\n"
-                                                              "flash shows the next frame; for about 25 s after it comes on it tries start times to find the\n"
-                                                              "quickest one that shows every frame.\n"
-                                                              "Needs the Refresh rate cap; best with Lowest latency pacing. Turn off any frame limit in the\n"
-                                                              "game or in OptiScaler (FramerateLimit = 0). On by default.");
-                if (s.fgLimitNoReflex && st.fgLimitUs > 0)
-                {
-                    ImGui::SameLine();
-                    if (st.alignSlackMs >= 0.0) ImGui::TextDisabled("(in use: %.1f ms per rendered frame, ready %.1f ms before the pick)", st.fgLimitUs / 1000.0, st.alignSlackMs);
-                    else ImGui::TextDisabled("(in use: %.1f ms per rendered frame)", st.fgLimitUs / 1000.0);
-                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Forget this game")) { g_learnForgetFile.store(true); g_learnForgetNow.store(true); }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Deletes what was remembered for this game and starts over now: the cap goes back to\n"
+                                                              "Refresh rate and steps down again if needed, and the frame start is searched for again.\n"
+                                                              "E.g. after changing the game's graphics settings or the display mode.");
             }
-            if (st.relFlashMs >= 0.0) ImGui::TextDisabled("Game released -> lit flash: %.1f ms", st.relFlashMs);
+            ImGui::EndDisabled();
+            ImGui::Unindent(16.0f);
+            bool fl = s.fgLimitNoReflex != 0;
+            // Acts only on frame generation it detects in a game without Reflex: greyed out otherwise. The setting is kept,
+            // and the box comes back by itself once frame generation starts.
+            const bool flIdle = st.rfxGameUses || (!st.fgActive && g_fgFactNoRfx.load() <= 1 && st.fgLimitUs <= 0);
+            ImGui::BeginDisabled(flIdle);
+            if (ImGui::Checkbox("Frame limit for frame generation without Reflex", &fl)) s.fgLimitNoReflex = fl ? 1 : 0;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Frame generation in games without NVIDIA Reflex (e.g. XeSS frame generation through\n"
+                                                          "OptiScaler): the presenter holds the game's own frames to one per (strobe cycle x\n"
+                                                          "frame-generation factor) -- e.g. 30 rendered fps at 120 Hz with 2 frames and 2x -- so every\n"
+                                                          "flash shows the next frame; for about 25 s after it comes on it tries start times to find the\n"
+                                                          "quickest one that shows every frame.\n"
+                                                          "Best with Lowest latency pacing. Turn off any frame limit in the game or in OptiScaler\n"
+                                                          "(FramerateLimit = 0). On by default.");
+            if (s.fgLimitNoReflex && st.fgLimitUs > 0 && s.gameCap == 1)
+            {
+                ImGui::SameLine();
+                if (st.alignSlackMs >= 0.0) ImGui::TextDisabled("(in use: %.1f ms per rendered frame, ready %.1f ms before the pick)", st.fgLimitUs / 1000.0, st.alignSlackMs);
+                else ImGui::TextDisabled("(in use: %.1f ms per rendered frame)", st.fgLimitUs / 1000.0);
+            }
+            ImGui::EndDisabled();
+            if (st.rfxGameUses) { ImGui::SameLine(); ImGui::TextDisabled("(not used: the game has Reflex)"); }
+            else if (flIdle) { ImGui::SameLine(); ImGui::TextDisabled("(not used: no frame generation detected -- comes on by itself when it starts)"); }
         }
+        ImGui::EndDisabled();
+        if (s.gameCap != 1) ImGui::TextDisabled("Only with the Refresh rate cap.");
+
+        // ---------------------------------------------------------- below the refresh rate
+        ImGui::Spacing();
+        ImGui::SeparatorText("At caps below the refresh rate");
+        ImGui::BeginDisabled(per < 2);
+        {
+            bool cj = s.capJit != 0;
+            if (ImGui::Checkbox("Just-in-time release", &cj)) s.capJit = cj ? 1 : 0;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Releases the game for each frame at the lit refresh minus its measured frame time and a\n"
+                                                          "margin, so every frame lands on the same lit refresh: no repeat-then-skip at Half, no\n"
+                                                          "1-then-3 cycle frames at Quarter. Light games also get fresher frames. On by default.");
+            if (s.capJit && per >= 2)
+            {
+                static const char *kLrNames[] = { "off (needs Wait for vblank)", "measuring", "active", "at its limit (game frames take nearly the whole interval)" };
+                ImGui::Indent(16.0f);
+                ImGui::TextDisabled("%s", kLrNames[st.lrState & 3]);
+                if (st.lrState >= 2)
+                    ImGui::TextDisabled("Frames take %.1f ms, margin %.1f ms: released %.1f ms before the refresh (misses last second: %d)",
+                                        st.lrEst, st.lrMargin, st.lrEst + st.lrMargin, st.lrMisses);
+                ImGui::Unindent(16.0f);
+            }
+            bool cr = s.capReflex != 0;
+            if (ImGui::Checkbox("Apply the cap with Reflex's frame limit (irregular frame delivery only)", &cr)) s.capReflex = cr ? 1 : 0;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Half / Quarter cap in games with NVIDIA Reflex: the cap is applied by Reflex's own frame limit,\n"
+                                                          "like a game's own Reflex fps limit, instead of the presenter releasing the game just in time.\n"
+                                                          "Only for games whose frames still arrive irregularly at Half or Quarter -- just-in-time release\n"
+                                                          "keeps switching itself off and motion stutters (The Midnight Walk: 1.7%% of flashes off-cadence\n"
+                                                          "with it, 15.6%% without).\n"
+                                                          "Adds latency compared with just-in-time release (about 10-20 ms: Silent Hill 2 34 ms against\n"
+                                                          "25 ms) and is no smoother where just-in-time release works. Off by default.");
+            if (s.capReflex && per >= 2)
+            {
+                ImGui::SameLine();
+                if (st.rfxLimitUs > 0) ImGui::TextDisabled("(in use: %.1f ms)", st.rfxLimitUs / 1000.0);
+                else ImGui::TextDisabled("(not in use: no Reflex in this game)");
+            }
+        }
+        ImGui::EndDisabled();
+        if (per < 2) ImGui::TextDisabled("Only with Half, Quarter, one game frame per strobe cycle or Custom.");
+
+        // ---------------------------------------------------------- every cap
+        ImGui::Spacing();
+        ImGui::SeparatorText("Every cap");
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest latency shows the newest frame -- best at the Refresh cap.\nSmooth holds up to one finished frame in reserve (about one refresh more latency) so every\nframe is lit once and in order -- it only helps at the Half or Quarter cap.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest latency shows the newest frame -- best at the Refresh cap, and needed by the hold at\nthe frame start. Smooth holds up to one finished frame in reserve (about one refresh more latency)\nso every frame is lit once and in order -- it only helps at the Half or Quarter cap.");
         if (s.pacingMode == 0)
         {
+            ImGui::Indent(16.0f);
             bool cu = s.smoothCatchUp != 0;
-            if (ImGui::Checkbox("Smooth: catch up after a hitch", &cu)) s.smoothCatchUp = cu ? 1 : 0;
+            if (ImGui::Checkbox("Catch up after a hitch", &cu)) s.smoothCatchUp = cu ? 1 : 0;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off (default): after a game hitch the presenter stays one frame behind (about one cycle\n"
                                                           "more latency) and shows every frame once, in order.\n"
                                                           "On: when two finished frames keep waiting, one is skipped to get back to the lowest\n"
                                                           "latency -- a second stutter shortly after the first.");
-        }
-        bool cj = s.capJit != 0;
-        if (ImGui::Checkbox("Just-in-time release at caps below the refresh rate", &cj)) s.capJit = cj ? 1 : 0;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Releases the game for each frame at the lit refresh minus its measured frame time and a\n"
-                                                      "margin, so every frame lands on the same lit refresh: no repeat-then-skip at Half, no\n"
-                                                      "1-then-3 cycle frames at Quarter. Light games also get fresher frames.");
-        bool lr = s.laterRelease != 0;
-        if (ImGui::Checkbox("Later release at Refresh cap (Lowest latency, no frame generation)", &lr)) s.laterRelease = lr ? 1 : 0;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lets the game start each frame just in time for the refresh that shows it, instead of\na full refresh earlier, so its input is read later -- up to ~5 ms less latency in games\nthat render well within a refresh. Does nothing while frames take nearly a whole refresh.");
-        if (s.laterRelease || (s.capJit && CapPeriod(s.gameCap, s.frames, s.capDivisor) >= 2))
-        {
-            ImGui::Indent(16.0f);
-            ImGui::SliderFloat("Just-in-time safety margin (ms)", &s.laterReleaseMs, 0.5f, 5.0f, "%.1f");
-            static const char *kLrNames[] = { "off (needs Wait for vblank; at Refresh cap also Lowest latency + Later release)", "measuring", "active", "at its limit (game frames take nearly the whole interval)" };
-            ImGui::Text("Just-in-time release: %s", kLrNames[st.lrState & 3]);
-            if (st.lrState >= 2)
-                ImGui::Text("Frames take %.1f ms, margin %.1f ms: released %.1f ms before the refresh (misses last second: %d)",
-                            st.lrEst, st.lrMargin, st.lrEst + st.lrMargin, st.lrMisses);
             ImGui::Unindent(16.0f);
         }
         bool aa = s.autoAhead != 0;
@@ -8635,8 +9251,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many frames the game may queue on the GPU ahead of the screen.\n1 = lowest input lag (like a low-latency mode); 2 if the frame rate drops.");
         ImGui::Indent(16.0f);
         if (!s.autoAhead) ImGui::SliderInt("Max frames ahead (0 = off)", &s.maxAhead, 0, 3);
-        else ImGui::Text("Frames ahead in use: %d", st.aheadInUse);
+        else ImGui::TextDisabled("Frames ahead in use: %d", st.aheadInUse);
         ImGui::Unindent(16.0f);
+        ImGui::TextDisabled("Fine-tuning (later release at Refresh rate, the just-in-time margin, lining Reflex's limit up): Advanced.");
     }
 
     // ================================================================ 4. status
@@ -8660,6 +9277,43 @@ static void draw_overlay(reshade::api::effect_runtime *)
     // ================================================================ 5. advanced
     if (ImGui::CollapsingHeader("Advanced"))
     {
+        // ---------------------------------------------------------- latency fine-tuning (moved from Frame pacing)
+        ImGui::SeparatorText("Latency fine-tuning");
+        bool lr = s.laterRelease != 0;
+        const bool lrRfx = s.gameCap == 1 && st.rfxLimitUs > 0;   // Reflex's frame limit holds the game: later release idles
+        ImGui::BeginDisabled(lrRfx);
+        if (ImGui::Checkbox("Later release at the Refresh rate cap (Lowest latency, no frame generation)", &lr)) s.laterRelease = lr ? 1 : 0;
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Lets the game start each frame just in time for the refresh that shows it, instead of\na full refresh earlier, so its input is read later -- up to ~5 ms less latency in games\nthat render well within a refresh. Does nothing while frames take nearly a whole refresh. Off by default.\nNot used while Reflex's frame limit holds the game.");
+        ImGui::EndDisabled();
+        if (lrRfx) { ImGui::SameLine(); ImGui::TextDisabled("(not used: Reflex's frame limit paces this game)"); }
+        else if (s.laterRelease && s.gameCap == 1)
+        {
+            static const char *kLrNames2[] = { "off (needs Wait for vblank and Lowest latency)", "measuring", "active", "at its limit (game frames take nearly the whole refresh)" };
+            ImGui::Indent(16.0f);
+            ImGui::TextDisabled("%s", kLrNames2[st.lrState & 3]);
+            ImGui::Unindent(16.0f);
+        }
+        ImGui::SliderFloat("Just-in-time safety margin (ms)", &s.laterReleaseMs, 0.5f, 5.0f, "%.1f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How long before its refresh a game frame is due when the game is released just in time\n(just-in-time release below the refresh rate, later release at it). Widened by itself when frames miss.");
+        bool ra = s.reflexAlign != 0;
+        ImGui::BeginDisabled(!st.rfxGameUses);
+        if (ImGui::Checkbox("Line Reflex's frame limit up with the flash (test)", &ra)) s.reflexAlign = ra ? 1 : 0;
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Games with Reflex, capped with Reflex's frame limit (e.g. the automatic frame cap) and without frame\n"
+                                                      "generation: the presenter moves the moment the game starts each frame so the frame is ready just\n"
+                                                      "before the lit refresh picks it, instead of waiting there for up to a whole strobe cycle.\n"
+                                                      "Needs Lowest latency pacing. Best in games with steady frame times (God of War Ragnarok: about\n"
+                                                      "7 ms less from release to flash); in games whose frame times vary it gains little and can\n"
+                                                      "repeat a frame now and then (Spider-Man 2). Off by default. With it off, frames ready more than\n"
+                                                      "8 ms before the pick are still moved to 5 ms before it once (ReflexAlignCoarse=1 in the ini).");
+        if (!st.rfxGameUses) { ImGui::SameLine(); ImGui::TextDisabled("(not used: no Reflex in this game)"); }
+        else if (s.reflexAlign)
+        {
+            ImGui::SameLine();
+            if (st.alignSlackMs >= 0.0) ImGui::TextDisabled("(frames ready %.1f ms before the pick, moved %+.1f ms)", st.alignSlackMs, st.alignShiftMs);
+            else ImGui::TextDisabled(s.pacingMode == 0 ? "(not in use: needs Lowest latency pacing)" : "(not in use)");
+        }
+        ImGui::SeparatorText("Presenter");
         bool vb = s.pacing != 0, oq = s.ownQueue != 0;
         if (ImGui::Checkbox("Wait for vblank", &vb)) s.pacing = vb ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("One present per refresh, nothing queued: lowest latency. Needed by just-in-time release.");

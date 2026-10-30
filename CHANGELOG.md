@@ -7,6 +7,29 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.27] — 2026-10-30
+
+**The biggest latency update so far.** When the automatic frame cap holds a game to one frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames per cycle), the game used to finish its frame and then wait for the flash with your input already read. 1.0.27 holds the game *before* it starts the frame instead, and finds by testing the moment to let it go so the frame is finished just before its flash. That moment is then remembered per game.
+
+- **DX games without Reflex, at one frame per strobe cycle:** Shadow of the Tomb Raider 19 ms from frame start to flash against 25 ms, No Rest for the Wicked 19 against 23, Obduction 23 against 25, Resident Evil 4 27 against 30. Where the old cap left a game's finished frames waiting longest, the gap is much larger: God of War Ragnarök took about 65 ms with the old cap, against about 33 ms held at the frame start by Reflex's limit.
+- **Vulkan games about 6 ms quicker:** P.T.-PC 19 ms from release to flash against 25 ms (the lit frame's age 15.5 ms against 22). Games and emulators that time their frames themselves are recognised and left as they are.
+- **Reflex games:** frames ready far ahead of the flash are moved closer (Dead Space: the lit frame's age 23.7 ms against 26.5 ms).
+- **Learns once, then starts right:** the first session of a game measures the cap and the frame start (about half a minute of searching after the cap steps down). From the next session on it starts from that result, with no warm-up. If you change the game's graphics settings or display mode, press **Forget this game** once so it measures again.
+- **Emulators:** games at 59.94 fps are recognised as slower than a 60 Hz strobe, and the log suggests 119.88 Hz, at which they line up exactly (PCSX2, ICO-PC). Fractional refresh rates are read exactly now.
+- **Stability:** a crash from the watchdog's stack log (UE4) and a 5-second hang when a DX game closed are fixed.
+
+All of this is on by default.
+
+### Also in this release
+
+- **[Both] Overlay regrouped:** an **In use** line at the top, then the options grouped by cap (Refresh rate / below the refresh rate / every cap). Options that don't apply to the game or the cap in use are greyed out with the reason, e.g. the presenter's own limiter options while Reflex's frame limit paces the game. Fine-tuning moved to **Advanced**.
+- **[Both] Below-cap warning:** the **In use** line turns amber when the game stays below the cap for 5 s (e.g. 28 fps under a 60 fps cap): something outside the presenter is limiting it.
+- **[Both] Automatic frame cap:** fewer tries at Refresh rate in games that can't hold it; frames ahead no longer switches to 2 because of the cap's own changes or the frame-start search.
+- **[DX] 32-bit games:** timing is now precise (it moved in 64 ms steps on Direct3D 9's game thread; Alan Wake's cap didn't hold).
+- **[DX] Obduction-style streaming stalls** no longer restart the frame-start search.
+- **[Vulkan] `FrameGenDllCheck=0`** ignores a frame-generation DLL that a game loads but doesn't use (DriveClub-PC, P.T.-PC with RenoDX); the log names the DLL. RPCS3's doubled presents are no longer taken for frame generation.
+- **[Docs]** Settings guide (online, PDF, Markdown) follows the new layout, with a diagram of the frame-start hold. The log analyzer reports the frame-start result, remembered data and games slower than the strobe, reads the Vulkan logs, and tells the frame-start hold apart from the old cap.
+
 ## [1.0.26] — 2026-10-29 (Manager 1.3.11)
 
 - **[DX] FSR frame generation through OptiScaler: the frame limit for frame generation without Reflex works with it too.** FSR presents every frame, the game's and the generated ones, from a thread of its own, so the presenter couldn't tell the game's frames apart and FSR read as no frame generation. The game still presents to FSR's swap chain once per rendered frame: the presenter now finds that swap chain (by hooking the DXGI factory the game itself uses, before the game creates its swap chain), counts the game's presents there and holds the game right after each of them. Only for FSR frame generation's swap chain; XeSS frame generation and everything else keep the hook on the real swap chain and the timings tested with them. FSR follows a moved frame start with a lag, so its start-time search gives each start time 2 s to settle, prefers 8 ms to spare, makes no 2 ms steps while held, and looks again after 5 s of lost frames (at most every 20 s). The Callisto Protocol (FSR frame generation with OptiScaler's Async on and HUD fix off): 60 of 60 flashes, about 28–34 ms from release to flash. Riven: 55 of 60 flashes on average, 59–60 in 45% of seconds, against 46 and 20% with OptiScaler's 60 fps limit (FSR's own timing moves against the flashes there now and then; XeSS frame generation is steadier in Riven). `HookOuterSwapChain=0` in the ini turns the hook off.
