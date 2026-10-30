@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e19"
+#define BFI_ADDON_VERSION "1.0.27-e20"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2181,6 +2181,11 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
     ReleaseSRWLockExclusive(&g_learnLock);
 }
 
+// Last time the watchdog saw the game's window not responding (Windows' 5 s test): the frame-start search and its
+// held start time don't count lost frames then or for 10 s after (Obduction: streaming stalls set off two searches in a
+// minute, both finding the start time already in use).
+static std::atomic<double> g_windowHungT{-1e9};
+
 static DWORD WINAPI WatchdogThread(void *)
 {
     int lastPres = -1, lastGame = -1;
@@ -2241,6 +2246,7 @@ static DWORD WINAPI WatchdogThread(void *)
             static bool hungLogged = false;
             HWND gw = g_watchHwnd.load();
             const bool hung = gw && IsWindow(gw) && IsHungAppWindow(gw);
+            if (hung) g_windowHungT.store(Now());
             if (hung && !hungLogged)
             {
                 hungLogged = true;
@@ -4048,7 +4054,8 @@ static DWORD WINAPI PresenterThread(void *)
                         // The automatic frame cap at the frame start: only while the game holds the cap. Below it (a scene
                         // too heavy for 60) every start time loses frames and a search only shows its bad ones (Days Gone:
                         // four searches in four minutes, each started in a scene at 55-59 fps).
-                        const bool ok = holds && !hitchPaused && (g_fgPaceKind.load() != 2 || stNow.gameFps >= 0.98 * capFps);
+                        const bool ok = holds && !hitchPaused && (g_fgPaceKind.load() != 2 || stNow.gameFps >= 0.98 * capFps) &&
+                                        t - g_windowHungT.load() > 10.0;
                         const double base = swPhase - std::fmod(swPhase, cyc);   // stay within the same cycle's worth of moves
                         // The automatic frame cap at the frame start looks again as soon as FSR does: when a heavier
                         // scene makes frames miss the pick they were timed for, each waits a whole cycle more (Obduction:
