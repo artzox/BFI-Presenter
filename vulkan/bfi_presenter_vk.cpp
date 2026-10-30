@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v16"
+#define BFI_VERSION "1.0.27-v17"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -1493,6 +1493,21 @@ static std::string LearnKeyFor(const char *exe, HWND wnd)
         else if (!t.empty() && t.back() != ' ') t += ' ';
     }
     while (!t.empty() && (t.back() == ' ' || t.back() == '-')) t.pop_back();
+    // Short runs of a-f left from a build hash once its digits are gone (shadPS4: "WIP main 4d5a..." -> "d a") change with
+    // every build of the emulator: dropped, so its games keep their sections across updates.
+    {
+        std::string out, tok;
+        auto flush = [&]()
+        {
+            bool hex = !tok.empty() && tok.size() <= 3;
+            for (char c : tok) if (c < 'a' || c > 'f') { hex = false; break; }
+            if (!tok.empty() && !hex) { if (!out.empty()) out += ' '; out += tok; }
+            tok.clear();
+        };
+        for (char c : t) { if (c == ' ') flush(); else tok += c; }
+        flush();
+        t = out;
+    }
     if (t.size() > 100) t.resize(100);
     std::string k = exe;
     if (!t.empty()) k += " - " + t;
@@ -2926,7 +2941,25 @@ static void PresenterThread(Swapchain *sc)
                                         len += snprintf(list + len, sizeof(list) - len, " %.1f:%d/%.0f/%.1f", (fsStart + k * cyc / fsN) * 1000.0,
                                                         fsShownK[k], fsRelK[k], fsSlackK[k] < 1.0 ? fsSlackK[k] * 1000.0 : -1.0);
                                     fsDoneT = t; fsBad = fsTight = 0;
-                                    if (fsScore[best] >= 1e3 || fsRelK[best] > fsBaseRel - 1.0)
+                                    // A game that times its frames itself (emulators: shadPS4, PCSX2, ICO-PC): its frames are ready about the
+                                    // same time before the pick whatever the start time -- releasing it earlier only makes it wait inside its
+                                    // own pacing (it reads input on its own schedule), so the quicker release -> flash isn't a real gain.
+                                    // Ready times within 30% of the cycle across the start times that showed every frame: not needed.
+                                    double rdMin = 1.0, rdMax = -1.0;
+                                    int rdN = 0;
+                                    for (int k = 0; k < fsN; k++)
+                                        if (fsSlackK[k] < 1.0 && fsShownK[k] >= (int)(2.0 * capFps * 0.97))
+                                        { rdMin = std::min(rdMin, fsSlackK[k]); rdMax = std::max(rdMax, fsSlackK[k]); rdN++; }
+                                    if (rdN >= 6 && rdMax - rdMin < 0.3 * cyc)
+                                    {
+                                        fsState = 4; fsDeclT = t; sc->fsOn.store(false); sc->fsCtl.store(false);
+                                        learnFs(-2.0, fsBaseRel);
+                                        LOGI("BFI Presenter: automatic frame cap at the frame start: not needed -- frames are ready %.1f-%.1f ms before "
+                                             "the pick at every start time: the game times its frames itself, and releasing it earlier only makes it "
+                                             "wait inside (left at the usual release; released ms before the flash:shown/ms/ready ms before the pick --%s)",
+                                             rdMin * 1000.0, rdMax * 1000.0, list);
+                                    }
+                                    else if (fsScore[best] >= 1e3 || fsRelK[best] > fsBaseRel - 1.0)
                                     {
                                         fsState = 4; fsDeclT = t; sc->fsOn.store(false); sc->fsCtl.store(false);
                                         learnFs(-2.0, fsBaseRel);

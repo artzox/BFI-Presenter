@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e22"
+#define BFI_ADDON_VERSION "1.0.27-e23"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2144,6 +2144,21 @@ static std::string LearnKeyFor(const char *exe, HWND wnd)
         else if (!t.empty() && t.back() != ' ') t += ' ';
     }
     while (!t.empty() && (t.back() == ' ' || t.back() == '-')) t.pop_back();
+    // Short runs of a-f left from a build hash once its digits are gone (shadPS4: "WIP main 4d5a..." -> "d a") change with
+    // every build of the emulator: dropped, so its games keep their sections across updates.
+    {
+        std::string out, tok;
+        auto flush = [&]()
+        {
+            bool hex = !tok.empty() && tok.size() <= 3;
+            for (char c : tok) if (c < 'a' || c > 'f') { hex = false; break; }
+            if (!tok.empty() && !hex) { if (!out.empty()) out += ' '; out += tok; }
+            tok.clear();
+        };
+        for (char c : t) { if (c == ' ') flush(); else tok += c; }
+        flush();
+        t = out;
+    }
     if (t.size() > 100) t.resize(100);
     std::string k = exe;
     if (!t.empty()) k += " - " + t;
