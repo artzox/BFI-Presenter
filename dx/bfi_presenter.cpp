@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e14"
+#define BFI_ADDON_VERSION "1.0.27-e15"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -132,6 +132,7 @@ struct Settings
     int   reflexAlignCoarse = 1; // ReflexAlignCoarse: frames ready far ahead of the pick are moved closer once (ReflexAlign off)
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
+    int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap without Reflex holds the game before its next frame starts
     int   fgLimitNoReflex = 1; // FrameGenLimitWithoutReflex: frame generation without Reflex limited to one presented frame per strobe cycle
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
@@ -275,6 +276,7 @@ static void LoadSettings(Settings &s)
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
+    s.learnPerGame = IniInt("LearnPerGame", 1) ? 1 : 0;
     s.autoCapOwn = IniInt("AutoCapOwnWithoutFg", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
@@ -426,6 +428,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("ReflexAlignCoarse", s.reflexAlignCoarse);
     IniWriteInt("FrameGenLimitWithoutReflex", s.fgLimitNoReflex);
     IniWriteInt("AutoCapAtFrameStart", s.autoCapFrameStart);
+    IniWriteInt("LearnPerGame", s.learnPerGame);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
     IniWriteInt("GameFrameStatistics", s.virtualStats);
@@ -2046,15 +2049,160 @@ static LONG CALLBACK CrashLogger(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// ---------------------------------------------------------------- learned per game
+// LearnPerGame: what the automatic frame cap finds for a game -- one game frame per strobe cycle or the Refresh rate,
+// and the frame start time -- is kept in BFIPresenter_learned.ini next to BFIPresenter.ini, one section per game, and
+// the next session starts from it instead of finding it again (seconds of uneven frames before the cap steps down,
+// about 27 s for the frame start). The section is the executable and the window title without digits, so each game
+// of an emulator gets its own and fps counters or version numbers in a title don't make new ones. Used only at the same
+// refresh rate and frames per strobe cycle; what is learned is still checked as usual (tries at Refresh rate, a new
+// search after lost frames) and saved again when it changes. The file and the window title are read on a helper
+// thread: file access on the presenter's thread could miss a refresh, and GetWindowText waits on a hung window.
+struct LearnRec
+{
+    int    down = -1;       // 1 = one game frame per strobe cycle, 0 = Refresh rate, -1 = not known
+    double fsMs = 0.0;      // frame start: > 0 the start time found (ms), -2 not needed, -3 the game runs slower than the strobe, 0 not known
+    double bestMs = 0.0;    // release -> flash at that start time
+    double hz = 0.0;        // the refresh rate and frames per strobe cycle it was learned at
+    int    frames = 0;
+};
+static SRWLOCK     g_learnLock = SRWLOCK_INIT;
+static std::string g_learnKey;          // section in use ("" = none read yet)
+static LearnRec    g_learnRead;         // what the file had for it
+static int         g_learnGen = 0;      // bumped each time the section is read
+static LearnRec    g_learnOut;          // to be written to it
+static bool        g_learnDirty = false;
+
+static void LearnPost(const LearnRec &r)
+{
+    AcquireSRWLockExclusive(&g_learnLock);
+    g_learnOut = r;
+    g_learnDirty = true;
+    ReleaseSRWLockExclusive(&g_learnLock);
+}
+
+// The section read last, if newer than seenGen; returns its generation.
+static int LearnFetch(int seenGen, LearnRec &r)
+{
+    AcquireSRWLockShared(&g_learnLock);
+    const int g = g_learnGen;
+    if (g != seenGen) r = g_learnRead;
+    ReleaseSRWLockShared(&g_learnLock);
+    return g;
+}
+
+static std::string LearnKeyFor(const char *exe, HWND wnd)
+{
+    typedef int (WINAPI *PFN_InternalGetWindowText)(HWND, LPWSTR, int);
+    static PFN_InternalGetWindowText igwt =
+        (PFN_InternalGetWindowText)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "InternalGetWindowText");
+    char title[512] = "";
+    if (wnd)
+    {
+        wchar_t w[256] = L"";
+        int n = igwt ? igwt(wnd, w, 256) : 0;
+        // Fallback (InternalGetWindowText missing or empty): WM_GETTEXT, given up on a hung window.
+        DWORD_PTR got = 0;
+        if (n <= 0 && SendMessageTimeoutW(wnd, WM_GETTEXT, 256, (LPARAM)w, SMTO_ABORTIFHUNG | SMTO_BLOCK, 200, &got)) n = (int)got;
+        if (n > 0) { w[255] = 0; WideCharToMultiByte(CP_UTF8, 0, w, -1, title, sizeof(title), nullptr, nullptr); }
+    }
+    std::string t;
+    for (const unsigned char *p = (const unsigned char *)title; *p; p++)
+    {
+        const unsigned char ch = *p;
+        if (ch >= 0x80 || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '\'' || ch == '&' || ch == '-') t += (char)ch;
+        else if (!t.empty() && t.back() != ' ') t += ' ';
+    }
+    while (!t.empty() && (t.back() == ' ' || t.back() == '-')) t.pop_back();
+    if (t.size() > 100) t.resize(100);
+    std::string k = exe;
+    if (!t.empty()) k += " - " + t;
+    return k;
+}
+
+// Helper thread, every 2 s: writes what the presenter posted, then reads the section again when the game (its window
+// title) changed.
+static void LearnTick(const char *path, const char *exe, HWND wnd)
+{
+    const std::string key = LearnKeyFor(exe, wnd);
+    AcquireSRWLockExclusive(&g_learnLock);
+    const bool dirty = g_learnDirty;
+    const LearnRec out = g_learnOut;
+    const std::string cur = g_learnKey;
+    g_learnDirty = false;
+    ReleaseSRWLockExclusive(&g_learnLock);
+    char b[64];
+    if (dirty && !cur.empty())
+    {
+        const char *sec = cur.c_str();
+        // Whole numbers (us, mHz): a game that sets its own locale reads "120.000" as 120 thousand or 120.
+        snprintf(b, sizeof(b), "%d", out.down);                               WritePrivateProfileStringA(sec, "OneFramePerCycle", b, path);
+        snprintf(b, sizeof(b), "%ld", (long)std::lround(out.fsMs * 1000.0));   WritePrivateProfileStringA(sec, "FrameStartUs", b, path);
+        snprintf(b, sizeof(b), "%ld", (long)std::lround(out.bestMs * 1000.0)); WritePrivateProfileStringA(sec, "ReleaseToFlashUs", b, path);
+        snprintf(b, sizeof(b), "%ld", (long)std::lround(out.hz * 1000.0));     WritePrivateProfileStringA(sec, "RefreshMilliHz", b, path);
+        snprintf(b, sizeof(b), "%d", out.frames);                             WritePrivateProfileStringA(sec, "Frames", b, path);
+    }
+    if (key == cur) return;
+    LearnRec r;
+    const char *sec = key.c_str();
+    // GetPrivateProfileInt returns 0 for negative values: read as text.
+    auto get = [&](const char *name, long def) -> long
+    {
+        char v[32];
+        GetPrivateProfileStringA(sec, name, "", v, sizeof(v), path);
+        char *end = nullptr;
+        const long x = strtol(v, &end, 10);
+        return end && end != v ? x : def;
+    };
+    r.frames = (int)get("Frames", 0);
+    if (r.frames > 0)
+    {
+        r.down   = (int)get("OneFramePerCycle", -1);
+        r.fsMs   = get("FrameStartUs", 0) / 1000.0;
+        r.bestMs = get("ReleaseToFlashUs", 0) / 1000.0;
+        r.hz     = get("RefreshMilliHz", 0) / 1000.0;
+    }
+    AcquireSRWLockExclusive(&g_learnLock);
+    g_learnKey = key;
+    g_learnRead = r;
+    g_learnGen++;
+    g_learnDirty = false;     // posted for the previous game: the presenter posts again for this one
+    ReleaseSRWLockExclusive(&g_learnLock);
+}
+
 static DWORD WINAPI WatchdogThread(void *)
 {
     int lastPres = -1, lastGame = -1;
     double lastPresT = 0.0, lastGameT = 0.0;
+    int learnTicks = 0;
+    char exe[MAX_PATH] = "";
+    {
+        char full[MAX_PATH] = "";
+        GetModuleFileNameA(nullptr, full, MAX_PATH);
+        const char *b = strrchr(full, '\\');
+        strncpy(exe, b ? b + 1 : full, MAX_PATH - 1);
+    }
     for (;;)
     {
         Sleep(500);
         DrainInfoQueue();
         const double t = Now();
+        // Learned per game: written and read here, every 2 s, once the game has a window.
+        if (++learnTicks % 4 == 0 && g_iniPath[0])
+        {
+            EnterCriticalSection(&g_cfgLock);
+            const bool on = g_shared.learnPerGame && g_shared.autoCap;
+            LeaveCriticalSection(&g_cfgLock);
+            HWND gw = g_watchHwnd.load();
+            if (on && gw)
+            {
+                char path[MAX_PATH];
+                strncpy(path, g_iniPath, MAX_PATH - 1); path[MAX_PATH - 1] = 0;
+                if (char *sl = strrchr(path, '\\')) sl[1] = 0; else path[0] = 0;
+                strncat(path, "BFIPresenter_learned.ini", MAX_PATH - strlen(path) - 1);
+                LearnTick(path, exe, GetAncestor(gw, GA_ROOT));
+            }
+        }
         if (g_running.load())
         {
             const int st = g_presStage.load();
@@ -2518,6 +2666,11 @@ static DWORD WINAPI PresenterThread(void *)
     int    rcBadSecs = 0;
     int    rfxBadSecs = 0, gameLimBadSecs = 0;   // seconds collapsed under our Reflex limit / the game's own
     double fpsGoodT = -100.0;     // last second the game held at least half the strobe rate
+    // Learned per game (LearnPerGame): read on the watchdog thread, applied after 5 s with the automatic cap in use
+    // (so frame generation and Reflex are known first).
+    LearnRec learnRead, learnMine;
+    int    learnGen = 0, learnWarm = 0, learnSavedDown = -1;
+    bool   learnApply = false, learnSwNow = false;
     double fpsAtDown = 0.0;       // game fps when the automatic frame cap stepped down   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
     int    fgVotes = 0;           // seconds in a row the counts said the frame-generation state changed
     double fpsPrevSec = -1.0;
@@ -3599,7 +3752,36 @@ static DWORD WINAPI PresenterThread(void *)
                 // on top held frame generation's presents too, and the game's window stopped responding for
                 // seconds (The Callisto Protocol, Riven), so the cap stays at Refresh while that limit is in use.
                 const bool fgLimitOn = g_fgPaceUs.load() > 0 && g_fgPaceKind.load() == 1;
-                if (s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg) && !fgLimitOn)
+                const bool capOn = s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg) && !fgLimitOn;
+                if (s.learnPerGame)
+                {
+                    const int g = LearnFetch(learnGen, learnRead);
+                    if (g != learnGen)
+                    {
+                        // A game (window title) read: start from what it learned once its refresh rate is known.
+                        learnGen = g; learnApply = true; learnSavedDown = -1; learnMine = LearnRec();
+                    }
+                    learnWarm = capOn ? learnWarm + 1 : 0;
+                    if (learnApply && capOn && learnWarm >= 5)
+                    {
+                        learnApply = false;
+                        if (learnRead.frames == s.frames && fabs(learnRead.hz - hzA) < 0.05)
+                        {
+                            learnMine = learnRead;
+                            learnSavedDown = learnRead.down;
+                            if (learnRead.down == 1 && !autoCapDown && !capProbe)
+                            {
+                                autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
+                                probeWait = 60.0;
+                                LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- learned for this "
+                                     "game in an earlier session", hzA / s.frames, capByReflex ? "Reflex frame limit" : "the presenter's cap");
+                            }
+                        }
+                        learnMine.hz = hzA; learnMine.frames = s.frames;
+                        learnSwNow = true;    // a frame-start search already running (the cap stepped down by itself first): learned start instead
+                    }
+                }
+                if (capOn)
                 {
                     const double refMs = 1000.0 / hzA;
                     if (capProbe)
@@ -3680,6 +3862,13 @@ static DWORD WINAPI PresenterThread(void *)
                         LOGI("BFI Presenter: automatic frame cap: Refresh rate (frame generation without Reflex%s)",
                              fgLimitOn ? " -- the frame limit for it holds the game" : "");
                     autoCapDown = capProbe = false; capDownSecs = capUpSecs = 0;
+                }
+                // Learned per game: the cap's state once it has stayed 30 s (a try at Refresh rate that fails isn't a change).
+                if (s.learnPerGame && learnMine.frames > 0 && capOn && !capProbe && t - capSwitchT > 30.0 && (autoCapDown ? 1 : 0) != learnSavedDown)
+                {
+                    learnSavedDown = autoCapDown ? 1 : 0;
+                    learnMine.down = learnSavedDown;
+                    LearnPost(learnMine);
                 }
                 g_status.autoCapDown = autoCapDown ? 1 : 0;
                 g_status.autoCapProbe = capProbe ? 1 : 0;
@@ -3767,6 +3956,20 @@ static DWORD WINAPI PresenterThread(void *)
                     // Refresh rate and back down (within 10 minutes): looking again each time showed its bad start
                     // times every 30 s (Alan Wake: 30 of 60 frames for seconds at a time). Frame generation looks again.
                     {
+                        // Learned for this game in an earlier session (LearnPerGame): its place in the strobe cycle.
+                        const bool learnSwOk = s.learnPerGame && learnMine.frames > 0 && learnMine.fsMs > 0.0 && cyc > 0.0 &&
+                                               learnMine.fsMs < cyc * 1000.0;
+                        auto learnSwUse = [&]()
+                        {
+                            double ph = std::fmod(swPhase, cyc);
+                            if (ph < 0.0) ph += cyc;
+                            const int d = (int)((learnMine.fsMs * 0.001 - ph) * 1e6);
+                            if (d) { shiftUs.fetch_add(d); alignShiftTot += d * 1e-6; swPhase += d * 1e-6; }
+                            swIdx = -1; swBad = 0; swDoneT = t;
+                            swBestMs = learnMine.bestMs > 0.0 ? learnMine.bestMs : 1e3;
+                            LOGI("BFI Presenter: automatic frame cap at the frame start: start time learned for this game in an earlier session "
+                                 "(start %+.1f ms in the cycle, %.1f ms from release to flash)", learnMine.fsMs, learnMine.bestMs);
+                        };
                         static int swKind = 0; static double swOffT = -1e9;
                         const int kindNow = g_fgPaceKind.load();
                         if (!fgOn && swWasOn) swOffT = t;
@@ -3774,7 +3977,13 @@ static DWORD WINAPI PresenterThread(void *)
                         {
                             const bool keep = kindNow == 2 && swKind == 2 && swIdx < 0 && swDoneT >= 0.0 && t - swOffT < 600.0;
                             if (keep) { swBad = 0; swDoneT = t; LOGI("BFI Presenter: automatic frame cap at the frame start: start time kept from before"); }
+                            else if (kindNow == 2 && learnSwOk) learnSwUse();
                             else { swDoneT = -1.0; swIdx = -1; swBad = 0; }
+                        }
+                        if (learnSwNow)
+                        {
+                            learnSwNow = false;
+                            if (fgOn && kindNow == 2 && swIdx >= 0 && learnSwOk) learnSwUse();
                         }
                         if (fgOn) swKind = kindNow;
                     }
@@ -3788,6 +3997,15 @@ static DWORD WINAPI PresenterThread(void *)
                         // timings tested with it.
                         const bool fsr = g_fgOuterFsr.load() != 0;
                         const int settle = fsr ? 3 : 2;
+                        // Learned per game: the frame start's place in the strobe cycle (the automatic frame cap only).
+                        auto learnSw = [&]()
+                        {
+                            if (!s.learnPerGame || learnMine.frames <= 0 || g_fgPaceKind.load() != 2) return;
+                            double ph = std::fmod(swPhase, cyc);
+                            if (ph < 0.0) ph += cyc;
+                            learnMine.fsMs = ph * 1000.0; learnMine.bestMs = swBestMs;
+                            LearnPost(learnMine);
+                        };
                         auto moveTo = [&](double ph)
                         {
                             const int d = (int)((ph - swPhase) * 1e6);
@@ -3847,6 +4065,7 @@ static DWORD WINAPI PresenterThread(void *)
                                         for (int k = 1; k < swN; k++) if (swScore[k] < swScore[best]) best = k;
                                         moveTo(start + best * cyc / swN);
                                         swIdx = -1; swDoneT = t; swBestMs = swRelMs[best];
+                                        learnSw();
                                         char list[400]; int len = 0;
                                         for (int k = 0; k < swN && len < (int)sizeof(list) - 32; k++)
                                             len += snprintf(list + len, sizeof(list) - len, " %.1f:%d/%.0f/%.1f", k * cyc / swN * 1000.0,
@@ -3870,6 +4089,7 @@ static DWORD WINAPI PresenterThread(void *)
                             {
                                 swTight = 0;
                                 moveTo(swPhase - 0.002);
+                                learnSw();
                                 LOGI("BFI Presenter: %s: frames repeated close to their flash -- 2 ms earlier",
                                      g_fgPaceKind.load() == 2 ? "automatic frame cap at the frame start" : "frame limit for frame generation");
                             }
@@ -8792,6 +9012,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "It reads your input later, so less delay to the flash. For about 25 s it tries start\n"
                                                               "times across the strobe cycle and keeps the quickest that shows every frame.\n"
                                                               "Needs Lowest latency pacing.");
+                bool lp = s.learnPerGame != 0;
+                if (ImGui::Checkbox("Remember per game", &lp)) s.learnPerGame = lp ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("What the automatic frame cap finds for a game (one game frame per strobe cycle, the frame\n"
+                                                              "start time) is kept in BFIPresenter_learned.ini, and the next session starts from it instead\n"
+                                                              "of finding it again. Still checked as usual: tries at Refresh rate, a new search after lost\n"
+                                                              "frames. Delete the file to forget.");
                 ImGui::Unindent(16.0f);
                 ImGui::SameLine();
                 if (s.gameCap != 1) ImGui::TextColored(kAmber, "needs the Refresh rate cap");
