@@ -4,7 +4,10 @@ set -e
 cd "$(dirname "$0")"
 IG=../third_party/imgui
 python3 gen_tested.py
-x86_64-w64-mingw32-windres app.rc -O coff -o app_res.o
+# the exe's version info follows MANAGER_VERSION in core.h
+V=$(sed -n 's/^#define MANAGER_VERSION "\(.*\)"/\1/p' core.h)
+VN=$(echo "$V" | tr '.' ',' ),0
+x86_64-w64-mingw32-windres -DMGR_VER_STR="\\\"$V\\\"" -DMGR_VER_NUM="$VN" app.rc -O coff -o app_res.o
 x86_64-w64-mingw32-g++ -O2 -std=c++17 -municode -mwindows -static -s \
     -I "$IG" -I "$IG/backends" -I ../third_party/mingw-shim \
     main.cpp core.cpp nvdrs.cpp unzip.cpp \

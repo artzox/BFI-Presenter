@@ -2,8 +2,8 @@
 1 ICON "app.ico"
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION MGR_VER_NUM
+PRODUCTVERSION MGR_VER_NUM
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -13,9 +13,9 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "artzox"
       VALUE "FileDescription", "BFI Presenter Manager"
-      VALUE "FileVersion", "1.0.0"
+      VALUE "FileVersion", MGR_VER_STR
       VALUE "ProductName", "BFI Presenter Manager"
-      VALUE "ProductVersion", "1.0.0"
+      VALUE "ProductVersion", MGR_VER_STR
       VALUE "LegalCopyright", "Copyright (C) 2026 artzox. GPL-3.0-or-later"
     END
   END
