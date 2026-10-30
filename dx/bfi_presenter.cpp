@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e26"
+#define BFI_ADDON_VERSION "1.0.27-e27"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2439,6 +2439,7 @@ static IUnknown *ReflexOwnDevice();
 // For the rest of the process: no limit from the presenter, and the game's own limit is
 // taken out too (kept across swap chain changes, which recreate the presenter's state).
 static std::atomic<bool> g_rfxLimitBad{false};
+static std::atomic<int>  g_fgFactNoRfx{1};       // frame generation factor seen from present counts (the overlay greys its limit at 1)
 static int ReflexGameLimitUs();
 
 // Frame generation that presents its own frames (DLSS-G, FSR 3 FG, XeSS FG): its
@@ -3426,6 +3427,7 @@ static DWORD WINAPI PresenterThread(void *)
                     LOGI("BFI Presenter: frame generation without Reflex: %dx (%ld presents a second, %ld from the game's thread %lu%s)",
                          fgFact, tot, gt, (unsigned long)gtid, outerN > 0 ? ", counted on the outer swap chain" : "");
                 }
+                g_fgFactNoRfx.store(fgFact);
                 const double hzP = modeHz > 0.0 ? modeHz : peakHz;
                 int want = 0;
                 if (s.fgLimitNoReflex && fgFact > 1 && !g_status.rfxGameUses && s.enabled && s.frames >= 2 && userCap == 1 && hzP > 0.0 &&
@@ -9158,7 +9160,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::EndDisabled();
             ImGui::Unindent(16.0f);
             bool fl = s.fgLimitNoReflex != 0;
-            ImGui::BeginDisabled(st.rfxGameUses != 0);
+            // Acts only on frame generation it detects in a game without Reflex: greyed out otherwise. The setting is kept,
+            // and the box comes back by itself once frame generation starts.
+            const bool flIdle = st.rfxGameUses || (!st.fgActive && g_fgFactNoRfx.load() <= 1 && st.fgLimitUs <= 0);
+            ImGui::BeginDisabled(flIdle);
             if (ImGui::Checkbox("Frame limit for frame generation without Reflex", &fl)) s.fgLimitNoReflex = fl ? 1 : 0;
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Frame generation in games without NVIDIA Reflex (e.g. XeSS frame generation through\n"
                                                           "OptiScaler): the presenter holds the game's own frames to one per (strobe cycle x\n"
@@ -9175,6 +9180,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
             }
             ImGui::EndDisabled();
             if (st.rfxGameUses) { ImGui::SameLine(); ImGui::TextDisabled("(not used: the game has Reflex)"); }
+            else if (flIdle) { ImGui::SameLine(); ImGui::TextDisabled("(not used: no frame generation detected -- comes on by itself when it starts)"); }
         }
         ImGui::EndDisabled();
         if (s.gameCap != 1) ImGui::TextDisabled("Only with the Refresh rate cap.");
