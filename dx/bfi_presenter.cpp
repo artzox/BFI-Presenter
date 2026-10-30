@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e18"
+#define BFI_ADDON_VERSION "1.0.27-e19"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2684,6 +2684,9 @@ static DWORD WINAPI PresenterThread(void *)
     // misses strobe cycles, which aren't counted toward frames ahead (Shadow of the Tomb Raider: frames ahead went to 2
     // a second before the remembered cap came on).
     bool learnHoldAhead = false;
+    // The frame-start search is trying start times (some lose frames on purpose): not counted toward frames ahead,
+    // as in the Vulkan layer (Shadow of the Tomb Raider went to 2 during one and stayed there for the session).
+    bool swSearching = false;
     int    learnGen = 0, learnWarm = 0, learnSavedDown = -1;
     bool   learnApply = false, learnSwNow = false, learnSwReset = false;
     double fpsAtDown = 0.0;       // game fps when the automatic frame cap stepped down   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
@@ -3581,7 +3584,7 @@ static DWORD WINAPI PresenterThread(void *)
                     repSum -= repWin[repIdx];
                     // Not in the first 8 s after the cap changes (the switch itself and the frame-start hold coming on make uneven
                     // cycles: Shadow of the Tomb Raider went to 2 frames ahead 6 s after the remembered cap came on, for good).
-                    const bool aheadCount = !hitchPaused && !learnHoldAhead && t - capSwitchT > 8.0;
+                    const bool aheadCount = !hitchPaused && !learnHoldAhead && !swSearching && t - capSwitchT > 8.0;
                     repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && aheadCount && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
                     repSum += repWin[repIdx];
                     repIdx = (repIdx + 1) % 30;
@@ -4017,6 +4020,7 @@ static DWORD WINAPI PresenterThread(void *)
                         if (fgOn) swKind = kindNow;
                     }
                     swWasOn = fgOn;
+                    swSearching = fgOn && swIdx >= 0 && g_fgPaceKind.load() == 2;
                     if (fgOn && locked && s.pacingMode == 1 && cyc > 0.0)
                     {
                         // FSR frame generation paces its own output and follows a moved frame start with a lag, and the
