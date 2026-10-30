@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e24"
+#define BFI_ADDON_VERSION "1.0.27-e25"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2852,7 +2852,8 @@ static DWORD WINAPI PresenterThread(void *)
         {
             const int per = std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
             const bool capOk = s.capJit && per >= 2 && s.frames >= 2 && per % s.frames == 0;
-            const bool llOk  = s.laterRelease && s.pacingMode == 1 && per == 1 && s.gameCap >= 1 && g_fgPaceKind.load() != 2;
+            const bool llOk  = s.laterRelease && s.pacingMode == 1 && per == 1 && s.gameCap >= 1 && g_fgPaceKind.load() != 2 &&
+                                 !(autoCapDown && capByReflex);
             g_lrAllowed.store((capOk || llOk) && s.pacing && !vsyncOverridden && output);
             g_lrWindow.store(per / (modeHz > 0.0 ? modeHz : 120.0));
         }
@@ -9047,7 +9048,28 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 n += snprintf(use + n, sizeof(use) - n, ", %s pacing, %d frame%s ahead", s.pacingMode == 1 ? "lowest latency" : "smooth",
                               st.aheadInUse, st.aheadInUse == 1 ? "" : "s");
             if (st.relFlashMs >= 0.0 && n > 0 && n < (int)sizeof(use)) snprintf(use + n, sizeof(use) - n, ", release -> flash %.1f ms", st.relFlashMs);
-            ImGui::TextWrapped("In use: %s", use);
+            // The game stays below the cap in use: something outside the presenter limits it (its graphics settings,
+            // its own fps limit, video memory). Shown after 5 s, so a short dip or a cap switch doesn't trigger it.
+            double capFps = 0.0;
+            if (st.refreshHz > 1.0 && !st.fgActive && !st.hitchPaused && !st.autoCapProbe)
+            {
+                if (s.gameCap == 1 && s.autoCap && st.autoCapDown) capFps = st.refreshHz / std::max(1, s.frames);
+                else if (per >= 2) capFps = st.refreshHz / per;
+            }
+            static double belowT = -1.0;
+            const double tNow = Now();
+            const bool below = capFps > 0.0 && st.gameFps > 1.0 && st.gameFps < 0.9 * capFps;
+            if (!below) belowT = -1.0; else if (belowT < 0.0) belowT = tNow;
+            if (below && tNow - belowT >= 5.0)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+                ImGui::TextWrapped("In use: %s", use);
+                ImGui::TextWrapped("The game runs at %.0f fps, below the %.0f fps cap: something outside BFI Presenter limits it "
+                                   "(its graphics settings, its own fps limit, video memory). Lower the game's settings, or choose "
+                                   "a lower cap (e.g. Quarter refresh for a steady 30 fps at 120 Hz).", st.gameFps, capFps);
+                ImGui::PopStyleColor(1);
+            }
+            else ImGui::TextWrapped("In use: %s", use);
         }
         ImGui::Combo("Game frame cap", &s.gameCap, "Off\0Refresh rate\0Half refresh (one game frame per lit + dark pair)\0Quarter refresh (one game frame per two lit + dark pairs)\0One game frame per strobe cycle (refresh / Frames)\0Custom (refresh / divisor)\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refresh rate: lowest latency when the game holds it; with the automatic frame cap below it also\nsteps down to one game frame per strobe cycle when the game can't (the usual choice).\nHalf refresh = 60 fps at 120 Hz: every game frame is shown once lit, the smoothest motion\nwith 2-frame BFI. With frame generation use Refresh rate: Half throws away half the generated frames.\nOne game frame per strobe cycle: refresh / Frames per cycle -- 60 fps at 360 Hz with 6 frames,\n90 fps at 360 Hz with 4, 80 fps at 240 Hz with 3.\nCustom: the game gets a new frame every N refreshes.");
@@ -9092,6 +9114,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 else ImGui::TextDisabled("%s", st.autoCapProbe ? "(trying Refresh rate)" :
                                                st.autoCapDown ? "(in use: one game frame per strobe cycle)" : "(at Refresh rate)");
             }
+            // In a Reflex game the cap steps down with Reflex's frame limit (unless the presenter's own cap is chosen
+            // and frame generation is off): the presenter's own limiter is then idle, so what only tunes it is greyed out.
+            const bool rfxPaces = st.rfxGameUses && (!s.autoCapOwn || st.fgActive);
             ImGui::Indent(16.0f);
             ImGui::BeginDisabled(!s.autoCap);
             bool aco = s.autoCapOwn != 0;
@@ -9101,6 +9126,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "On: the presenter's own cap (held at the frame start, below) while frame generation is off;\n"
                                                           "Reflex's frame limit while it is on. Follows frame generation being switched on and off.");
             bool fe = s.autoCapFrameStart != 0;
+            ImGui::BeginDisabled(rfxPaces);
             if (ImGui::Checkbox("Hold at the frame start", &fe)) s.autoCapFrameStart = fe ? 1 : 0;
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Games without Reflex or frame generation (or with the presenter's own cap above): when the\n"
                                                           "cap steps down to one game frame per strobe cycle, the game is held before it starts its\n"
@@ -9108,7 +9134,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "It reads your input later, so less delay to the flash. For about 25 s it tries start\n"
                                                           "times across the strobe cycle and keeps the quickest that shows every frame.\n"
                                                           "Needs Lowest latency pacing.");
-            if (s.autoCap && s.autoCapFrameStart && s.pacingMode != 1) { ImGui::SameLine(); ImGui::TextColored(kAmber, "needs Lowest latency pacing"); }
+            ImGui::EndDisabled();
+            if (rfxPaces) { ImGui::SameLine(); ImGui::TextDisabled(st.fgActive ? "(not used: Reflex's frame limit paces frame generation)" :
+                                                                   "(not used: Reflex's frame limit paces this game -- tick the presenter's own cap above to use it)"); }
+            else if (s.autoCap && s.autoCapFrameStart && s.pacingMode != 1) { ImGui::SameLine(); ImGui::TextColored(kAmber, "needs Lowest latency pacing"); }
             bool lp = s.learnPerGame != 0;
             if (ImGui::Checkbox("Remember per game", &lp)) s.learnPerGame = lp ? 1 : 0;
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("What the automatic frame cap finds for a game (one game frame per strobe cycle, the frame\n"
@@ -9126,6 +9155,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::EndDisabled();
             ImGui::Unindent(16.0f);
             bool fl = s.fgLimitNoReflex != 0;
+            ImGui::BeginDisabled(st.rfxGameUses != 0);
             if (ImGui::Checkbox("Frame limit for frame generation without Reflex", &fl)) s.fgLimitNoReflex = fl ? 1 : 0;
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Frame generation in games without NVIDIA Reflex (e.g. XeSS frame generation through\n"
                                                           "OptiScaler): the presenter holds the game's own frames to one per (strobe cycle x\n"
@@ -9140,6 +9170,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 if (st.alignSlackMs >= 0.0) ImGui::TextDisabled("(in use: %.1f ms per rendered frame, ready %.1f ms before the pick)", st.fgLimitUs / 1000.0, st.alignSlackMs);
                 else ImGui::TextDisabled("(in use: %.1f ms per rendered frame)", st.fgLimitUs / 1000.0);
             }
+            ImGui::EndDisabled();
+            if (st.rfxGameUses) { ImGui::SameLine(); ImGui::TextDisabled("(not used: the game has Reflex)"); }
         }
         ImGui::EndDisabled();
         if (s.gameCap != 1) ImGui::TextDisabled("Only with the Refresh rate cap.");
@@ -9233,9 +9265,13 @@ static void draw_overlay(reshade::api::effect_runtime *)
         // ---------------------------------------------------------- latency fine-tuning (moved from Frame pacing)
         ImGui::SeparatorText("Latency fine-tuning");
         bool lr = s.laterRelease != 0;
+        const bool lrRfx = s.gameCap == 1 && st.rfxLimitUs > 0;   // Reflex's frame limit holds the game: later release idles
+        ImGui::BeginDisabled(lrRfx);
         if (ImGui::Checkbox("Later release at the Refresh rate cap (Lowest latency, no frame generation)", &lr)) s.laterRelease = lr ? 1 : 0;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lets the game start each frame just in time for the refresh that shows it, instead of\na full refresh earlier, so its input is read later -- up to ~5 ms less latency in games\nthat render well within a refresh. Does nothing while frames take nearly a whole refresh. Off by default.");
-        if (s.laterRelease && s.gameCap == 1)
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Lets the game start each frame just in time for the refresh that shows it, instead of\na full refresh earlier, so its input is read later -- up to ~5 ms less latency in games\nthat render well within a refresh. Does nothing while frames take nearly a whole refresh. Off by default.\nNot used while Reflex's frame limit holds the game.");
+        ImGui::EndDisabled();
+        if (lrRfx) { ImGui::SameLine(); ImGui::TextDisabled("(not used: Reflex's frame limit paces this game)"); }
+        else if (s.laterRelease && s.gameCap == 1)
         {
             static const char *kLrNames2[] = { "off (needs Wait for vblank and Lowest latency)", "measuring", "active", "at its limit (game frames take nearly the whole refresh)" };
             ImGui::Indent(16.0f);
@@ -9245,15 +9281,18 @@ static void draw_overlay(reshade::api::effect_runtime *)
         ImGui::SliderFloat("Just-in-time safety margin (ms)", &s.laterReleaseMs, 0.5f, 5.0f, "%.1f");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("How long before its refresh a game frame is due when the game is released just in time\n(just-in-time release below the refresh rate, later release at it). Widened by itself when frames miss.");
         bool ra = s.reflexAlign != 0;
+        ImGui::BeginDisabled(!st.rfxGameUses);
         if (ImGui::Checkbox("Line Reflex's frame limit up with the flash (test)", &ra)) s.reflexAlign = ra ? 1 : 0;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Games with Reflex, capped with Reflex's frame limit (e.g. the automatic frame cap) and without frame\n"
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Games with Reflex, capped with Reflex's frame limit (e.g. the automatic frame cap) and without frame\n"
                                                       "generation: the presenter moves the moment the game starts each frame so the frame is ready just\n"
                                                       "before the lit refresh picks it, instead of waiting there for up to a whole strobe cycle.\n"
                                                       "Needs Lowest latency pacing. Best in games with steady frame times (God of War Ragnarok: about\n"
                                                       "7 ms less from release to flash); in games whose frame times vary it gains little and can\n"
                                                       "repeat a frame now and then (Spider-Man 2). Off by default. With it off, frames ready more than\n"
                                                       "8 ms before the pick are still moved to 5 ms before it once (ReflexAlignCoarse=1 in the ini).");
-        if (s.reflexAlign)
+        if (!st.rfxGameUses) { ImGui::SameLine(); ImGui::TextDisabled("(not used: no Reflex in this game)"); }
+        else if (s.reflexAlign)
         {
             ImGui::SameLine();
             if (st.alignSlackMs >= 0.0) ImGui::TextDisabled("(frames ready %.1f ms before the pick, moved %+.1f ms)", st.alignSlackMs, st.alignShiftMs);
