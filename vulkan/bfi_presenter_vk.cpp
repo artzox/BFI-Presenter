@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v20"
+#define BFI_VERSION "1.0.27-v21"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -5319,6 +5319,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                                       "(not used with frame generation)"); }
             else if (s.autoCap && s.autoCapFrameStart && s.pacingMode != 1) { ImGui::SameLine(); ImGui::TextColored(kAmber, "needs Lowest latency pacing"); }
             bool lp = s.learnPerGame != 0;
+            ImGui::BeginDisabled(st.fgActive);   // with frame generation the cap isn't learned (Refresh, or Reflex's frame limit)
             if (ImGui::Checkbox("Remember per game", &lp)) s.learnPerGame = lp ? 1 : 0;
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("What the automatic frame cap finds for a game (one game frame per strobe cycle, the frame\n"
                                                           "start time) is kept in BFIPresenter_learned.ini, and the next session starts from it instead\n"
@@ -5333,6 +5334,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "Refresh rate and steps down again if needed, and the frame start is searched for again.\n"
                                                               "E.g. after changing the game's graphics settings or the display mode.");
             }
+            ImGui::EndDisabled();
+            if (st.fgActive) { ImGui::SameLine(); ImGui::TextDisabled("(not used with frame generation)"); }
             ImGui::EndDisabled();
             ImGui::Unindent(16.0f);
         }
