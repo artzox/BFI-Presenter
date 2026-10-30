@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v12"
+#define BFI_VERSION "1.0.27-v13"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -1594,6 +1594,10 @@ static void PresenterThread(Swapchain *sc)
     // Learned per game (LearnPerGame): read on the helper thread, applied after 5 s with the automatic cap in use (so
     // frame generation and doubled presents are known first).
     LearnRec learnRead, learnMine;
+    // A remembered one-frame-per-strobe-cycle cap waiting to be applied: the game runs at the Refresh cap meanwhile and
+    // misses strobe cycles, which aren't counted toward frames ahead (Shadow of the Tomb Raider: frames ahead went to 2
+    // a second before the remembered cap came on).
+    bool learnHoldAhead = false;
     int learnGen = 0, learnWarm = 0, learnSavedDown = -1;
     bool learnApply = false;
     double fsFpsSum = 0.0; int fsFpsN = 0; bool fsDriftLogged = false;   // the game's rate against the strobe's, over 30 s
@@ -2412,12 +2416,12 @@ static void PresenterThread(Swapchain *sc)
             if (s.autoAhead && s.maxAhead != 0)
             {
                 repSum -= repWin[repIdx];
-                repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && fsState != 2 && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading) or while the frame-start search tries start times
+                repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && fsState != 2 && !learnHoldAhead && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading) or while the frame-start search tries start times
                 repSum += repWin[repIdx];
                 repIdx = (repIdx + 1) % 30;
                 if (autoAhead == 1)
                 {
-                    missSecs = (secRepU >= 2 && s.gameCap >= 1 && fsState != 2) ? missSecs + 1 : 0;
+                    missSecs = (secRepU >= 2 && s.gameCap >= 1 && fsState != 2 && !learnHoldAhead) ? missSecs + 1 : 0;
                     if (missSecs >= 3 || repSum >= 6)
                     {
                         if (missSecs < 3)
@@ -2613,6 +2617,7 @@ static void PresenterThread(Swapchain *sc)
                     if (fsState != 0) { fsState = 0; sc->fsOn.store(false); sc->fsCtl.store(false); }
                     LOGI("BFI Presenter: remembered data for this game cleared -- the automatic frame cap starts over");
                 }
+                learnHoldAhead = false;
                 if (s.learnPerGame)
                 {
                     const int g = LearnFetch(learnGen, learnRead);
@@ -2622,9 +2627,10 @@ static void PresenterThread(Swapchain *sc)
                         learnGen = g; learnApply = true; learnSavedDown = -1; learnMine = LearnRec();
                     }
                     learnWarm = capOn ? learnWarm + 1 : 0;
+                    learnHoldAhead = learnApply && capOn && learnRead.down == 1 && learnRead.frames == s.frames && fabs(learnRead.hz - hzA) < 0.05;
                     if (learnApply && capOn && learnWarm >= 5)
                     {
-                        learnApply = false;
+                        learnApply = false; learnHoldAhead = false;
                         if (learnRead.frames == s.frames && fabs(learnRead.hz - hzA) < 0.05)
                         {
                             learnMine = learnRead;

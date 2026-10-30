@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e16"
+#define BFI_ADDON_VERSION "1.0.27-e17"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2680,6 +2680,10 @@ static DWORD WINAPI PresenterThread(void *)
     // Learned per game (LearnPerGame): read on the watchdog thread, applied after 5 s with the automatic cap in use
     // (so frame generation and Reflex are known first).
     LearnRec learnRead, learnMine;
+    // A remembered one-frame-per-strobe-cycle cap waiting to be applied: the game runs at the Refresh cap meanwhile and
+    // misses strobe cycles, which aren't counted toward frames ahead (Shadow of the Tomb Raider: frames ahead went to 2
+    // a second before the remembered cap came on).
+    bool learnHoldAhead = false;
     int    learnGen = 0, learnWarm = 0, learnSavedDown = -1;
     bool   learnApply = false, learnSwNow = false, learnSwReset = false;
     double fpsAtDown = 0.0;       // game fps when the automatic frame cap stepped down   // the automatic frame cap steps down with Reflex's frame limit (game uses Reflex)
@@ -3575,12 +3579,12 @@ static DWORD WINAPI PresenterThread(void *)
                 if (s.autoAhead && s.maxAhead != 0)
                 {
                     repSum -= repWin[repIdx];
-                    repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
+                    repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && !learnHoldAhead && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
                     repSum += repWin[repIdx];
                     repIdx = (repIdx + 1) % 30;
                     if (autoAhead == 1)
                     {
-                        missSecs = (secRepU >= 2 && s.gameCap >= 1) ? missSecs + 1 : 0;
+                        missSecs = (secRepU >= 2 && s.gameCap >= 1 && !learnHoldAhead) ? missSecs + 1 : 0;
                         if (missSecs >= 3 || repSum >= 6)
                         {
                             if (missSecs < 3)
@@ -3772,6 +3776,7 @@ static DWORD WINAPI PresenterThread(void *)
                     if (autoCapDown || capProbe) { autoCapDown = capProbe = false; capDownSecs = capUpSecs = 0; capSwitchT = t; probeWait = 30.0; }
                     LOGI("BFI Presenter: remembered data for this game cleared -- the automatic frame cap starts over");
                 }
+                learnHoldAhead = false;
                 if (s.learnPerGame)
                 {
                     const int g = LearnFetch(learnGen, learnRead);
@@ -3781,9 +3786,10 @@ static DWORD WINAPI PresenterThread(void *)
                         learnGen = g; learnApply = true; learnSavedDown = -1; learnMine = LearnRec();
                     }
                     learnWarm = capOn ? learnWarm + 1 : 0;
+                    learnHoldAhead = learnApply && capOn && learnRead.down == 1 && learnRead.frames == s.frames && fabs(learnRead.hz - hzA) < 0.05;
                     if (learnApply && capOn && learnWarm >= 5)
                     {
-                        learnApply = false;
+                        learnApply = false; learnHoldAhead = false;
                         if (learnRead.frames == s.frames && fabs(learnRead.hz - hzA) < 0.05)
                         {
                             learnMine = learnRead;
