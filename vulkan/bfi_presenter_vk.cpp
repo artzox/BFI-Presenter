@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27-v13"
+#define BFI_VERSION "1.0.27-v14"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -2416,12 +2416,14 @@ static void PresenterThread(Swapchain *sc)
             if (s.autoAhead && s.maxAhead != 0)
             {
                 repSum -= repWin[repIdx];
-                repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && fsState != 2 && !learnHoldAhead && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading) or while the frame-start search tries start times
+                // Not in the first 8 s after the cap changes (the switch itself makes uneven cycles), as the DX add-on.
+                const bool aheadCount = !hitchPaused && fsState != 2 && !learnHoldAhead && t - capSwitchT > 8.0;
+                repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && aheadCount && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading) or while the frame-start search tries start times
                 repSum += repWin[repIdx];
                 repIdx = (repIdx + 1) % 30;
                 if (autoAhead == 1)
                 {
-                    missSecs = (secRepU >= 2 && s.gameCap >= 1 && fsState != 2 && !learnHoldAhead) ? missSecs + 1 : 0;
+                    missSecs = (secRepU >= 2 && s.gameCap >= 1 && aheadCount) ? missSecs + 1 : 0;
                     if (missSecs >= 3 || repSum >= 6)
                     {
                         if (missSecs < 3)

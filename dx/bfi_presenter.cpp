@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e17"
+#define BFI_ADDON_VERSION "1.0.27-e18"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3579,12 +3579,15 @@ static DWORD WINAPI PresenterThread(void *)
                 if (s.autoAhead && s.maxAhead != 0)
                 {
                     repSum -= repWin[repIdx];
-                    repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && !hitchPaused && !learnHoldAhead && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
+                    // Not in the first 8 s after the cap changes (the switch itself and the frame-start hold coming on make uneven
+                    // cycles: Shadow of the Tomb Raider went to 2 frames ahead 6 s after the remembered cap came on, for good).
+                    const bool aheadCount = !hitchPaused && !learnHoldAhead && t - capSwitchT > 8.0;
+                    repWin[repIdx] = (s.gameCap >= 1 && autoAhead == 1 && aheadCount && ++repSecsRun > 5) ? secRepU : 0;   // only what happened at 1 frame ahead, not while paused (loading)
                     repSum += repWin[repIdx];
                     repIdx = (repIdx + 1) % 30;
                     if (autoAhead == 1)
                     {
-                        missSecs = (secRepU >= 2 && s.gameCap >= 1 && !learnHoldAhead) ? missSecs + 1 : 0;
+                        missSecs = (secRepU >= 2 && s.gameCap >= 1 && aheadCount) ? missSecs + 1 : 0;
                         if (missSecs >= 3 || repSum >= 6)
                         {
                             if (missSecs < 3)
@@ -4817,9 +4820,17 @@ static void FgPaceAfterPresent()
             nextT = cycStart + ph + std::floor((nextT - cycStart - ph) / cyc + 0.5) * cyc;
         }
     }
+    const double held0 = Now();
     while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
     SleepUntil(nextT, timer);
     nextT += iv;
+    // The automatic frame cap at the frame start: the game waits here instead of in the presenter's cap, so this is its
+    // spare time for automatic frames ahead (counted only in the cap before, about 0 here: it stayed at 2 for good).
+    if (g_fgPaceKind.load() == 2)
+    {
+        g_capWaitUs.fetch_add((long long)((Now() - held0) * 1e6));
+        g_capWaits.fetch_add(1);
+    }
     // The automatic frame cap at the frame start: the game's next frame starts now, so release -> flash is measured
     // from here (from the return of its Present it counted the hold too: Soul Reaver showed 34.7 ms where frame start
     // -> flash was about 21 ms, and the start-time search preferred the shorter holds).
