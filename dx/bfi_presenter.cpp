@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27-e20"
+#define BFI_ADDON_VERSION "1.0.27-e21"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -721,6 +721,11 @@ static std::atomic<HWND>      g_watchHwnd{nullptr};    // game window the watchd
 static std::atomic<DWORD>     g_uiTid{0};              // DX11: thread that owns the presenter's child window
 static IDXGISwapChain3       *g_sc = nullptr;    // managed real swap chain (not AddRef'd)
 static reshade::api::swapchain *g_rsSwapchain = nullptr;
+// The game swap chain's colour space (reshade::api::color_space), read on the game's threads and kept here for the
+// presenter thread: asking the swap chain from the presenter thread blocked on DXGI's lock while the game destroyed it
+// at exit, and the game then waited the 5 s for the presenter to stop (Obduction). -1 = not read yet.
+static std::atomic<int> g_rsCs{-1};
+static void ReadRsColorSpace() { if (g_rsSwapchain) g_rsCs.store((int)g_rsSwapchain->get_color_space()); }
 static std::atomic<bool>      g_active{false};   // hooks redirect for g_sc
 static ID3D12Device          *g_device = nullptr;
 static ID3D12CommandQueue    *g_gameQueue = nullptr;
@@ -1803,14 +1808,11 @@ static int ResolveOutput(const Settings &s)
     // (RenoDX) leave the reported space at sRGB some or all of the time;
     // reading that as SDR clipped every highlight above SDR white.
     if (g_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) return 1;
-    if (g_rsSwapchain)
+    switch ((reshade::api::color_space)g_rsCs.load())
     {
-        switch (g_rsSwapchain->get_color_space())
-        {
-        case reshade::api::color_space::extended_srgb_linear: return 1;
-        case reshade::api::color_space::hdr10_st2084:         return 2;
-        default: break;
-        }
+    case reshade::api::color_space::extended_srgb_linear: return 1;
+    case reshade::api::color_space::hdr10_st2084:         return 2;
+    default: break;
     }
     return (g_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 1 : 0;
 }
@@ -4715,6 +4717,7 @@ static HRESULT SubmitGameFrameLocked()
     g_cur = (g_cur + 1) % g_bufCount;
     g_stagedThisSecond.fetch_add(1);
     if (!g_firstStaged.exchange(true)) LOGI("BFI Presenter: first game frame received");
+    if ((g_frameId & 31) == 1) ReadRsColorSpace();     // for the presenter thread (see g_rsCs)
     if (g_gameFence->GetCompletedValue() == UINT64_MAX) DumpDeviceRemoved(g_device, "game Present");
 
     // VSync-like cap: at most one game frame per display refresh.
@@ -6291,6 +6294,7 @@ static void ReleaseAll()
     g_device = nullptr;
     g_sc = nullptr;
     g_rsSwapchain = nullptr;
+    g_rsCs.store(-1);
 }
 
 
@@ -6768,6 +6772,7 @@ static void ReleaseDx11()
     g_dx11.store(false);
     g_device = nullptr;                // g_dev12own and g_presQueue stay for the next swap chain
     g_rsSwapchain = nullptr;
+    g_rsCs.store(-1);
     g_ownPresentQueue = false;
     g_cs11.store(-1);
     g_fsWanted = FALSE;
@@ -7043,6 +7048,7 @@ static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 
     g_sc11 = sc3;
     g_desc11 = d;
     g_rsSwapchain = swapchain;
+    ReadRsColorSpace();
     g_dx11.store(true);
     g_ownPresentQueue = true;
     g_gameQueue = nullptr;
@@ -7164,6 +7170,7 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
     g_stageNext = (s + 1) % kStage;
     g_stagedThisSecond.fetch_add(1);
     if (!g_firstStaged.exchange(true)) LOGI("BFI Presenter: DX11: first game frame received");
+    if ((g_frameId & 31) == 1) ReadRsColorSpace();     // for the presenter thread (see g_rsCs)
 
     // Latency limit and frame cap, as for DX12 games.
     const int ahead = g_maxAhead.load();
@@ -8545,6 +8552,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     LOGI("BFI Presenter: init 3/6 -- hooks in place");
     g_sc = sc3;
     g_rsSwapchain = swapchain;
+    ReadRsColorSpace();
     g_lastPresentT.store(0.0);
     g_stallLogged.store(false);
     g_firstStaged.store(false);
