@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.28-t3"
+#define BFI_ADDON_VERSION "1.0.28-t4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3785,7 +3785,9 @@ static DWORD WINAPI PresenterThread(void *)
                 // Reflex in use: reports within the last 3 s, not only in the last second -- a one-second stall with no
                 // reports took the cap to Refresh rate with frame generation for ~7 s (Alan Wake 2, 2x: "frame generation
                 // without Reflex").
-                const bool rfxUse = rsEverT > 0.0 && t - rsEverT < 3.0 && !g_rfxLimitBad.load();
+                // (8 s with frame generation on, as its state is kept that long: Alan Wake 2 paused its reports for 3-4 s
+                // after some hitches, and with frame generation still on the cap went to Refresh rate for 5 s.)
+                const bool rfxUse = rsEverT > 0.0 && t - rsEverT < (fgWas ? 8.0 : 3.0) && !g_rfxLimitBad.load();
                 // Game frame cap with Reflex's frame limit (CapWithReflex, off by default): in games with
                 // Reflex, a cap below the refresh rate (Half, Quarter, one per strobe cycle, custom) is applied
                 // by the driver where the game starts each frame, instead of holding the game at Present --
@@ -4335,6 +4337,9 @@ static DWORD WINAPI PresenterThread(void *)
                     int cand = 1;
                     if (stNow.fgActive && rf > 1.0 && presPrev > 1.0) cand = std::max(2, std::min(4, (int)(presPrev / rf + 0.5)));
                     if (!stNow.fgActive) cand = 1;
+                    // Frame generation on but no rendered count for now (the game's Reflex reports pause for 3-4 s after
+                    // some hitches): the factor is kept -- it went to 1x at once and the limit came off (Alan Wake 2, 3x).
+                    else if (rf <= 1.0 && g_sleepFgFactor.load() > 1) cand = g_sleepFgFactor.load();
                     candRun = (cand == candPrev) ? candRun + 1 : 1;
                     candPrev = cand;
                     const int cur = g_sleepFgFactor.load();
