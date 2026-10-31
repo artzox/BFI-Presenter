@@ -127,6 +127,18 @@ third_party/ ReShade, Dear ImGui and Vulkan headers
 BFIPresenter.example.ini   shared settings reference
 ```
 
+## Acknowledgements
+
+- **[Mark Rejhon](https://github.com/mdrejhon) and [Blur Busters](https://blurbusters.com)**, for the ideas much of BFI Presenter is built on, and for advice along the way:
+  - **Variable MPRT**: front-loading each pixel's light into the lit refresh and spilling what doesn't fit into the next one;
+  - the **CRT beam simulator** approach, created with **Timothy Lottes**: rolling scan with phosphor fade, and the **LCD Saver**, which the Gradual mode follows, including the hold-then-slew variant for 2:1 strobing;
+  - **[TestUFO](https://testufo.com)**, the inspiration for the motion test;
+  - advice in the issues on low-ratio strobing, HDR brightness boosting, OLED VRR flicker and making the tool simpler to set up ([#57](https://github.com/artzox/BFI-Presenter/issues/57), [#67](https://github.com/artzox/BFI-Presenter/issues/67)).
+
+  BFI Presenter's code is written from scratch from those descriptions; no Blur Busters code is used.
+- **[crosire](https://github.com/crosire)**, for [ReShade](https://reshade.me) and its add-on API, which the DirectX and OpenGL presenter runs on, and **Omar Cornut**, for [Dear ImGui](https://github.com/ocornut/imgui).
+- Everyone who tested games, sent logs and reported issues: most of the fixes and the tested-games list come from you.
+
 ## Licence
 
 BFI Presenter is free software under the [GNU General Public License v3.0](LICENSE): you may use, study, share and modify it. If you distribute a modified version, you must release its source under the same licence. The vendored headers in [`third_party`](third_party/README.md) keep their own (permissive) licences.
