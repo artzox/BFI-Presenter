@@ -200,7 +200,7 @@ struct App {
 static App g_app;
 static void RestartAsAdmin();
 static std::string VkMachineElevated(bool add, const std::wstring &dir);
-static std::string GrantPriorityElevated(const std::wstring &sid);
+static std::string GrantPriorityElevated(const std::wstring &sid, bool remove = false);
 
 // ------------------------------------------------------------------ batch jobs
 // Installs, updates and removes over many games run a few per frame, so the window keeps drawing (a progress
@@ -1135,8 +1135,27 @@ static void DrawTop(HWND hwnd)
             ImGui::EndDisabled();
             Tooltip("Adds the Windows right 'Increase scheduling priority' to your account (one administrator prompt), so games "
                     "can run the presenter's GPU queue at realtime priority, ahead of the game's own GPU work, without being run "
-                    "as administrator. Takes effect after you sign out and back in. Any program you run can then raise its "
-                    "priority too; remove it in Local Security Policy > User Rights Assignment if you change your mind.");
+                    "as administrator. Takes effect after you sign out and back in. Windows gives rights to accounts, not to single "
+                    "programs, so any program you run can then raise its own priority too; Remove takes it away again.");
+        }
+        else if (!IsElevated() && (ps.held || !grantedAt.empty()))
+        {
+            ImGui::SameLine();
+            ImGui::BeginDisabled(g_app.busy || ps.sid.empty());
+            if (ImGui::SmallButton("Remove..."))
+            {
+                const std::string e = GrantPriorityElevated(ps.sid, true);
+                if (e.empty())
+                {
+                    SaveSetting(L"PrioGrantedLogon", L"");
+                    g_app.SetMsg("'Increase scheduling priority' removed from your account. It stays in effect until you sign out of "
+                                 "Windows; after that, games use the high-priority queue again.", false);
+                }
+                else g_app.SetMsg(e, true);
+            }
+            ImGui::EndDisabled();
+            Tooltip("Takes the 'Increase scheduling priority' right away from your account again (one administrator prompt). "
+                    "Applies after you sign out and back in.");
         }
     }
 
@@ -2333,12 +2352,12 @@ static void LoadFonts(float scale)
 }
 
 // Runs the Manager elevated to grant the user's account "Increase scheduling priority"; "" or the error.
-static std::string GrantPriorityElevated(const std::wstring &sid)
+static std::string GrantPriorityElevated(const std::wstring &sid, bool remove)
 {
-    if (IsElevated()) return GrantRealtimeGpuPriority(sid);
+    if (IsElevated()) return GrantRealtimeGpuPriority(sid, remove);
     wchar_t self[MAX_PATH];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
-    std::wstring args = L"--grant-priority " + sid;
+    std::wstring args = (remove ? L"--remove-priority " : L"--grant-priority ") + sid;
     SHELLEXECUTEINFOW ei = { sizeof(ei) };
     ei.fMask = SEE_MASK_NOCLOSEPROCESS;
     ei.lpVerb = L"runas";
@@ -2351,7 +2370,7 @@ static std::string GrantPriorityElevated(const std::wstring &sid)
     DWORD code = 1;
     GetExitCodeProcess(ei.hProcess, &code);
     CloseHandle(ei.hProcess);
-    return code == 0 ? "" : "Windows refused to add the right.";
+    return code == 0 ? "" : remove ? "Windows refused to remove the right." : "Windows refused to add the right.";
 }
 
 // Runs the Manager elevated for the all-users Vulkan layer registration (HKLM); "" or the error.
@@ -2383,9 +2402,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         int argc = 0;
         wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
         // Elevated helper: BFIPresenterManager.exe --grant-priority <user SID>
-        if (argv && argc >= 3 && wcscmp(argv[1], L"--grant-priority") == 0)
+        if (argv && argc >= 3 && (wcscmp(argv[1], L"--grant-priority") == 0 || wcscmp(argv[1], L"--remove-priority") == 0))
         {
-            const std::string e = GrantRealtimeGpuPriority(argv[2]);
+            const std::string e = GrantRealtimeGpuPriority(argv[2], wcscmp(argv[1], L"--remove-priority") == 0);
             LocalFree(argv);
             return e.empty() ? 0 : 1;
         }

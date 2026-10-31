@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.28-t5"
+#define BFI_ADDON_VERSION "1.0.28-t6"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2711,7 +2711,8 @@ static DWORD WINAPI PresenterThread(void *)
         g_running.store(false);
     }
     else
-        LOGI("BFI Presenter: presenter running (high-priority queue, %s pacing, presents on %s queue)",
+        LOGI("BFI Presenter: presenter running (%s queue, %s pacing, presents on %s queue)",
+             g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME ? "global realtime" : "high-priority",
              output ? "vblank" : "present-queue", g_ownPresentQueue ? "its own" : "the game's");
     EnterCriticalSection(&g_cfgLock);
     g_status.running = ok ? 1 : 0;

@@ -2383,8 +2383,8 @@ PrioState RealtimeGpuPriorityState()
     return st;
 }
 
-// Run elevated: adds "Increase scheduling priority" to the account with this SID. "" = done.
-std::string GrantRealtimeGpuPriority(const std::wstring &sid)
+// Run elevated: adds (or, with remove, takes away) "Increase scheduling priority" for the account with this SID. "" = done.
+std::string GrantRealtimeGpuPriority(const std::wstring &sid, bool remove)
 {
     PSID psid = nullptr;
     if (!ConvertStringSidToSidW(sid.c_str(), &psid)) return "Unknown account.";
@@ -2399,8 +2399,10 @@ std::string GrantRealtimeGpuPriority(const std::wstring &sid)
         right.Buffer = (PWSTR)kIncBasePrio;
         right.Length = (USHORT)(wcslen(kIncBasePrio) * sizeof(wchar_t));
         right.MaximumLength = right.Length + sizeof(wchar_t);
-        r = LsaAddAccountRights(pol, psid, &right, 1);
-        if (r != 0) err = "Couldn't add the right (error " + std::to_string(LsaNtStatusToWinError(r)) + ").";
+        r = remove ? LsaRemoveAccountRights(pol, psid, FALSE, &right, 1) : LsaAddAccountRights(pol, psid, &right, 1);
+        const DWORD we = LsaNtStatusToWinError(r);
+        if (r != 0 && !(remove && we == ERROR_FILE_NOT_FOUND))     // removing a right the account doesn't have: done
+            err = std::string(remove ? "Couldn't remove the right" : "Couldn't add the right") + " (error " + std::to_string(we) + ").";
         LsaClose(pol);
     }
     LocalFree(psid);

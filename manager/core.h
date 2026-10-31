@@ -159,7 +159,7 @@ std::string RegisterVulkanLayerMachine(bool add, const std::wstring &dir);
 bool IsElevated();
 struct PrioState { bool held = false; unsigned long long logon = 0; std::wstring sid; };
 PrioState RealtimeGpuPriorityState();                       // this process's token (as the games get it)
-std::string GrantRealtimeGpuPriority(const std::wstring &sid);   // elevated only
+std::string GrantRealtimeGpuPriority(const std::wstring &sid, bool remove = false);   // elevated only
 bool ExeRunsAsAdmin(const std::wstring &exe);    // "Run this program as an administrator" set for it
 std::wstring BackupDir();
 std::wstring LogPath();
