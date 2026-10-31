@@ -137,7 +137,7 @@ BFIPresenter.example.ini   shared settings reference
 
   BFI Presenter's code is written from scratch from those descriptions; no Blur Busters code is used.
 - **[crosire](https://github.com/crosire)**, for [ReShade](https://reshade.me) and its add-on API, which the DirectX and OpenGL presenter runs on, and **Omar Cornut**, for [Dear ImGui](https://github.com/ocornut/imgui).
-- Everyone who tested games, sent logs and reported issues: most of the fixes and the tested-games list come from you.
+- Everyone who tested games, sent logs and reported issues.
 
 ## Licence
 
