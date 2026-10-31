@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.28-t6"
+#define BFI_ADDON_VERSION "1.0.28-t7"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3792,7 +3792,10 @@ static DWORD WINAPI PresenterThread(void *)
                 // drawing steadily with the hitch guard running (Returnal ~7 fps, Pragmata ~8), so a second
                 // with the hitch guard paused or below 3 fps restarts the check instead of counting.
                 const bool rfxLimitBad = g_rfxLimitBad.load();
-                const bool stallSec = fpsA < 3.0 || hitchPaused;
+                // Also a second without the game's Reflex reports: a game collapsed under the limit keeps reporting (Returnal
+                // at 7 fps), a load screen doesn't (Control, 3x frame generation: 20 presented, 0 reports, 2 s after a hitch
+                // -- read as a collapse, and with frame generation the cap then stayed at Refresh rate for the session).
+                const bool stallSec = fpsA < 3.0 || hitchPaused || t - rsLastT >= 1.5 || rsLast.frames <= 0;
                 // Nor is frame generation switching off: until 5 seconds agree it stays 'active' and the limit keeps
                 // its 2x per rendered frame, so the game runs at half the cap for those seconds (Returnal with frame
                 // generation turned off in the options: "fell to 30 fps", Reflex's limit gone for the session).
