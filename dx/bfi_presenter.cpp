@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.28-t2"
+#define BFI_ADDON_VERSION "1.0.28-t3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2722,6 +2722,8 @@ static DWORD WINAPI PresenterThread(void *)
     bool   fgWas = false;
     bool   capByReflex = false;
     bool   fgSkipLogged = false;  // the frame-generation try at Refresh rate skipped (logged once)
+    int    fgFillSecs = 0;        // seconds in a row the frame-generation estimate said the game could fill the refresh rate
+    double fgNeedNow = 0.0, fgTryNeedMs = 0.0, fgFailNeedMs = 0.0;   // GPU/CPU ms per rendered frame: now, at the try, at a failed try
     bool   reflexCap = false;     // the game frame cap applied with Reflex's frame limit (CapWithReflex)
     double rcOnT = -100.0, fpsAtRc = 0.0;
     double rfxChkT = -100.0;      // start of the collapse check after a step-down with Reflex's limit (moved on by stalls)
@@ -3714,7 +3716,10 @@ static DWORD WINAPI PresenterThread(void *)
                     const bool fgRate = hzA <= 0.0 || g_status.gameFps >= 0.35 * hzA;
                     // Reflex reports still coming (within 3 s) but no rendered count for now: a stall, so the state is
                     // kept (Alan Wake 2 with 2x read as "not active" right after each hitch, and the cap went to Refresh).
-                    if (rsEverT > 0.0 && !rfxStopped) fg = fgWas;
+                    // Frame generation already on: kept for up to 8 s without reports, so a stall of a few seconds doesn't
+                    // switch the limit to 1x and back (Alan Wake 2, 3x: "not active (60 presented, 20 rendered)" right after
+                    // a 2 s hitch, back 5 s later).
+                    if (rsEverT > 0.0 && (!rfxStopped || (fgWas && t - rsEverT < 8.0))) fg = fgWas;
                     else fg = dlssOnPath && (!g_fgCallerDlss.load() || (rfxStopped && (fgWas || fgRate)));
                     if (dlssOnPath && g_fgCallerDlss.load() && rsEverT > 0.0 && !rfxStopped && !fgEarlyLogged)
                     {
@@ -3837,8 +3842,11 @@ static DWORD WINAPI PresenterThread(void *)
                 // frames can't reach it anyway -- the frame-generation factor times what the GPU / CPU time per rendered
                 // frame allows, against the refresh rate. Each try was 4 s of uneven frames (Alan Wake 2, 3x: GPU 33 ms
                 // per rendered frame, at most ~90 of 120).
+                // Reflex's GPU time leaves out frame generation's own GPU work, so the estimate is optimistic (Alan Wake 2,
+                // 3x: 27 ms read as ~111 fps possible, the try held 67): it has to say "can fill" for 5 s in a row, and
+                // after a failed try, the next one waits until the GPU time per rendered frame is 20% below that try's.
                 auto FgCantFill = [&]() -> bool {
-                    if (t - rsLastT >= 3.0 || rsLast.frames <= 0 || rsLast.gpuActiveMs <= 0.0) return false;
+                    if (t - rsLastT >= 3.0 || rsLast.frames <= 0 || rsLast.gpuActiveMs <= 0.0) { fgFillSecs = 0; return false; }
                     const double rend = g_rfxRenderedFps.load();
                     if (rend <= 1.0 || fpsA <= 0.0) return false;
                     const double factor = std::max(1.0, std::round(fpsA / rend));
@@ -3846,12 +3854,19 @@ static DWORD WINAPI PresenterThread(void *)
                     if (rsLast.simMs > needMs) needMs = rsLast.simMs;
                     if (rsLast.submitMs > needMs) needMs = rsLast.submitMs;
                     const double canFps = factor * 1000.0 / needMs;
-                    if (canFps >= 0.9 * hzA) return false;
+                    fgNeedNow = needMs;
+                    const bool failedHere = fgFailNeedMs > 0.0 && needMs > 0.8 * fgFailNeedMs;
+                    fgFillSecs = (canFps >= 0.9 * hzA && !failedHere) ? fgFillSecs + 1 : 0;
+                    if (fgFillSecs >= 5) return false;
                     if (!fgSkipLogged)
                     {
                         fgSkipLogged = true;
-                        LOGI("BFI Presenter: automatic frame cap: no try at Refresh rate with frame generation -- %.0fx at %.1f ms "
-                             "per rendered frame allows about %.0f of %.0f fps", factor, needMs, canFps, hzA);
+                        if (failedHere)
+                            LOGI("BFI Presenter: automatic frame cap: no try at Refresh rate with frame generation -- %.1f ms per rendered "
+                                 "frame, not well below the %.1f ms of the last try that failed", needMs, fgFailNeedMs);
+                        else
+                            LOGI("BFI Presenter: automatic frame cap: no try at Refresh rate with frame generation -- %.0fx at %.1f ms "
+                                 "per rendered frame allows about %.0f of %.0f fps", factor, needMs, canFps, hzA);
                     }
                     return true;
                 };
@@ -3917,6 +3932,7 @@ static DWORD WINAPI PresenterThread(void *)
                                 // longest delay (Soul Reaver at 64 of 120: 53 ms from release to flash for 4 s), so the
                                 // next one waits 5 minutes.
                                 if (fpsA < 0.8 * hzA) probeWait = 300.0;
+                                if (fg && fgTryNeedMs > 0.0) { fgFailNeedMs = fgTryNeedMs; fgSkipLogged = false; }
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
                             }
@@ -3967,6 +3983,7 @@ static DWORD WINAPI PresenterThread(void *)
                         // No Reflex reports (or frame generation, whose reports are for rendered frames):
                         // try Refresh for a few seconds.
                         autoCapDown = false; capProbe = true; probeSecs = probeGood = 0; capSwitchT = t; capUpT = t;
+                        fgTryNeedMs = fg ? fgNeedNow : 0.0; fgFillSecs = 0;
                     }
                 }
                 else
