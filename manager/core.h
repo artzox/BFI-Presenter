@@ -5,8 +5,8 @@
 #include <vector>
 #include <functional>
 
-#define MANAGER_VERSION "1.3.12"
-#define MANAGER_VERSION_W L"1.3.12"
+#define MANAGER_VERSION "1.3.13"
+#define MANAGER_VERSION_W L"1.3.13"
 
 namespace bfi {
 
@@ -84,6 +84,8 @@ struct Game {
     bool         nvVrrOwn = false, nvVsyncOwn = false;
     long long    nvGl = -1;      // Vulkan/OpenGL present method
     bool         nvGlOwn = false;
+    long long    nvPower = -1;   // Power management mode
+    bool         nvPowerOwn = false;
     bool         hidden = false;
 };
 
@@ -155,6 +157,9 @@ std::string UninstallVulkanLayer();
 // with --vk-machine add|remove <dir> for it.
 std::string RegisterVulkanLayerMachine(bool add, const std::wstring &dir);
 bool IsElevated();
+struct PrioState { bool held = false; unsigned long long logon = 0; std::wstring sid; };
+PrioState RealtimeGpuPriorityState();                       // this process's token (as the games get it)
+std::string GrantRealtimeGpuPriority(const std::wstring &sid);   // elevated only
 bool ExeRunsAsAdmin(const std::wstring &exe);    // "Run this program as an administrator" set for it
 std::wstring BackupDir();
 std::wstring LogPath();

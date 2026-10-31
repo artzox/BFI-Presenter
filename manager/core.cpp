@@ -7,6 +7,8 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <winhttp.h>
+#include <ntsecapi.h>
+#include <sddl.h>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -2343,6 +2345,66 @@ bool IsElevated()
     const bool ok = GetTokenInformation(tok, TokenElevation, &e, sizeof(e), &n) && e.TokenIsElevated;
     CloseHandle(tok);
     return ok;
+}
+
+// ---------------------------------------------------------------- Realtime GPU priority
+// The presenter's GPU queue runs at "global realtime" priority only in a process whose token holds
+// SeIncreaseBasePriorityPrivilege ("Increase scheduling priority"). Games normally run without it.
+static const wchar_t kIncBasePrio[] = L"SeIncreaseBasePriorityPrivilege";
+
+PrioState RealtimeGpuPriorityState()
+{
+    PrioState st;
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return st;
+    LUID want{};
+    LookupPrivilegeValueW(nullptr, kIncBasePrio, &want);
+    DWORD n = 0;
+    GetTokenInformation(tok, TokenPrivileges, nullptr, 0, &n);
+    std::vector<BYTE> buf(n ? n : 1);
+    if (n && GetTokenInformation(tok, TokenPrivileges, buf.data(), n, &n))
+    {
+        auto *tp = (TOKEN_PRIVILEGES *)buf.data();
+        for (DWORD i = 0; i < tp->PrivilegeCount; i++)
+            if (tp->Privileges[i].Luid.LowPart == want.LowPart && tp->Privileges[i].Luid.HighPart == want.HighPart) st.held = true;
+    }
+    TOKEN_STATISTICS ts{};
+    if (GetTokenInformation(tok, TokenStatistics, &ts, sizeof(ts), &n))
+        st.logon = ((unsigned long long)(unsigned)ts.AuthenticationId.HighPart << 32) | ts.AuthenticationId.LowPart;
+    // the user's SID, as text (the elevated helper grants the right to it, not to the administrator account)
+    GetTokenInformation(tok, TokenUser, nullptr, 0, &n);
+    std::vector<BYTE> ub(n ? n : 1);
+    if (n && GetTokenInformation(tok, TokenUser, ub.data(), n, &n))
+    {
+        wchar_t *s = nullptr;
+        if (ConvertSidToStringSidW(((TOKEN_USER *)ub.data())->User.Sid, &s)) { st.sid = s; LocalFree(s); }
+    }
+    CloseHandle(tok);
+    return st;
+}
+
+// Run elevated: adds "Increase scheduling priority" to the account with this SID. "" = done.
+std::string GrantRealtimeGpuPriority(const std::wstring &sid)
+{
+    PSID psid = nullptr;
+    if (!ConvertStringSidToSidW(sid.c_str(), &psid)) return "Unknown account.";
+    LSA_OBJECT_ATTRIBUTES oa{};
+    LSA_HANDLE pol = nullptr;
+    NTSTATUS r = LsaOpenPolicy(nullptr, &oa, POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES, &pol);
+    std::string err;
+    if (r != 0) err = "Couldn't open the local security policy (error " + std::to_string(LsaNtStatusToWinError(r)) + ").";
+    else
+    {
+        LSA_UNICODE_STRING right;
+        right.Buffer = (PWSTR)kIncBasePrio;
+        right.Length = (USHORT)(wcslen(kIncBasePrio) * sizeof(wchar_t));
+        right.MaximumLength = right.Length + sizeof(wchar_t);
+        r = LsaAddAccountRights(pol, psid, &right, 1);
+        if (r != 0) err = "Couldn't add the right (error " + std::to_string(LsaNtStatusToWinError(r)) + ").";
+        LsaClose(pol);
+    }
+    LocalFree(psid);
+    return err;
 }
 
 static bool RegDword(HKEY root, const wchar_t *sub, const wchar_t *val, DWORD &out)

@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.28-t4"
+#define BFI_ADDON_VERSION "1.0.28-t5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -133,6 +133,7 @@ struct Settings
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
     int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
+    int   threadBoost = 1;       // PresenterThreadBoost: the presenter thread registered with MMCSS (applies at the next start)
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap without Reflex holds the game before its next frame starts
     int   fgLimitNoReflex = 1; // FrameGenLimitWithoutReflex: frame generation without Reflex limited to one presented frame per strobe cycle
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
@@ -277,6 +278,7 @@ static void LoadSettings(Settings &s)
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = IniInt("LearnPerGame", 1) ? 1 : 0;
+    s.threadBoost = IniInt("PresenterThreadBoost", 1) ? 1 : 0;
     s.autoCapOwn = IniInt("AutoCapOwnWithoutFg", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
@@ -429,6 +431,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameGenLimitWithoutReflex", s.fgLimitNoReflex);
     IniWriteInt("AutoCapAtFrameStart", s.autoCapFrameStart);
     IniWriteInt("LearnPerGame", s.learnPerGame);
+    IniWriteInt("PresenterThreadBoost", s.threadBoost);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
     IniWriteInt("GameFrameStatistics", s.virtualStats);
@@ -894,6 +897,38 @@ static bool EnableBasePriorityPrivilege()
                       : "Steam and other launchers restart the game without administrator rights: run the launcher itself "
                         "as administrator, or grant your account 'Increase scheduling priority' in Local Security Policy.");
     return done == 1;
+}
+
+// The presenter thread first, as Blur Busters advises: a late strobe flickers, a late game frame is only a stutter.
+// 1. Out of Windows' power throttling (EcoQoS): on laptops and in Balanced power plans Windows can run a thread at
+//    reduced clock speed; the presenter wakes every refresh and must not be slowed. No administrator rights needed.
+// 2. Registered with the Multimedia Class Scheduler (MMCSS, "Games" task, high): the scheduler audio and DWM use,
+//    which raises the thread above every normal thread while it keeps to its share (PresenterThreadBoost=0: off).
+static void BoostPresenterThread(bool mmcss, const char *who)
+{
+    struct PowerThrottling { ULONG version, controlMask, stateMask; };
+    typedef BOOL (WINAPI *SetThreadInformation_t)(HANDLE, int, LPVOID, DWORD);
+    bool ecoOff = false, mm = false;
+    if (auto sti = (SetThreadInformation_t)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation"))
+    {
+        PowerThrottling ps = { 1, 0x1 /*EXECUTION_SPEED*/, 0 /*off*/ };
+        ecoOff = sti(GetCurrentThread(), 3 /*ThreadPowerThrottling*/, &ps, sizeof(ps)) != FALSE;
+    }
+    if (mmcss)
+    {
+        typedef HANDLE (WINAPI *AvSet_t)(LPCWSTR, LPDWORD);
+        typedef BOOL (WINAPI *AvPrio_t)(HANDLE, int);
+        if (HMODULE av = LoadLibraryW(L"avrt.dll"))
+        {
+            auto set = (AvSet_t)(void *)GetProcAddress(av, "AvSetMmThreadCharacteristicsW");
+            auto prio = (AvPrio_t)(void *)GetProcAddress(av, "AvSetMmThreadPriority");
+            DWORD idx = 0;
+            HANDLE h = set ? set(L"Games", &idx) : nullptr;
+            if (h) { mm = true; if (prio) prio(h, 1 /*AVRT_PRIORITY_HIGH*/); }
+        }
+    }
+    LOGI("BFI Presenter: %s thread: power throttling %s, multimedia scheduler %s", who, ecoOff ? "off" : "unchanged",
+         !mmcss ? "off (PresenterThreadBoost=0)" : mm ? "on (Games, high)" : "not available");
 }
 
 // Later release: time each game frame from its release to its copy finishing
@@ -2497,6 +2532,12 @@ static DWORD WINAPI PresenterThread(void *)
     // any other queue gets the device removed (seen in Resonance).
     ID3D12CommandQueue *queue = g_ownPresentQueue ? g_presQueue : g_gameQueue;
     t_presenterThread = true;
+    {
+        EnterCriticalSection(&g_cfgLock);
+        const bool mm = g_shared.threadBoost != 0;
+        LeaveCriticalSection(&g_cfgLock);
+        BoostPresenterThread(mm, "presenter");
+    }
     ID3D12DescriptorHeap *rtvHeap = nullptr, *srvHeap = nullptr;
     ID3D12CommandAllocator *alloc[kMaxBuf] = {};
     ID3D12GraphicsCommandList *list = nullptr;
@@ -9369,6 +9410,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
         bool vb = s.pacing != 0, oq = s.ownQueue != 0;
         if (ImGui::Checkbox("Wait for vblank", &vb)) s.pacing = vb ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("One present per refresh, nothing queued: lowest latency. Needed by just-in-time release.");
+        bool tb = s.threadBoost != 0;
+        if (ImGui::Checkbox("Multimedia scheduler for the presenter thread (applies at the next start)", &tb)) s.threadBoost = tb ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Registers the presenter thread with Windows' Multimedia Class Scheduler (the one audio and\n"
+                                                      "the desktop compositor use), which runs it ahead of every normal thread, the game's included.\n"
+                                                      "A late strobe flickers; a late game frame is only a stutter. On by default; the log says\n"
+                                                      "whether it took effect. Power throttling is turned off for the thread either way.");
         bool qa = s.queueAhead != 0;
         if (ImGui::Checkbox("Queue one refresh ahead (needs 3 presenter buffers, Wait for vblank on)", &qa)) s.queueAhead = qa ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keeps exactly one extra present queued, so an occasional late slot is covered\nwithout a flash. +1 refresh (8 ms) of latency. Unlike Wait for vblank off, the\nqueue never grows, so the driver doesn't throttle the game.");
