@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.28-t1"
+#define BFI_ADDON_VERSION "1.0.28-t2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2721,6 +2721,7 @@ static DWORD WINAPI PresenterThread(void *)
     double capSwitchT = -100.0, capUpT = -100.0, probeWait = 30.0, stayMin = 10.0;
     bool   fgWas = false;
     bool   capByReflex = false;
+    bool   fgSkipLogged = false;  // the frame-generation try at Refresh rate skipped (logged once)
     bool   reflexCap = false;     // the game frame cap applied with Reflex's frame limit (CapWithReflex)
     double rcOnT = -100.0, fpsAtRc = 0.0;
     double rfxChkT = -100.0;      // start of the collapse check after a step-down with Reflex's limit (moved on by stalls)
@@ -3832,6 +3833,28 @@ static DWORD WINAPI PresenterThread(void *)
                 // seconds (The Callisto Protocol, Riven), so the cap stays at Refresh while that limit is in use.
                 const bool fgLimitOn = g_fgPaceUs.load() > 0 && g_fgPaceKind.load() == 1;
                 const bool capOn = s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg) && !fgLimitOn;
+                // Frame generation under Reflex's limit: skip the 5-minute try at Refresh rate when the game's rendered
+                // frames can't reach it anyway -- the frame-generation factor times what the GPU / CPU time per rendered
+                // frame allows, against the refresh rate. Each try was 4 s of uneven frames (Alan Wake 2, 3x: GPU 33 ms
+                // per rendered frame, at most ~90 of 120).
+                auto FgCantFill = [&]() -> bool {
+                    if (t - rsLastT >= 3.0 || rsLast.frames <= 0 || rsLast.gpuActiveMs <= 0.0) return false;
+                    const double rend = g_rfxRenderedFps.load();
+                    if (rend <= 1.0 || fpsA <= 0.0) return false;
+                    const double factor = std::max(1.0, std::round(fpsA / rend));
+                    double needMs = rsLast.gpuActiveMs;
+                    if (rsLast.simMs > needMs) needMs = rsLast.simMs;
+                    if (rsLast.submitMs > needMs) needMs = rsLast.submitMs;
+                    const double canFps = factor * 1000.0 / needMs;
+                    if (canFps >= 0.9 * hzA) return false;
+                    if (!fgSkipLogged)
+                    {
+                        fgSkipLogged = true;
+                        LOGI("BFI Presenter: automatic frame cap: no try at Refresh rate with frame generation -- %.0fx at %.1f ms "
+                             "per rendered frame allows about %.0f of %.0f fps", factor, needMs, canFps, hzA);
+                    }
+                    return true;
+                };
                 // "Forget this game": the cap and the frame start start over (the section is deleted on the watchdog thread).
                 if (g_learnForgetNow.exchange(false))
                 {
@@ -3938,7 +3961,8 @@ static DWORD WINAPI PresenterThread(void *)
                     // With frame generation, a try means 3 s without the limit, and DLSS-G re-pacing twice:
                     // a visible stutter each time (God of War Ragnarok, every 30-120 s). Frame generation that
                     // could fill the refresh rate is rare, so try only every 5 minutes then.
-                    else if (t - capSwitchT >= (fg && capByReflex ? 300.0 : probeWait) && !hitchPaused)
+                    else if (t - capSwitchT >= (fg && capByReflex ? 300.0 : probeWait) && !hitchPaused &&
+                             !(fg && capByReflex && FgCantFill()))
                     {
                         // No Reflex reports (or frame generation, whose reports are for rendered frames):
                         // try Refresh for a few seconds.
