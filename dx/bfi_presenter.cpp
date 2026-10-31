@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27"
+#define BFI_ADDON_VERSION "1.0.28-t1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3711,7 +3711,10 @@ static DWORD WINAPI PresenterThread(void *)
                     // stopped its reports in loading stalls at 27-29 fps and was read as frame generation for ~20 s
                     // (the cap at Refresh, Reflex's limit off). Returnal with frame generation presented 50-60.
                     const bool fgRate = hzA <= 0.0 || g_status.gameFps >= 0.35 * hzA;
-                    fg = dlssOnPath && (!g_fgCallerDlss.load() || (rfxStopped && (fgWas || fgRate)));
+                    // Reflex reports still coming (within 3 s) but no rendered count for now: a stall, so the state is
+                    // kept (Alan Wake 2 with 2x read as "not active" right after each hitch, and the cap went to Refresh).
+                    if (rsEverT > 0.0 && !rfxStopped) fg = fgWas;
+                    else fg = dlssOnPath && (!g_fgCallerDlss.load() || (rfxStopped && (fgWas || fgRate)));
                     if (dlssOnPath && g_fgCallerDlss.load() && rsEverT > 0.0 && !rfxStopped && !fgEarlyLogged)
                     {
                         fgEarlyLogged = true;
@@ -3773,7 +3776,10 @@ static DWORD WINAPI PresenterThread(void *)
                     }
                 }
                 else gameLimBadSecs = 0;
-                const bool rfxUse = t - rsLastT < 3.0 && rsLast.frames > 0 && !g_rfxLimitBad.load();
+                // Reflex in use: reports within the last 3 s, not only in the last second -- a one-second stall with no
+                // reports took the cap to Refresh rate with frame generation for ~7 s (Alan Wake 2, 2x: "frame generation
+                // without Reflex").
+                const bool rfxUse = rsEverT > 0.0 && t - rsEverT < 3.0 && !g_rfxLimitBad.load();
                 // Game frame cap with Reflex's frame limit (CapWithReflex, off by default): in games with
                 // Reflex, a cap below the refresh rate (Half, Quarter, one per strobe cycle, custom) is applied
                 // by the driver where the game starts each frame, instead of holding the game at Present --
