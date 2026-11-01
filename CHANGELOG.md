@@ -9,6 +9,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 
 ## [Unreleased] (Manager 1.3.14)
 
+- **[Manager] Ticked-games controls wrap** in a narrow right pane instead of running off its edge (Remove, Change version, the NVIDIA settings and Apply were hidden until the pane was widened).
 - **[Manager] Power management for ticked games:** the NVIDIA row for several ticked games (G-SYNC, VSync, Apply) has a **Power** choice too: leave, use global, prefer maximum performance or normal.
 
 ## [1.0.28] — 2026-11-01 (Manager 1.3.13)
