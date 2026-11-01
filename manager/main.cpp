@@ -1690,6 +1690,8 @@ static void DrawInstallQuestion()
     ImGui::EndPopup();
 }
 
+static float LabeledW(const char *l, float comboW) { return ImGui::CalcTextSize(l).x + ImGui::GetStyle().ItemSpacing.x + comboW; }
+
 static void DrawBatch()
 {
     std::vector<Game *> sel;
@@ -1711,12 +1713,12 @@ static void DrawBatch()
         RequestInstall(todo);
     }
     ImGui::EndDisabled();
-    ImGui::SameLine();
     snprintf(lbl, 64, "Remove (%d)", nRem);
+    SameLineIfFits(ButtonW(lbl));
     ImGui::BeginDisabled(nRem == 0 || g_app.busy);
     if (ImGui::Button(lbl)) ImGui::OpenPopup("Remove ticked");
     ImGui::EndDisabled();
-    ImGui::SameLine();
+    SameLineIfFits(ImGui::GetFrameHeight() + ButtonW("Remove deletes the ini too"));
     ImGui::Checkbox("Remove deletes the ini too", &g_app.removeIni);
     if (ImGui::BeginPopupModal("Remove ticked", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
     {
@@ -1748,14 +1750,14 @@ static void DrawBatch()
             }
         ImGui::Spacing();
         ReShadeVersionCombo(ImGui::GetFontSize() * 11);
-        ImGui::SameLine();
         snprintf(lbl, 64, "Install ReShade (%d)", (int)need.size());
+        SameLineIfFits(ButtonW(lbl));
         ImGui::BeginDisabled(need.empty() || g_app.busy || g_app.rsVersion.empty());
         if (ImGui::Button(lbl)) RequestReShade(g_app.rsVersion, need);
         ImGui::EndDisabled();
         Tooltip("Installs the chosen ReShade version in the ticked games that don't have ReShade yet.");
-        ImGui::SameLine();
         snprintf(lbl, 64, "Change version (%d)", (int)change.size());
+        SameLineIfFits(ButtonW(lbl));
         ImGui::BeginDisabled(change.empty() || g_app.busy || g_app.rsVersion.empty());
         if (ImGui::Button(lbl)) StartReShade(g_app.rsVersion, change);
         ImGui::EndDisabled();
@@ -1773,21 +1775,24 @@ static void DrawBatch()
         ImGui::SameLine();
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
         ImGui::Combo("##bg", &gi, gItems, 4);
-        ImGui::SameLine();
+        const float fs = ImGui::GetFontSize();
+        SameLineIfFits(LabeledW("VSync", fs * 9));
+        ImGui::AlignTextToFramePadding();
         ImGui::TextColored(kGrey, "VSync");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
+        ImGui::SetNextItemWidth(fs * 9);
         ImGui::Combo("##bv", &vi, vItems, 4);
-        ImGui::SameLine();
         const char *pItems[] = { "leave", "use global", "prefer maximum performance", "normal" };
+        SameLineIfFits(LabeledW("Power", fs * 11));
+        ImGui::AlignTextToFramePadding();
         ImGui::TextColored(kGrey, "Power");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11);
+        ImGui::SetNextItemWidth(fs * 11);
         ImGui::Combo("##bp", &pi, pItems, 4);
         Tooltip("NVIDIA's power management mode for the ticked games. Prefer maximum performance keeps the card's clocks up "
                 "between frames, so a refresh isn't held up while it ramps back up.");
-        ImGui::SameLine();
         snprintf(lbl, 64, "Apply (%d)", (int)sel.size());
+        SameLineIfFits(ButtonW(lbl));
         ImGui::BeginDisabled(gi == 0 && vi == 0 && pi == 0);
         if (ImGui::Button(lbl))
         {
