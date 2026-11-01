@@ -7,6 +7,10 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Unreleased] (Manager 1.3.14)
+
+- **[Manager] Power management for ticked games:** the NVIDIA row for several ticked games (G-SYNC, VSync, Apply) has a **Power** choice too: leave, use global, prefer maximum performance or normal.
+
 ## [1.0.28] — 2026-11-01 (Manager 1.3.13)
 
 **The strobe comes first.** A late strobe flickers; a late game frame is only a stutter. 1.0.28 gives the presenter priority over the game on the GPU and the CPU, and makes frame generation under Reflex's limit hold steady through hitches and load screens.

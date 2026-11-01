@@ -1765,7 +1765,7 @@ static void DrawBatch()
     // NVIDIA settings for the ticked games
     if (g_app.nvOk)
     {
-        static int gi = 2, vi = 2;
+        static int gi = 2, vi = 2, pi = 0;
         const char *gItems[] = { "leave", "use global", "on", "off (fixed refresh)" };
         const char *vItems[] = { "leave", "use global", "3D application setting", "force on" };
         ImGui::AlignTextToFramePadding();
@@ -1779,18 +1779,27 @@ static void DrawBatch()
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
         ImGui::Combo("##bv", &vi, vItems, 4);
         ImGui::SameLine();
+        const char *pItems[] = { "leave", "use global", "prefer maximum performance", "normal" };
+        ImGui::TextColored(kGrey, "Power");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11);
+        ImGui::Combo("##bp", &pi, pItems, 4);
+        Tooltip("NVIDIA's power management mode for the ticked games. Prefer maximum performance keeps the card's clocks up "
+                "between frames, so a refresh isn't held up while it ramps back up.");
+        ImGui::SameLine();
         snprintf(lbl, 64, "Apply (%d)", (int)sel.size());
-        ImGui::BeginDisabled(gi == 0 && vi == 0);
+        ImGui::BeginDisabled(gi == 0 && vi == 0 && pi == 0);
         if (ImGui::Button(lbl))
         {
             long long vrr = gi == 0 ? -2 : gi == 1 ? -1 : gi == 2 ? kVrrAllow : kVrrForceOff;
             long long vs = vi == 0 ? -2 : vi == 1 ? -1 : vi == 2 ? kVsyncApp : kVsyncForceOn;
+            long long pw = pi == 0 ? -2 : pi == 1 ? -1 : pi == 2 ? kPowerMax : kPowerOptimal;
             int ok = 0, fail = 0;
             std::string firstErr;
             for (auto *g : sel)
             {
                 if (g->exe.empty()) continue;
-                std::string e = NvWrite(g->exe, W(g->name), vrr, vs);
+                std::string e = NvWrite(g->exe, W(g->name), vrr, vs, -2, pw);
                 if (e.empty()) ok++; else { fail++; if (firstErr.empty()) firstErr = e; }
                 if (fail && NvNeedsAdmin(firstErr)) break;
             }
