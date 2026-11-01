@@ -200,6 +200,7 @@ struct App {
 static App g_app;
 static void RestartAsAdmin();
 static std::string VkMachineElevated(bool add, const std::wstring &dir);
+static std::string GrantPriorityElevated(const std::wstring &sid, bool remove = false);
 
 // ------------------------------------------------------------------ batch jobs
 // Installs, updates and removes over many games run a few per frame, so the window keeps drawing (a progress
@@ -318,6 +319,7 @@ static void NvFill(std::vector<Game> &games)
         g.nvVrr = st[i].vrr; g.nvVrrOwn = st[i].vrrOwn;
         g.nvVsync = st[i].vsync; g.nvVsyncOwn = st[i].vsyncOwn;
         g.nvGl = st[i].glPresent; g.nvGlOwn = st[i].glPresentOwn;
+        g.nvPower = st[i].power; g.nvPowerOwn = st[i].powerOwn;
     }
 }
 
@@ -329,14 +331,15 @@ static void NvFillOne(Game &g)
     g.nvVrr = one[0].nvVrr; g.nvVrrOwn = one[0].nvVrrOwn;
     g.nvVsync = one[0].nvVsync; g.nvVsyncOwn = one[0].nvVsyncOwn;
     g.nvGl = one[0].nvGl; g.nvGlOwn = one[0].nvGlOwn;
+    g.nvPower = one[0].nvPower; g.nvPowerOwn = one[0].nvPowerOwn;
 }
 
 static std::wstring ExeName(const Game &g) { return g.exe.substr(g.exe.find_last_of(L'\\') + 1); }
 
 // vrr / vsync: -2 leave, -1 use global, else the value. Returns "" or the error (needAdmin set when that's the cause).
-static std::string NvSet(Game &g, long long vrr, long long vsync, long long gl = -2)
+static std::string NvSet(Game &g, long long vrr, long long vsync, long long gl = -2, long long power = -2)
 {
-    std::string e = NvWrite(g.exe, W(g.name), vrr, vsync, gl);
+    std::string e = NvWrite(g.exe, W(g.name), vrr, vsync, gl, power);
     NvFillOne(g);
     return e;
 }
@@ -1089,6 +1092,73 @@ static void DrawTop(HWND hwnd)
         if (!tv.empty() && tv != "0") { ImGui::SameLine(); ImGui::TextColored(kGrey, "(v%s)", tv.c_str()); }
     }
 
+    // GPU priority: whether games get the presenter's realtime GPU queue
+    {
+        static PrioState ps;
+        static bool init = false;
+        if (!init) { init = true; ps = RealtimeGpuPriorityState(); }
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(kGrey, "GPU priority");
+        ImGui::SameLine(ImGui::CalcTextSize("Vulkan layer").x + ImGui::GetFontSize() * 1.5f);
+        const std::wstring grantedAt = LoadSetting(L"PrioGrantedLogon", L"");
+        const std::wstring logonNow = std::to_wstring(ps.logon);
+        bool offerGrant = false;
+        if (IsElevated())
+            ImGui::TextColored(kGrey, "can't be checked while the Manager runs as administrator");
+        else if (ps.held)
+            ImGui::TextColored(kGreen, "Realtime: games get the presenter's realtime GPU queue");
+        else if (!grantedAt.empty() && grantedAt == logonNow)
+            ImGui::TextColored(kYellow, "Allowed for your account: sign out of Windows and back in to apply");
+        else if (!grantedAt.empty())
+        {
+            ImGui::TextColored(kOrange, "Allowed, but Windows withholds it from programs not run as administrator");
+            Tooltip("With an administrator account, Windows (User Account Control) gives programs a reduced set of rights unless "
+                    "they run as administrator, and this right isn't in it. Games then keep the high-priority queue, which works "
+                    "well in most games. Running the game (or its launcher) as administrator gives it realtime.");
+        }
+        else { ImGui::TextColored(kGrey, "High (realtime needs the 'Increase scheduling priority' right)"); offerGrant = true; }
+        if (offerGrant)
+        {
+            ImGui::SameLine();
+            ImGui::BeginDisabled(g_app.busy || ps.sid.empty());
+            if (ImGui::SmallButton("Allow for my account..."))
+            {
+                const std::string e = GrantPriorityElevated(ps.sid);
+                if (e.empty())
+                {
+                    SaveSetting(L"PrioGrantedLogon", logonNow);
+                    g_app.SetMsg("'Increase scheduling priority' added to your account. Sign out of Windows and back in, then start a "
+                                 "game: its ReShade.log says \"realtime GPU priority privilege enabled\".", false);
+                }
+                else g_app.SetMsg(e, true);
+            }
+            ImGui::EndDisabled();
+            Tooltip("Adds the Windows right 'Increase scheduling priority' to your account (one administrator prompt), so games "
+                    "can run the presenter's GPU queue at realtime priority, ahead of the game's own GPU work, without being run "
+                    "as administrator. Takes effect after you sign out and back in. Windows gives rights to accounts, not to single "
+                    "programs, so any program you run can then raise its own priority too; Remove takes it away again.");
+        }
+        else if (!IsElevated() && (ps.held || !grantedAt.empty()))
+        {
+            ImGui::SameLine();
+            ImGui::BeginDisabled(g_app.busy || ps.sid.empty());
+            if (ImGui::SmallButton("Remove..."))
+            {
+                const std::string e = GrantPriorityElevated(ps.sid, true);
+                if (e.empty())
+                {
+                    SaveSetting(L"PrioGrantedLogon", L"");
+                    g_app.SetMsg("'Increase scheduling priority' removed from your account. It stays in effect until you sign out of "
+                                 "Windows; after that, games use the high-priority queue again.", false);
+                }
+                else g_app.SetMsg(e, true);
+            }
+            ImGui::EndDisabled();
+            Tooltip("Takes the 'Increase scheduling priority' right away from your account again (one administrator prompt). "
+                    "Applies after you sign out and back in.");
+        }
+    }
+
     ImGui::Separator();
 
     // Toolbar
@@ -1413,13 +1483,13 @@ static bool IsGlAddon(const Game &g) { return (g.apis & ApiGL) && (g.route == Ro
 
 // Install or update, then (if chosen) set G-SYNC off / Vertical Sync Force on in each game's NVIDIA profile,
 // and for OpenGL games the Vulkan/OpenGL present method to Prefer layered on DXGI swapchain.
-static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsync, bool nvGl, bool rsVk = false)
+static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsync, bool nvGl, bool rsVk = false, bool nvPower = false)
 {
     std::vector<std::wstring> roots;
     for (auto *g : list) roots.push_back(g->root);
     std::string one = list.size() == 1 ? list[0]->name : "";
     StartJob("Installing BFI Presenter in " + std::to_string(roots.size()) + " games...", roots,
-             [nvGsync, nvVsync, nvGl, rsVk](Game &g, Job &j) {
+             [nvGsync, nvVsync, nvGl, rsVk, nvPower](Game &g, Job &j) {
                  std::string e = InstallOrUpdate(g, g_app.src);
                  if (!e.empty()) return e;
                  // Vulkan games: ReShade's Vulkan layer for the settings window, unless the tested list says the game
@@ -1428,20 +1498,22 @@ static void RunInstall(const std::vector<Game *> &list, bool nvGsync, bool nvVsy
                      g.tested.find("without ReShade") == std::string::npos)
                      SetReShadeVulkan(g, true, nullptr);
                  const bool gl = nvGl && IsGlAddon(g);
-                 if (g_app.nvOk && (nvGsync || nvVsync || gl))
+                 if (g_app.nvOk && (nvGsync || nvVsync || gl || nvPower))
                  {
-                     std::string ne = NvSet(g, nvGsync ? kVrrForceOff : -2, nvVsync ? kVsyncForceOn : -2, gl ? kGlPresentLayered : -2);
+                     std::string ne = NvSet(g, nvGsync ? kVrrForceOff : -2, nvVsync ? kVsyncForceOn : -2, gl ? kGlPresentLayered : -2,
+                                            nvPower ? kPowerMax : -2);
                      if (!ne.empty()) { j.nvFail++; if (j.nvErr.empty()) j.nvErr = ne; }
                  }
                  return std::string();
              },
-             [one, nvGsync, nvVsync, nvGl](Job &j) {
+             [one, nvGsync, nvVsync, nvGl, nvPower](Job &j) {
                  g_app.vk = DetectVulkanLayer();
                  std::string m = (!one.empty() && j.ok == 1) ? "Installed in " + one + "." : JobSummary(j, "Installed or updated");
                  if (!one.empty() && j.fail) m = "Failed: " + j.firstErr;
                  if (j.nvFail) m += " NVIDIA settings not changed: " + j.nvErr;
-                 else if (j.ok && (nvGsync || nvVsync) && g_app.nvOk)
-                     m += std::string(" NVIDIA:") + (nvGsync ? " G-SYNC off" : "") + (nvVsync ? " VSync force on" : "") + (nvGl ? " (OpenGL: present layered on DXGI)" : "") + ".";
+                 else if (j.ok && (nvGsync || nvVsync || nvPower) && g_app.nvOk)
+                     m += std::string(" NVIDIA:") + (nvGsync ? " G-SYNC off" : "") + (nvVsync ? " VSync force on" : "") +
+                          (nvPower ? " power: prefer maximum performance" : "") + (nvGl ? " (OpenGL: present layered on DXGI)" : "") + ".";
                  g_app.SetMsg(m, j.fail || j.nvFail);
                  if (j.nvFail && NvNeedsAdmin(j.nvErr)) g_app.needAdmin = true;
              });
@@ -1548,7 +1620,8 @@ static void RequestInstallNow(const std::vector<Game *> &list)
     }
     RunInstall(list, g_app.nvOk && LoadSetting(L"NvGsyncOff", L"1") == L"1" && LoadSetting(L"NvAskOnInstall", L"1") == L"0",
                g_app.nvOk && LoadSetting(L"NvVsyncOn", L"1") == L"1" && LoadSetting(L"NvAskOnInstall", L"1") == L"0",
-               g_app.nvOk && LoadSetting(L"NvGlLayered", L"1") == L"1" && LoadSetting(L"NvAskOnInstall", L"1") == L"0");
+               g_app.nvOk && LoadSetting(L"NvGlLayered", L"1") == L"1" && LoadSetting(L"NvAskOnInstall", L"1") == L"0", false,
+               g_app.nvOk && LoadSetting(L"NvPowerMax", L"1") == L"1" && LoadSetting(L"NvAskOnInstall", L"1") == L"0");
 }
 
 static void DrawInstallQuestion()
@@ -1565,13 +1638,14 @@ static void DrawInstallQuestion()
     else ImGui::TextWrapped("Install or update BFI Presenter in %d games.", (int)list.size());
     ImGui::Spacing();
     ImGui::TextUnformatted("Also change these NVIDIA settings in the game's profile:");
-    static bool gs = true, vs = true, gl = true, askAgain = true, init = false;
+    static bool gs = true, vs = true, gl = true, pw = true, askAgain = true, init = false;
     if (!init)
     {
         init = true;
         gs = LoadSetting(L"NvGsyncOff", L"1") == L"1";
         vs = LoadSetting(L"NvVsyncOn", L"1") == L"1";
         gl = LoadSetting(L"NvGlLayered", L"1") == L"1";
+        pw = LoadSetting(L"NvPowerMax", L"1") == L"1";
     }
     bool anyGl = false, anyVk = false;
     for (auto *g : list) { if (IsGlAddon(*g)) anyGl = true; if (g->route == Route::Vulkan && !g->reshadeVkIni) anyVk = true; }
@@ -1581,6 +1655,9 @@ static void DrawInstallQuestion()
             "below 120 Hz (Control, Undying). Same as NVIDIA Profile Inspector: G-SYNC = Force off.");
     ImGui::Checkbox("Vertical Sync: Force on", &vs);
     Tooltip("Games that ignore VSync otherwise tear or run unpaced (Resonance). Never use Force off or Fast Sync with BFI.");
+    ImGui::Checkbox("Power management: Prefer maximum performance", &pw);
+    Tooltip("Keeps the graphics card at full clocks while the game runs instead of letting it clock down between frames, so "
+            "the presenter's refreshes aren't held up by the card ramping back up. Only for this game; uses a little more power.");
     if (anyGl)
     {
         ImGui::Checkbox("OpenGL: present method Prefer layered on DXGI swapchain", &gl);
@@ -1602,10 +1679,11 @@ static void DrawInstallQuestion()
     {
         SaveSetting(L"NvGsyncOff", gs ? L"1" : L"0");
         SaveSetting(L"NvVsyncOn", vs ? L"1" : L"0");
+        SaveSetting(L"NvPowerMax", pw ? L"1" : L"0");
         if (anyGl) SaveSetting(L"NvGlLayered", gl ? L"1" : L"0");
         SaveSetting(L"NvAskOnInstall", askAgain ? L"1" : L"0");
         ImGui::CloseCurrentPopup();
-        RunInstall(list, gs, vs, anyGl && gl, anyVk && g_app.vk.reshadeLayer && rsVk);
+        RunInstall(list, gs, vs, anyGl && gl, anyVk && g_app.vk.reshadeLayer && rsVk, pw);
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
@@ -1896,6 +1974,23 @@ static void NvidiaControls(Game &g, float lab)
     {
         ImGui::TextColored(kYellow, "  *"); ImGui::SameLine(lab);
         ImGui::TextWrapped("Force off and Fast Sync break the strobe's cadence: use the 3D application setting or Force on.");
+    }
+    {
+        const char *pItems[] = { "Use global setting", "Prefer maximum performance", "Normal" };
+        int pi = !g.nvPowerOwn ? 0 : g.nvPower == kPowerMax ? 1 : 2;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(kGrey, "Power"); ImGui::SameLine(lab);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11);
+        if (ImGui::Combo("##power", &pi, pItems, 3))
+        {
+            std::string e = NvSet(g, -2, -2, -2, pi == 0 ? -1 : pi == 1 ? kPowerMax : kPowerOptimal);
+            if (e.empty()) g_app.SetMsg("Power management for " + g.name + ": " + std::string(pItems[pi]) + ".", false);
+            else { g_app.SetMsg(e, true); g_app.needAdmin = NvNeedsAdmin(e); }
+        }
+        Tooltip("NVIDIA's power management mode for this game. Prefer maximum performance keeps the card's clocks up between "
+                "frames, so a refresh isn't held up while it ramps back up (the per-game equivalent of a performance mode).");
+        ImGui::SameLine();
+        ImGui::TextColored(g.nvPower == kPowerMax ? kGreen : kGrey, "now: %s%s", PowerText(g.nvPower).c_str(), g.nvPowerOwn ? "" : " (global)");
     }
     if (!(g.apis & ApiGL)) return;
     const char *oItems[] = { "Use global setting", "Auto", "Prefer layered on DXGI swapchain", "Prefer native" };
@@ -2256,6 +2351,28 @@ static void LoadFonts(float scale)
     }
 }
 
+// Runs the Manager elevated to grant the user's account "Increase scheduling priority"; "" or the error.
+static std::string GrantPriorityElevated(const std::wstring &sid, bool remove)
+{
+    if (IsElevated()) return GrantRealtimeGpuPriority(sid, remove);
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring args = (remove ? L"--remove-priority " : L"--grant-priority ") + sid;
+    SHELLEXECUTEINFOW ei = { sizeof(ei) };
+    ei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    ei.lpVerb = L"runas";
+    ei.lpFile = self;
+    ei.lpParameters = args.c_str();
+    ei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&ei) || !ei.hProcess)
+        return GetLastError() == ERROR_CANCELLED ? "Administrator rights weren't granted." : "Couldn't start the Manager as administrator.";
+    WaitForSingleObject(ei.hProcess, 30000);
+    DWORD code = 1;
+    GetExitCodeProcess(ei.hProcess, &code);
+    CloseHandle(ei.hProcess);
+    return code == 0 ? "" : remove ? "Windows refused to remove the right." : "Windows refused to add the right.";
+}
+
 // Runs the Manager elevated for the all-users Vulkan layer registration (HKLM); "" or the error.
 static std::string VkMachineElevated(bool add, const std::wstring &dir)
 {
@@ -2284,6 +2401,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         // Elevated helper: BFIPresenterManager.exe --vk-machine add|remove "<layer folder>"
         int argc = 0;
         wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        // Elevated helper: BFIPresenterManager.exe --grant-priority <user SID>
+        if (argv && argc >= 3 && (wcscmp(argv[1], L"--grant-priority") == 0 || wcscmp(argv[1], L"--remove-priority") == 0))
+        {
+            const std::string e = GrantRealtimeGpuPriority(argv[2], wcscmp(argv[1], L"--remove-priority") == 0);
+            LocalFree(argv);
+            return e.empty() ? 0 : 1;
+        }
         if (argv && argc >= 4 && wcscmp(argv[1], L"--vk-machine") == 0)
         {
             const std::string e = RegisterVulkanLayerMachine(wcscmp(argv[2], L"add") == 0, argv[3]);

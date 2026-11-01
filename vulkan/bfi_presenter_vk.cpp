@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.27"
+#define BFI_VERSION "1.0.28"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -266,6 +266,7 @@ struct Settings
     int   output   = -1;      // -1 auto, 0 SDR, 1 scRGB, 2 HDR10
     int   autoCap  = 1;       // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
+    int   threadBoost = 1;       // PresenterThreadBoost: the presenter thread registered with MMCSS (applies at the next start)
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap times the game's frame start with a search across the strobe cycle
     int   fgDllCheck = 1;     // FrameGenDllCheck: a loaded frame generation DLL counts as frame generation (games without Reflex)
     int   gameCap  = 1;       // 0 off, 1 refresh rate, 2 half refresh, 3 quarter refresh,
@@ -359,6 +360,7 @@ static void LoadSettings(Settings &s)
     s.fgDllCheck = KvInt(kv, "FrameGenDllCheck", 1) ? 1 : 0;
     s.autoCapFrameStart = KvInt(kv, "AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = KvInt(kv, "LearnPerGame", 1) ? 1 : 0;
+    s.threadBoost = KvInt(kv, "PresenterThreadBoost", 1) ? 1 : 0;
     s.laterRelease = KvInt(kv, "LaterRelease", 0) ? 1 : 0;
     s.laterReleaseMs = Clamp(KvFloat(kv, "LaterReleaseMarginMs", 1.5f), 0.5f, 5.0f);
     s.maxAhead = Clamp(KvInt(kv, "MaxFramesAhead", 1), 0, 3);
@@ -400,7 +402,7 @@ static void LoadSettings(Settings &s)
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
     I("RollingScan", s.rolling); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
-    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
+    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
@@ -1579,6 +1581,41 @@ static int LearnFetch(int, LearnRec &) { return 0; }
 static std::atomic<bool> g_learnForgetFile{false}, g_learnForgetNow{false};
 #endif
 
+#ifdef _WIN32
+// The presenter thread first, as Blur Busters advises: a late strobe flickers, a late game frame is only a stutter.
+// 1. Out of Windows' power throttling (EcoQoS): on laptops and in Balanced power plans Windows can run a thread at
+//    reduced clock speed; the presenter wakes every refresh and must not be slowed. No administrator rights needed.
+// 2. Registered with the Multimedia Class Scheduler (MMCSS, "Games" task, high): the scheduler audio and DWM use,
+//    which raises the thread above every normal thread while it keeps to its share (PresenterThreadBoost=0: off).
+static void BoostPresenterThread(bool mmcss, const char *who)
+{
+    struct PowerThrottling { ULONG version, controlMask, stateMask; };
+    typedef BOOL (WINAPI *SetThreadInformation_t)(HANDLE, int, LPVOID, DWORD);
+    bool ecoOff = false, mm = false;
+    if (auto sti = (SetThreadInformation_t)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation"))
+    {
+        PowerThrottling ps = { 1, 0x1 /*EXECUTION_SPEED*/, 0 /*off*/ };
+        ecoOff = sti(GetCurrentThread(), 3 /*ThreadPowerThrottling*/, &ps, sizeof(ps)) != FALSE;
+    }
+    if (mmcss)
+    {
+        typedef HANDLE (WINAPI *AvSet_t)(LPCWSTR, LPDWORD);
+        typedef BOOL (WINAPI *AvPrio_t)(HANDLE, int);
+        if (HMODULE av = LoadLibraryW(L"avrt.dll"))
+        {
+            auto set = (AvSet_t)(void *)GetProcAddress(av, "AvSetMmThreadCharacteristicsW");
+            auto prio = (AvPrio_t)(void *)GetProcAddress(av, "AvSetMmThreadPriority");
+            DWORD idx = 0;
+            HANDLE h = set ? set(L"Games", &idx) : nullptr;
+            if (h) { mm = true; if (prio) prio(h, 1 /*AVRT_PRIORITY_HIGH*/); }
+        }
+    }
+    LOGI("BFI Presenter: %s thread: power throttling %s, multimedia scheduler %s", who, ecoOff ? "off" : "unchanged",
+         !mmcss ? "off (PresenterThreadBoost=0)" : mm ? "on (Games, high)" : "not available");
+}
+
+#endif
+
 static void PresenterThread(Swapchain *sc)
 {
     DeviceData *d = sc->d;
@@ -1599,6 +1636,11 @@ static void PresenterThread(Swapchain *sc)
     vb.Find(sc->hwnd);
 #ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    {
+        bool mm;
+        { std::lock_guard<std::mutex> l(g_cfgLock); mm = g_shared.threadBoost != 0; }
+        BoostPresenterThread(mm, "presenter");
+    }
 #endif
     LOGI("BFI Presenter: presenter running (%s, %s queue, %u real images)", copyMode ? "copy mode" : "BFI",
          d->sharedQueue ? "the game's" : "its own", sc->nReal);
@@ -5087,13 +5129,20 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::TextColored(kAmber, "Hitch guard: BFI paused (loading or missed refreshes)");
         if (st.unevenRep + st.unevenSkip >= 3)
         {
-            const double capRate = st.refreshHz / std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
+            // The cap in effect: one game frame per strobe cycle while the automatic frame cap is down (it warned
+            // "below 120" at 60 fps, the rate the automatic cap had chosen).
+            const bool autoDown = s.gameCap == 1 && s.autoCap && st.autoCapDown && !st.autoCapProbe;
+            const double capRate = autoDown ? st.refreshHz / std::max(1, s.frames)
+                                            : st.refreshHz / std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
             if (s.gameCap >= 1 && st.gameFps < 0.97 * capRate)
                 ImGui::TextColored(kAmber, "The game is below the cap's frame rate (%.0f of %.0f fps): motion stutters.\n"
                                    "Lower its settings or resolution, or use a lower cap (Half refresh).", st.gameFps, capRate);
             else
-                ImGui::TextColored(kAmber, "Game frames reach the strobe unevenly: motion may stutter. If it persists, the GPU\n"
-                                   "is probably finishing frames right at the refresh -- lower settings or try Smooth pacing.");
+                ImGui::TextColored(kAmber, "%s", st.fgActive && s.pacingMode == 1
+                    ? "Game frames reach the strobe unevenly: frame generation is handing frames over in bunches,\n"
+                      "and Lowest latency shows only the newest of each. Use Smooth pacing (every frame once, in order)."
+                    : "Game frames reach the strobe unevenly: motion may stutter. If it persists, the GPU\n"
+                      "is probably finishing frames right at the refresh -- lower settings or try Smooth pacing.");
         }
     }
         ImGui::EndChild();
@@ -5429,6 +5478,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
         bool vb = s.pacing != 0;
         if (ImGui::Checkbox("Wait for vblank", &vb)) s.pacing = vb ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("One present per refresh, nothing queued: lowest latency. Needed by just-in-time release.");
+        bool tb = s.threadBoost != 0;
+        if (ImGui::Checkbox("Multimedia scheduler for the presenter thread (applies at the next start)", &tb)) s.threadBoost = tb ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Registers the presenter thread with Windows' Multimedia Class Scheduler (the one audio and\n"
+                                                      "the desktop compositor use), which runs it ahead of every normal thread, the game's included.\n"
+                                                      "A late strobe flickers; a late game frame is only a stutter. On by default; the log says\n"
+                                                      "whether it took effect. Power throttling is turned off for the thread either way.");
         bool qa = s.queueAhead != 0;
         if (ImGui::Checkbox("Queue one refresh ahead (Wait for vblank on, 3 presenter buffers)", &qa)) s.queueAhead = qa ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keeps one extra finished refresh queued, so a draw delayed by the game's GPU work is\n"

@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.27"
+#define BFI_ADDON_VERSION "1.0.28"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -133,6 +133,7 @@ struct Settings
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
     int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
+    int   threadBoost = 1;       // PresenterThreadBoost: the presenter thread registered with MMCSS (applies at the next start)
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap without Reflex holds the game before its next frame starts
     int   fgLimitNoReflex = 1; // FrameGenLimitWithoutReflex: frame generation without Reflex limited to one presented frame per strobe cycle
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
@@ -277,6 +278,7 @@ static void LoadSettings(Settings &s)
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = IniInt("LearnPerGame", 1) ? 1 : 0;
+    s.threadBoost = IniInt("PresenterThreadBoost", 1) ? 1 : 0;
     s.autoCapOwn = IniInt("AutoCapOwnWithoutFg", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
     if (s.laterReleaseMs < 0.5f) s.laterReleaseMs = 0.5f;
@@ -429,6 +431,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameGenLimitWithoutReflex", s.fgLimitNoReflex);
     IniWriteInt("AutoCapAtFrameStart", s.autoCapFrameStart);
     IniWriteInt("LearnPerGame", s.learnPerGame);
+    IniWriteInt("PresenterThreadBoost", s.threadBoost);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
     IniWriteInt("GameFrameStatistics", s.virtualStats);
@@ -894,6 +897,38 @@ static bool EnableBasePriorityPrivilege()
                       : "Steam and other launchers restart the game without administrator rights: run the launcher itself "
                         "as administrator, or grant your account 'Increase scheduling priority' in Local Security Policy.");
     return done == 1;
+}
+
+// The presenter thread first, as Blur Busters advises: a late strobe flickers, a late game frame is only a stutter.
+// 1. Out of Windows' power throttling (EcoQoS): on laptops and in Balanced power plans Windows can run a thread at
+//    reduced clock speed; the presenter wakes every refresh and must not be slowed. No administrator rights needed.
+// 2. Registered with the Multimedia Class Scheduler (MMCSS, "Games" task, high): the scheduler audio and DWM use,
+//    which raises the thread above every normal thread while it keeps to its share (PresenterThreadBoost=0: off).
+static void BoostPresenterThread(bool mmcss, const char *who)
+{
+    struct PowerThrottling { ULONG version, controlMask, stateMask; };
+    typedef BOOL (WINAPI *SetThreadInformation_t)(HANDLE, int, LPVOID, DWORD);
+    bool ecoOff = false, mm = false;
+    if (auto sti = (SetThreadInformation_t)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation"))
+    {
+        PowerThrottling ps = { 1, 0x1 /*EXECUTION_SPEED*/, 0 /*off*/ };
+        ecoOff = sti(GetCurrentThread(), 3 /*ThreadPowerThrottling*/, &ps, sizeof(ps)) != FALSE;
+    }
+    if (mmcss)
+    {
+        typedef HANDLE (WINAPI *AvSet_t)(LPCWSTR, LPDWORD);
+        typedef BOOL (WINAPI *AvPrio_t)(HANDLE, int);
+        if (HMODULE av = LoadLibraryW(L"avrt.dll"))
+        {
+            auto set = (AvSet_t)(void *)GetProcAddress(av, "AvSetMmThreadCharacteristicsW");
+            auto prio = (AvPrio_t)(void *)GetProcAddress(av, "AvSetMmThreadPriority");
+            DWORD idx = 0;
+            HANDLE h = set ? set(L"Games", &idx) : nullptr;
+            if (h) { mm = true; if (prio) prio(h, 1 /*AVRT_PRIORITY_HIGH*/); }
+        }
+    }
+    LOGI("BFI Presenter: %s thread: power throttling %s, multimedia scheduler %s", who, ecoOff ? "off" : "unchanged",
+         !mmcss ? "off (PresenterThreadBoost=0)" : mm ? "on (Games, high)" : "not available");
 }
 
 // Later release: time each game frame from its release to its copy finishing
@@ -2497,6 +2532,12 @@ static DWORD WINAPI PresenterThread(void *)
     // any other queue gets the device removed (seen in Resonance).
     ID3D12CommandQueue *queue = g_ownPresentQueue ? g_presQueue : g_gameQueue;
     t_presenterThread = true;
+    {
+        EnterCriticalSection(&g_cfgLock);
+        const bool mm = g_shared.threadBoost != 0;
+        LeaveCriticalSection(&g_cfgLock);
+        BoostPresenterThread(mm, "presenter");
+    }
     ID3D12DescriptorHeap *rtvHeap = nullptr, *srvHeap = nullptr;
     ID3D12CommandAllocator *alloc[kMaxBuf] = {};
     ID3D12GraphicsCommandList *list = nullptr;
@@ -2670,7 +2711,8 @@ static DWORD WINAPI PresenterThread(void *)
         g_running.store(false);
     }
     else
-        LOGI("BFI Presenter: presenter running (high-priority queue, %s pacing, presents on %s queue)",
+        LOGI("BFI Presenter: presenter running (%s queue, %s pacing, presents on %s queue)",
+             g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME ? "global realtime" : "high-priority",
              output ? "vblank" : "present-queue", g_ownPresentQueue ? "its own" : "the game's");
     EnterCriticalSection(&g_cfgLock);
     g_status.running = ok ? 1 : 0;
@@ -2721,6 +2763,9 @@ static DWORD WINAPI PresenterThread(void *)
     double capSwitchT = -100.0, capUpT = -100.0, probeWait = 30.0, stayMin = 10.0;
     bool   fgWas = false;
     bool   capByReflex = false;
+    bool   fgSkipLogged = false;  // the frame-generation try at Refresh rate skipped (logged once)
+    int    fgFillSecs = 0;        // seconds in a row the frame-generation estimate said the game could fill the refresh rate
+    double fgNeedNow = 0.0, fgTryNeedMs = 0.0, fgFailNeedMs = 0.0;   // GPU/CPU ms per rendered frame: now, at the try, at a failed try
     bool   reflexCap = false;     // the game frame cap applied with Reflex's frame limit (CapWithReflex)
     double rcOnT = -100.0, fpsAtRc = 0.0;
     double rfxChkT = -100.0;      // start of the collapse check after a step-down with Reflex's limit (moved on by stalls)
@@ -3711,7 +3756,13 @@ static DWORD WINAPI PresenterThread(void *)
                     // stopped its reports in loading stalls at 27-29 fps and was read as frame generation for ~20 s
                     // (the cap at Refresh, Reflex's limit off). Returnal with frame generation presented 50-60.
                     const bool fgRate = hzA <= 0.0 || g_status.gameFps >= 0.35 * hzA;
-                    fg = dlssOnPath && (!g_fgCallerDlss.load() || (rfxStopped && (fgWas || fgRate)));
+                    // Reflex reports still coming (within 3 s) but no rendered count for now: a stall, so the state is
+                    // kept (Alan Wake 2 with 2x read as "not active" right after each hitch, and the cap went to Refresh).
+                    // Frame generation already on: kept for up to 8 s without reports, so a stall of a few seconds doesn't
+                    // switch the limit to 1x and back (Alan Wake 2, 3x: "not active (60 presented, 20 rendered)" right after
+                    // a 2 s hitch, back 5 s later).
+                    if (rsEverT > 0.0 && (!rfxStopped || (fgWas && t - rsEverT < 8.0))) fg = fgWas;
+                    else fg = dlssOnPath && (!g_fgCallerDlss.load() || (rfxStopped && (fgWas || fgRate)));
                     if (dlssOnPath && g_fgCallerDlss.load() && rsEverT > 0.0 && !rfxStopped && !fgEarlyLogged)
                     {
                         fgEarlyLogged = true;
@@ -3741,7 +3792,10 @@ static DWORD WINAPI PresenterThread(void *)
                 // drawing steadily with the hitch guard running (Returnal ~7 fps, Pragmata ~8), so a second
                 // with the hitch guard paused or below 3 fps restarts the check instead of counting.
                 const bool rfxLimitBad = g_rfxLimitBad.load();
-                const bool stallSec = fpsA < 3.0 || hitchPaused;
+                // Also a second without the game's Reflex reports: a game collapsed under the limit keeps reporting (Returnal
+                // at 7 fps), a load screen doesn't (Control, 3x frame generation: 20 presented, 0 reports, 2 s after a hitch
+                // -- read as a collapse, and with frame generation the cap then stayed at Refresh rate for the session).
+                const bool stallSec = fpsA < 3.0 || hitchPaused || t - rsLastT >= 1.5 || rsLast.frames <= 0;
                 // Nor is frame generation switching off: until 5 seconds agree it stays 'active' and the limit keeps
                 // its 2x per rendered frame, so the game runs at half the cap for those seconds (Returnal with frame
                 // generation turned off in the options: "fell to 30 fps", Reflex's limit gone for the session).
@@ -3773,7 +3827,12 @@ static DWORD WINAPI PresenterThread(void *)
                     }
                 }
                 else gameLimBadSecs = 0;
-                const bool rfxUse = t - rsLastT < 3.0 && rsLast.frames > 0 && !g_rfxLimitBad.load();
+                // Reflex in use: reports within the last 3 s, not only in the last second -- a one-second stall with no
+                // reports took the cap to Refresh rate with frame generation for ~7 s (Alan Wake 2, 2x: "frame generation
+                // without Reflex").
+                // (8 s with frame generation on, as its state is kept that long: Alan Wake 2 paused its reports for 3-4 s
+                // after some hitches, and with frame generation still on the cap went to Refresh rate for 5 s.)
+                const bool rfxUse = rsEverT > 0.0 && t - rsEverT < (fgWas ? 8.0 : 3.0) && !g_rfxLimitBad.load();
                 // Game frame cap with Reflex's frame limit (CapWithReflex, off by default): in games with
                 // Reflex, a cap below the refresh rate (Half, Quarter, one per strobe cycle, custom) is applied
                 // by the driver where the game starts each frame, instead of holding the game at Present --
@@ -3826,6 +3885,38 @@ static DWORD WINAPI PresenterThread(void *)
                 // seconds (The Callisto Protocol, Riven), so the cap stays at Refresh while that limit is in use.
                 const bool fgLimitOn = g_fgPaceUs.load() > 0 && g_fgPaceKind.load() == 1;
                 const bool capOn = s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && (rfxUse || !fg) && !fgLimitOn;
+                // Frame generation under Reflex's limit: skip the 5-minute try at Refresh rate when the game's rendered
+                // frames can't reach it anyway -- the frame-generation factor times what the GPU / CPU time per rendered
+                // frame allows, against the refresh rate. Each try was 4 s of uneven frames (Alan Wake 2, 3x: GPU 33 ms
+                // per rendered frame, at most ~90 of 120).
+                // Reflex's GPU time leaves out frame generation's own GPU work, so the estimate is optimistic (Alan Wake 2,
+                // 3x: 27 ms read as ~111 fps possible, the try held 67): it has to say "can fill" for 5 s in a row, and
+                // after a failed try, the next one waits until the GPU time per rendered frame is 20% below that try's.
+                auto FgCantFill = [&]() -> bool {
+                    if (t - rsLastT >= 3.0 || rsLast.frames <= 0 || rsLast.gpuActiveMs <= 0.0) { fgFillSecs = 0; return false; }
+                    const double rend = g_rfxRenderedFps.load();
+                    if (rend <= 1.0 || fpsA <= 0.0) return false;
+                    const double factor = std::max(1.0, std::round(fpsA / rend));
+                    double needMs = rsLast.gpuActiveMs;
+                    if (rsLast.simMs > needMs) needMs = rsLast.simMs;
+                    if (rsLast.submitMs > needMs) needMs = rsLast.submitMs;
+                    const double canFps = factor * 1000.0 / needMs;
+                    fgNeedNow = needMs;
+                    const bool failedHere = fgFailNeedMs > 0.0 && needMs > 0.8 * fgFailNeedMs;
+                    fgFillSecs = (canFps >= 0.9 * hzA && !failedHere) ? fgFillSecs + 1 : 0;
+                    if (fgFillSecs >= 5) return false;
+                    if (!fgSkipLogged)
+                    {
+                        fgSkipLogged = true;
+                        if (failedHere)
+                            LOGI("BFI Presenter: automatic frame cap: no try at Refresh rate with frame generation -- %.1f ms per rendered "
+                                 "frame, not well below the %.1f ms of the last try that failed", needMs, fgFailNeedMs);
+                        else
+                            LOGI("BFI Presenter: automatic frame cap: no try at Refresh rate with frame generation -- %.0fx at %.1f ms "
+                                 "per rendered frame allows about %.0f of %.0f fps", factor, needMs, canFps, hzA);
+                    }
+                    return true;
+                };
                 // "Forget this game": the cap and the frame start start over (the section is deleted on the watchdog thread).
                 if (g_learnForgetNow.exchange(false))
                 {
@@ -3888,6 +3979,7 @@ static DWORD WINAPI PresenterThread(void *)
                                 // longest delay (Soul Reaver at 64 of 120: 53 ms from release to flash for 4 s), so the
                                 // next one waits 5 minutes.
                                 if (fpsA < 0.8 * hzA) probeWait = 300.0;
+                                if (fg && fgTryNeedMs > 0.0) { fgFailNeedMs = fgTryNeedMs; fgSkipLogged = false; }
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
                             }
@@ -3907,6 +3999,10 @@ static DWORD WINAPI PresenterThread(void *)
                             // and each time the frame start was looked for again.
                             if (t - capUpT < 30.0) probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
                             else probeWait = 30.0;
+                            // Frame generation: a try that held the refresh rate only for a few seconds (a load screen or a
+                            // light corner) counts as failed too, so the next one waits for clearly lighter frames (Control,
+                            // 3x: up at 02:10:59, down 9 s later at 65 fps).
+                            if (fg && t - capUpT < 30.0 && fgTryNeedMs > 0.0) { fgFailNeedMs = fgTryNeedMs; fgSkipLogged = false; }
                             if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;   // well under the refresh rate: first try after a minute
                             autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
@@ -3932,11 +4028,13 @@ static DWORD WINAPI PresenterThread(void *)
                     // With frame generation, a try means 3 s without the limit, and DLSS-G re-pacing twice:
                     // a visible stutter each time (God of War Ragnarok, every 30-120 s). Frame generation that
                     // could fill the refresh rate is rare, so try only every 5 minutes then.
-                    else if (t - capSwitchT >= (fg && capByReflex ? 300.0 : probeWait) && !hitchPaused)
+                    else if (t - capSwitchT >= (fg && capByReflex ? 300.0 : probeWait) && !hitchPaused &&
+                             !(fg && capByReflex && FgCantFill()))
                     {
                         // No Reflex reports (or frame generation, whose reports are for rendered frames):
                         // try Refresh for a few seconds.
                         autoCapDown = false; capProbe = true; probeSecs = probeGood = 0; capSwitchT = t; capUpT = t;
+                        fgTryNeedMs = fg ? fgNeedNow : 0.0; fgFillSecs = 0;
                     }
                 }
                 else
@@ -4288,6 +4386,9 @@ static DWORD WINAPI PresenterThread(void *)
                     int cand = 1;
                     if (stNow.fgActive && rf > 1.0 && presPrev > 1.0) cand = std::max(2, std::min(4, (int)(presPrev / rf + 0.5)));
                     if (!stNow.fgActive) cand = 1;
+                    // Frame generation on but no rendered count for now (the game's Reflex reports pause for 3-4 s after
+                    // some hitches): the factor is kept -- it went to 1x at once and the limit came off (Alan Wake 2, 3x).
+                    else if (rf <= 1.0 && g_sleepFgFactor.load() > 1) cand = g_sleepFgFactor.load();
                     candRun = (cand == candPrev) ? candRun + 1 : 1;
                     candPrev = cand;
                     const int cur = g_sleepFgFactor.load();
@@ -8877,8 +8978,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
             if (s.queuePriority >= 2 && g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH)
-                ImGui::TextWrapped("Flashes? Start Steam (or the game's launcher) as administrator, then the game: the presenter's "
-                                   "GPU queue then runs at realtime priority, so the game's GPU work can't hold up the flashes.");
+                ImGui::TextWrapped("Flashes? Give the presenter's GPU queue realtime priority, so the game's GPU work can't hold up the "
+                                   "flashes: BFI Presenter Manager > GPU priority > Allow for my account (then sign out of Windows and "
+                                   "back in), or start Steam (or the game's launcher) as administrator.");
             else if (s.reuseBuffers && (s.frames == 2 || s.frames == 4) && st.presBufs > 0 && st.presBufs < 4 && s.presBuffers == 4)
                 ImGui::TextWrapped("4 presenter buffers apply at the game's next resize: change the resolution or display mode "
                                    "once (and back), or restart the game.");
@@ -8910,13 +9012,20 @@ static void draw_overlay(reshade::api::effect_runtime *)
         // Only when it persists: a stray repeat now and then is not worth a warning.
         if (st.unevenRep + st.unevenSkip >= 3)
         {
-            const double capRate = st.refreshHz / std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
+            // The cap in effect: one game frame per strobe cycle while the automatic frame cap is down (it warned
+            // "below 120" at 60 fps, the rate the automatic cap had chosen).
+            const bool autoDown = s.gameCap == 1 && s.autoCap && st.autoCapDown && !st.autoCapProbe;
+            const double capRate = autoDown ? st.refreshHz / std::max(1, s.frames)
+                                            : st.refreshHz / std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
             if (s.gameCap >= 1 && st.gameFps < 0.97 * capRate)
                 ImGui::TextColored(kAmber, "The game is below the cap's frame rate (%.0f of %.0f fps): motion stutters.\n"
                                    "Lower its settings or resolution, or use a lower cap (Half refresh).", st.gameFps, capRate);
             else
-                ImGui::TextColored(kAmber, "Game frames reach the strobe unevenly: motion may stutter. If it persists, the GPU\n"
-                                   "is probably finishing frames right at the refresh -- lower settings or try Smooth pacing.");
+                ImGui::TextColored(kAmber, "%s", st.fgActive && s.pacingMode == 1
+                    ? "Game frames reach the strobe unevenly: frame generation is handing frames over in bunches,\n"
+                      "and Lowest latency shows only the newest of each. Use Smooth pacing (every frame once, in order)."
+                    : "Game frames reach the strobe unevenly: motion may stutter. If it persists, the GPU\n"
+                      "is probably finishing frames right at the refresh -- lower settings or try Smooth pacing.");
         }
     }
         ImGui::EndChild();
@@ -9270,7 +9379,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                     (st.outType >= 0 && st.outType <= 2) ? outs[st.outType] : "-", st.format,
                     st.width, st.height, st.buffers);
         ImGui::Text("Presenter queue: %s", g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME ? "global realtime" :
-                                            g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH ? "high (run the launcher as administrator for realtime)" : "normal");
+                                            g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH ? "high (realtime: Manager > GPU priority, or run the launcher as administrator)" : "normal");
         if (g_scOwner[0]) ImGui::TextDisabled("Swap chain implemented by %s", g_scOwner);
     }
 
@@ -9317,6 +9426,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
         bool vb = s.pacing != 0, oq = s.ownQueue != 0;
         if (ImGui::Checkbox("Wait for vblank", &vb)) s.pacing = vb ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("One present per refresh, nothing queued: lowest latency. Needed by just-in-time release.");
+        bool tb = s.threadBoost != 0;
+        if (ImGui::Checkbox("Multimedia scheduler for the presenter thread (applies at the next start)", &tb)) s.threadBoost = tb ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Registers the presenter thread with Windows' Multimedia Class Scheduler (the one audio and\n"
+                                                      "the desktop compositor use), which runs it ahead of every normal thread, the game's included.\n"
+                                                      "A late strobe flickers; a late game frame is only a stutter. On by default; the log says\n"
+                                                      "whether it took effect. Power throttling is turned off for the thread either way.");
         bool qa = s.queueAhead != 0;
         if (ImGui::Checkbox("Queue one refresh ahead (needs 3 presenter buffers, Wait for vblank on)", &qa)) s.queueAhead = qa ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keeps exactly one extra present queued, so an occasional late slot is covered\nwithout a flash. +1 refresh (8 ms) of latency. Unlike Wait for vblank off, the\nqueue never grows, so the driver doesn't throttle the game.");

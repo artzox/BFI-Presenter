@@ -50,6 +50,7 @@ const NvStatus NV_OK = 0, NV_SETTING_NOT_FOUND = -160, NV_PROFILE_NOT_FOUND = -1
 const NvU32 VSYNCMODE_ID = 0x00A879CF;
 const NvU32 OGL_CPL_PREFER_DXPRESENT_ID = 0x20D690F8;   // "Vulkan/OpenGL present method"
 const NvU32 VRR_APP_OVERRIDE_ID = 0x10A879CF;
+const NvU32 PREFERRED_PSTATE_ID = 0x1057EB71;            // "Power management mode"
 const NvU32 VRR_APP_OVERRIDE_REQUEST_STATE_ID = 0x10A879AC;
 const NvU32 VRRFEATUREINDICATOR_ID = 0x1094F157;      // "Toggle the VRR global feature" (NVPI: GSYNC - Enable)
 
@@ -192,6 +193,7 @@ std::string NvRead(const std::vector<std::wstring> &exeNames, std::vector<NvStat
     long long gVrr = base ? Read(a, ses.s, base, VRR_APP_OVERRIDE_ID, own) : -1;
     long long gVs = base ? Read(a, ses.s, base, VSYNCMODE_ID, own) : -1;
     long long gGl = base ? Read(a, ses.s, base, OGL_CPL_PREFER_DXPRESENT_ID, own) : -1;
+    long long gPw = base ? Read(a, ses.s, base, PREFERRED_PSTATE_ID, own) : -1;
     NvApplication *app = new NvApplication();
     NvProfileInfo *pi = new NvProfileInfo();
     for (size_t i = 0; i < exeNames.size(); i++)
@@ -201,6 +203,7 @@ std::string NvRead(const std::vector<std::wstring> &exeNames, std::vector<NvStat
         o.vrr = gVrr;
         o.vsync = gVs;
         o.glPresent = gGl;
+        o.power = gPw;
         memset(app, 0, sizeof(*app));
         app->version = Ver(sizeof(NvApplication), 4);
         NvUStr name;
@@ -223,13 +226,16 @@ std::string NvRead(const std::vector<std::wstring> &exeNames, std::vector<NvStat
         if (!o.vsyncOwn) o.vsync = gVs;
         o.glPresent = Read(a, ses.s, p, OGL_CPL_PREFER_DXPRESENT_ID, o.glPresentOwn);
         if (!o.glPresentOwn) o.glPresent = gGl;
+        o.power = Read(a, ses.s, p, PREFERRED_PSTATE_ID, o.powerOwn);
+        if (!o.powerOwn) o.power = gPw;
     }
     delete app;
     delete pi;
     return {};
 }
 
-std::string NvWrite(const std::wstring &exeName, const std::wstring &profileName, long long vrr, long long vsync, long long glPresent)
+std::string NvWrite(const std::wstring &exeName, const std::wstring &profileName, long long vrr, long long vsync, long long glPresent,
+                    long long power)
 {
     Api &a = GetApi();
     if (!a.ok) return "No NVIDIA driver found.";
@@ -299,8 +305,23 @@ std::string NvWrite(const std::wstring &exeName, const std::wstring &profileName
     else if ((r = set(VRRFEATUREINDICATOR_ID, feature)) != NV_OK) err = Err("Setting G-SYNC", r);
     else if ((r = set(VSYNCMODE_ID, vsync)) != NV_OK) err = Err("Setting Vertical Sync", r);
     else if ((r = set(OGL_CPL_PREFER_DXPRESENT_ID, glPresent)) != NV_OK) err = Err("Setting the Vulkan/OpenGL present method", r);
+    else if ((r = set(PREFERRED_PSTATE_ID, power)) != NV_OK) err = Err("Setting the power management mode", r);
     if (err.empty() && (r = a.SaveSettings(ses.s)) != NV_OK) err = Err("Saving the NVIDIA settings", r);
     return err;
+}
+
+std::string PowerText(long long v)
+{
+    switch (v)
+    {
+    case -1: case kPowerOptimal: return "normal";
+    case kPowerMax: return "prefer maximum performance";
+    case kPowerAdaptive: return "adaptive";
+    case kPowerDriver: return "driver controlled";
+    case kPowerConsistent: return "prefer consistent performance";
+    case kPowerMin: return "prefer minimum power";
+    default: return "other (" + std::to_string(v) + ")";
+    }
 }
 
 std::string GlPresentText(long long v)
