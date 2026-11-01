@@ -260,7 +260,11 @@ How many picture slots BFI Presenter uses to hand flashes to the screen. More sl
 
 **Queue one refresh ahead** · `QueueAhead` · default: off\
 Keeps one finished flash ready in advance, so if the graphics card is briefly too busy, the screen still gets its flash on time. Costs one refresh (about 8 ms at 120 Hz) of delay.\
-*When to change it:* turn on only if you see single bright or dark flashes in very GPU-heavy games, or if G-SYNC keeps sneaking in.
+*When to change it:* turn on if you see single bright or dark flashes in GPU-heavy games, frame-generation games and games that stream a lot (Alan Wake 2, Control), or if G-SYNC keeps sneaking in. Set Presenter buffers to 3 with it.
+
+**Multimedia scheduler for the presenter thread** · `PresenterThreadBoost` · default: on\
+Registers the presenter's thread with Windows' multimedia scheduler, the one audio and the desktop compositor use, so it runs ahead of the game's own threads: a late flash flickers, a late game frame is only a stutter. Windows' power throttling (which can slow threads down on laptops and in the Balanced power plan) is turned off for the thread either way. The log says whether it took effect. Applies at the next game start (v1.0.28).\
+*When to change it:* leave on.
 
 ## Safety nets
 
@@ -269,7 +273,7 @@ When the game freezes for a moment (loading screens, big stutters), a lit or dar
 *When to change it:* leave on. The loading time (1000 ms) is how long the game may stop sending new pictures before it counts as a loading screen.
 
 **Flash hints** · `FlashHints` · default: on\
-When the strobe keeps flashing (refreshes missed in 3 of 10 seconds; loading screens don't count), the status box at the top of the overlay suggests what to try next, one step at a time: start Steam or the game's launcher as administrator for a realtime GPU queue (DirectX), 4 presenter buffers, Queue one refresh ahead (+1 refresh of latency), and if it still flashes, lighter game settings or the Half refresh cap. The buttons apply and save the step for this game; nothing changes unless you click. The hint goes away after 30 seconds without flashes.\
+When the strobe keeps flashing (refreshes missed in 3 of 10 seconds; loading screens don't count), the status box at the top of the overlay suggests what to try next, one step at a time: a realtime GPU queue (DirectX: Manager > GPU priority, or Steam or the game's launcher started as administrator), 4 presenter buffers, Queue one refresh ahead (+1 refresh of latency), and if it still flashes, lighter game settings or the Half refresh cap. The buttons apply and save the step for this game; nothing changes unless you click. The hint goes away after 30 seconds without flashes.\
 *When to change it:* **Hide flash hints** turns them off for this game if you accept the odd flash.
 
 **Allow RivaTuner** · `AllowRTSS` · default: on\
@@ -283,8 +287,8 @@ These exist to make specific games work. The defaults are right for nearly every
 BFI Presenter sends its flashes on a separate lane of the graphics card, so a busy game can't hold them up.
 
 **Queue priority** · `PresenterQueuePriority` · default: 2 (realtime)\
-How urgently the graphics card treats the flashes. Realtime needs the game (or Steam) started as administrator; otherwise it falls back to high.\
-*When to change it:* lower to 1 or 0 only if a game freezes with BFI Presenter.
+How urgently the graphics card treats the flashes. At realtime ("global realtime") the graphics card runs the presenter's small amount of work ahead of the game's, so flashes stay on time however busy it is; at high it waits for a convenient moment. Windows allows realtime only to programs that have the right "Increase scheduling priority": the Manager's **GPU priority** row grants it to your account (one administrator prompt, then sign out and back in) and can remove it again (v1.0.28); running the game or its launcher as administrator also works. Otherwise the queue falls back to high. The log says which one a game got. In testing, realtime halved the missed refreshes in Alan Wake 2 with 3× frame generation and let Lossless Scaling's frame generation run on top of a game without flicker, for about 1 fps less in GPU-bound games. DirectX only for now: the Vulkan layer's queue stays at normal priority.\
+*When to change it:* lower to 1 or 0 if a game freezes with BFI Presenter, or try 1 if a GPU-bound game loses more than a frame or two per second at realtime. Windows grants rights to accounts, not single programs, so with the right granted any program you run can raise its own priority too.
 
 **Start BFI after the game resizes** · `StartBFIAfterGameResize`, `WaitForResizeOnRecreatedSwapChain` · default: on\
 BFI starts once the game has finished setting up its window (almost every game does this at launch). This avoids freezes in a few games.\
@@ -375,6 +379,9 @@ If a game crashes, these write a short report of what went wrong (`BFIPresenter_
 | Emulated games at 59.94 fps (PS2 NTSC in PCSX2, ICO-PC) | Display mode 119.88 Hz (NirCmd can switch it when the emulator starts) · Frame cap: Refresh rate with Automatic frame cap · Pacing: Lowest latency |
 | You've settled on a game's graphics settings | Press **Forget this game** once and play a minute, so the remembered cap and frame start match them |
 | Before anything else | G-SYNC / VRR off for the game, VSync on or "app setting" · No frame limiter (RivaTuner, NVIDIA) on the game · CRT shader: set its own decay off |
+| Every DirectX game | Manager: GPU priority **Allow for my account** (realtime GPU queue) · NVIDIA power management: Prefer maximum performance (the Manager offers it at install) |
+| Flashes that come at regular intervals | A monitoring tool polling the graphics card: in MSI Afterburner set the hardware polling period to 5000 ms or close it while playing (Alan Wake 2: periodic missed refreshes at 1000 ms, none in 14 minutes at 5000 ms); the same for HWiNFO and RGB/peripheral software |
+| Lossless Scaling frame generation | DirectX games with the realtime GPU queue (above): no flicker in testing (The Witcher 3). Vulkan games can still lose sync for now |
 
 ---
 

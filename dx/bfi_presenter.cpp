@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.28-t8"
+#define BFI_ADDON_VERSION "1.0.28"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -8978,8 +8978,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
             if (s.queuePriority >= 2 && g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH)
-                ImGui::TextWrapped("Flashes? Start Steam (or the game's launcher) as administrator, then the game: the presenter's "
-                                   "GPU queue then runs at realtime priority, so the game's GPU work can't hold up the flashes.");
+                ImGui::TextWrapped("Flashes? Give the presenter's GPU queue realtime priority, so the game's GPU work can't hold up the "
+                                   "flashes: BFI Presenter Manager > GPU priority > Allow for my account (then sign out of Windows and "
+                                   "back in), or start Steam (or the game's launcher) as administrator.");
             else if (s.reuseBuffers && (s.frames == 2 || s.frames == 4) && st.presBufs > 0 && st.presBufs < 4 && s.presBuffers == 4)
                 ImGui::TextWrapped("4 presenter buffers apply at the game's next resize: change the resolution or display mode "
                                    "once (and back), or restart the game.");
@@ -9371,7 +9372,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                     (st.outType >= 0 && st.outType <= 2) ? outs[st.outType] : "-", st.format,
                     st.width, st.height, st.buffers);
         ImGui::Text("Presenter queue: %s", g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME ? "global realtime" :
-                                            g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH ? "high (run the launcher as administrator for realtime)" : "normal");
+                                            g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH ? "high (realtime: Manager > GPU priority, or run the launcher as administrator)" : "normal");
         if (g_scOwner[0]) ImGui::TextDisabled("Swap chain implemented by %s", g_scOwner);
     }
 

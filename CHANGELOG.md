@@ -7,6 +7,17 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.28] — 2026-11-01 (Manager 1.3.13)
+
+**The strobe comes first.** A late strobe flickers; a late game frame is only a stutter. 1.0.28 gives the presenter priority over the game on the GPU and the CPU, and makes frame generation under Reflex's limit hold steady through hitches and load screens.
+
+- **[DX] Realtime GPU priority without running as administrator.** The presenter's GPU queue can run at "global realtime", ahead of the game's own GPU work, when Windows allows it. The Manager's new **GPU priority** row grants your account the right for it ("Increase scheduling priority", one administrator prompt, applies after you sign out and back in) and can remove it again. Alan Wake 2 with 3x frame generation: missed refreshes outside hitches down by more than half. Lossless Scaling's frame generation on top of a game now runs without flicker (The Witcher 3). Costs about 1 fps in GPU-bound games.
+- **[Both] The presenter thread first on the CPU:** registered with Windows' multimedia scheduler (as audio and the desktop compositor are) and out of Windows' power throttling. `PresenterThreadBoost=0`, or the checkbox under Advanced > Presenter, turns the scheduler part off.
+- **[Manager] NVIDIA power management:** "Prefer maximum performance" for the game's driver profile, offered at install (on by default) and per game, so the card doesn't clock down between frames.
+- **[DX] Frame generation with Reflex's limit holds through hitches and load screens.** A second or a few without the game's Reflex reports no longer reads as "frame generation off" or "no Reflex": the cap stayed at Refresh rate for 4–7 s after hitches (Alan Wake 2), the limit dropped to 1x (Alan Wake 2, 3x), and a load screen was taken for the game collapsing under Reflex's limit, which turned the cap off for the rest of the session (Control).
+- **[DX] Fewer tries at Refresh rate with frame generation.** A try is skipped while the game's own frame times show it can't reach the refresh rate, needs 5 s in a row that say it can, and after a failed try (or one that drops back within 30 s) waits until frames are clearly lighter. Alan Wake 2 and Control: a 4-second stutter every 5 minutes before, about one try per session now.
+- **[Docs]** Settings guide: realtime GPU priority, monitoring tools that poll the GPU (MSI Afterburner at a 1000 ms polling period caused the remaining periodic misses in Alan Wake 2; 5000 ms: none in 14 minutes), and Lossless Scaling.
+
 ## [1.0.27] — 2026-10-30 (Manager 1.3.12)
 
 **The biggest latency update so far.** When the automatic frame cap holds a game to one frame per strobe cycle (e.g. 60 fps at 120 Hz with 2 frames per cycle), the game used to finish its frame and then wait for the flash with your input already read. 1.0.27 holds the game *before* it starts the frame instead, and finds by testing the moment to let it go so the frame is finished just before its flash. That moment is then remembered per game.
