@@ -89,7 +89,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.28-t7"
+#define BFI_ADDON_VERSION "1.0.28-t8"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3999,6 +3999,10 @@ static DWORD WINAPI PresenterThread(void *)
                             // and each time the frame start was looked for again.
                             if (t - capUpT < 30.0) probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
                             else probeWait = 30.0;
+                            // Frame generation: a try that held the refresh rate only for a few seconds (a load screen or a
+                            // light corner) counts as failed too, so the next one waits for clearly lighter frames (Control,
+                            // 3x: up at 02:10:59, down 9 s later at 65 fps).
+                            if (fg && t - capUpT < 30.0 && fgTryNeedMs > 0.0) { fgFailNeedMs = fgTryNeedMs; fgSkipLogged = false; }
                             if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;   // well under the refresh rate: first try after a minute
                             autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
