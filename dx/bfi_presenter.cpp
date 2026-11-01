@@ -9012,13 +9012,20 @@ static void draw_overlay(reshade::api::effect_runtime *)
         // Only when it persists: a stray repeat now and then is not worth a warning.
         if (st.unevenRep + st.unevenSkip >= 3)
         {
-            const double capRate = st.refreshHz / std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
+            // The cap in effect: one game frame per strobe cycle while the automatic frame cap is down (it warned
+            // "below 120" at 60 fps, the rate the automatic cap had chosen).
+            const bool autoDown = s.gameCap == 1 && s.autoCap && st.autoCapDown && !st.autoCapProbe;
+            const double capRate = autoDown ? st.refreshHz / std::max(1, s.frames)
+                                            : st.refreshHz / std::max(1, CapPeriod(s.gameCap, s.frames, s.capDivisor));
             if (s.gameCap >= 1 && st.gameFps < 0.97 * capRate)
                 ImGui::TextColored(kAmber, "The game is below the cap's frame rate (%.0f of %.0f fps): motion stutters.\n"
                                    "Lower its settings or resolution, or use a lower cap (Half refresh).", st.gameFps, capRate);
             else
-                ImGui::TextColored(kAmber, "Game frames reach the strobe unevenly: motion may stutter. If it persists, the GPU\n"
-                                   "is probably finishing frames right at the refresh -- lower settings or try Smooth pacing.");
+                ImGui::TextColored(kAmber, "%s", st.fgActive && s.pacingMode == 1
+                    ? "Game frames reach the strobe unevenly: frame generation is handing frames over in bunches,\n"
+                      "and Lowest latency shows only the newest of each. Use Smooth pacing (every frame once, in order)."
+                    : "Game frames reach the strobe unevenly: motion may stutter. If it persists, the GPU\n"
+                      "is probably finishing frames right at the refresh -- lower settings or try Smooth pacing.");
         }
     }
         ImGui::EndChild();
