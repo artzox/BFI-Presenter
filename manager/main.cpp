@@ -1248,7 +1248,7 @@ static void DrawTable(float height)
                          ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
                          ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Sortable;
     const float em = ImGui::GetFontSize();
-    if (!ImGui::BeginTable("games", 10, tf, ImVec2(0, height))) return;
+    if (!ImGui::BeginTable("games", 11, tf, ImVec2(0, height))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("##pick", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize | ImGuiTableColumnFlags_NoSort, ImGui::GetFrameHeight());
     ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_NoHide, em * 15.0f);
@@ -1259,6 +1259,7 @@ static void DrawTable(float height)
     ImGui::TableSetupColumn("BFI Presenter", ImGuiTableColumnFlags_WidthFixed, em * 8.5f);
     ImGui::TableSetupColumn("G-SYNC", ImGuiTableColumnFlags_WidthFixed, em * 4.5f);
     ImGui::TableSetupColumn("VSync", ImGuiTableColumnFlags_WidthFixed, em * 6.0f);
+    ImGui::TableSetupColumn("Power", ImGuiTableColumnFlags_WidthFixed, em * 8.0f);
     ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoHide, em * 8.0f);
     std::vector<int> vis;
     for (int i = 0; i < (int)g_app.games.size(); i++)
@@ -1285,7 +1286,8 @@ static void DrawTable(float height)
             case 6: return g.route == Route::Vulkan ? (g.ini ? "vulkan" : "") : g.route == Route::Shader ? g.shaderVersion : g.addonVersion;
             case 7: return g.nvKnown ? std::string(g.nvVrrOwn ? "0" : "1") + VrrText(g.nvVrr) : "2";
             case 8: return g.nvKnown ? std::string(g.nvVsyncOwn ? "0" : "1") + VsyncText(g.nvVsync) : "2";
-            case 9: snprintf(b, 32, "%02d", (int)StatusOf(g)); return b;
+            case 9: return g.nvKnown ? std::string(g.nvPowerOwn ? "0" : "1") + PowerText(g.nvPower) : "2";
+            case 10: snprintf(b, 32, "%02d", (int)StatusOf(g)); return b;
             default: return low(g.name);
             }
         };
@@ -1322,7 +1324,7 @@ static void DrawTable(float height)
         if (mixed) ImGui::PopItemFlag();     // pop what was pushed, whatever the click changed
         Tooltip("Tick or clear all games shown (Ctrl+A ticks all, Esc clears)");
     }
-    for (int c = 1; c < 10; c++) { ImGui::TableSetColumnIndex(c); ImGui::TableHeader(ImGui::TableGetColumnName(c)); }
+    for (int c = 1; c < 11; c++) { ImGui::TableSetColumnIndex(c); ImGui::TableHeader(ImGui::TableGetColumnName(c)); }
 
     // Keyboard: Up/Down/PageUp/PageDown/Home/End move the selection itself (Shift extends the ticks),
     // Ctrl+A ticks every game shown, Esc clears the ticks.
@@ -1387,6 +1389,10 @@ static void DrawTable(float height)
         ImGui::TableNextColumn();
         if (!g.nvKnown) ImGui::TextColored(kGrey, "-");
         else ImGui::TextColored(g.nvVsyncOwn ? (g.nvVsync == kVsyncForceOff || g.nvVsync == kVsyncFast ? kRed : kText) : kGrey, "%s", VsyncText(g.nvVsync).c_str());
+        ImGui::TableNextColumn();
+        if (!g.nvKnown) ImGui::TextColored(kGrey, "-");
+        else ImGui::TextColored(g.nvPowerOwn ? (g.nvPower == kPowerMax ? kGreen : kText) : kGrey, "%s",
+                                g.nvPower == kPowerMax ? "max performance" : PowerText(g.nvPower).c_str());
         ImGui::TableNextColumn(); StatusText(g);
     }
     ImGui::EndTable();
