@@ -7,7 +7,7 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [1.0.28] — 2026-11-01 (Manager 1.3.14)
+## [1.0.28] — 2026-11-01 (Manager 1.3.15)
 
 **The strobe comes first.** A late strobe flickers; a late game frame is only a stutter. 1.0.28 gives the presenter priority over the game on the GPU and the CPU, and makes frame generation under Reflex's limit hold steady through hitches and load screens.
 
@@ -19,6 +19,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
 - **[Both] Overlay: the "below the cap's frame rate" warning uses the cap in effect.** With the automatic frame cap stepped down it compared the game with the refresh rate (e.g. "60 of 120 fps" while the cap was rightly at 60). With frame generation and Lowest latency, uneven frames now point to Smooth pacing: frame generation can hand frames over in bunches, and Lowest latency shows only the newest of each (Pragmata).
 - **[Manager] Ticked-games controls wrap** in a narrow right pane instead of running off its edge (Remove, Change version, the NVIDIA settings and Apply were hidden until the pane was widened).
 - **[Manager] Power management for ticked games:** the NVIDIA row for several ticked games (G-SYNC, VSync, Apply) has a **Power** choice too: leave, use global, prefer maximum performance or normal.
+- **[Manager] Power column:** the game list shows each game's NVIDIA power management mode next to G-SYNC and VSync (green for prefer maximum performance, grey when inherited from the global profile), and sorts by it.
 - **[Docs]** Settings guide: realtime GPU priority, monitoring tools that poll the GPU (MSI Afterburner at a 1000 ms polling period caused the remaining periodic misses in Alan Wake 2; 5000 ms: none in 14 minutes), and Lossless Scaling.
 
 ## [1.0.27] — 2026-10-30 (Manager 1.3.12)
