@@ -8,9 +8,13 @@ cd "$(dirname "$0")"
 TP=../third_party
 if command -v glslangValidator >/dev/null 2>&1; then
     tmp=$(mktemp -d)
-    for f in fullscreen.vert bfi.frag measure.frag; do
+    for f in fullscreen.vert bfi.frag measure.frag measure.comp; do
         glslangValidator -V "shaders/$f" -o "$tmp/$f.spv" >/dev/null
     done
+    # BFI compute pass (realtime queue), one per storage format
+    glslangValidator -V -DOUT_FMT=rgba8 shaders/bfi.comp -o "$tmp/bfi8.comp.spv" >/dev/null
+    glslangValidator -V -DOUT_FMT=rgb10_a2 shaders/bfi.comp -o "$tmp/bfi10.comp.spv" >/dev/null
+    glslangValidator -V -DOUT_FMT=rgba16f shaders/bfi.comp -o "$tmp/bfi16.comp.spv" >/dev/null
     python3 tools/genspv.py "$tmp" shaders_spv.h
     rm -rf "$tmp"
     echo "shaders recompiled into shaders_spv.h"

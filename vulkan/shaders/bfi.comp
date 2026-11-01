@@ -1,0 +1,20 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Realtime compute queue: the BFI picture into a storage image, copied to the
+// swap chain image afterwards (swap chain formats can't be written as storage
+// images everywhere). OUT_FMT (rgba8, rgb10_a2, rgba16f) is set at compile time.
+#include "common.glsl"
+#include "bfi_shade.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 1, OUT_FMT) uniform writeonly image2D dst;
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(dst);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    vec4 o = BfiShade(vec2(p) + 0.5);
+    if ((pc.store & 2u) != 0u) o.rgb = LinToSrgb(clamp(o.rgb, 0.0, 1.0));   // _SRGB swap chain: encode here
+    if ((pc.store & 1u) != 0u) o.rgb = o.bgr;                               // B-first swap chain format: bytes copied as-is
+    imageStore(dst, p, o);
+}

@@ -1,0 +1,14 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Realtime compute queue: the ABL guard's 32x18 measurement (see measure_cell.glsl).
+#include "common.glsl"
+#include "measure_cell.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dst;
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= 32 || p.y >= 18) return;
+    imageStore(dst, p, vec4(MeasureCell(vec2(p) + 0.5), 0.0, 0.0, 0.0));
+}
