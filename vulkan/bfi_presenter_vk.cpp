@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.29-rt2"
+#define BFI_VERSION "1.0.29-rt3"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -1613,12 +1613,27 @@ static double g_rebuildGap = 20.0;          // automatic rebuilds at least this 
 static int    g_rebuildMisses = 0;          // automatic rebuilds in a row after which presentation slowed again within a minute
 
 // The game's video memory use against the budget Windows gives it (DXGI, the NVIDIA adapter), in MB.
+// The game's video memory use and budget, from the kernel (D3DKMT) for the GPU with the most video memory. DXGI is
+// used once to find that GPU and released at once: a DXGI adapter kept for the session crashed RPCS3 -- the code behind
+// it had been unloaded by the time the per-second check called it.
+struct KmtQueryVideoMemoryInfo
+{
+    HANDLE   hProcess;
+    UINT     hAdapter;
+    UINT     MemorySegmentGroup;   // 0 local
+    UINT64   Budget, CurrentUsage, CurrentReservation, AvailableForReservation;
+    UINT     PhysicalAdapterIndex;
+};
+struct KmtOpenAdapterFromLuid { LUID AdapterLuid; UINT hAdapter; };
 static bool VramMB(double &use, double &budget)
 {
-    static IDXGIAdapter3 *ad = nullptr; static bool tried = false;
+    typedef LONG (APIENTRY *PFN_Open)(KmtOpenAdapterFromLuid *);
+    typedef LONG (APIENTRY *PFN_Query)(KmtQueryVideoMemoryInfo *);
+    static PFN_Query query = nullptr; static UINT adapter = 0; static bool tried = false;
     if (!tried)
     {
         tried = true;
+        LUID luid = {}; bool found = false;
         typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void **);
         HMODULE h = LoadLibraryA("dxgi.dll");
         PFN_CF1 cf = h ? (PFN_CF1)(void *)GetProcAddress(h, "CreateDXGIFactory1") : nullptr;
@@ -1628,21 +1643,30 @@ static bool VramMB(double &use, double &budget)
             IDXGIAdapter1 *a = nullptr; SIZE_T best = 0;
             for (UINT k = 0; fac->EnumAdapters1(k, &a) == S_OK; k++)
             {
-                DXGI_ADAPTER_DESC1 d; a->GetDesc1(&d);
-                IDXGIAdapter3 *a3 = nullptr;
-                if (d.DedicatedVideoMemory > best && SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter3), (void **)&a3)) && a3)
+                DXGI_ADAPTER_DESC1 d;
+                if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && d.DedicatedVideoMemory > best)
                 {
-                    if (ad) ad->Release();
-                    ad = a3; best = d.DedicatedVideoMemory;
+                    best = d.DedicatedVideoMemory; luid = d.AdapterLuid; found = true;
                 }
                 a->Release();
             }
             fac->Release();
         }
+        HMODULE g = GetModuleHandleA("gdi32.dll");
+        if (!g) g = LoadLibraryA("gdi32.dll");
+        PFN_Open open = g ? (PFN_Open)(void *)GetProcAddress(g, "D3DKMTOpenAdapterFromLuid") : nullptr;
+        PFN_Query q = g ? (PFN_Query)(void *)GetProcAddress(g, "D3DKMTQueryVideoMemoryInfo") : nullptr;
+        KmtOpenAdapterFromLuid oa = {};
+        oa.AdapterLuid = luid;
+        if (found && open && q && open(&oa) == 0 && oa.hAdapter) { adapter = oa.hAdapter; query = q; }
+        else LOGI("BFI Presenter: video memory use not available (D3DKMT)");
     }
-    if (!ad) return false;
-    DXGI_QUERY_VIDEO_MEMORY_INFO mi = {};
-    if (FAILED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) return false;
+    if (!query) return false;
+    KmtQueryVideoMemoryInfo mi = {};
+    mi.hProcess = nullptr;          // the current process
+    mi.hAdapter = adapter;
+    mi.MemorySegmentGroup = 0;
+    if (query(&mi) != 0) return false;
     use = mi.CurrentUsage / 1048576.0; budget = mi.Budget / 1048576.0;
     return true;
 }
