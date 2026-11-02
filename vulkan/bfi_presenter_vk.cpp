@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.29-rt1"
+#define BFI_VERSION "1.0.29-rt2"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -2895,7 +2895,7 @@ static void PresenterThread(Swapchain *sc)
                         {
                             dupLogged = true;
                             LOGI("BFI Presenter: the game presents each frame twice (%.0f presents, %ld Reflex sleeps a second) -- "
-                                 "the automatic frame cap goes by its frames and stays at Refresh rate", fpsA, rend);
+                                 "the automatic frame cap tries Refresh rate again every 20 s when it steps down", fpsA, rend);
                         }
                     }
                     // A second with far fewer presents than rendered frames is a stall or a rebuilt swap chain (its first
@@ -2997,7 +2997,14 @@ static void PresenterThread(Swapchain *sc)
                     }
                 }
                 bool down = sc->autoCapDown.load();
-                const bool capOn = s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg && !dupPresents;
+                // Each frame presented twice (RPCS3): the cap still steps down when the game falls between the two
+                // (an RPCS3 game at 70-80 presents, 35-40 frames, picked unevenly by 60 strobe cycles) -- then 60
+                // presents, each frame over two strobe cycles. Its tries at Refresh rate stay 20 s apart instead of
+                // growing: a game running at 60 frames dips only while loading (God of War Collection stayed at 30 fps
+                // for a minute when the cap stepped down there).
+                static bool dupSeen = false;
+                if (dupPresents) dupSeen = true;
+                const bool capOn = s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg;
                 // "Forget this game": the cap and the frame start start over (the section is deleted on the helper thread).
                 if (g_learnForgetNow.exchange(false))
                 {
@@ -3064,7 +3071,7 @@ static void PresenterThread(Swapchain *sc)
                                 // 120: 5 s with every eighth frame skipped), so the next one waits 5 minutes (as the DX add-on).
                                 if (fpsA < 0.8 * hzA) probeWait = 300.0;
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
-                                     "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
+                                     "at Refresh); next try in %.0f s", fpsA, hzA, dupSeen ? std::min(probeWait, 20.0) : probeWait);
                             }
                         }
                     }
@@ -3083,7 +3090,7 @@ static void PresenterThread(Swapchain *sc)
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames, fpsA, hzA);
                         }
                     }
-                    else if (t - capSwitchT >= probeWait && !hitchPaused)
+                    else if (t - capSwitchT >= (dupSeen ? std::min(probeWait, 20.0) : probeWait) && !hitchPaused)
                     {
                         down = false; capProbe = true; probeSecs = probeGood = 0; capSwitchT = t;
                     }
