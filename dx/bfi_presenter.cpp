@@ -91,7 +91,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.30-t3"
+#define BFI_ADDON_VERSION "1.0.30-t4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2644,6 +2644,7 @@ static DWORD WINAPI PresenterThread(void *)
         LeaveCriticalSection(&g_cfgLock);
         BoostPresenterThread(mm, "presenter");
     }
+    const double runStartT = Now();     // automatic frame cap: no step down in the first seconds (warm-up, intros)
     if (g_device)
     {
         // The GPU the game renders on, for the system check (its monitor driven by another GPU).
@@ -4117,7 +4118,8 @@ static DWORD WINAPI PresenterThread(void *)
                                 // Far from the refresh rate (under 80%): each try is seconds of uneven frames and the
                                 // longest delay (Soul Reaver at 64 of 120: 53 ms from release to flash for 4 s), so the
                                 // next one waits 5 minutes.
-                                if (fpsA < 0.8 * hzA) probeWait = 300.0;
+                                if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;   // its own limit (see above)
+                                else if (fpsA < 0.8 * hzA) probeWait = 300.0;
                                 if (fg && fgTryNeedMs > 0.0) { fgFailNeedMs = fgTryNeedMs; fgSkipLogged = false; }
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
@@ -4126,7 +4128,10 @@ static DWORD WINAPI PresenterThread(void *)
                     }
                     else if (!autoCapDown)
                     {
-                        capDownSecs = (!hitchPaused && fgVotes == 0 && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;   // not while frame generation may be starting
+                        // Not while frame generation may be starting, nor in the first 10 s after the presenter starts: the
+                        // game is still warming up (Castlevania: 60 fps for 3 s while its GPU caught up, then a minute at 60).
+                        capDownSecs = (!hitchPaused && fgVotes == 0 && t - runStartT > 10.0 && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA)
+                                      ? capDownSecs + 1 : 0;
                         if (capDownSecs >= 3 && t - capSwitchT > 3.0)
                         {
                             // Down again soon after going back up: the game is close to the limit, so the
@@ -4142,7 +4147,11 @@ static DWORD WINAPI PresenterThread(void *)
                             // light corner) counts as failed too, so the next one waits for clearly lighter frames (Control,
                             // 3x: up at 02:10:59, down 9 s later at 65 fps).
                             if (fg && t - capUpT < 30.0 && fgTryNeedMs > 0.0) { fgFailNeedMs = fgTryNeedMs; fgSkipLogged = false; }
-                            if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;   // well under the refresh rate: first try after a minute
+                            // Well under the refresh rate: first try after a minute -- unless the game holds exactly the strobe rate,
+                            // which is a limit of its own (an intro, a menu), not a struggle: tries every 30 s cost nothing there.
+                            const bool atStrobe = fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames;
+                            if (atStrobe) probeWait = 30.0;
+                            else if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;
                             autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames,

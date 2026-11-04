@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.30-t2"
+#define BFI_VERSION "1.0.30-t4"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -1897,6 +1897,7 @@ static void PresenterThread(Swapchain *sc)
         BoostPresenterThread(mm, "presenter");
     }
 #endif
+    const double runStartT = Now();     // automatic frame cap: no step down in the first seconds (warm-up, intros)
     LOGI("BFI Presenter: presenter running (%s, %s queue, %u real images)", copyMode ? "copy mode" : R.rt ? "BFI, compute" : "BFI",
          R.rt ? (d->rtPrio == VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR ? "global realtime" : "high-priority") :
          d->sharedQueue ? "the game's" : "its own", sc->nReal);
@@ -3108,7 +3109,10 @@ static void PresenterThread(Swapchain *sc)
                                 probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
                                 // Far from the refresh rate (under 80%): each try is seconds of uneven frames (P.T.-PC at 72 of
                                 // 120: 5 s with every eighth frame skipped), so the next one waits 5 minutes (as the DX add-on).
-                                if (fpsA < 0.8 * hzA) probeWait = 300.0;
+                                // Exactly the strobe rate is a limit of the game's own (an intro, a menu), not a struggle: tries
+                                // every 30 s cost nothing there (as the DX add-on).
+                                if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;
+                                else if (fpsA < 0.8 * hzA) probeWait = 300.0;
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, dupSeen ? std::min(probeWait, 20.0) : probeWait);
                             }
@@ -3116,14 +3120,16 @@ static void PresenterThread(Swapchain *sc)
                     }
                     else if (!down)
                     {
-                        capDownSecs = (!hitchPaused && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;
+                        // Not in the first 10 s after the presenter starts: the game is still warming up (as the DX add-on).
+                        capDownSecs = (!hitchPaused && t - runStartT > 10.0 && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;
                         if (capDownSecs >= 3 && t - capSwitchT > 3.0)
                         {
                             // Down again soon after going back up: the game is close to the limit, so the next try waits
                             // longer; well under the refresh rate, the first try waits a minute (as the DX add-on).
                             if (t - capUpT < 30.0) probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
                             else probeWait = 30.0;
-                            if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;
+                            if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;
+                            else if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;
                             down = true; capDownSecs = 0; capSwitchT = t;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames, fpsA, hzA);
