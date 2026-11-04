@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.30-t4"
+#define BFI_VERSION "1.0.30-t5"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -3087,13 +3087,18 @@ static void PresenterThread(Swapchain *sc)
                         if (fsState == 3) { learnMine.fsMs = fsLeadCur * 1000.0; learnMine.bestMs = fsBestMs; LearnPost(learnMine); }
                     }
                 }
+                // Each frame presented twice (RPCS3): stepping down halves the game's own frame rate (60 -> 30), far more
+                // than the unevenness of a game just short of 60 (MotorStorm at 113 of 120 presents went to 30 for 20 s at
+                // a time). Those step down only well below it -- 85% of the refresh rate, about 51 game fps at 120 Hz --
+                // and a try at Refresh rate that holds 85% is good enough to stay there.
+                const double capHoldFrac = dupSeen ? 0.85 : 0.95;
                 if (capOn)
                 {
                     if (capProbe)
                     {
                         // Trying Refresh: the first second still counts frames from the cap.
                         probeSecs++;
-                        if (probeSecs >= 2 && fpsA >= 0.95 * hzA && !hitchPaused) probeGood++;
+                        if (probeSecs >= 2 && fpsA >= capHoldFrac * hzA && !hitchPaused) probeGood++;
                         if (probeSecs >= 4)
                         {
                             capProbe = false; capDownSecs = 0; capSwitchT = t;
@@ -3121,7 +3126,7 @@ static void PresenterThread(Swapchain *sc)
                     else if (!down)
                     {
                         // Not in the first 10 s after the presenter starts: the game is still warming up (as the DX add-on).
-                        capDownSecs = (!hitchPaused && t - runStartT > 10.0 && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;
+                        capDownSecs = (!hitchPaused && t - runStartT > 10.0 && fpsA > 0.3 * hzA / s.frames && fpsA < capHoldFrac * hzA) ? capDownSecs + 1 : 0;
                         if (capDownSecs >= 3 && t - capSwitchT > 3.0)
                         {
                             // Down again soon after going back up: the game is close to the limit, so the next try waits
