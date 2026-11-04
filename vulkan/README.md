@@ -90,6 +90,7 @@ All other keys are shared with the DX add-on; see the comments in `BFIPresenter.
 |---|---|---|
 | `VulkanLayer` | 1 | 0 = the layer stays off in this game even though the ini is there |
 | `VulkanOwnQueue` | 1 | 0 = the presenter shares the game's queue (locked) instead of its own |
+| `PresenterQueuePriority` | 2 | GPU priority of the presenter's work: 0 normal, 1 high, 2 realtime if allowed (Manager > GPU priority), else high. Above 0 it runs as a compute shader on a queue of its own compute family; not when the game uses that family itself. Applies at the next game start |
 | `VulkanExclusiveFullscreen` | 1 | The presenter's own swap chain runs in exclusive fullscreen (`VK_EXT_full_screen_exclusive`, application-controlled), so an overlay or alt-tab can't move presentation into the desktop compositor, where the strobe loses its timing and flashes. The game's own window mode is unchanged. Applies at the next game start |
 | `VulkanAutoRecover` | 1 | When the display keeps handing the presenter's frames back late for 5 seconds (a window covered the game, such as a launcher's splash screen, or the ReShade menu was open), the game is asked to rebuild its swap chain: a short pause, at most every 20 seconds. The log lists the windows over the game when it happens. Ctrl+Shift+O does it by hand |
 | `SdrToHdr` | 1 | SDR games are presented as HDR10 when the display offers it (Windows HDR on), so the lit refresh has headroom. 0 = plain SDR (use Gain 0.5 then). In DXVK games 1 keeps them SDR (HDR10 hung the NVIDIA driver's present there); 2 forces HDR10 there too, together with NVIDIA "Vulkan/OpenGL present method: Prefer native" for the game |
@@ -106,7 +107,8 @@ Environment variable `DISABLE_BFI_PRESENTER_VK=1` turns the layer off for anythi
 - **Anti-cheat games** may refuse unknown Vulkan layers.
 - **32-bit games through DXVK can't strobe cleanly.** In Twelve Minutes (DX11) and Alan Wake (DX9) the presenter's BFI flickered as if the display showed some refreshes twice, even though its timing log was clean, and the CRT shader's own BFI (decay) flickered the same way without the layer. So the frames don't reach the screen one per refresh through DXVK there; it isn't the layer. HDR10 output also gave a black screen (Alan Wake) or froze the game (Twelve Minutes). For 32-bit Direct3D 11 games use the DX add-on's `BFIPresenter.addon32`; 32-bit Direct3D 9 games have no BFI route for now (CRT-Standalone doesn't run under ReShade's DirectX 9 path either).
 - **GPU-heavy games** can still flash when the GPU is saturated (Indiana Jones). Give the GPU headroom, raise the dark floor slightly, or try `QueueAhead=1`.
-- **Not yet in the Vulkan layer:** the VRR warning (Vulkan has no frame statistics to drive it), the crash and hang loggers, and realtime GPU priority for the presenter queue.
+- **Not yet in the Vulkan layer:** the VRR warning (Vulkan has no frame statistics to drive it) and the crash and hang loggers.
+- **Realtime GPU priority only in some games** (v1.0.29): Vulkan sets queue priority per queue family, so the presenter's raised queue has to be in the compute family. Games that use that family themselves (async compute: RPCS3, likely id Tech games) keep the presenter at normal priority; the log says why.
 
 ## Building
 

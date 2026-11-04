@@ -44,7 +44,7 @@ The [Vulkan layer](../vulkan/README.md) covers Vulkan games and DirectX 9–11 g
 | Frame generation reaching only ~60 (e.g. 3× at 20 fps, 2× at 30), Reflex game | Refresh rate + automatic frame cap | Lowest latency | Just-in-time (default) | Reflex's limit paces it (v1.0.19): Alan Wake 2 with 3× about 42 ms from frame start to the GPU against about 140 ms at Half refresh |
 | Frame generation reaching only ~60, no Reflex | Half refresh | Smooth | Just-in-time (default) | Every generated frame gets a flash |
 | Game below 60 fps | Quarter refresh | Lowest latency | Just-in-time (default) | Even 30 fps; each frame lit twice (double image in motion) |
-| Flashes in a GPU-heavy game | any | any | — | Start the launcher (Steam) as administrator for a realtime presenter queue |
+| Flashes in a GPU-heavy game | any | any | — | Manager > GPU priority > Allow for my account (or the launcher started as administrator) for a realtime presenter queue |
 
 Avoid Smooth at the Refresh cap: it adds a refresh of latency and doesn't make 120 fps motion more even. With frame generation it added a full cycle (God of War Ragnarok: ~38 ms against ~21.5 ms release to flash) for no smoother motion. At Half or Quarter it only helps while just-in-time release keeps hitting its limit.
 
@@ -118,7 +118,7 @@ Settings apply immediately. **Save to BFIPresenter.ini** keeps them; **Reload in
 
 ### Status
 
-Game fps, refreshes per second (should equal the display rate), frame age, uneven strobe cycles (repeats / skips against the expected step), late refreshes and display repeats (both should be 0), output format, buffers, and the **presenter queue priority** (global realtime only when the game's launcher runs as administrator).
+Game fps, refreshes per second (should equal the display rate), frame age, uneven strobe cycles (repeats / skips against the expected step), late refreshes and display repeats (both should be 0), output format, buffers, and the **presenter queue priority** (global realtime with Manager > GPU priority, or with the game's launcher run as administrator).
 
 ### Advanced
 
@@ -148,7 +148,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 | `OpenGLSupport` (1) | Manage OpenGL games (NVIDIA): frames are shared into the add-on's D3D11 device and shown by the same presenter |
 | `OpenGLSwapInterval0` (1) | Set the OpenGL game's swap interval to 0 so its own SwapBuffers doesn't wait for vblank; 0 = keep the game's interval |
 | `BorderlessFullscreen` (1) | Where exclusive fullscreen is held off (DX11, DX9), make the game's window borderless over its monitor; 0 = leave the window as the game made it |
-| `PresenterQueuePriority` (2) | 0 normal, 1 high, 2 global realtime when Windows allows it (launcher run as administrator), otherwise high. Try 1 or 0 if a game hangs the GPU. Read at game start |
+| `PresenterQueuePriority` (2) | 0 normal, 1 high, 2 global realtime when Windows allows it (Manager > GPU priority, or the launcher run as administrator), otherwise high. Try 1 or 0 if a game hangs the GPU. Read at game start |
 | `ReuseDrawnBuffers` (1) | A refresh that would redraw the same frame with the same settings re-presents the buffer that already holds it: no GPU work, so a busy GPU can't hold up the strobe |
 | `StartBFIAfterGameResize` (1) | Every swap chain shows the game's own frames until its first resize, then BFI starts on the presenter's queue (0 deadlocked Pragmata) |
 | `WaitForResizeOnRecreatedSwapChain` (1) | Same for swap chains the game destroys and recreates (God of War Ragnarök on loading) |

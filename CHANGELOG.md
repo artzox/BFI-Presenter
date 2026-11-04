@@ -7,6 +7,16 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.29] — 2026-11-04 (Manager 1.3.15)
+
+**Realtime GPU priority for the Vulkan layer.** The presenter's strobe can now run ahead of the game's GPU work in Vulkan games too, where the game leaves room for it.
+
+- **[Vulkan] Realtime GPU priority** (`PresenterQueuePriority`, 2 by default as in DX; the overlay's new **Presenter GPU priority** choice under Advanced > Presenter, applies at the next game start). Vulkan sets queue priority for a whole queue family, not for single queues, and raising the graphics family would raise the game's own queues with it. So the presenter gets a queue of its own in the graphics card's compute family and draws the strobe there as a compute shader (the same picture as before, checked in every swap chain format). It works only in games that don't use the compute family themselves. Many games and emulators do, for work alongside their rendering (async compute): RPCS3 does, and id Tech games likely do. There the presenter stays at normal priority, because raising that family would raise the game's compute work too. DXVK games usually leave it free. Realtime needs the right from the Manager's **GPU priority** row, as in DX; otherwise it falls back to high. The log names the reason when the queue isn't raised, and the overlay's **Presenter queue** line shows what the presenter got.
+- **[Vulkan] Automatic frame cap in games that present each frame twice (RPCS3).** It stayed at Refresh rate there, so a game at 35–40 fps (70–80 presents) reached the strobe cycles unevenly. It now steps down to one present per strobe cycle (each frame over two cycles) and tries Refresh rate again every 20 s (Killzone 2). In games that move between 30 and 60 (inFamous at 44–60), it then switches back and forth: use the Half refresh cap there. It costs no more latency than the automatic cap at 30.
+- **[Vulkan] Fixed an occasional crash in RPCS3.** The once-a-second video memory check kept a DXGI object for the whole session; when the code behind it was unloaded, the next check crashed. It now reads video memory use from Windows directly (D3DKMT).
+- **[DX]** No changes; version number only.
+- **[Docs]** Settings guide: realtime priority in Vulkan and why it applies only in some games; RPCS3 games that move between 30 and 60 fps (Half refresh). Tested games: RPCS3 (Killzone 2, inFamous); Dead Space (2023) with the Ishimura patch needs Reflex enabled in `IshimuraPatch.ini` for the automatic frame cap to use Reflex's limit.
+
 ## [1.0.28] — 2026-11-01 (Manager 1.3.15)
 
 **The strobe comes first.** A late strobe flickers; a late game frame is only a stutter. 1.0.28 gives the presenter priority over the game on the GPU and the CPU, and makes frame generation under Reflex's limit hold steady through hitches and load screens.

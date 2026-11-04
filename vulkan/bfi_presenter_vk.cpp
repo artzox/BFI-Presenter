@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.28"
+#define BFI_VERSION "1.0.29"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -292,6 +292,8 @@ struct Settings
     int   queueAhead = 0;     // keep one extra refresh queued (covers a late draw; +1 refresh latency)
     int   log      = 0;
     int   ownQueue = 1;       // present on a queue of the layer's own (else share the game's)
+    int   queuePriority = 2;  // PresenterQueuePriority (applies at the next start): 0 off, 1 high, 2 realtime if allowed else high --
+                              // the presenter's GPU work on a compute queue of its own family at that global priority
     int   sdrToHdr = 1;       // SDR game + HDR display: present HDR10 so the lit refresh has headroom
     float sdrWhite = 200.0f;  // nits of SDR white in that mode (Windows' SDR content brightness)
     float sdrHiNits = 800.0f; // highlight expansion: SDR white highlights stretch to this (0 = off)
@@ -382,6 +384,7 @@ static void LoadSettings(Settings &s)
     s.queueAhead = KvInt(kv, "QueueAhead", 0) ? 1 : 0;
     s.log      = KvInt(kv, "Log", 0);
     s.ownQueue = KvInt(kv, "VulkanOwnQueue", 1) ? 1 : 0;
+    s.queuePriority = Clamp(KvInt(kv, "PresenterQueuePriority", 2), 0, 2);
     s.sdrToHdr = Clamp(KvInt(kv, "SdrToHdr", 1), 0, 2);   // 2 = also in DXVK games
     s.sdrWhite = Clamp(KvFloat(kv, "SdrWhiteNits", 200.0f), 80.0f, 600.0f);
     s.sdrHiNits = KvFloat(kv, "SdrHighlightNits", 800.0f);
@@ -408,7 +411,7 @@ static void LoadSettings(Settings &s)
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
     I("AutoFramesAhead", s.autoAhead); I("SmoothCatchUp", s.smoothCatchUp); I("PresenterBuffers", s.presBuffers); I("VulkanExclusiveFullscreen", s.vkExclusive); I("VulkanAutoRecover", s.vkAutoRecover); I("AblGuard", s.ablGuard);
     I("AblGuardBudgetNits", s.ablBudget); k.push_back({"AblCurve", s.ablCurve}); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs); I("FlashHints", s.flashHints);
-    I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue);
+    I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue); I("PresenterQueuePriority", s.queuePriority);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
     F("SdrHighlightKnee", s.sdrKnee);
     return k;
@@ -452,6 +455,7 @@ struct Status
     int    rfxLimitUs = 0;                  // Reflex frame limit at the game's sleep (frame generation), per rendered frame
     double rawAvg = -1.0, litAvg = -1.0, ceilInUse = 0.0;
     int    sharedQueue = 0;
+    char   queueInfo[160] = "";     // presenter GPU queue in use (overlay)
     int    layerOrder = 0;      // 0 unknown, 1 below ReShade (good), 2 ReShade not above the layer
     char   caller[64] = "";
 };
@@ -510,7 +514,7 @@ struct InstanceData
     X(QueueSubmit2) X(QueueSubmit2KHR) X(QueueBindSparse) X(AcquireNextImage2KHR) X(WaitForPresentKHR) \
     X(GetSwapchainStatusKHR) X(ReleaseSwapchainImagesEXT) X(GetDeviceQueue2) \
     X(AcquireFullScreenExclusiveModeEXT) X(ReleaseFullScreenExclusiveModeEXT) \
-    X(SetLatencySleepModeNV) X(LatencySleepNV)
+    X(SetLatencySleepModeNV) X(LatencySleepNV) X(CreateComputePipelines) X(CmdDispatch)
 
 struct Swapchain;
 struct DeviceData
@@ -532,6 +536,13 @@ struct DeviceData
     std::vector<uint32_t> families;    // every family the device created queues in
     VkPhysicalDeviceMemoryProperties mem = {};
     std::recursive_mutex qlock;        // external synchronisation of 'queue'
+    // Realtime queue (PresenterQueuePriority): a compute queue in a family the game doesn't use, created at a raised
+    // global priority. Vulkan sets the priority per family entry, so it can't be the graphics family's: that would
+    // raise the game's queues with it. The presenter's BFI pass runs there as a compute shader.
+    uint32_t rtFamily = UINT32_MAX;
+    VkQueue  rtQueue = VK_NULL_HANDLE;
+    int      rtPrio = 0;               // VK_QUEUE_GLOBAL_PRIORITY_*: 1024 realtime, 512 high, 0 none
+    std::mutex rtLock;                 // the presenter thread and teardown
 };
 
 static std::mutex g_mapLock;
@@ -578,6 +589,7 @@ struct Constants
     float    decay;       // rolling scan: phosphor decay time in sub-frames (0 = hard bands)
     float    soften;      // 0..1: blend toward the steady average picture (LCD phase swap fade)
     float    phase;       // LCD gradual saver: start of the lit window within the first sub-frame, 0..1
+    uint32_t store;       // compute path: 1 swap R and B (B-first swap chain format), 2 sRGB-encode (_SRGB swap chain format)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -713,6 +725,7 @@ struct Swapchain
     VkImageUsageFlags realUsage = 0;
     VkFormat       realFormat = VK_FORMAT_UNDEFINED;     // differs from 'format' when SDR is presented as HDR10
     bool           hdrUpgrade = false;
+    bool           rtPresent = false;      // the realtime queue presents too (else the presenter queue, after it)
 
     // stand-in images the game renders to
     uint32_t       nVirt = 0;
@@ -1048,6 +1061,20 @@ struct PresenterRes
     VkBuffer              dumpBuf = VK_NULL_HANDLE;
     VkDeviceMemory        dumpMem = VK_NULL_HANDLE;
     uint8_t              *dumpPtr = nullptr;
+    // realtime queue: compute BFI pass into 'mid', copied to the swap chain image
+    bool                  rt = false;
+    uint32_t              store = 0;          // Constants::store for the swap chain format
+    VkCommandPool         rtPool = VK_NULL_HANDLE;
+    VkCommandBuffer       rtCmd[kMaxImg] = {};
+    VkDescriptorSetLayout dslC = VK_NULL_HANDLE;
+    VkPipelineLayout      plC = VK_NULL_HANDLE;
+    VkShaderModule        csBfi = VK_NULL_HANDLE, csMeas = VK_NULL_HANDLE;
+    VkPipeline            psoC = VK_NULL_HANDLE, psoMC = VK_NULL_HANDLE;
+    VkDescriptorPool      dpC = VK_NULL_HANDLE;
+    VkDescriptorSet       dsC[kStage] = {}, dsM[kStage] = {};
+    VkImage               mid = VK_NULL_HANDLE;
+    VkDeviceMemory        midMem = VK_NULL_HANDLE;
+    VkImageView           midView = VK_NULL_HANDLE;
 };
 
 static VkRenderPass MakeRenderPass(DeviceData *d, VkFormat fmt, VkImageLayout finalLayout)
@@ -1142,6 +1169,187 @@ static VkPipeline MakePipeline(DeviceData *d, VkRenderPass rp, VkPipelineLayout 
     VkPipeline p = VK_NULL_HANDLE;
     if (d->CreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
     return p;
+}
+
+// Realtime queue resources: the BFI pass (and the ABL guard's measurement) as compute shaders on d->rtQueue, into a
+// storage image of a format compatible with the swap chain's, then a copy into the swap chain image. Without them
+// (format not covered, objects not created) the presenter keeps to its graphics queue.
+static VkPipeline MakeComputePipeline(DeviceData *d, VkPipelineLayout pl, VkShaderModule cs)
+{
+    VkComputePipelineCreateInfo ci = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = cs;
+    ci.stage.pName = "main";
+    ci.layout = pl;
+    VkPipeline p = VK_NULL_HANDLE;
+    if (d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    return p;
+}
+static void CreateRtRes(Swapchain *sc, PresenterRes &R)
+{
+    DeviceData *d = sc->d;
+    if (!d->rtQueue || R.pso == VK_NULL_HANDLE) return;
+    VkDevice dev = d->device;
+    // storage format the swap chain's bytes can be copied from (same texel size), and what the shader does for it
+    VkFormat mf = VK_FORMAT_UNDEFINED;
+    const uint32_t *code = nullptr;
+    size_t bytes = 0;
+    switch (sc->realFormat)
+    {
+    case VK_FORMAT_R8G8B8A8_UNORM:  mf = VK_FORMAT_R8G8B8A8_UNORM; break;
+    case VK_FORMAT_B8G8R8A8_UNORM:  mf = VK_FORMAT_R8G8B8A8_UNORM; R.store = 1; break;
+    case VK_FORMAT_R8G8B8A8_SRGB:   mf = VK_FORMAT_R8G8B8A8_UNORM; R.store = 2; break;
+    case VK_FORMAT_B8G8R8A8_SRGB:   mf = VK_FORMAT_R8G8B8A8_UNORM; R.store = 3; break;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: mf = VK_FORMAT_A2B10G10R10_UNORM_PACK32; break;
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: mf = VK_FORMAT_A2B10G10R10_UNORM_PACK32; R.store = 1; break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: mf = VK_FORMAT_R16G16B16A16_SFLOAT; break;
+    default: break;
+    }
+    if (mf == VK_FORMAT_R8G8B8A8_UNORM) { code = kBfiComp8Spv; bytes = sizeof(kBfiComp8Spv); }
+    else if (mf == VK_FORMAT_A2B10G10R10_UNORM_PACK32) { code = kBfiComp10Spv; bytes = sizeof(kBfiComp10Spv); }
+    else if (mf == VK_FORMAT_R16G16B16A16_SFLOAT) { code = kBfiComp16Spv; bytes = sizeof(kBfiComp16Spv); }
+    const char *why = nullptr;
+    VkFormatProperties fp = {};
+    if (code) d->inst->GetPhysicalDeviceFormatProperties(d->phys, mf, &fp);
+    if (!code) why = "swap chain format not covered";
+    else if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) why = "no storage image support for its format";
+    else if (!(sc->realUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) why = "the swap chain can't be copied into";
+    bool p = !why;
+    if (p)
+    {
+        VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = d->rtFamily;
+        p = d->CreateCommandPool(dev, &pci, nullptr, &R.rtPool) == VK_SUCCESS;
+        VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        cai.commandPool = R.rtPool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = sc->nReal;
+        p = p && d->AllocateCommandBuffers(dev, &cai, R.rtCmd) == VK_SUCCESS;
+        for (uint32_t i = 0; p && i < sc->nReal; i++)
+            if (d->setLoaderData) d->setLoaderData(dev, R.rtCmd[i]);
+    }
+    if (p)
+    {
+        VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = mf;
+        ici.extent = { sc->extent.width, sc->extent.height, 1 };
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        p = CreateImageMem(d, ici, &R.mid, &R.midMem);
+        VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vci.image = R.mid;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = mf;
+        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        p = p && d->CreateImageView(dev, &vci, nullptr, &R.midView) == VK_SUCCESS;
+    }
+    if (p)
+    {
+        VkDescriptorSetLayoutBinding b[2] = {};
+        b[0].binding = 0;
+        b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[0].descriptorCount = 1;
+        b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        b[1].binding = 1;
+        b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[1].descriptorCount = 1;
+        b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        dli.bindingCount = 2;
+        dli.pBindings = b;
+        p = d->CreateDescriptorSetLayout(dev, &dli, nullptr, &R.dslC) == VK_SUCCESS;
+        VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Constants) };
+        VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &R.dslC;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pr;
+        p = p && d->CreatePipelineLayout(dev, &pli, nullptr, &R.plC) == VK_SUCCESS;
+    }
+    if (p)
+    {
+        R.csBfi = MakeShader(d, code, bytes);
+        R.psoC = R.csBfi ? MakeComputePipeline(d, R.plC, R.csBfi) : VK_NULL_HANDLE;
+        p = R.psoC != VK_NULL_HANDLE;
+        if (!p) why = "its compute pipeline could not be created";
+    }
+    const bool meas = p && R.psoMeas && R.measView;
+    if (p)
+    {
+        VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kStage } };
+        VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        dpi.maxSets = 2 * kStage;
+        dpi.poolSizeCount = 2;
+        dpi.pPoolSizes = ps;
+        p = d->CreateDescriptorPool(dev, &dpi, nullptr, &R.dpC) == VK_SUCCESS;
+        VkDescriptorSetLayout l[2 * kStage];
+        for (uint32_t i = 0; i < 2 * kStage; i++) l[i] = R.dslC;
+        VkDescriptorSet sets[2 * kStage] = {};
+        VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dai.descriptorPool = R.dpC;
+        dai.descriptorSetCount = meas ? 2 * kStage : kStage;
+        dai.pSetLayouts = l;
+        p = p && d->AllocateDescriptorSets(dev, &dai, sets) == VK_SUCCESS;
+        for (uint32_t i = 0; p && i < kStage; i++)
+        {
+            R.dsC[i] = sets[i];
+            if (meas) R.dsM[i] = sets[kStage + i];
+            for (int k = 0; k < (meas ? 2 : 1); k++)
+            {
+                VkDescriptorImageInfo src = { R.sampler, sc->stageView[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                VkDescriptorImageInfo dst = { VK_NULL_HANDLE, k ? R.measView : R.midView, VK_IMAGE_LAYOUT_GENERAL };
+                VkWriteDescriptorSet w[2] = { { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
+                w[0].dstSet = w[1].dstSet = k ? R.dsM[i] : R.dsC[i];
+                w[0].dstBinding = 0;
+                w[0].descriptorCount = 1;
+                w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                w[0].pImageInfo = &src;
+                w[1].dstBinding = 1;
+                w[1].descriptorCount = 1;
+                w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                w[1].pImageInfo = &dst;
+                d->UpdateDescriptorSets(dev, 2, w, 0, nullptr);
+            }
+        }
+    }
+    if (p && meas)
+    {
+        R.csMeas = MakeShader(d, kMeasCompSpv, sizeof(kMeasCompSpv));
+        R.psoMC = R.csMeas ? MakeComputePipeline(d, R.plC, R.csMeas) : VK_NULL_HANDLE;
+    }
+    if (!p)
+    {
+        LOGW("BFI Presenter: realtime queue not used for this swap chain (%s) -- the presenter's GPU work stays on the graphics queue",
+             why ? why : "its objects could not be created");
+        // only the compute objects go; DestroyPresenterRes would take everything
+        if (R.rtPool) d->DestroyCommandPool(dev, R.rtPool, nullptr);
+        if (R.psoC) d->DestroyPipeline(dev, R.psoC, nullptr);
+        if (R.csBfi) d->DestroyShaderModule(dev, R.csBfi, nullptr);
+        if (R.plC) d->DestroyPipelineLayout(dev, R.plC, nullptr);
+        if (R.dslC) d->DestroyDescriptorSetLayout(dev, R.dslC, nullptr);
+        if (R.dpC) d->DestroyDescriptorPool(dev, R.dpC, nullptr);
+        if (R.midView) d->DestroyImageView(dev, R.midView, nullptr);
+        if (R.mid) d->DestroyImage(dev, R.mid, nullptr);
+        if (R.midMem) d->FreeMemory(dev, R.midMem, nullptr);
+        R.rtPool = VK_NULL_HANDLE; R.psoC = VK_NULL_HANDLE; R.csBfi = VK_NULL_HANDLE; R.plC = VK_NULL_HANDLE;
+        R.dslC = VK_NULL_HANDLE; R.dpC = VK_NULL_HANDLE; R.midView = VK_NULL_HANDLE; R.mid = VK_NULL_HANDLE; R.midMem = VK_NULL_HANDLE;
+        R.store = 0;
+        return;
+    }
+    if (R.psoMeas && !R.psoMC)
+    {
+        LOGW("BFI Presenter: ABL guard unavailable on the realtime queue (its compute pipeline could not be created)");
+        d->DestroyPipeline(dev, R.psoMeas, nullptr);
+        R.psoMeas = VK_NULL_HANDLE;
+        R.measPtr = nullptr;
+    }
+    R.rt = true;
 }
 
 // Creates what the presenter needs. Returns false only if nothing can be
@@ -1299,7 +1507,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
         m = CreateImageMem(d, ici, &R.measImg, &R.measMem);
     }
     if (m)
@@ -1348,6 +1556,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         R.psoMeas = VK_NULL_HANDLE;
         R.measPtr = nullptr;
     }
+    CreateRtRes(sc, R);
     return true;
 }
 
@@ -1383,6 +1592,17 @@ static void DestroyPresenterRes(DeviceData *d, PresenterRes &R)
     if (R.measBufMem) d->FreeMemory(dev, R.measBufMem, nullptr);
     if (R.dumpBuf) d->DestroyBuffer(dev, R.dumpBuf, nullptr);
     if (R.dumpMem) d->FreeMemory(dev, R.dumpMem, nullptr);
+    if (R.rtPool) d->DestroyCommandPool(dev, R.rtPool, nullptr);
+    if (R.psoC) d->DestroyPipeline(dev, R.psoC, nullptr);
+    if (R.psoMC) d->DestroyPipeline(dev, R.psoMC, nullptr);
+    if (R.csBfi) d->DestroyShaderModule(dev, R.csBfi, nullptr);
+    if (R.csMeas) d->DestroyShaderModule(dev, R.csMeas, nullptr);
+    if (R.plC) d->DestroyPipelineLayout(dev, R.plC, nullptr);
+    if (R.dslC) d->DestroyDescriptorSetLayout(dev, R.dslC, nullptr);
+    if (R.dpC) d->DestroyDescriptorPool(dev, R.dpC, nullptr);
+    if (R.midView) d->DestroyImageView(dev, R.midView, nullptr);
+    if (R.mid) d->DestroyImage(dev, R.mid, nullptr);
+    if (R.midMem) d->FreeMemory(dev, R.midMem, nullptr);
     R = PresenterRes();
 }
 
@@ -1393,12 +1613,27 @@ static double g_rebuildGap = 20.0;          // automatic rebuilds at least this 
 static int    g_rebuildMisses = 0;          // automatic rebuilds in a row after which presentation slowed again within a minute
 
 // The game's video memory use against the budget Windows gives it (DXGI, the NVIDIA adapter), in MB.
+// The game's video memory use and budget, from the kernel (D3DKMT) for the GPU with the most video memory. DXGI is
+// used once to find that GPU and released at once: a DXGI adapter kept for the session crashed RPCS3 -- the code behind
+// it had been unloaded by the time the per-second check called it.
+struct KmtQueryVideoMemoryInfo
+{
+    HANDLE   hProcess;
+    UINT     hAdapter;
+    UINT     MemorySegmentGroup;   // 0 local
+    UINT64   Budget, CurrentUsage, CurrentReservation, AvailableForReservation;
+    UINT     PhysicalAdapterIndex;
+};
+struct KmtOpenAdapterFromLuid { LUID AdapterLuid; UINT hAdapter; };
 static bool VramMB(double &use, double &budget)
 {
-    static IDXGIAdapter3 *ad = nullptr; static bool tried = false;
+    typedef LONG (APIENTRY *PFN_Open)(KmtOpenAdapterFromLuid *);
+    typedef LONG (APIENTRY *PFN_Query)(KmtQueryVideoMemoryInfo *);
+    static PFN_Query query = nullptr; static UINT adapter = 0; static bool tried = false;
     if (!tried)
     {
         tried = true;
+        LUID luid = {}; bool found = false;
         typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void **);
         HMODULE h = LoadLibraryA("dxgi.dll");
         PFN_CF1 cf = h ? (PFN_CF1)(void *)GetProcAddress(h, "CreateDXGIFactory1") : nullptr;
@@ -1408,21 +1643,30 @@ static bool VramMB(double &use, double &budget)
             IDXGIAdapter1 *a = nullptr; SIZE_T best = 0;
             for (UINT k = 0; fac->EnumAdapters1(k, &a) == S_OK; k++)
             {
-                DXGI_ADAPTER_DESC1 d; a->GetDesc1(&d);
-                IDXGIAdapter3 *a3 = nullptr;
-                if (d.DedicatedVideoMemory > best && SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter3), (void **)&a3)) && a3)
+                DXGI_ADAPTER_DESC1 d;
+                if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && d.DedicatedVideoMemory > best)
                 {
-                    if (ad) ad->Release();
-                    ad = a3; best = d.DedicatedVideoMemory;
+                    best = d.DedicatedVideoMemory; luid = d.AdapterLuid; found = true;
                 }
                 a->Release();
             }
             fac->Release();
         }
+        HMODULE g = GetModuleHandleA("gdi32.dll");
+        if (!g) g = LoadLibraryA("gdi32.dll");
+        PFN_Open open = g ? (PFN_Open)(void *)GetProcAddress(g, "D3DKMTOpenAdapterFromLuid") : nullptr;
+        PFN_Query q = g ? (PFN_Query)(void *)GetProcAddress(g, "D3DKMTQueryVideoMemoryInfo") : nullptr;
+        KmtOpenAdapterFromLuid oa = {};
+        oa.AdapterLuid = luid;
+        if (found && open && q && open(&oa) == 0 && oa.hAdapter) { adapter = oa.hAdapter; query = q; }
+        else LOGI("BFI Presenter: video memory use not available (D3DKMT)");
     }
-    if (!ad) return false;
-    DXGI_QUERY_VIDEO_MEMORY_INFO mi = {};
-    if (FAILED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) return false;
+    if (!query) return false;
+    KmtQueryVideoMemoryInfo mi = {};
+    mi.hProcess = nullptr;          // the current process
+    mi.hAdapter = adapter;
+    mi.MemorySegmentGroup = 0;
+    if (query(&mi) != 0) return false;
     use = mi.CurrentUsage / 1048576.0; budget = mi.Budget / 1048576.0;
     return true;
 }
@@ -1642,11 +1886,18 @@ static void PresenterThread(Swapchain *sc)
         BoostPresenterThread(mm, "presenter");
     }
 #endif
-    LOGI("BFI Presenter: presenter running (%s, %s queue, %u real images)", copyMode ? "copy mode" : "BFI",
+    LOGI("BFI Presenter: presenter running (%s, %s queue, %u real images)", copyMode ? "copy mode" : R.rt ? "BFI, compute" : "BFI",
+         R.rt ? (d->rtPrio == VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR ? "global realtime" : "high-priority") :
          d->sharedQueue ? "the game's" : "its own", sc->nReal);
     {
         std::lock_guard<std::mutex> l(g_cfgLock);
         g_status.running = 1;
+        if (R.rt)
+            snprintf(g_status.queueInfo, sizeof(g_status.queueInfo), "global %s (compute family %u%s)",
+                     d->rtPrio == VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR ? "realtime" : "high", d->rtFamily,
+                     sc->rtPresent ? "" : ", presented on the graphics queue");
+        else
+            snprintf(g_status.queueInfo, sizeof(g_status.queueInfo), "%s", d->sharedQueue ? "the game's graphics queue (shared)" : "normal (graphics queue)");
     }
 
     Settings s;
@@ -2084,7 +2335,7 @@ static void PresenterThread(Swapchain *sc)
             d->WaitForFences(dev, 1, &R.fence[idx], VK_TRUE, 1000000000ull);
             d->ResetFences(dev, 1, &R.fence[idx]);
             tFence = Now();
-            VkCommandBuffer cb = R.cmd[idx];
+            VkCommandBuffer cb = R.rt ? R.rtCmd[idx] : R.cmd[idx];
             d->ResetCommandBuffer(cb, 0);
             VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -2106,6 +2357,70 @@ static void PresenterThread(Swapchain *sc)
                 br2[1] = ImgBarrier(sc->stage[pick], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                     VK_ACCESS_TRANSFER_READ_BIT, 0);
                 d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 2, br2);
+            }
+            else if (R.rt)
+            {
+                // Realtime queue: the BFI pass as a compute shader into 'mid', then copied to the swap chain image.
+                Constants cc = c;
+                cc.store = R.store;
+                VkImageMemoryBarrier mb = ImgBarrier(R.mid, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
+                d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &mb);
+                d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.psoC);
+                d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plC, 0, 1, &R.dsC[pick], 0, nullptr);
+                d->CmdPushConstants(cb, R.plC, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cc), &cc);
+                d->CmdDispatch(cb, (sc->extent.width + 7) / 8, (sc->extent.height + 7) / 8, 1);
+                VkImageMemoryBarrier b2[2] = {
+                    ImgBarrier(R.mid, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT),
+                    ImgBarrier(sc->realImg[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT) };
+                d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      0, 0, nullptr, 0, nullptr, 2, b2);
+                VkImageCopy ic = {};
+                ic.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                ic.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                ic.extent = { sc->extent.width, sc->extent.height, 1 };
+                d->CmdCopyImage(cb, R.mid, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc->realImg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+                const bool dumpHere = R.dumpPtr && dumpLeft > 0;
+                VkImageMemoryBarrier pb = ImgBarrier(sc->realImg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                     dumpHere ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                                     VK_ACCESS_TRANSFER_WRITE_BIT, dumpHere ? VK_ACCESS_TRANSFER_READ_BIT : 0);
+                d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, dumpHere ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                      0, 0, nullptr, 0, nullptr, 1, &pb);
+                if (dumpHere)
+                {
+                    VkBufferImageCopy bic = {};
+                    bic.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                    bic.imageExtent = { sc->extent.width, sc->extent.height, 1 };
+                    d->CmdCopyImageToBuffer(cb, sc->realImg[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, R.dumpBuf, 1, &bic);
+                    pb = ImgBarrier(sc->realImg[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT, 0);
+                    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &pb);
+                    dumpNow = true;
+                }
+                if (ablOn && !measSub && pickId != lastShownId && c.method < 2 && R.psoMC)
+                {
+                    Constants mc = cc;
+                    mc.gain = s.gain;
+                    mc.ceilLin = s.peakNits / 80.0f;
+                    VkImageMemoryBarrier qb = ImgBarrier(R.measImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
+                    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &qb);
+                    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.psoMC);
+                    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plC, 0, 1, &R.dsM[pick], 0, nullptr);
+                    d->CmdPushConstants(cb, R.plC, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mc), &mc);
+                    d->CmdDispatch(cb, 4, 3, 1);
+                    qb = ImgBarrier(R.measImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &qb);
+                    VkBufferImageCopy bic = {};
+                    bic.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                    bic.imageExtent = { 32, 18, 1 };
+                    d->CmdCopyImageToBuffer(cb, R.measImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, R.measBuf, 1, &bic);
+                    VkBufferMemoryBarrier hb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+                    hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                    hb.srcQueueFamilyIndex = hb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    hb.buffer = R.measBuf;
+                    hb.size = VK_WHOLE_SIZE;
+                    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hb, 0, nullptr);
+                    measSub = presSub + 1;
+                }
             }
             else
             {
@@ -2174,7 +2489,7 @@ static void PresenterThread(Swapchain *sc)
                 sc->slotReadSub[pick] = presSub;
             }
             bufSub[idx] = presSub;
-            VkPipelineStageFlags waitStage = copyMode ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            VkPipelineStageFlags waitStage = (copyMode || R.rt) ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
             VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
             si.waitSemaphoreCount = 1;
             si.pWaitSemaphores = &acqSem;
@@ -2184,6 +2499,12 @@ static void PresenterThread(Swapchain *sc)
             si.signalSemaphoreCount = 1;
             si.pSignalSemaphores = &R.done[idx];
             VkResult sr;
+            if (R.rt)
+            {
+                std::lock_guard<std::mutex> l(d->rtLock);
+                sr = d->QueueSubmit(d->rtQueue, 1, &si, R.fence[idx]);
+            }
+            else
             {
                 std::lock_guard<std::recursive_mutex> l(d->qlock);
                 sr = d->QueueSubmit(d->queue, 1, &si, R.fence[idx]);
@@ -2234,6 +2555,12 @@ static void PresenterThread(Swapchain *sc)
         pi.pSwapchains = &sc->real;
         pi.pImageIndices = &idx;
         VkResult pr;
+        if (R.rt && sc->rtPresent)
+        {
+            std::lock_guard<std::mutex> l(d->rtLock);
+            pr = d->QueuePresentKHR(d->rtQueue, &pi);
+        }
+        else
         {
             std::lock_guard<std::recursive_mutex> l(d->qlock);
             pr = d->QueuePresentKHR(d->queue, &pi);
@@ -2592,7 +2919,7 @@ static void PresenterThread(Swapchain *sc)
                         {
                             dupLogged = true;
                             LOGI("BFI Presenter: the game presents each frame twice (%.0f presents, %ld Reflex sleeps a second) -- "
-                                 "the automatic frame cap goes by its frames and stays at Refresh rate", fpsA, rend);
+                                 "the automatic frame cap tries Refresh rate again every 20 s when it steps down", fpsA, rend);
                         }
                     }
                     // A second with far fewer presents than rendered frames is a stall or a rebuilt swap chain (its first
@@ -2694,7 +3021,14 @@ static void PresenterThread(Swapchain *sc)
                     }
                 }
                 bool down = sc->autoCapDown.load();
-                const bool capOn = s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg && !dupPresents;
+                // Each frame presented twice (RPCS3): the cap still steps down when the game falls between the two
+                // (an RPCS3 game at 70-80 presents, 35-40 frames, picked unevenly by 60 strobe cycles) -- then 60
+                // presents, each frame over two strobe cycles. Its tries at Refresh rate stay 20 s apart instead of
+                // growing: a game running at 60 frames dips only while loading (God of War Collection stayed at 30 fps
+                // for a minute when the cap stepped down there).
+                static bool dupSeen = false;
+                if (dupPresents) dupSeen = true;
+                const bool capOn = s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 && !fg;
                 // "Forget this game": the cap and the frame start start over (the section is deleted on the helper thread).
                 if (g_learnForgetNow.exchange(false))
                 {
@@ -2761,7 +3095,7 @@ static void PresenterThread(Swapchain *sc)
                                 // 120: 5 s with every eighth frame skipped), so the next one waits 5 minutes (as the DX add-on).
                                 if (fpsA < 0.8 * hzA) probeWait = 300.0;
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
-                                     "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
+                                     "at Refresh); next try in %.0f s", fpsA, hzA, dupSeen ? std::min(probeWait, 20.0) : probeWait);
                             }
                         }
                     }
@@ -2780,7 +3114,7 @@ static void PresenterThread(Swapchain *sc)
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames, fpsA, hzA);
                         }
                     }
-                    else if (t - capSwitchT >= probeWait && !hitchPaused)
+                    else if (t - capSwitchT >= (dupSeen ? std::min(probeWait, 20.0) : probeWait) && !hitchPaused)
                     {
                         down = false; capProbe = true; probeSecs = probeGood = 0; capSwitchT = t;
                     }
@@ -3086,6 +3420,11 @@ static void PresenterThread(Swapchain *sc)
     {
         std::lock_guard<std::recursive_mutex> l(d->qlock);
         d->QueueWaitIdle(d->queue);
+    }
+    if (d->rtQueue)
+    {
+        std::lock_guard<std::mutex> l(d->rtLock);
+        d->QueueWaitIdle(d->rtQueue);
     }
     if (logf) fclose(logf);
     DestroyPresenterRes(d, R);
@@ -3774,6 +4113,11 @@ static void DestroySCResources(Swapchain *sc)
         std::lock_guard<std::recursive_mutex> l(d->qlock);
         d->QueueWaitIdle(d->queue);
     }
+    if (d->rtQueue)
+    {
+        std::lock_guard<std::mutex> l(d->rtLock);
+        d->QueueWaitIdle(d->rtQueue);
+    }
     for (auto &kv : sc->copyCmds) d->DestroyCommandPool(dev, kv.second.pool, nullptr);
     sc->copyCmds.clear();
     for (uint32_t i = 0; i < kStage; i++)
@@ -3985,6 +4329,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateSwapchainKHR(VkDevice device, co
     rci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     rci.queueFamilyIndexCount = 0;
     rci.pQueueFamilyIndices = nullptr;
+    // Realtime queue: it presents itself where its family can; otherwise the presenter queue presents after it, and
+    // the images are shared by both families.
+    bool rtPresent = false;
+    const uint32_t rtFams[2] = { d->family, d->rtFamily };
+    if (d->rtQueue)
+    {
+        VkBool32 rs = VK_FALSE;
+        inst->GetPhysicalDeviceSurfaceSupportKHR(d->phys, d->rtFamily, ci->surface, &rs);
+        rtPresent = rs == VK_TRUE;
+        if (!rtPresent)
+        {
+            rci.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+            rci.queueFamilyIndexCount = 2;
+            rci.pQueueFamilyIndices = rtFams;
+        }
+        LOGI("BFI Presenter: realtime queue %s", rtPresent ? "presents itself" : "can't present here -- the presenter's graphics queue presents after it");
+    }
     rci.presentMode = VK_PRESENT_MODE_FIFO_KHR;          // the presenter paces to vblank itself
     rci.oldSwapchain = old ? old->real : ci->oldSwapchain;
     // SDR game on an HDR display: present HDR10, so the lit refresh can be
@@ -4127,6 +4488,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateSwapchainKHR(VkDevice device, co
     sc->realUsage = rci.imageUsage;
     sc->realFormat = rci.imageFormat;
     sc->hdrUpgrade = upgrade;
+    sc->rtPresent = rtPresent;
     if (upgrade) LOGI("BFI Presenter: SDR game presented as HDR10 (SDR white %.0f nits) for BFI headroom", s.sdrWhite);
     sc->maxAhead.store(s.autoAhead && s.maxAhead ? 1 : s.maxAhead);
     if (!BuildSC(sc, ci))
@@ -4659,6 +5021,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateDevice(VkPhysicalDevice phys, co
     bool shared = false;
     bool fseSupported = false, fseOn = false;
     std::vector<const char *> dexts(ci->ppEnabledExtensionNames, ci->ppEnabledExtensionNames + ci->enabledExtensionCount);
+    // Realtime queue (see DeviceData::rtFamily)
+    uint32_t rtFamily = UINT32_MAX;
+    float rtQPrio = 1.0f;
+    VkDeviceQueueGlobalPriorityCreateInfoKHR gpci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR };
+    const char *gpAdded = nullptr;
+    bool gpK = false, gpE = false;
     if (g_active)
     {
         uint32_t nf = 0;
@@ -4672,7 +5040,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateDevice(VkPhysicalDevice phys, co
             id->EnumerateDeviceExtensionProperties(phys, nullptr, &ne, nullptr);
             std::vector<VkExtensionProperties> ep(ne);
             if (ne) id->EnumerateDeviceExtensionProperties(phys, nullptr, &ne, ep.data());
-            bool gpK = false, gpE = false;
             for (auto &e : ep)
             {
                 if (!strcmp(e.extensionName, "VK_KHR_global_priority")) gpK = true;
@@ -4712,6 +5079,44 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateDevice(VkPhysicalDevice phys, co
             }
             else { shared = true; index = 0; }
         }
+        if (which >= 0 && !shared && s.queuePriority > 0)
+        {
+            // A compute-only family the game creates no queues in.
+            uint32_t cf = UINT32_MAX, used = UINT32_MAX;
+            for (uint32_t i = 0; i < nf && cf == UINT32_MAX; i++)
+            {
+                if (!(fp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) || (fp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) || !fp[i].queueCount) continue;
+                bool gameUses = false;
+                for (auto &q : qci) if (q.queueFamilyIndex == i) gameUses = true;
+                if (gameUses) { if (used == UINT32_MAX) used = i; continue; }
+                cf = i;
+            }
+            if (!gpK && !gpE)
+                LOGI("BFI Presenter: presenter GPU queue priority not raised -- the driver offers no queue global priority");
+            else if (cf == UINT32_MAX)
+                LOGI("BFI Presenter: presenter GPU queue priority not raised -- %s", used != UINT32_MAX ?
+                     "the game uses the compute queue family itself (raising it would raise the game's compute work too)" :
+                     "the GPU has no separate compute queue family");
+            else
+            {
+                rtFamily = cf;
+                gpci.globalPriority = s.queuePriority >= 2 ? VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR : VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR;
+                VkDeviceQueueCreateInfo q = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
+                q.pNext = &gpci;
+                q.queueFamilyIndex = cf;
+                q.queueCount = 1;
+                q.pQueuePriorities = &rtQPrio;
+                qci.push_back(q);
+                mci.pQueueCreateInfos = qci.data();
+                mci.queueCreateInfoCount = (uint32_t)qci.size();
+                const char *want = gpK ? "VK_KHR_global_priority" : "VK_EXT_global_priority";
+                bool has = false;
+                for (const char *e : dexts) if (!strcmp(e, "VK_KHR_global_priority") || !strcmp(e, "VK_EXT_global_priority")) has = true;
+                if (!has) { dexts.push_back(want); gpAdded = want; }
+                mci.enabledExtensionCount = (uint32_t)dexts.size();
+                mci.ppEnabledExtensionNames = dexts.data();
+            }
+        }
     }
     if (g_active)
     {
@@ -4734,6 +5139,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateDevice(VkPhysicalDevice phys, co
                  !fseSupported ? "the driver has no VK_EXT_full_screen_exclusive" : "VK_KHR_get_surface_capabilities2 could not be enabled");
     }
     VkResult r = create(phys, &mci, a, out);
+    while (r != VK_SUCCESS && rtFamily != UINT32_MAX)
+    {
+        if (gpci.globalPriority == VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR)
+        {
+            LOGW("BFI Presenter: realtime queue priority refused (%d%s) -- trying high", (int)r,
+                 r == VK_ERROR_NOT_PERMITTED_KHR ? ": not permitted, see Manager > GPU priority" : "");
+            gpci.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR;
+        }
+        else
+        {
+            LOGW("BFI Presenter: high queue priority refused too (%d) -- the presenter's GPU work stays on the graphics queue", (int)r);
+            qci.pop_back();
+            mci.queueCreateInfoCount = (uint32_t)qci.size();
+            if (gpAdded) dexts.erase(std::find(dexts.begin(), dexts.end(), gpAdded));
+            mci.enabledExtensionCount = (uint32_t)dexts.size();
+            mci.ppEnabledExtensionNames = dexts.data();
+            rtFamily = UINT32_MAX;
+        }
+        r = create(phys, &mci, a, out);
+    }
     if (r != VK_SUCCESS && fseOn)
     {
         LOGW("BFI Presenter: device creation with VK_EXT_full_screen_exclusive failed (%d) -- trying without", (int)r);
@@ -4781,6 +5206,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateDevice(VkPhysicalDevice phys, co
         LOGI("BFI Presenter: device %s -- presenter queue: family %u index %u (%s)", pp.deviceName, family, index,
              shared ? "shared with the game, locked" : "its own");
         if (shared) LOGW("BFI Presenter: no spare queue in family %u -- the presenter shares the game's queue", family);
+        if (rtFamily != UINT32_MAX && mci.pQueueCreateInfos != ci->pQueueCreateInfos)
+        {
+            if (!d->CreateComputePipelines || !d->CmdDispatch)
+                LOGW("BFI Presenter: compute entry points missing -- the realtime queue is not used");
+            else
+            {
+                d->GetDeviceQueue(*out, rtFamily, 0, &d->rtQueue);
+                if (d->rtQueue && d->setLoaderData) d->setLoaderData(*out, d->rtQueue);
+            }
+            if (d->rtQueue)
+            {
+                d->rtFamily = rtFamily;
+                d->rtPrio = (int)gpci.globalPriority;
+                if (std::find(d->families.begin(), d->families.end(), rtFamily) == d->families.end())
+                    d->families.push_back(rtFamily);   // the staging images are read there too
+                LOGI("BFI Presenter: presenter GPU queue: compute family %u at global %s priority", rtFamily,
+                     d->rtPrio == VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR ? "realtime" : "high");
+            }
+        }
     }
     {
         std::lock_guard<std::mutex> l(g_mapLock);
@@ -5450,7 +5894,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         ImGui::Text("Late refreshes: %d/s", st.late);
         ImGui::Text("Presenter: %s   Output: %s   Format: %d   %ux%u, %u game images, %u real",
                     st.running ? "running" : "stopped", OutName(st.outType), st.format, st.width, st.height, st.images, st.realImages);
-        ImGui::Text("Presenter queue: %s", st.sharedQueue ? "shared with the game (no spare queue)" : "its own");
+        ImGui::Text("Presenter queue: %s", st.queueInfo[0] ? st.queueInfo : st.sharedQueue ? "shared with the game (no spare queue)" : "its own");
     }
 
     // ================================================================ 5. advanced
@@ -5484,6 +5928,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "the desktop compositor use), which runs it ahead of every normal thread, the game's included.\n"
                                                       "A late strobe flickers; a late game frame is only a stutter. On by default; the log says\n"
                                                       "whether it took effect. Power throttling is turned off for the thread either way.");
+        ImGui::Combo("Presenter GPU priority (applies at the next game start)", &s.queuePriority, "Normal\0High\0Realtime (if allowed, else high)\0");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Runs the presenter's GPU work on a compute queue of its own at a raised global priority,\n"
+                                                      "so the strobe is drawn ahead of the game's GPU work. Needs a compute queue family the game\n"
+                                                      "doesn't use itself. Realtime needs the right from Manager > GPU priority (else high).\n"
+                                                      "The line above says what the presenter got.");
         bool qa = s.queueAhead != 0;
         if (ImGui::Checkbox("Queue one refresh ahead (Wait for vblank on, 3 presenter buffers)", &qa)) s.queueAhead = qa ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keeps one extra finished refresh queued, so a draw delayed by the game's GPU work is\n"
