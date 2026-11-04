@@ -18,6 +18,7 @@ layout(push_constant) uniform C
     float soften;     // 0..1: blend toward the steady average picture (LCD phase swap fade)
     float phase;      // LCD gradual saver: start of the lit window within the first sub-frame, 0..1
     uint  store;      // compute path only: 1 swap R and B (B-first swap chain format), 2 sRGB-encode (_SRGB swap chain format)
+    float gamut;      // outType 4/5: gamut expansion strength (0 = off)
 } pc;
 layout(set = 0, binding = 0) uniform sampler2D src;
 
@@ -34,26 +35,54 @@ vec3 LinToPq(vec3 l)
     vec3 p = pow(clamp(max(l, 0.0) * (80.0 / 10000.0), 0.0, 1.0), vec3(m1));
     return pow((c1 + c2 * p) / (1.0 + c3 * p), vec3(m2));
 }
-// SDR shown as HDR10: SDR white at sdrScale, and above the knee the
-// brightest channel is stretched toward sdrPeak (hue kept). Below the knee
-// the image is untouched; the curve meets the straight part with the same
-// slope, so there is no visible seam:  out = W*m + (P - W) * t^2.
+// SDR shown as HDR10 (outType 4/5). SDR white at sdrScale, and above the knee the
+// brightest channel (flags & 128: the luminance) is stretched toward sdrPeak (hue kept).
+// Below the knee the image is untouched; the curve meets the straight part with the
+// same slope, so there is no visible seam:  out = W*m + (P - W) * t^2.
 vec3 SdrExpand(vec3 l)
 {
     l = max(l, 0.0);
-    float m = max(max(l.r, l.g), l.b);
+    float m = (pc.flags & 128u) != 0u ? dot(l, vec3(0.2126, 0.7152, 0.0722)) : max(max(l.r, l.g), l.b);
     if (pc.sdrPeak <= pc.sdrScale || m <= pc.sdrKnee) return l * pc.sdrScale;
     float t = (min(m, 1.0) - pc.sdrKnee) / max(1.0 - pc.sdrKnee, 1e-4);
     float o = pc.sdrScale * m + (pc.sdrPeak - pc.sdrScale) * t * t;
     return l * (o / m);
 }
+// Gamut expansion (Pumbo's AdvancedAutoHDR "Extra HDR saturation", after Unreal Engine): bright saturated colours
+// move out of BT.709 toward a gamut between P3 and ACES AP1, as if the game had rendered wider colours. The weight
+// grows with the colour's distance from grey (in AP1) and its brightness, at a 203-nit paper white whatever SDR white
+// is set to, as in AdvancedAutoHDR. Matrices folded from its Color.fxh: AP1 is BT.709 through the D65 -> D60 CAT.
+vec3 ExpandGamut(vec3 v, float amount)
+{
+    const float pw = 203.0 / 80.0;
+    vec3 r = v * pw;
+    vec3 ap1 = vec3(dot(r, vec3(0.613191478, 0.339512089, 0.047366331)),
+                    dot(r, vec3(0.070206904, 0.916335817, 0.013450011)),
+                    dot(r, vec3(0.020618871, 0.109567294, 0.869606747)));
+    float luma = dot(ap1, vec3(0.2722287168, 0.6740817658, 0.0536895174));
+    if (luma <= 0.0) return v;
+    vec3 ch = ap1 / luma - 1.0;
+    float k = (1.0 - exp2(-4.0 * dot(ch, ch))) * (1.0 - exp2(-4.0 * amount * luma * luma));
+    vec3 e = vec3(dot(r, vec3(1.375026308, -0.342531728, -0.079080858)),
+                  dot(r, vec3(-0.077049702, 1.092442754, -0.010129544)),
+                  dot(r, vec3(-0.020494311, -0.091839135, 1.203626612)));
+    return mix(r, e, k) / pw;
+}
+// flags & 32: SDR decoded with gamma 2.2, flags & 64: gamma 2.4, else the sRGB curve.
+vec3 SdrDecode(vec3 c) { c = max(c, 0.0); return (pc.flags & 32u) != 0u ? pow(c, vec3(2.2)) : (pc.flags & 64u) != 0u ? pow(c, vec3(2.4)) : SrgbToLin(c); }
+vec3 SdrToHdr(vec3 lin)
+{
+    vec3 o = SdrExpand(lin);
+    if (pc.gamut > 0.0) o = ExpandGamut(o / pc.sdrScale, pc.gamut) * pc.sdrScale;
+    return o;
+}
 vec3 Decode(vec3 c)
 {
     if (pc.outType == 0u) return SrgbToLin(c);
     if (pc.outType == 2u) return PqToLin(c);
-    // flags & 32: SDR decoded with gamma 2.2 instead of the sRGB curve (5: the hardware decoded sRGB, re-encoded first)
-    if (pc.outType == 4u) return SdrExpand((pc.flags & 32u) != 0u ? pow(max(c, 0.0), vec3(2.2)) : SrgbToLin(c));
-    if (pc.outType == 5u) return SdrExpand((pc.flags & 32u) != 0u ? pow(LinToSrgb(c), vec3(2.2)) : c);
+    if (pc.outType == 4u) return SdrToHdr(SdrDecode(c));
+    // 5: the hardware decoded the sRGB curve; for gamma 2.2 / 2.4 the signal is re-encoded first
+    if (pc.outType == 5u) return SdrToHdr((pc.flags & 96u) != 0u ? SdrDecode(LinToSrgb(c)) : c);
     return c;
 }
 // BT.709 -> BT.2020 primaries (ITU-R BT.2087), for SDR games presented as HDR10. Every row is a positive blend

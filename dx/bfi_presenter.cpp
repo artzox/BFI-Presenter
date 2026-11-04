@@ -91,7 +91,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.30-t1"
+#define BFI_ADDON_VERSION "1.0.30-t2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -168,7 +168,9 @@ struct Settings
     float sdrWhite = 200.0f;  // nits of SDR white (Windows' SDR content brightness: 80 + 4 x the slider)
     float sdrHiNits = 800.0f; // highlights stretch toward this (0 = off)
     float sdrKnee  = 0.65f;   // expansion starts at this SDR signal level
-    int   sdrGamma = 0;       // SDR decoding: 0 sRGB (as Windows), 1 gamma 2.2 (deeper shadows, as most SDR displays)
+    int   sdrGamma = 0;       // SdrGamma: SDR decoding: 0 sRGB (as Windows), 1 gamma 2.2 (deeper shadows), 2 gamma 2.4
+    int   sdrMethod = 0;      // SdrHighlightMethod: highlights stretched by 0 the brightest channel, 1 luminance
+    float sdrGamut = 0.0f;    // SdrGamutExpansion: 0..1 (0 = off)
 };
 
 static HMODULE  g_module = nullptr;
@@ -342,7 +344,12 @@ static void LoadSettings(Settings &s)
     s.sdrKnee = IniFloat("SdrHighlightKnee", 0.65f);
     if (s.sdrKnee < 0.3f) s.sdrKnee = 0.3f;
     if (s.sdrKnee > 0.95f) s.sdrKnee = 0.95f;
-    s.sdrGamma = IniInt("SdrGamma22", 0) ? 1 : 0;
+    s.sdrGamma = IniInt("SdrGamma", 0);
+    if (s.sdrGamma < 0 || s.sdrGamma > 2) s.sdrGamma = 0;
+    s.sdrMethod = IniInt("SdrHighlightMethod", 0) ? 1 : 0;
+    s.sdrGamut = IniFloat("SdrGamutExpansion", 0.0f);
+    if (s.sdrGamut < 0.0f) s.sdrGamut = 0.0f;
+    if (s.sdrGamut > 1.0f) s.sdrGamut = 1.0f;
     char out[32];
     GetPrivateProfileStringA("BFI", "Output", "auto", out, sizeof(out), g_iniPath);
     s.output = !_stricmp(out, "sdr") ? 0 : !_stricmp(out, "scrgb") ? 1 : !_stricmp(out, "hdr10") ? 2 : -1;
@@ -437,7 +444,9 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("SdrWhiteNits", s.sdrWhite);
     IniWriteFloat("SdrHighlightNits", s.sdrHiNits);
     IniWriteFloat("SdrHighlightKnee", s.sdrKnee);
-    IniWriteInt("SdrGamma22", s.sdrGamma);
+    IniWriteInt("SdrGamma", s.sdrGamma);
+    IniWriteInt("SdrHighlightMethod", s.sdrMethod);
+    IniWriteFloat("SdrGamutExpansion", s.sdrGamut);
     IniWriteInt("CapGameToRefresh", s.gameCap);
     IniWriteInt("CapDivisor", s.capDivisor);
     IniWriteInt("PresentOnOwnQueue", s.ownQueue);
@@ -1467,6 +1476,7 @@ cbuffer C : register(b0)
     float sdrScale;   // outType 4 (SDR game shown as HDR10): SDR white in 80-nit units
     float sdrKnee;    // highlight expansion starts here (linear, 1.0 = SDR white)
     float sdrPeak;    // SDR white highlights expand to this (80-nit units); <= sdrScale = off
+    float gamut;      // outType 4: gamut expansion strength (0 = off)
 };
 Texture2D<float4> src : register(t0);
 
@@ -1490,18 +1500,43 @@ float3 LinToPq(float3 l)
     return pow((c1 + c2 * p) / (1 + c3 * p), m2);
 }
 // SDR shown as HDR10 (outType 4, as the Vulkan layer): SDR white at sdrScale, and above the knee the brightest channel
-// is stretched toward sdrPeak (hue kept); below it the image is untouched. flags & 32: the SDR signal is decoded with
-// gamma 2.2 instead of the sRGB curve.
+// (flags & 128: the luminance) is stretched toward sdrPeak (hue kept); below it the image is untouched.
 float3 SdrExpand(float3 l)
 {
     l = max(l, 0);
-    float m = max(max(l.r, l.g), l.b);
+    float m = (flags & 128) != 0 ? dot(l, float3(0.2126, 0.7152, 0.0722)) : max(max(l.r, l.g), l.b);
     if (sdrPeak <= sdrScale || m <= sdrKnee) return l * sdrScale;
     float t = (min(m, 1.0) - sdrKnee) / max(1.0 - sdrKnee, 1e-4);
     float o = sdrScale * m + (sdrPeak - sdrScale) * t * t;
     return l * (o / m);
 }
-float3 SdrDecode(float3 c) { return (flags & 32) != 0 ? pow(max(c, 0), 2.2) : SrgbToLin(c); }
+// flags & 32: SDR decoded with gamma 2.2, flags & 64: gamma 2.4, else the sRGB curve.
+float3 SdrDecode(float3 c) { c = max(c, 0); return (flags & 32) != 0 ? pow(c, 2.2) : (flags & 64) != 0 ? pow(c, 2.4) : SrgbToLin(c); }
+// Gamut expansion (Pumbo's AdvancedAutoHDR "Extra HDR saturation", after Unreal Engine): see the Vulkan layer's
+// common.glsl. Bright saturated colours move out of BT.709, weighted by their distance from grey (in ACES AP1) and
+// their brightness at a 203-nit paper white.
+float3 ExpandGamut(float3 v, float amount)
+{
+    const float pw = 203.0 / 80.0;
+    float3 r = v * pw;
+    float3 ap1 = float3(dot(r, float3(0.613191478, 0.339512089, 0.047366331)),
+                        dot(r, float3(0.070206904, 0.916335817, 0.013450011)),
+                        dot(r, float3(0.020618871, 0.109567294, 0.869606747)));
+    float luma = dot(ap1, float3(0.2722287168, 0.6740817658, 0.0536895174));
+    if (luma <= 0) return v;
+    float3 ch = ap1 / luma - 1;
+    float k = (1 - exp2(-4 * dot(ch, ch))) * (1 - exp2(-4 * amount * luma * luma));
+    float3 e = float3(dot(r, float3(1.375026308, -0.342531728, -0.079080858)),
+                      dot(r, float3(-0.077049702, 1.092442754, -0.010129544)),
+                      dot(r, float3(-0.020494311, -0.091839135, 1.203626612)));
+    return lerp(r, e, k) / pw;
+}
+float3 SdrToHdr(float3 lin)
+{
+    float3 o = SdrExpand(lin);
+    if (gamut > 0) o = ExpandGamut(o / sdrScale, gamut) * sdrScale;
+    return o;
+}
 // BT.709 -> BT.2020 primaries (ITU-R BT.2087).
 float3 Bt709To2020(float3 l)
 {
@@ -1513,7 +1548,7 @@ float3 Decode(float3 c)
 {
     if (outType == 0) return SrgbToLin(c);
     if (outType == 2) return PqToLin(c);
-    if (outType == 4) return SdrExpand(SdrDecode(c));
+    if (outType == 4) return SdrToHdr(SdrDecode(c));
     return c;
 }
 float3 Encode(float3 l)
@@ -1767,6 +1802,7 @@ struct Constants
     float    sdrScale;    // outType 4: SDR white in 80-nit units
     float    sdrKnee;     // highlight expansion knee (linear, 1 = SDR white)
     float    sdrPeak;     // expanded SDR white (80-nit units); <= sdrScale = off
+    float    gamut;       // outType 4: gamut expansion strength (0 = off)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -3298,12 +3334,14 @@ static DWORD WINAPI PresenterThread(void *)
         c.knee    = s.knee;
         c.ceilLin = (c.outType == 0) ? 1.0f : (float)(floor(ceilNow / 10.0 + 0.5) * 10.0 / 80.0);
         c.flags   = (s.rolloff ? 1u : 0u) | (s.sine ? 2u : 0u) | (s.invert ? 4u : 0u) | (s.rolling ? 8u : 0u) |
-                    (c.outType == 4 && s.sdrGamma ? 32u : 0u);
+                    (c.outType == 4 ? (s.sdrGamma == 1 ? 32u : s.sdrGamma == 2 ? 64u : 0u) | (s.sdrMethod ? 128u : 0u) : 0u);
         c.sdrScale = s.sdrWhite / 80.0f;
         {
             // knee given as signal level (what the game writes); the shader works in linear light
             const float k = s.sdrKnee;
-            c.sdrKnee = s.sdrGamma ? powf(k, 2.2f) : (k <= 0.04045f ? k / 12.92f : powf((k + 0.055f) / 1.055f, 2.4f));
+            c.sdrKnee = s.sdrGamma == 1 ? powf(k, 2.2f) : s.sdrGamma == 2 ? powf(k, 2.4f)
+                                         : (k <= 0.04045f ? k / 12.92f : powf((k + 0.055f) / 1.055f, 2.4f));
+            c.gamut = c.outType == 4 ? s.sdrGamut : 0.0f;
             const float hi = (std::min)(s.sdrHiNits, s.peakNits);
             c.sdrPeak = hi > s.sdrWhite ? hi / 80.0f : 0.0f;
         }
@@ -9341,9 +9379,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::SliderFloat("SDR highlights expand to (nits, 0 = off)", &s.sdrHiNits, 0.0f, 2000.0f, "%.0f");
             ImGui::SliderFloat("Highlight expansion starts at (SDR signal)", &s.sdrKnee, 0.3f, 0.95f, "%.2f");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Below this level the image is unchanged; above it the brightest parts\nstretch toward the highlight value (an HDR look for SDR games).");
-            bool g22 = s.sdrGamma != 0;
-            if (ImGui::Checkbox("Gamma 2.2 (deeper shadows)", &g22)) s.sdrGamma = g22 ? 1 : 0;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decodes the SDR picture with gamma 2.2, as most SDR monitors and TVs show it.\nOff: the sRGB curve, as Windows' own SDR-in-HDR and Auto HDR use, whose shadows\nlook a little raised.");
+            ImGui::Combo("Highlights stretched by", &s.sdrMethod, "Brightest channel\0Luminance (mostly near-white highlights)\0");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightest channel also brightens bright saturated colours (reds, blues).\nLuminance stretches mostly near-white highlights; saturated colours stay closer to SDR.");
+            ImGui::Combo("SDR decoding", &s.sdrGamma, "sRGB curve (as Windows)\0Gamma 2.2 (deeper shadows)\0Gamma 2.4 (dark-room grading)\0");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the SDR picture is turned into light. Most SDR games were made on gamma 2.2 screens:\nthe sRGB curve (Windows' own SDR-in-HDR and Auto HDR) shows their shadows a little raised.");
+            ImGui::SliderFloat("Gamut expansion", &s.sdrGamut, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves bright saturated colours past SDR's colour range, toward the wider colours of\nHDR games (after Pumbo's AdvancedAutoHDR / Unreal Engine). 0 = SDR's colours exactly.");
             ImGui::Unindent(16.0f);
         }
     }

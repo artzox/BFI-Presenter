@@ -17,8 +17,12 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
   - **More than one active display**, shown while refreshes are being missed: their refresh clocks are never exactly in step, and in borderless or windowed mode Windows composes them all at one rate.
   - The VRR warning (and the Vulkan layer's frame-limiter warning) now also names Windows' **Dynamic refresh rate**.
 - **[DX] SDR to HDR for DX11, DX9 and OpenGL games** (`SdrToHdr`, on by default as in Vulkan). An 8-bit SDR game on a display with Windows HDR on is presented as HDR10, so the lit refresh has headroom above SDR white and BFI doesn't make the picture dim. The game keeps its own swap chain; the presenter's own one is HDR10. Same settings as the Vulkan layer: SDR white, highlight expansion and its start. Not the same as Windows Auto HDR: the conversion happens before the strobe, so the lit refresh uses the headroom. DX12 games present through their own swap chain and aren't covered yet.
-- **[Both] Gamma 2.2 for SDR to HDR** (`SdrGamma22`, off by default): decodes the SDR picture as most SDR monitors and TVs show it, with deeper shadows. Off, it uses the sRGB curve, as Windows' own SDR-in-HDR and Auto HDR do.
-- **[Docs]** Settings guide: the system check; SDR to HDR in DX, gamma 2.2, and how it differs from Windows Auto HDR.
+- **[Both] More SDR to HDR choices** (after Pumbo's AdvancedAutoHDR), all off by default so the picture doesn't change unless you choose:
+  - **SDR decoding** (`SdrGamma`): the sRGB curve, as Windows' own SDR-in-HDR and Auto HDR use; **gamma 2.2**, as most SDR monitors and TVs show it, with deeper shadows; or **gamma 2.4** for games graded for a dark room.
+  - **Highlights stretched by** (`SdrHighlightMethod`): the brightest channel, as before, or luminance (mostly near-white highlights; saturated colours stay closer to SDR).
+  - **Gamut expansion** (`SdrGamutExpansion`, 0–1): bright saturated colours move past SDR's colour range toward the wider colours of HDR games, as AdvancedAutoHDR's "Extra HDR saturation" (itself after Unreal Engine).
+- **[Both] The AutoHDR ReShade add-on:** when it upgrades the game's swap chain to HDR, BFI Presenter's conversion stays off, also when the add-on does it after the presenter has taken over (DX11, DX9, OpenGL: its frames would otherwise have been converted a second time). The overlay notes when the add-on is loaded.
+- **[Docs]** Settings guide: the system check; SDR to HDR in DX, its new choices, how it differs from Windows Auto HDR and from the AutoHDR add-on. README: Pumbo in the acknowledgements.
 
 ## [1.0.29] — 2026-11-04 (Manager 1.3.15)
 
