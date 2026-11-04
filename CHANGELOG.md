@@ -7,6 +7,25 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.30] — 2026-11-04 (Manager 1.3.15)
+
+**Warnings for what's outside the game, and SDR to HDR in DirectX.**
+
+- **[Both] System check.** Every 10 s the presenter checks for things outside the game that make flashes come late, and the overlay's status box and the log say what to change. Nothing is changed for you.
+  - Windows' **Power saver** plan or the **Best power efficiency** power mode, **energy saver**, and a laptop **on battery**.
+  - **A monitor driven by another graphics card** than the one the game renders on (Optimus laptops, or a monitor plugged into the motherboard): every frame is copied across on a schedule of its own and the strobe's timing wobbles.
+  - **More than one active display**, shown while refreshes are being missed: their refresh clocks are never exactly in step, and in borderless or windowed mode Windows composes them all at one rate.
+  - The VRR warning (and the Vulkan layer's frame-limiter warning) now also names Windows' **Dynamic refresh rate**.
+- **[DX] SDR to HDR for DX11, DX9 and OpenGL games** (`SdrToHdr`, on by default as in Vulkan). An SDR game (8-bit, or 10-bit with the SDR colour space, as many Unreal Engine 4 games: Obduction) on a display with Windows HDR on is presented as HDR10, so the lit refresh has headroom above SDR white and BFI doesn't make the picture dim. The game keeps its own swap chain; the presenter's own one is HDR10. Same settings as the Vulkan layer: SDR white, highlight expansion and its start. Not the same as Windows Auto HDR: the conversion happens before the strobe, so the lit refresh uses the headroom. DX12 games present through their own swap chain and aren't covered yet.
+- **[Both] More SDR to HDR choices** (after Pumbo's AdvancedAutoHDR), all off by default so the picture doesn't change unless you choose:
+  - **SDR decoding** (`SdrGamma`): the sRGB curve, as Windows' own SDR-in-HDR and Auto HDR use; **gamma 2.2**, as most SDR monitors and TVs show it, with deeper shadows; or **gamma 2.4** for games graded for a dark room.
+  - **Highlights stretched by** (`SdrHighlightMethod`): the brightest channel, as before, or luminance (mostly near-white highlights; saturated colours stay closer to SDR).
+  - **Gamut expansion** (`SdrGamutExpansion`, 0–1): bright saturated colours move past SDR's colour range toward the wider colours of HDR games, as AdvancedAutoHDR's "Extra HDR saturation" (itself after Unreal Engine).
+- **[Both] The AutoHDR ReShade add-on:** when it upgrades the game's swap chain to HDR, BFI Presenter's conversion stays off, also when the add-on does it after the presenter has taken over (DX11, DX9, OpenGL: its frames would otherwise have been converted a second time). The overlay notes when the add-on is loaded.
+- **[Vulkan] Games that present each frame twice (RPCS3): the automatic cap steps down only well below 60 game fps.** Stepping down halves the game's own frame rate (60 to 30), so it now happens below 85% of the refresh rate (about 51 game fps at 120 Hz) instead of 95%, and a try at Refresh rate that holds 85% stays there. MotorStorm at about 56 game fps (113 of 120 presents) was held at 30 for 20 s at a time.
+- **[Both] Automatic frame cap: no lock at 60 after a slow start.** It no longer steps down in the first 10 s after the presenter starts, while the game is still warming up. When the game holds exactly the strobe rate (e.g. 60 of 120: its own limit in an intro or a menu, not a struggle), tries at Refresh rate come every 30 s instead of growing to 1 and 5 minutes. Castlevania stepped down to 60 three seconds in and stayed there for a minute although it runs at 120.
+- **[Docs]** Settings guide: the system check; SDR to HDR in DX, its new choices, how it differs from Windows Auto HDR and from the AutoHDR add-on, and to turn RTX HDR and Auto HDR off where it is on (a starting-point recipe for SDR games with Windows HDR on). README: Pumbo in the acknowledgements.
+
 ## [1.0.29] — 2026-11-04 (Manager 1.3.15)
 
 **Realtime GPU priority for the Vulkan layer.** The presenter's strobe can now run ahead of the game's GPU work in Vulkan games too, where the game leaves room for it.

@@ -52,6 +52,7 @@
 #define ImTextureID ImU64
 #include <imgui.h>
 #include <reshade.hpp>
+#include "../common/bfi_syscheck.h"
 
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d12.lib")
@@ -77,6 +78,7 @@ static void Log(reshade::log::level lvl, const char *fmt, ...)
 }
 #define LOGI(...) Log(reshade::log::level::info, __VA_ARGS__)
 #define LOGW(...) Log(reshade::log::level::warning, __VA_ARGS__)
+static SysCheck g_sysCheck;      // power plan, GPUs, displays (checked on the watchdog thread)
 #define LOGE(...) Log(reshade::log::level::error, __VA_ARGS__)
 
 static double g_qpcFreq = 1.0;
@@ -89,7 +91,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.29"
+#define BFI_ADDON_VERSION "1.0.30"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -160,6 +162,15 @@ struct Settings
     int   pacing   = 1;       // 1 = wait for vblank before each present, 0 = present queue only
     int   log      = 0;
     int   dx11     = 1;       // manage DX11 games (through the add-on's own D3D12 presenter)
+    // SDR to HDR (DX11, DX9, OpenGL: the presenter's own swap chain): an SDR game on an HDR display is presented as
+    // HDR10, so the lit refresh has headroom above SDR white (as the Vulkan layer). Applies when the swap chain is next created.
+    int   sdrToHdr = 1;
+    float sdrWhite = 200.0f;  // nits of SDR white (Windows' SDR content brightness: 80 + 4 x the slider)
+    float sdrHiNits = 800.0f; // highlights stretch toward this (0 = off)
+    float sdrKnee  = 0.65f;   // expansion starts at this SDR signal level
+    int   sdrGamma = 0;       // SdrGamma: SDR decoding: 0 sRGB (as Windows), 1 gamma 2.2 (deeper shadows), 2 gamma 2.4
+    int   sdrMethod = 0;      // SdrHighlightMethod: highlights stretched by 0 the brightest channel, 1 luminance
+    float sdrGamut = 0.0f;    // SdrGamutExpansion: 0..1 (0 = off)
 };
 
 static HMODULE  g_module = nullptr;
@@ -323,6 +334,22 @@ static void LoadSettings(Settings &s)
     s.pacing   = IniInt("WaitForVBlank", 1);
     s.log      = IniInt("Log", 0);
     s.dx11     = IniInt("DX11Support", 1) ? 1 : 0;
+    s.sdrToHdr = IniInt("SdrToHdr", 1) ? 1 : 0;
+    s.sdrWhite = IniFloat("SdrWhiteNits", 200.0f);
+    if (s.sdrWhite < 80.0f) s.sdrWhite = 80.0f;
+    if (s.sdrWhite > 600.0f) s.sdrWhite = 600.0f;
+    s.sdrHiNits = IniFloat("SdrHighlightNits", 800.0f);
+    if (s.sdrHiNits < 0.0f) s.sdrHiNits = 0.0f;
+    if (s.sdrHiNits > 4000.0f) s.sdrHiNits = 4000.0f;
+    s.sdrKnee = IniFloat("SdrHighlightKnee", 0.65f);
+    if (s.sdrKnee < 0.3f) s.sdrKnee = 0.3f;
+    if (s.sdrKnee > 0.95f) s.sdrKnee = 0.95f;
+    s.sdrGamma = IniInt("SdrGamma", 0);
+    if (s.sdrGamma < 0 || s.sdrGamma > 2) s.sdrGamma = 0;
+    s.sdrMethod = IniInt("SdrHighlightMethod", 0) ? 1 : 0;
+    s.sdrGamut = IniFloat("SdrGamutExpansion", 0.0f);
+    if (s.sdrGamut < 0.0f) s.sdrGamut = 0.0f;
+    if (s.sdrGamut > 1.0f) s.sdrGamut = 1.0f;
     char out[32];
     GetPrivateProfileStringA("BFI", "Output", "auto", out, sizeof(out), g_iniPath);
     s.output = !_stricmp(out, "sdr") ? 0 : !_stricmp(out, "scrgb") ? 1 : !_stricmp(out, "hdr10") ? 2 : -1;
@@ -413,6 +440,13 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("RolloffKnee", s.knee);
     IniWriteFloat("DisplayPeakNits", s.peakNits);
     IniWrite("Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto");
+    IniWriteInt("SdrToHdr", s.sdrToHdr);
+    IniWriteFloat("SdrWhiteNits", s.sdrWhite);
+    IniWriteFloat("SdrHighlightNits", s.sdrHiNits);
+    IniWriteFloat("SdrHighlightKnee", s.sdrKnee);
+    IniWriteInt("SdrGamma", s.sdrGamma);
+    IniWriteInt("SdrHighlightMethod", s.sdrMethod);
+    IniWriteFloat("SdrGamutExpansion", s.sdrGamut);
     IniWriteInt("CapGameToRefresh", s.gameCap);
     IniWriteInt("CapDivisor", s.capDivisor);
     IniWriteInt("PresentOnOwnQueue", s.ownQueue);
@@ -734,6 +768,9 @@ static ID3D12Device          *g_device = nullptr;
 static ID3D12CommandQueue    *g_gameQueue = nullptr;
 
 static DXGI_SWAP_CHAIN_DESC1  g_desc = {};
+static DXGI_FORMAT            g_stageFmt = DXGI_FORMAT_UNKNOWN;   // the game's frames (staging ring); g_desc.Format if unknown
+static std::atomic<bool>      g_hdrUp{false};   // DX11 / DX9 / OpenGL: SDR game presented as HDR10 (SdrToHdr)
+static DXGI_FORMAT StageFormat() { return g_stageFmt != DXGI_FORMAT_UNKNOWN ? g_stageFmt : g_desc.Format; }
 static ID3D12Resource        *g_virt[kMaxBuf] = {};
 static UINT                   g_bufCount = 0;
 static UINT                   g_cur = 0;
@@ -1436,6 +1473,10 @@ cbuffer C : register(b0)
     float decay;      // rolling scan: phosphor decay time in sub-frames (0 = hard bands)
     float soften;     // 0..1: blend toward the steady average picture (LCD phase swap fade)
     float phase;      // LCD gradual saver: start of the lit window within the first sub-frame, 0..1
+    float sdrScale;   // outType 4 (SDR game shown as HDR10): SDR white in 80-nit units
+    float sdrKnee;    // highlight expansion starts here (linear, 1.0 = SDR white)
+    float sdrPeak;    // SDR white highlights expand to this (80-nit units); <= sdrScale = off
+    float gamut;      // outType 4: gamut expansion strength (0 = off)
 };
 Texture2D<float4> src : register(t0);
 
@@ -1458,8 +1499,65 @@ float3 LinToPq(float3 l)
     float3 p = pow(saturate(max(l, 0) * (80.0 / 10000.0)), m1);
     return pow((c1 + c2 * p) / (1 + c3 * p), m2);
 }
-float3 Decode(float3 c) { if (outType == 0) return SrgbToLin(c); if (outType == 2) return PqToLin(c); return c; }
-float3 Encode(float3 l) { if (outType == 0) return saturate(LinToSrgb(l)); if (outType == 2) return LinToPq(l); return l; }
+// SDR shown as HDR10 (outType 4, as the Vulkan layer): SDR white at sdrScale, and above the knee the brightest channel
+// (flags & 128: the luminance) is stretched toward sdrPeak (hue kept); below it the image is untouched.
+float3 SdrExpand(float3 l)
+{
+    l = max(l, 0);
+    float m = (flags & 128) != 0 ? dot(l, float3(0.2126, 0.7152, 0.0722)) : max(max(l.r, l.g), l.b);
+    if (sdrPeak <= sdrScale || m <= sdrKnee) return l * sdrScale;
+    float t = (min(m, 1.0) - sdrKnee) / max(1.0 - sdrKnee, 1e-4);
+    float o = sdrScale * m + (sdrPeak - sdrScale) * t * t;
+    return l * (o / m);
+}
+// flags & 32: SDR decoded with gamma 2.2, flags & 64: gamma 2.4, else the sRGB curve.
+float3 SdrDecode(float3 c) { c = max(c, 0); return (flags & 32) != 0 ? pow(c, 2.2) : (flags & 64) != 0 ? pow(c, 2.4) : SrgbToLin(c); }
+// Gamut expansion (Pumbo's AdvancedAutoHDR "Extra HDR saturation", after Unreal Engine): see the Vulkan layer's
+// common.glsl. Bright saturated colours move out of BT.709, weighted by their distance from grey (in ACES AP1) and
+// their brightness at a 203-nit paper white.
+float3 ExpandGamut(float3 v, float amount)
+{
+    const float pw = 203.0 / 80.0;
+    float3 r = v * pw;
+    float3 ap1 = float3(dot(r, float3(0.613191478, 0.339512089, 0.047366331)),
+                        dot(r, float3(0.070206904, 0.916335817, 0.013450011)),
+                        dot(r, float3(0.020618871, 0.109567294, 0.869606747)));
+    float luma = dot(ap1, float3(0.2722287168, 0.6740817658, 0.0536895174));
+    if (luma <= 0) return v;
+    float3 ch = ap1 / luma - 1;
+    float k = (1 - exp2(-4 * dot(ch, ch))) * (1 - exp2(-4 * amount * luma * luma));
+    float3 e = float3(dot(r, float3(1.375026308, -0.342531728, -0.079080858)),
+                      dot(r, float3(-0.077049702, 1.092442754, -0.010129544)),
+                      dot(r, float3(-0.020494311, -0.091839135, 1.203626612)));
+    return lerp(r, e, k) / pw;
+}
+float3 SdrToHdr(float3 lin)
+{
+    float3 o = SdrExpand(lin);
+    if (gamut > 0) o = ExpandGamut(o / sdrScale, gamut) * sdrScale;
+    return o;
+}
+// BT.709 -> BT.2020 primaries (ITU-R BT.2087).
+float3 Bt709To2020(float3 l)
+{
+    return float3(dot(l, float3(0.627404, 0.329283, 0.043313)),
+                  dot(l, float3(0.069097, 0.919540, 0.011362)),
+                  dot(l, float3(0.016391, 0.088013, 0.895595)));
+}
+float3 Decode(float3 c)
+{
+    if (outType == 0) return SrgbToLin(c);
+    if (outType == 2) return PqToLin(c);
+    if (outType == 4) return SdrToHdr(SdrDecode(c));
+    return c;
+}
+float3 Encode(float3 l)
+{
+    if (outType == 0) return saturate(LinToSrgb(l));
+    if (outType == 2) return LinToPq(l);
+    if (outType == 4) return LinToPq(Bt709To2020(l));
+    return l;
+}
 
 bool Inverted() { return (flags & 4) != 0 && frames > 2; }
 
@@ -1623,7 +1721,7 @@ float DecayShare(uint s, float phi, float T, float n)
 float4 PSMain(float4 pos : SV_Position) : SV_Target
 {
     float3 c = src.Load(int3(pos.xy, 0)).rgb;
-    if (method == 2) return float4(c, 1);
+    if (method == 2) return float4(outType == 4 ? Encode(Decode(c)) : c, 1);
     float3 lin = Decode(c);
     float litGain = Inverted() ? float(frames) * gain / float(frames - 1) : float(frames) * gain;
     float3 o;
@@ -1701,6 +1799,10 @@ struct Constants
     float    decay;       // rolling scan: phosphor decay time in sub-frames (0 = hard bands)
     float    soften;      // 0..1: blend toward the steady average picture (LCD phase swap fade)
     float    phase;       // LCD gradual saver: start of the lit window within the first sub-frame, 0..1
+    float    sdrScale;    // outType 4: SDR white in 80-nit units
+    float    sdrKnee;     // highlight expansion knee (linear, 1 = SDR white)
+    float    sdrPeak;     // expanded SDR white (80-nit units); <= sdrScale = off
+    float    gamut;       // outType 4: gamut expansion strength (0 = off)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -1863,6 +1965,7 @@ static double ExactRefreshHz(const wchar_t *gdiName, double fallback)
 // ---------------------------------------------------------------- presenter thread
 static int ResolveOutput(const Settings &s)
 {
+    if (g_hdrUp.load()) return 4;           // SDR game in an HDR10 swap chain of the presenter's own
     if (s.output >= 0) return s.output;
     // A 16-bit float swap chain is always scRGB to Windows, whatever colour
     // space is reported. Mods that upgrade an SDR game's swap chain to HDR
@@ -2281,6 +2384,9 @@ static DWORD WINAPI WatchdogThread(void *)
         Sleep(500);
         DrainInfoQueue();
         const double t = Now();
+        if (g_running.load())
+            g_sysCheck.Tick(g_watchHwnd.load() ? GetAncestor(g_watchHwnd.load(), GA_ROOT) : nullptr,
+                            [](int lvl, const char *m) { if (lvl) LOGW("BFI Presenter: %s", m); else LOGI("BFI Presenter: %s", m); });
         // Learned per game: written and read here, every 2 s, once the game has a window.
         if (++learnTicks % 4 == 0 && g_iniPath[0])
         {
@@ -2538,6 +2644,28 @@ static DWORD WINAPI PresenterThread(void *)
         LeaveCriticalSection(&g_cfgLock);
         BoostPresenterThread(mm, "presenter");
     }
+    const double runStartT = Now();     // automatic frame cap: no step down in the first seconds (warm-up, intros)
+    if (g_device)
+    {
+        // The GPU the game renders on, for the system check (its monitor driven by another GPU).
+        const LUID rl = g_device->GetAdapterLuid();
+        char gpuName[128] = "";
+        IDXGIFactory1 *gf = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&gf)) && gf)
+        {
+            IDXGIAdapter1 *a = nullptr;
+            for (UINT k = 0; gf->EnumAdapters1(k, &a) == S_OK; k++)
+            {
+                DXGI_ADAPTER_DESC1 dd = {};
+                a->GetDesc1(&dd);
+                if (dd.AdapterLuid.LowPart == rl.LowPart && dd.AdapterLuid.HighPart == rl.HighPart)
+                    WideCharToMultiByte(CP_UTF8, 0, dd.Description, -1, gpuName, sizeof(gpuName), nullptr, nullptr);
+                a->Release();
+            }
+            gf->Release();
+        }
+        g_sysCheck.SetRenderGpu(rl, gpuName);
+    }
     ID3D12DescriptorHeap *rtvHeap = nullptr, *srvHeap = nullptr;
     ID3D12CommandAllocator *alloc[kMaxBuf] = {};
     ID3D12GraphicsCommandList *list = nullptr;
@@ -2591,7 +2719,7 @@ static DWORD WINAPI PresenterThread(void *)
         }
         D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
         D3D12_SHADER_RESOURCE_VIEW_DESC svd = {};
-        svd.Format                  = g_desc.Format;
+        svd.Format                  = StageFormat();
         svd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
         svd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         svd.Texture2D.MipLevels     = 1;
@@ -3125,8 +3253,8 @@ static DWORD WINAPI PresenterThread(void *)
         c.outType = (uint32_t)ResolveOutput(s);
         if ((int)c.outType != lastOutType)
         {
-            static const char *kOut[] = { "SDR", "HDR scRGB", "HDR10 (PQ)" };
-            LOGI("BFI Presenter: output %s (%s, swap chain format %d)", kOut[c.outType % 3],
+            static const char *kOut[] = { "SDR", "HDR scRGB", "HDR10 (PQ)", "?", "SDR shown as HDR10" };
+            LOGI("BFI Presenter: output %s (%s, swap chain format %d)", kOut[c.outType % 5],
                  s.output >= 0 ? "set in the settings" : "Auto", (int)g_desc.Format);
             lastOutType = (int)c.outType;
         }
@@ -3206,7 +3334,18 @@ static DWORD WINAPI PresenterThread(void *)
         c.dfloor  = s.dfloor;
         c.knee    = s.knee;
         c.ceilLin = (c.outType == 0) ? 1.0f : (float)(floor(ceilNow / 10.0 + 0.5) * 10.0 / 80.0);
-        c.flags   = (s.rolloff ? 1u : 0u) | (s.sine ? 2u : 0u) | (s.invert ? 4u : 0u) | (s.rolling ? 8u : 0u);
+        c.flags   = (s.rolloff ? 1u : 0u) | (s.sine ? 2u : 0u) | (s.invert ? 4u : 0u) | (s.rolling ? 8u : 0u) |
+                    (c.outType == 4 ? (s.sdrGamma == 1 ? 32u : s.sdrGamma == 2 ? 64u : 0u) | (s.sdrMethod ? 128u : 0u) : 0u);
+        c.sdrScale = s.sdrWhite / 80.0f;
+        {
+            // knee given as signal level (what the game writes); the shader works in linear light
+            const float k = s.sdrKnee;
+            c.sdrKnee = s.sdrGamma == 1 ? powf(k, 2.2f) : s.sdrGamma == 2 ? powf(k, 2.4f)
+                                         : (k <= 0.04045f ? k / 12.92f : powf((k + 0.055f) / 1.055f, 2.4f));
+            c.gamut = c.outType == 4 ? s.sdrGamut : 0.0f;
+            const float hi = (std::min)(s.sdrHiNits, s.peakNits);
+            c.sdrPeak = hi > s.sdrWhite ? hi / 80.0f : 0.0f;
+        }
         if (GradualSaverOn(s))
         {
             c.flags |= 16u;
@@ -3560,7 +3699,8 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     vrrLogged = true;
                     LOGW("BFI Presenter: the display is refreshing at %.1f Hz instead of %.1f Hz with no missed refreshes -- "
-                         "VRR (G-SYNC) is active. Turn G-SYNC off for this game (NVIDIA profile) or turn on Queue one refresh ahead.",
+                         "VRR (G-SYNC) or Windows' dynamic refresh rate is active. Turn G-SYNC off for this game (NVIDIA profile) and Dynamic "
+                         "refresh rate off in Windows' display settings, or turn on Queue one refresh ahead.",
                          hz, peakHz);
                 }
                 displayHz = hz;
@@ -3978,7 +4118,8 @@ static DWORD WINAPI PresenterThread(void *)
                                 // Far from the refresh rate (under 80%): each try is seconds of uneven frames and the
                                 // longest delay (Soul Reaver at 64 of 120: 53 ms from release to flash for 4 s), so the
                                 // next one waits 5 minutes.
-                                if (fpsA < 0.8 * hzA) probeWait = 300.0;
+                                if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;   // its own limit (see above)
+                                else if (fpsA < 0.8 * hzA) probeWait = 300.0;
                                 if (fg && fgTryNeedMs > 0.0) { fgFailNeedMs = fgTryNeedMs; fgSkipLogged = false; }
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
@@ -3987,7 +4128,10 @@ static DWORD WINAPI PresenterThread(void *)
                     }
                     else if (!autoCapDown)
                     {
-                        capDownSecs = (!hitchPaused && fgVotes == 0 && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;   // not while frame generation may be starting
+                        // Not while frame generation may be starting, nor in the first 10 s after the presenter starts: the
+                        // game is still warming up (Castlevania: 60 fps for 3 s while its GPU caught up, then a minute at 60).
+                        capDownSecs = (!hitchPaused && fgVotes == 0 && t - runStartT > 10.0 && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA)
+                                      ? capDownSecs + 1 : 0;
                         if (capDownSecs >= 3 && t - capSwitchT > 3.0)
                         {
                             // Down again soon after going back up: the game is close to the limit, so the
@@ -4003,7 +4147,11 @@ static DWORD WINAPI PresenterThread(void *)
                             // light corner) counts as failed too, so the next one waits for clearly lighter frames (Control,
                             // 3x: up at 02:10:59, down 9 s later at 65 fps).
                             if (fg && t - capUpT < 30.0 && fgTryNeedMs > 0.0) { fgFailNeedMs = fgTryNeedMs; fgSkipLogged = false; }
-                            if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;   // well under the refresh rate: first try after a minute
+                            // Well under the refresh rate: first try after a minute -- unless the game holds exactly the strobe rate,
+                            // which is a limit of its own (an intro, a menu), not a struggle: tries every 30 s cost nothing there.
+                            const bool atStrobe = fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames;
+                            if (atStrobe) probeWait = 30.0;
+                            else if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;
                             autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames,
@@ -6722,6 +6870,7 @@ static void ApplyColorSpace11()
     }
     if (g_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && cs == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
         cs = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;              // a float swap chain is scRGB
+    if (g_hdrUp.load()) cs = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;   // SDR game presented as HDR10
     OwnCall own;
     UINT sup = 0;
     auto check = SC_DIRECT(HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE, UINT *), 37);
@@ -6756,7 +6905,7 @@ static bool CreateStage11()
         rd.Height           = g_desc.Height;
         rd.DepthOrArraySize = 1;
         rd.MipLevels        = 1;
-        rd.Format           = g_desc.Format;
+        rd.Format           = StageFormat();
         rd.SampleDesc.Count = 1;
         rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;    // DX11 opens shared textures with a bind flag
         const char *step = "CreateCommittedResource";
@@ -6769,7 +6918,7 @@ static bool CreateStage11()
         if (FAILED(hr))
         {
             LOGE("BFI Presenter: DX11: shared staging texture %u failed in %s (0x%08lX), %ux%u format %u", s, step,
-                 (unsigned long)hr, g_desc.Width, g_desc.Height, (unsigned)g_desc.Format);
+                 (unsigned long)hr, g_desc.Width, g_desc.Height, (unsigned)StageFormat());
             ReleaseStage11();
             return false;
         }
@@ -6882,6 +7031,12 @@ static HRESULT STDMETHODCALLTYPE hk_SetCS1(IDXGISwapChain3 *sc, DXGI_COLOR_SPACE
     if (!t_ownCall && IsGame11(sc) && SUCCEEDED(hr) && g_cs11.exchange((int)cs) != (int)cs)
     {
         LOGI("BFI Presenter: DX11: the game set colour space %d", (int)cs);
+        if (g_hdrUp.load() && cs != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
+        {
+            // The game now outputs HDR itself (a 10-bit swap chain switched to HDR10): shown as it is, not converted again.
+            g_hdrUp.store(false);
+            LOGI("BFI Presenter: DX11: the game switched to an HDR colour space -- SDR to HDR off");
+        }
         ApplyColorSpace11();
     }
     return hr;
@@ -6921,6 +7076,8 @@ static void ReleaseDx11()
     g_ownPresentQueue = false;
     g_cs11.store(-1);
     g_fsWanted = FALSE;
+    g_hdrUp.store(false);
+    g_stageFmt = DXGI_FORMAT_UNKNOWN;
 }
 
 // The presenter's own D3D12 device, factory and swap chain are created past
@@ -7047,6 +7204,30 @@ static bool InitDx11(reshade::api::swapchain *swapchain)
 // D3D12 device, shared fences, presenter queue, child window, swap chain and
 // staging ring. g_dev11 / g_ctx11 are set by the caller. sc3 is the game's
 // DXGI swap chain (DX11; hooked here) or null (DX9: hooked by the caller).
+// Windows HDR on for the monitor the window is on (its output reports the HDR10 colour space).
+static bool HdrDisplayFor(IDXGIFactory4 *fac, HWND hwnd)
+{
+    if (!fac) return false;
+    const HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    bool hdr = false;
+    IDXGIAdapter1 *a = nullptr;
+    for (UINT i = 0; fac->EnumAdapters1(i, &a) == S_OK; i++)
+    {
+        IDXGIOutput *o = nullptr;
+        for (UINT k = 0; a->EnumOutputs(k, &o) == S_OK; k++)
+        {
+            IDXGIOutput6 *o6 = nullptr;
+            DXGI_OUTPUT_DESC1 od = {};
+            if (SUCCEEDED(o->QueryInterface(IID_PPV_ARGS(&o6))) && o6 && SUCCEEDED(o6->GetDesc1(&od)) && od.Monitor == mon)
+                hdr = od.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+            SafeRelease(o6);
+            o->Release();
+        }
+        a->Release();
+    }
+    return hdr;
+}
+
 static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 *sc3, const DXGI_SWAP_CHAIN_DESC1 &d,
                             HWND hwnd, DXGI_FORMAT ff, LUID luid, const char *what)
 {
@@ -7138,12 +7319,35 @@ static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 
     EnterCriticalSection(&g_cfgLock);
     cur = g_shared;
     LeaveCriticalSection(&g_cfgLock);
+    // SDR to HDR: an 8-bit SDR game on a display with Windows HDR on gets an HDR10 swap chain of the presenter's own,
+    // so the lit refresh has headroom above SDR white; the game keeps its own 8-bit swap chain and frames.
+    g_stageFmt = ff;
+    g_hdrUp.store(false);
+    if (ok)
+    {
+        // 8-bit, or 10-bit with the SDR colour space (many UE4 games: Obduction). A 10-bit game that switches to HDR10
+        // later turns the conversion off again (hk_SetCS1).
+        const bool sdrGame = (ff == DXGI_FORMAT_R8G8B8A8_UNORM || ff == DXGI_FORMAT_B8G8R8A8_UNORM || ff == DXGI_FORMAT_R10G10B10A2_UNORM) &&
+                             (!swapchain || swapchain->get_color_space() == reshade::api::color_space::srgb_nonlinear ||
+                              swapchain->get_color_space() == reshade::api::color_space::unknown) &&
+                             (g_cs11.load() < 0 || g_cs11.load() == (int)DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        if (cur.sdrToHdr && cur.output < 0 && sdrGame)
+        {
+            if (HdrDisplayFor(fac, hwnd)) g_hdrUp.store(true);
+            else LOGI("BFI Presenter: %s: SDR game; the display has no HDR output (Windows HDR off?) -- staying SDR, use Gain 0.5", what);
+        }
+        else if (cur.sdrToHdr && cur.output < 0)
+            LOGI("BFI Presenter: %s: SDR to HDR not used -- the game's swap chain is format %u, colour space %d (not SDR)",
+                 what, (unsigned)ff, swapchain ? (int)swapchain->get_color_space() : -1);
+        else if (cur.sdrToHdr)
+            LOGI("BFI Presenter: %s: SDR to HDR not used -- Output is set by hand (Auto needed)", what);
+    }
     if (ok)
     {
         DXGI_SWAP_CHAIN_DESC1 sd = {};
         sd.Width       = d.Width;
         sd.Height      = d.Height;
-        sd.Format      = ff;
+        sd.Format      = g_hdrUp.load() ? DXGI_FORMAT_R10G10B10A2_UNORM : ff;
         sd.SampleDesc.Count = 1;
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         sd.BufferCount = (UINT)(std::max)(2, cur.presBuffers);
@@ -7157,8 +7361,32 @@ static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 
             hr = RawCreateSwapChain(fac, g_presQueue, g_childHwnd.load(), &sd, &own1);
             g_creatingOwn.store(false);
         }
+        if (FAILED(hr) && g_hdrUp.load())
+        {
+            LOGW("BFI Presenter: %s: HDR10 swap chain refused (0x%08lX) -- staying SDR", what, (unsigned long)hr);
+            g_hdrUp.store(false);
+            sd.Format = ff;
+            OwnCall own;
+            g_creatingOwn.store(true);
+            hr = RawCreateSwapChain(fac, g_presQueue, g_childHwnd.load(), &sd, &own1);
+            g_creatingOwn.store(false);
+        }
         ok = SUCCEEDED(hr) && own1 && SUCCEEDED(own1->QueryInterface(IID_PPV_ARGS(&g_sc)));
         SafeRelease(own1);
+        if (ok && g_hdrUp.load())
+        {
+            UINT sup = 0;
+            if (FAILED(g_sc->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &sup)) ||
+                !(sup & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
+            {
+                LOGW("BFI Presenter: %s: HDR10 not supported for presentation on this swap chain -- staying SDR", what);
+                g_hdrUp.store(false);
+                OwnCall own;
+                SC_DIRECT(PFN_ResizeBuffers, 13)(g_sc, 0, d.Width, d.Height, ff, 0);
+            }
+            else LOGI("BFI Presenter: %s: SDR game presented as HDR10 (SDR white %.0f nits%s) for BFI headroom", what, cur.sdrWhite,
+                      cur.sdrGamma ? ", gamma 2.2" : "");
+        }
         if (ok) fac->MakeWindowAssociation(g_childHwnd.load(), DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
         LOGI("BFI Presenter: DX11 init 4/5 -- presenter swap chain on its own window: 0x%08lX", (unsigned long)hr);
     }
@@ -7299,7 +7527,7 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
     g_stageId[s] = 0;                                    // being rewritten: not selectable
     LeaveCriticalSection(&g_lock);
     if (waitRead) g_ctx11->Wait(g_presFence11, waitRead);   // presenter done reading this slot
-    if (bd.SampleDesc.Count > 1) g_ctx11->ResolveSubresource(g_stage11[s], 0, bb, 0, g_desc.Format);
+    if (bd.SampleDesc.Count > 1) g_ctx11->ResolveSubresource(g_stage11[s], 0, bb, 0, StageFormat());
     else                         g_ctx11->CopyResource(g_stage11[s], bb);
     g_ctx11->Signal(g_gameFence11, ++g_gameFenceVal);
     g_ctx11->Flush();
@@ -7388,11 +7616,21 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
     g_desc11 = d;
     if (cnt) g_virtCount = cnt;
     DXGI_FORMAT ff = FlipFormat(d.Format);
-    if (ff == DXGI_FORMAT_UNKNOWN) ff = g_desc.Format;
+    if (ff == DXGI_FORMAT_UNKNOWN) ff = StageFormat();
+    g_stageFmt = ff;
+    // SDR to HDR only while the game's swap chain stays 8-bit SDR. Another add-on can upgrade it after the presenter
+    // took over (AutoHDR.addon64 resizes it to scRGB or HDR10 in its own swap chain event): the game's frames are HDR
+    // from then on and are shown as they are -- decoding them as SDR again would be a second conversion.
+    if (g_hdrUp.load() && ff != DXGI_FORMAT_R8G8B8A8_UNORM && ff != DXGI_FORMAT_B8G8R8A8_UNORM && ff != DXGI_FORMAT_R10G10B10A2_UNORM)
+    {
+        g_hdrUp.store(false);
+        LOGI("BFI Presenter: DX11: the game's swap chain is now format %u (upgraded to HDR by the game or an add-on?) -- "
+             "SDR to HDR off, its frames are presented as they are", (unsigned)ff);
+    }
     HRESULT hr2;
     {
         OwnCall own;
-        hr2 = SC_DIRECT(PFN_ResizeBuffers, 13)(g_sc, 0, d.Width, d.Height, ff, 0);
+        hr2 = SC_DIRECT(PFN_ResizeBuffers, 13)(g_sc, 0, d.Width, d.Height, g_hdrUp.load() ? DXGI_FORMAT_R10G10B10A2_UNORM : ff, 0);
     }
     LOGI("BFI Presenter: DX11: game resized to %ux%u format %u (0x%08lX); presenter swap chain 0x%08lX",
          d.Width, d.Height, (unsigned)d.Format, (unsigned long)hr, (unsigned long)hr2);
@@ -8957,13 +9195,24 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (g_deferPresenter.load() && !g_ownPresentQueue)
             ImGui::TextColored(kAmber, "BFI starts when the game resizes its swap chain.\nIf it doesn't, change resolution or display mode once (and back).");
         if (st.vrrSuspect)
-            ImGui::TextColored(kRed, "The display is refreshing slower than it can: VRR (G-SYNC) is active.\nTurn G-SYNC off for this game in the NVIDIA profile, or turn on Queue one refresh ahead.");
+            ImGui::TextColored(kRed, "The display is refreshing slower than it can: VRR (G-SYNC) or Windows' dynamic refresh rate is active.\n"
+                               "Turn G-SYNC off for this game in the NVIDIA profile, and Dynamic refresh rate off in Windows' display\n"
+                               "settings (Advanced display), or turn on Queue one refresh ahead.");
         if (st.limitSuspect)
             ImGui::TextColored(kRed, "A frame limiter is holding the presenter below the display's refresh rate.\nSet the RTSS frame limit to 0 for this game (and check NVIDIA Profile Inspector).");
         if (st.vramOver)
             ImGui::TextColored(kRed, "The game uses more video memory than Windows gives it (%.0f of %.0f MB): the GPU stalls,\n"
                                "refreshes are missed, frame generation drops frames. Lower its texture or memory settings.",
                                st.vramUse, st.vramBudget);
+        {
+            // System check: power plan, GPUs, displays (the displays note only while refreshes are missed).
+            std::string always, withFlashes;
+            SysCheck::Lines(g_sysCheck.Get(), always, withFlashes);
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            if (!always.empty()) ImGui::TextWrapped("%s", always.c_str());
+            if (!withFlashes.empty() && st.flashHint && s.enabled) ImGui::TextWrapped("%s", withFlashes.c_str());
+            ImGui::PopStyleColor();
+        }
         if (st.glPresentBlocked)
             ImGui::TextColored(kRed, "The presenter's presents are blocked (OpenGL). In this game's NVIDIA profile set\n"
                                "Vulkan/OpenGL present method = Prefer layered on DXGI swapchain (BFI Presenter Manager does it).");
@@ -9130,6 +9379,34 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Your panel's full-screen (100%% window) white brightness. Bright areas are held to what the\npanel sustains at their size: from Peak brightness at 10%% of the screen down to this budget at\n100%% (AblCurve in the ini takes your panel's measured curve). The ceiling is lowered just enough;\nsmall highlights keep the full one. Lower it if bright scenes still darken.");
             if (st.hotArea >= 0.0)
                 ImGui::Text("Scene asks for: %.0f nits average   After ceiling: %.0f   Ceiling in use: %.0f nits", st.rawAvg, st.hotArea, st.ceilInUse);
+            ImGui::Unindent(16.0f);
+        }
+        // SDR to HDR: the presenter's own swap chain only (DX11, DX9, OpenGL); DX12 games present through their own.
+        const bool dx12Game = st.managed && !g_dx11.load();
+        ImGui::BeginDisabled(dx12Game || s.output >= 0);
+        bool sh = s.sdrToHdr != 0;
+        if (ImGui::Checkbox("SDR games: present as HDR10 (applies when the swap chain is next created)", &sh)) s.sdrToHdr = sh ? 1 : 0;
+        ImGui::EndDisabled();
+        if (dx12Game) ImGui::TextDisabled("DX11, DX9 and OpenGL games only for now (this game is DX12).");
+        else if (s.output >= 0) ImGui::TextDisabled("Only with Output: Auto.");
+        else if (g_hdrUp.load()) ImGui::TextDisabled("In use: this SDR game is shown as HDR10.");
+        if (GetModuleHandleA("AutoHDR.addon64") || GetModuleHandleA("AutoHDR.addon32") || GetModuleHandleA("AutoHDR.addon"))
+            ImGui::TextWrapped("AutoHDR add-on loaded: it upgrades the game's swap chain to HDR and its effect (e.g. "
+                               "AdvancedAutoHDR.fx) does the conversion; BFI Presenter's SDR to HDR then stays off. Use one or the other.");
+        if (s.sdrToHdr && !dx12Game)
+        {
+            ImGui::Indent(16.0f);
+            ImGui::SliderFloat("SDR white (nits)", &s.sdrWhite, 80.0f, 600.0f, "%.0f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Windows: 80 + 4 x the 'SDR content brightness' slider (40 -> 240).");
+            ImGui::SliderFloat("SDR highlights expand to (nits, 0 = off)", &s.sdrHiNits, 0.0f, 2000.0f, "%.0f");
+            ImGui::SliderFloat("Highlight expansion starts at (SDR signal)", &s.sdrKnee, 0.3f, 0.95f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Below this level the image is unchanged; above it the brightest parts\nstretch toward the highlight value (an HDR look for SDR games).");
+            ImGui::Combo("Highlights stretched by", &s.sdrMethod, "Brightest channel\0Luminance (mostly near-white highlights)\0");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightest channel also brightens bright saturated colours (reds, blues).\nLuminance stretches mostly near-white highlights; saturated colours stay closer to SDR.");
+            ImGui::Combo("SDR decoding", &s.sdrGamma, "sRGB curve (as Windows)\0Gamma 2.2 (deeper shadows)\0Gamma 2.4 (dark-room grading)\0");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the SDR picture is turned into light. Most SDR games were made on gamma 2.2 screens:\nthe sRGB curve (Windows' own SDR-in-HDR and Auto HDR) shows their shadows a little raised.");
+            ImGui::SliderFloat("Gamut expansion", &s.sdrGamut, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves bright saturated colours past SDR's colour range, toward the wider colours of\nHDR games (after Pumbo's AdvancedAutoHDR / Unreal Engine). 0 = SDR's colours exactly.");
             ImGui::Unindent(16.0f);
         }
     }
@@ -9368,7 +9645,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
     // ================================================================ 4. status
     if (st.managed && ImGui::CollapsingHeader("Status", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        static const char *outs[] = { "SDR", "scRGB", "HDR10" };
+        static const char *outs[] = { "SDR", "scRGB", "HDR10", "-", "SDR shown as HDR10" };
         ImGui::Text("Game: %.1f fps   Refreshes: %.1f/s (display %.1f Hz)   Frame age: %.1f ms",
                     st.gameFps, st.refreshHz, st.displayHz, st.frameAgeMs);
         ImGui::Text("Uneven strobe cycles: %d/s (a frame repeated %d, frames skipped %d)",
@@ -9376,7 +9653,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         ImGui::Text("Late refreshes: %d/s   Display repeats: %d/s", st.late, st.repeats);
         ImGui::Text("Presenter: %s   Output: %s   Format: %u   %ux%u, %u buffers",
                     st.running ? "running" : "stopped",
-                    (st.outType >= 0 && st.outType <= 2) ? outs[st.outType] : "-", st.format,
+                    (st.outType >= 0 && st.outType <= 4) ? outs[st.outType] : "-", st.format,
                     st.width, st.height, st.buffers);
         ImGui::Text("Presenter queue: %s", g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME ? "global realtime" :
                                             g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH ? "high (realtime: Manager > GPU priority, or run the launcher as administrator)" : "normal");

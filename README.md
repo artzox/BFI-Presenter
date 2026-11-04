@@ -136,6 +136,7 @@ BFIPresenter.example.ini   shared settings reference
   - advice in the issues on low-ratio strobing, HDR brightness boosting, OLED VRR flicker and making the tool simpler to set up ([#57](https://github.com/artzox/BFI-Presenter/issues/57), [#67](https://github.com/artzox/BFI-Presenter/issues/67)).
 
   BFI Presenter's code is written from scratch from those descriptions; no Blur Busters code is used.
+- **Pumbo**, for AdvancedAutoHDR: the SDR to HDR conversion's gamut expansion follows its "Extra HDR saturation" (itself after Unreal Engine), and its gamma choices and expansion by luminance were the model for the others.
 - **[crosire](https://github.com/crosire)**, for [ReShade](https://reshade.me) and its add-on API, which the DirectX and OpenGL presenter runs on, and **Omar Cornut**, for [Dear ImGui](https://github.com/ocornut/imgui).
 - Everyone who tested games, sent logs and reported issues.
 

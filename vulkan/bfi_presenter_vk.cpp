@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.29"
+#define BFI_VERSION "1.0.30"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -137,6 +137,10 @@ static void Log(const char *lvl, const char *fmt, ...)
 }
 #define LOGI(...) Log("INFO ", __VA_ARGS__)
 #define LOGW(...) Log("WARN ", __VA_ARGS__)
+#ifdef _WIN32
+#include "../common/bfi_syscheck.h"
+static SysCheck g_sysCheck;      // power plan, GPUs, displays (checked on the window watch thread)
+#endif
 #define LOGE(...) Log("ERROR", __VA_ARGS__)
 
 // ---------------------------------------------------------------- ini (portable, [BFI] section)
@@ -298,6 +302,9 @@ struct Settings
     float sdrWhite = 200.0f;  // nits of SDR white in that mode (Windows' SDR content brightness)
     float sdrHiNits = 800.0f; // highlight expansion: SDR white highlights stretch to this (0 = off)
     float sdrKnee  = 0.65f;   // expansion starts at this SDR signal level (0..1, as the game outputs it)
+    int   sdrGamma = 0;       // SdrGamma: decode the SDR picture with 0 the sRGB curve, 1 gamma 2.2, 2 gamma 2.4
+    int   sdrMethod = 0;      // SdrHighlightMethod: highlights stretched by 0 the brightest channel, 1 luminance
+    float sdrGamut = 0.0f;    // SdrGamutExpansion: 0..1, bright saturated colours toward wider-gamut colours (0 = off)
 };
 
 static std::mutex g_cfgLock;            // guards g_shared and g_status
@@ -391,6 +398,9 @@ static void LoadSettings(Settings &s)
     if (s.sdrHiNits < 0.0f) s.sdrHiNits = 0.0f;
     if (s.sdrHiNits > 4000.0f) s.sdrHiNits = 4000.0f;
     s.sdrKnee = Clamp(KvFloat(kv, "SdrHighlightKnee", 0.65f), 0.3f, 0.95f);
+    s.sdrGamma = Clamp(KvInt(kv, "SdrGamma", 0), 0, 2);
+    s.sdrMethod = KvInt(kv, "SdrHighlightMethod", 0) ? 1 : 0;
+    s.sdrGamut = Clamp(KvFloat(kv, "SdrGamutExpansion", 0.0f), 0.0f, 1.0f);
     auto it = kv.find("output");
     std::string out = it == kv.end() ? "auto" : it->second;
     for (char &c : out) c = (char)tolower((unsigned char)c);
@@ -413,7 +423,7 @@ static void LoadSettings(Settings &s)
     I("AblGuardBudgetNits", s.ablBudget); k.push_back({"AblCurve", s.ablCurve}); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs); I("FlashHints", s.flashHints);
     I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue); I("PresenterQueuePriority", s.queuePriority);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
-    F("SdrHighlightKnee", s.sdrKnee);
+    F("SdrHighlightKnee", s.sdrKnee); I("SdrGamma", s.sdrGamma); I("SdrHighlightMethod", s.sdrMethod); F("SdrGamutExpansion", s.sdrGamut);
     return k;
 }
 static void LoadShared()
@@ -590,6 +600,7 @@ struct Constants
     float    soften;      // 0..1: blend toward the steady average picture (LCD phase swap fade)
     float    phase;       // LCD gradual saver: start of the lit window within the first sub-frame, 0..1
     uint32_t store;       // compute path: 1 swap R and B (B-first swap chain format), 2 sRGB-encode (_SRGB swap chain format)
+    float    gamut;       // SDR shown as HDR10: gamut expansion strength (0 = off)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -1886,6 +1897,7 @@ static void PresenterThread(Swapchain *sc)
         BoostPresenterThread(mm, "presenter");
     }
 #endif
+    const double runStartT = Now();     // automatic frame cap: no step down in the first seconds (warm-up, intros)
     LOGI("BFI Presenter: presenter running (%s, %s queue, %u real images)", copyMode ? "copy mode" : R.rt ? "BFI, compute" : "BFI",
          R.rt ? (d->rtPrio == VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR ? "global realtime" : "high-priority") :
          d->sharedQueue ? "the game's" : "its own", sc->nReal);
@@ -2274,7 +2286,8 @@ static void PresenterThread(Swapchain *sc)
         c.dfloor  = s.dfloor;
         c.knee    = s.knee;
         c.ceilLin = (c.outType == 0 || c.outType == 3) ? 1.0f : (float)(std::floor(ceilNow / 10.0 + 0.5) * 10.0 / 80.0);
-        c.flags   = (s.rolloff ? 1u : 0u) | (s.sine ? 2u : 0u) | (s.invert ? 4u : 0u) | (s.rolling ? 8u : 0u);
+        c.flags   = (s.rolloff ? 1u : 0u) | (s.sine ? 2u : 0u) | (s.invert ? 4u : 0u) | (s.rolling ? 8u : 0u) |
+                    (c.outType >= 4 ? (s.sdrGamma == 1 ? 32u : s.sdrGamma == 2 ? 64u : 0u) | (s.sdrMethod ? 128u : 0u) : 0u);
         if (GradualSaverOn(s))
         {
             c.flags |= 16u;
@@ -2286,7 +2299,9 @@ static void PresenterThread(Swapchain *sc)
         {
             // knee given as signal level (what the game writes); the shader works in linear light
             const float k = s.sdrKnee;
-            c.sdrKnee = k <= 0.04045f ? k / 12.92f : std::pow((k + 0.055f) / 1.055f, 2.4f);
+            c.sdrKnee = s.sdrGamma == 1 ? std::pow(k, 2.2f) : s.sdrGamma == 2 ? std::pow(k, 2.4f)
+                                         : (k <= 0.04045f ? k / 12.92f : std::pow((k + 0.055f) / 1.055f, 2.4f));
+            c.gamut = c.outType >= 4 ? s.sdrGamut : 0.0f;
             const float hi = std::min(s.sdrHiNits, s.peakNits);
             c.sdrPeak = hi > s.sdrWhite ? hi / 80.0f : 0.0f;
         }
@@ -2787,8 +2802,9 @@ static void PresenterThread(Swapchain *sc)
                 {
                     limitLogged = true;
                     LOGW("BFI Presenter: the presenter is held to %.1f presents/s on a %.0f Hz display -- a frame limiter is "
-                         "acting on it (RTSS limit, or NVIDIA Control Panel / NVIDIA app 'Max Frame Rate', global or for this exe). "
-                         "Turn it off for this program: the strobe slips a refresh about %.0f times a second, which shows as flicker.",
+                         "acting on it (RTSS limit, or NVIDIA Control Panel / NVIDIA app 'Max Frame Rate', global or for this exe), or VRR (G-SYNC) "
+                         "or Windows' dynamic refresh rate slows the display. "
+                         "Turn off whichever applies for this game: the strobe slips a refresh about %.0f times a second, which shows as flicker.",
                          prate, hz, hz - prate);
                 }
                 g_status.limitSuspect = limitSecs >= 3;
@@ -3071,13 +3087,18 @@ static void PresenterThread(Swapchain *sc)
                         if (fsState == 3) { learnMine.fsMs = fsLeadCur * 1000.0; learnMine.bestMs = fsBestMs; LearnPost(learnMine); }
                     }
                 }
+                // Each frame presented twice (RPCS3): stepping down halves the game's own frame rate (60 -> 30), far more
+                // than the unevenness of a game just short of 60 (MotorStorm at 113 of 120 presents went to 30 for 20 s at
+                // a time). Those step down only well below it -- 85% of the refresh rate, about 51 game fps at 120 Hz --
+                // and a try at Refresh rate that holds 85% is good enough to stay there.
+                const double capHoldFrac = dupSeen ? 0.85 : 0.95;
                 if (capOn)
                 {
                     if (capProbe)
                     {
                         // Trying Refresh: the first second still counts frames from the cap.
                         probeSecs++;
-                        if (probeSecs >= 2 && fpsA >= 0.95 * hzA && !hitchPaused) probeGood++;
+                        if (probeSecs >= 2 && fpsA >= capHoldFrac * hzA && !hitchPaused) probeGood++;
                         if (probeSecs >= 4)
                         {
                             capProbe = false; capDownSecs = 0; capSwitchT = t;
@@ -3093,7 +3114,10 @@ static void PresenterThread(Swapchain *sc)
                                 probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
                                 // Far from the refresh rate (under 80%): each try is seconds of uneven frames (P.T.-PC at 72 of
                                 // 120: 5 s with every eighth frame skipped), so the next one waits 5 minutes (as the DX add-on).
-                                if (fpsA < 0.8 * hzA) probeWait = 300.0;
+                                // Exactly the strobe rate is a limit of the game's own (an intro, a menu), not a struggle: tries
+                                // every 30 s cost nothing there (as the DX add-on).
+                                if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;
+                                else if (fpsA < 0.8 * hzA) probeWait = 300.0;
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, dupSeen ? std::min(probeWait, 20.0) : probeWait);
                             }
@@ -3101,14 +3125,16 @@ static void PresenterThread(Swapchain *sc)
                     }
                     else if (!down)
                     {
-                        capDownSecs = (!hitchPaused && fpsA > 0.3 * hzA / s.frames && fpsA < 0.95 * hzA) ? capDownSecs + 1 : 0;
+                        // Not in the first 10 s after the presenter starts: the game is still warming up (as the DX add-on).
+                        capDownSecs = (!hitchPaused && t - runStartT > 10.0 && fpsA > 0.3 * hzA / s.frames && fpsA < capHoldFrac * hzA) ? capDownSecs + 1 : 0;
                         if (capDownSecs >= 3 && t - capSwitchT > 3.0)
                         {
                             // Down again soon after going back up: the game is close to the limit, so the next try waits
                             // longer; well under the refresh rate, the first try waits a minute (as the DX add-on).
                             if (t - capUpT < 30.0) probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
                             else probeWait = 30.0;
-                            if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;
+                            if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;
+                            else if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;
                             down = true; capDownSecs = 0; capSwitchT = t;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps) -- the game held "
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames, fpsA, hzA);
@@ -3780,6 +3806,8 @@ static void WinWatchThread(Swapchain *sc)
                 LearnTick(path.c_str(), (g_exeName + " (Vulkan)").c_str(), sc->hwnd ? GetAncestor((HWND)sc->hwnd, GA_ROOT) : nullptr);
             }
         }
+        g_sysCheck.Tick(sc->hwnd ? GetAncestor((HWND)sc->hwnd, GA_ROOT) : nullptr,
+                        [](int lvl, const char *m) { if (lvl) LOGW("BFI Presenter: %s", m); else LOGI("BFI Presenter: %s", m); });
         if (!sc->winDumpReq.exchange(false)) continue;
         HWND game = sc->hwnd ? GetAncestor((HWND)sc->hwnd, GA_ROOT) : nullptr;
         if (!game) continue;
@@ -5203,6 +5231,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateDevice(VkPhysicalDevice phys, co
         if (d->queue && d->setLoaderData) d->setLoaderData(*out, d->queue);
         VkPhysicalDeviceProperties pp;
         id->GetPhysicalDeviceProperties(phys, &pp);
+#ifdef _WIN32
+        {
+            // The GPU the game renders on, for the system check (its monitor driven by another GPU).
+            auto gp2 = (PFN_vkGetPhysicalDeviceProperties2)id->gipa(id->instance, "vkGetPhysicalDeviceProperties2");
+            if (!gp2) gp2 = (PFN_vkGetPhysicalDeviceProperties2)id->gipa(id->instance, "vkGetPhysicalDeviceProperties2KHR");
+            VkPhysicalDeviceIDProperties idp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+            VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+            p2.pNext = &idp;
+            if (gp2) gp2(phys, &p2);
+            if (gp2 && idp.deviceLUIDValid)
+            {
+                LUID l;
+                memcpy(&l, idp.deviceLUID, sizeof(l));
+                g_sysCheck.SetRenderGpu(l, pp.deviceName);
+            }
+        }
+#endif
         LOGI("BFI Presenter: device %s -- presenter queue: family %u index %u (%s)", pp.deviceName, family, index,
              shared ? "shared with the game, locked" : "its own");
         if (shared) LOGW("BFI Presenter: no spare queue in family %u -- the presenter shares the game's queue", family);
@@ -5533,8 +5578,20 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                "presentation slows, frame generation drops frames. Lower its texture or memory settings.",
                                st.vramUse, st.vramBudget);
         if (st.limitSuspect)
-            ImGui::TextColored(kRed, "A frame limiter is holding the presenter below the display's refresh rate.\n"
-                               "Turn off the RTSS limit and NVIDIA's Max Frame Rate (global and for this exe; check NVIDIA Profile Inspector).");
+            ImGui::TextColored(kRed, "Something holds the presenter below the display's refresh rate: a frame limiter, VRR (G-SYNC)\n"
+                               "or Windows' dynamic refresh rate. Turn off the RTSS limit and NVIDIA's Max Frame Rate (global and for\n"
+                               "this exe), G-SYNC for this game, and Dynamic refresh rate in Windows' display settings.");
+#ifdef _WIN32
+        {
+            // System check: power plan, GPUs, displays (the displays note only while refreshes are missed).
+            std::string always, withFlashes;
+            SysCheck::Lines(g_sysCheck.Get(), always, withFlashes);
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            if (!always.empty()) ImGui::TextWrapped("%s", always.c_str());
+            if (!withFlashes.empty() && st.flashHint && s.enabled) ImGui::TextWrapped("%s", withFlashes.c_str());
+            ImGui::PopStyleColor();
+        }
+#endif
         // Flash hint: when missed refreshes keep coming back, the first step that isn't done yet (the red
         // warnings above come first).
         if (st.flashHint && s.flashHints && s.enabled && !st.limitSuspect && st.layerOrder != 2)
@@ -5694,6 +5751,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
         }
         bool sh = s.sdrToHdr != 0;
         if (ImGui::Checkbox("SDR games: present as HDR10 (applies when the swap chain is next created)", &sh)) s.sdrToHdr = sh ? 1 : 0;
+#ifdef _WIN32
+        if (GetModuleHandleA("AutoHDR.addon64") || GetModuleHandleA("AutoHDR.addon32") || GetModuleHandleA("AutoHDR.addon"))
+            ImGui::TextWrapped("AutoHDR add-on loaded: it upgrades the game's swap chain to HDR and its effect (e.g. "
+                               "AdvancedAutoHDR.fx) does the conversion; BFI Presenter's SDR to HDR then stays off. Use one or the other.");
+#endif
         if (s.sdrToHdr)
         {
             ImGui::Indent(16.0f);
@@ -5702,6 +5764,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::SliderFloat("SDR highlights expand to (nits, 0 = off)", &s.sdrHiNits, 0.0f, 2000.0f, "%.0f");
             ImGui::SliderFloat("Highlight expansion starts at (SDR signal)", &s.sdrKnee, 0.3f, 0.95f, "%.2f");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Below this level the image is unchanged; above it the brightest parts\nstretch toward the highlight value (an HDR look for SDR games).");
+            ImGui::Combo("Highlights stretched by", &s.sdrMethod, "Brightest channel\0Luminance (mostly near-white highlights)\0");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightest channel also brightens bright saturated colours (reds, blues).\nLuminance stretches mostly near-white highlights; saturated colours stay closer to SDR.");
+            ImGui::Combo("SDR decoding", &s.sdrGamma, "sRGB curve (as Windows)\0Gamma 2.2 (deeper shadows)\0Gamma 2.4 (dark-room grading)\0");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the SDR picture is turned into light. Most SDR games were made on gamma 2.2 screens:\nthe sRGB curve (Windows' own SDR-in-HDR and Auto HDR) shows their shadows a little raised.");
+            ImGui::SliderFloat("Gamut expansion", &s.sdrGamut, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves bright saturated colours past SDR's colour range, toward the wider colours of\nHDR games (after Pumbo's AdvancedAutoHDR / Unreal Engine). 0 = SDR's colours exactly.");
             ImGui::Unindent(16.0f);
         }
     }
