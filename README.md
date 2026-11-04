@@ -78,7 +78,7 @@ If you use a CRT shader with its own BFI (for example CRT-Standalone), turn that
 > **LCD monitors (IPS, VA, TN): turn on "LCD: prevent image retention" (`LcdPhaseSwap=1`).** With an even number of frames per cycle every lit refresh gets the same LCD drive polarity, and long sessions can leave a temporary ghost of the image. The option moves the strobe to the other refresh from time to time, so this evens out: **Immediate** fades and shifts it every few seconds, **Gradual** slides it slowly with no fade or stutter (see the [settings guide](docs/settings-guide.md)). OLED displays don't need it.
 
 > [!IMPORTANT]
-> **Special K's SDR-to-HDR (HDR retrofit) does not work with the presenter.** Special K applies its HDR processing, and draws its menu, in its own Present hook, and the presenter takes the game's frames before that hook runs. The image then reaches the display unprocessed but flagged as HDR, and looks heavily over-contrasted, and Special K's menu doesn't open. For SDR games in HDR use **RTX HDR** or a ReShade AutoHDR effect (for example Pumbo's AutoHDR add-on with AdvancedAutoHDR) instead, and turn Special K off for that game (in SKIF, stop global injection or blacklist the game's `.exe`).
+> **Special K's SDR-to-HDR (HDR retrofit) does not work with the presenter.** Special K applies its HDR processing, and draws its menu, in its own Present hook, and the presenter takes the game's frames before that hook runs. The image then reaches the display unprocessed but flagged as HDR, and looks heavily over-contrasted, and Special K's menu doesn't open. For SDR games in HDR use **RTX HDR** or a ReShade AutoHDR effect (for example the AutoHDR add-on with [Pumbo](https://github.com/Filoppi)'s [AdvancedAutoHDR](https://github.com/Filoppi/PumboAutoHDR)) instead, and turn Special K off for that game (in SKIF, stop global injection or blacklist the game's `.exe`).
 
 ## Documentation
 
@@ -136,7 +136,7 @@ BFIPresenter.example.ini   shared settings reference
   - advice in the issues on low-ratio strobing, HDR brightness boosting, OLED VRR flicker and making the tool simpler to set up ([#57](https://github.com/artzox/BFI-Presenter/issues/57), [#67](https://github.com/artzox/BFI-Presenter/issues/67)).
 
   BFI Presenter's code is written from scratch from those descriptions; no Blur Busters code is used.
-- **Pumbo**, for AdvancedAutoHDR: the SDR to HDR conversion's gamut expansion follows its "Extra HDR saturation" (itself after Unreal Engine), and its gamma choices and expansion by luminance were the model for the others.
+- **[Pumbo](https://github.com/Filoppi)**, for [AdvancedAutoHDR](https://github.com/Filoppi/PumboAutoHDR): the SDR to HDR conversion's gamut expansion follows its "Extra HDR saturation" (itself after Unreal Engine), and its gamma choices and expansion by luminance were the model for the others.
 - **[crosire](https://github.com/crosire)**, for [ReShade](https://reshade.me) and its add-on API, which the DirectX and OpenGL presenter runs on, and **Omar Cornut**, for [Dear ImGui](https://github.com/ocornut/imgui).
 - Everyone who tested games, sent logs and reported issues.
 
