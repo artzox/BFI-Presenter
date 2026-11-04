@@ -7558,6 +7558,15 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
     DXGI_FORMAT ff = FlipFormat(d.Format);
     if (ff == DXGI_FORMAT_UNKNOWN) ff = StageFormat();
     g_stageFmt = ff;
+    // SDR to HDR only while the game's swap chain stays 8-bit SDR. Another add-on can upgrade it after the presenter
+    // took over (AutoHDR.addon64 resizes it to scRGB or HDR10 in its own swap chain event): the game's frames are HDR
+    // from then on and are shown as they are -- decoding them as SDR again would be a second conversion.
+    if (g_hdrUp.load() && ff != DXGI_FORMAT_R8G8B8A8_UNORM && ff != DXGI_FORMAT_B8G8R8A8_UNORM)
+    {
+        g_hdrUp.store(false);
+        LOGI("BFI Presenter: DX11: the game's swap chain is now format %u (upgraded to HDR by the game or an add-on?) -- "
+             "SDR to HDR off, its frames are presented as they are", (unsigned)ff);
+    }
     HRESULT hr2;
     {
         OwnCall own;
@@ -9321,6 +9330,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (dx12Game) ImGui::TextDisabled("DX11, DX9 and OpenGL games only for now (this game is DX12).");
         else if (s.output >= 0) ImGui::TextDisabled("Only with Output: Auto.");
         else if (g_hdrUp.load()) ImGui::TextDisabled("In use: this SDR game is shown as HDR10.");
+        if (GetModuleHandleA("AutoHDR.addon64") || GetModuleHandleA("AutoHDR.addon32") || GetModuleHandleA("AutoHDR.addon"))
+            ImGui::TextWrapped("AutoHDR add-on loaded: it upgrades the game's swap chain to HDR and its effect (e.g. "
+                               "AdvancedAutoHDR.fx) does the conversion; BFI Presenter's SDR to HDR then stays off. Use one or the other.");
         if (s.sdrToHdr && !dx12Game)
         {
             ImGui::Indent(16.0f);

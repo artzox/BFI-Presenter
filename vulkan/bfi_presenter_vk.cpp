@@ -5733,6 +5733,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
         }
         bool sh = s.sdrToHdr != 0;
         if (ImGui::Checkbox("SDR games: present as HDR10 (applies when the swap chain is next created)", &sh)) s.sdrToHdr = sh ? 1 : 0;
+#ifdef _WIN32
+        if (GetModuleHandleA("AutoHDR.addon64") || GetModuleHandleA("AutoHDR.addon32") || GetModuleHandleA("AutoHDR.addon"))
+            ImGui::TextWrapped("AutoHDR add-on loaded: it upgrades the game's swap chain to HDR and its effect (e.g. "
+                               "AdvancedAutoHDR.fx) does the conversion; BFI Presenter's SDR to HDR then stays off. Use one or the other.");
+#endif
         if (s.sdrToHdr)
         {
             ImGui::Indent(16.0f);
