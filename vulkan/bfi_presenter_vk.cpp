@@ -302,6 +302,7 @@ struct Settings
     float sdrWhite = 200.0f;  // nits of SDR white in that mode (Windows' SDR content brightness)
     float sdrHiNits = 800.0f; // highlight expansion: SDR white highlights stretch to this (0 = off)
     float sdrKnee  = 0.65f;   // expansion starts at this SDR signal level (0..1, as the game outputs it)
+    int   sdrGamma = 0;       // SdrGamma22: decode the SDR picture with gamma 2.2 instead of the sRGB curve
 };
 
 static std::mutex g_cfgLock;            // guards g_shared and g_status
@@ -395,6 +396,7 @@ static void LoadSettings(Settings &s)
     if (s.sdrHiNits < 0.0f) s.sdrHiNits = 0.0f;
     if (s.sdrHiNits > 4000.0f) s.sdrHiNits = 4000.0f;
     s.sdrKnee = Clamp(KvFloat(kv, "SdrHighlightKnee", 0.65f), 0.3f, 0.95f);
+    s.sdrGamma = KvInt(kv, "SdrGamma22", 0) ? 1 : 0;
     auto it = kv.find("output");
     std::string out = it == kv.end() ? "auto" : it->second;
     for (char &c : out) c = (char)tolower((unsigned char)c);
@@ -417,7 +419,7 @@ static void LoadSettings(Settings &s)
     I("AblGuardBudgetNits", s.ablBudget); k.push_back({"AblCurve", s.ablCurve}); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs); I("FlashHints", s.flashHints);
     I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue); I("PresenterQueuePriority", s.queuePriority);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
-    F("SdrHighlightKnee", s.sdrKnee);
+    F("SdrHighlightKnee", s.sdrKnee); I("SdrGamma22", s.sdrGamma);
     return k;
 }
 static void LoadShared()
@@ -2278,7 +2280,8 @@ static void PresenterThread(Swapchain *sc)
         c.dfloor  = s.dfloor;
         c.knee    = s.knee;
         c.ceilLin = (c.outType == 0 || c.outType == 3) ? 1.0f : (float)(std::floor(ceilNow / 10.0 + 0.5) * 10.0 / 80.0);
-        c.flags   = (s.rolloff ? 1u : 0u) | (s.sine ? 2u : 0u) | (s.invert ? 4u : 0u) | (s.rolling ? 8u : 0u);
+        c.flags   = (s.rolloff ? 1u : 0u) | (s.sine ? 2u : 0u) | (s.invert ? 4u : 0u) | (s.rolling ? 8u : 0u) |
+                    (c.outType >= 4 && s.sdrGamma ? 32u : 0u);
         if (GradualSaverOn(s))
         {
             c.flags |= 16u;
@@ -2290,7 +2293,7 @@ static void PresenterThread(Swapchain *sc)
         {
             // knee given as signal level (what the game writes); the shader works in linear light
             const float k = s.sdrKnee;
-            c.sdrKnee = k <= 0.04045f ? k / 12.92f : std::pow((k + 0.055f) / 1.055f, 2.4f);
+            c.sdrKnee = s.sdrGamma ? std::pow(k, 2.2f) : (k <= 0.04045f ? k / 12.92f : std::pow((k + 0.055f) / 1.055f, 2.4f));
             const float hi = std::min(s.sdrHiNits, s.peakNits);
             c.sdrPeak = hi > s.sdrWhite ? hi / 80.0f : 0.0f;
         }
@@ -5738,6 +5741,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::SliderFloat("SDR highlights expand to (nits, 0 = off)", &s.sdrHiNits, 0.0f, 2000.0f, "%.0f");
             ImGui::SliderFloat("Highlight expansion starts at (SDR signal)", &s.sdrKnee, 0.3f, 0.95f, "%.2f");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Below this level the image is unchanged; above it the brightest parts\nstretch toward the highlight value (an HDR look for SDR games).");
+            bool g22 = s.sdrGamma != 0;
+            if (ImGui::Checkbox("Gamma 2.2 (deeper shadows)", &g22)) s.sdrGamma = g22 ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decodes the SDR picture with gamma 2.2, as most SDR monitors and TVs show it.\nOff: the sRGB curve, as Windows' own SDR-in-HDR and Auto HDR use, whose shadows\nlook a little raised.");
             ImGui::Unindent(16.0f);
         }
     }

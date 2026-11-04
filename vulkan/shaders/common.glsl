@@ -51,8 +51,9 @@ vec3 Decode(vec3 c)
 {
     if (pc.outType == 0u) return SrgbToLin(c);
     if (pc.outType == 2u) return PqToLin(c);
-    if (pc.outType == 4u) return SdrExpand(SrgbToLin(c));
-    if (pc.outType == 5u) return SdrExpand(c);
+    // flags & 32: SDR decoded with gamma 2.2 instead of the sRGB curve (5: the hardware decoded sRGB, re-encoded first)
+    if (pc.outType == 4u) return SdrExpand((pc.flags & 32u) != 0u ? pow(max(c, 0.0), vec3(2.2)) : SrgbToLin(c));
+    if (pc.outType == 5u) return SdrExpand((pc.flags & 32u) != 0u ? pow(LinToSrgb(c), vec3(2.2)) : c);
     return c;
 }
 // BT.709 -> BT.2020 primaries (ITU-R BT.2087), for SDR games presented as HDR10. Every row is a positive blend
