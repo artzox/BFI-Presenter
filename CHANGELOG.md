@@ -22,7 +22,7 @@ Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two we
   - **Highlights stretched by** (`SdrHighlightMethod`): the brightest channel, as before, or luminance (mostly near-white highlights; saturated colours stay closer to SDR).
   - **Gamut expansion** (`SdrGamutExpansion`, 0–1): bright saturated colours move past SDR's colour range toward the wider colours of HDR games, as AdvancedAutoHDR's "Extra HDR saturation" (itself after Unreal Engine).
 - **[Both] The AutoHDR ReShade add-on:** when it upgrades the game's swap chain to HDR, BFI Presenter's conversion stays off, also when the add-on does it after the presenter has taken over (DX11, DX9, OpenGL: its frames would otherwise have been converted a second time). The overlay notes when the add-on is loaded.
-- **[Docs]** Settings guide: the system check; SDR to HDR in DX, its new choices, how it differs from Windows Auto HDR and from the AutoHDR add-on. README: Pumbo in the acknowledgements.
+- **[Docs]** Settings guide: the system check; SDR to HDR in DX, its new choices, how it differs from Windows Auto HDR and from the AutoHDR add-on, and to turn RTX HDR and Auto HDR off where it is on (a starting-point recipe for SDR games with Windows HDR on). README: Pumbo in the acknowledgements.
 
 ## [1.0.29] — 2026-11-04 (Manager 1.3.15)
 
