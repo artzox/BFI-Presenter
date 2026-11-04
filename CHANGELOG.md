@@ -7,7 +7,7 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [1.0.30] — unreleased (Manager 1.3.15)
+## [1.0.30] — 2026-11-04 (Manager 1.3.15)
 
 **Warnings for what's outside the game, and SDR to HDR in DirectX.**
 
