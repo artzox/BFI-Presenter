@@ -82,7 +82,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Clive Barker's Undying | Working (DX11 via dgVoodoo, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32`; G-SYNC off for the game (Fixed refresh + VSync Force on), or Queue one refresh ahead |
 | DARQ | Working (DX11, 32-bit) | — | v1.0.18 | `BFIPresenter.addon32`; v1.0.18 or newer (the game makes a second swap chain at start); ReShade's overlay may react late to the mouse and keyboard in this game, with or without the presenter |
 | PCSX2 | Working (Vulkan) | — | — | Vulkan layer; Vulkan renderer, `BFIPresenter.ini` next to the emulator's .exe |
-| RPCS3 | Working (Vulkan) | — | — | Vulkan layer; `BFIPresenter.ini` next to the emulator's .exe |
+| RPCS3 | Working (Vulkan) | — | — | Vulkan layer; `BFIPresenter.ini` next to the emulator's .exe. RPCS3 presents each frame twice (the overlay shows 120 for 60 fps). Killzone 2: automatic frame cap. inFamous (44–60 fps): Half refresh, which stops the automatic cap switching between 30 and 60. Realtime GPU priority isn't used: RPCS3 uses the compute queue family itself (v1.0.29) |
 
 ### More games tested
 
@@ -98,7 +98,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Cocoon | Standard setup |
 | Crash Bandicoot N. Sane Trilogy | Standard setup |
 | Days Gone | Standard setup |
-| Dead Space (2023) | Standard setup; Frame pacing Lowest latency (about 37 ms from release to flash against about 44 ms with Smooth, v1.0.22). Refresh + automatic frame cap with Reflex's limit is the quickest: about 24 ms from frame start to flash against about 37 ms with the presenter's cap (v1.0.27) |
+| Dead Space (2023) | Standard setup; Frame pacing Lowest latency (about 37 ms from release to flash against about 44 ms with Smooth, v1.0.22). Refresh + automatic frame cap with Reflex's limit is the quickest: about 24 ms from frame start to flash against about 37 ms with the presenter's cap (v1.0.27). With the Ishimura patch, enable Reflex in `IshimuraPatch.ini`: with it off there, the automatic frame cap can't use Reflex's limit and falls back to the presenter's own cap |
 | Dishonored 2 | Standard setup |
 | FAR: Lone Sails | Standard setup |
 | GRIS | Standard setup |
