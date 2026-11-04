@@ -91,7 +91,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.30-t2"
+#define BFI_ADDON_VERSION "1.0.30-t3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -7022,6 +7022,12 @@ static HRESULT STDMETHODCALLTYPE hk_SetCS1(IDXGISwapChain3 *sc, DXGI_COLOR_SPACE
     if (!t_ownCall && IsGame11(sc) && SUCCEEDED(hr) && g_cs11.exchange((int)cs) != (int)cs)
     {
         LOGI("BFI Presenter: DX11: the game set colour space %d", (int)cs);
+        if (g_hdrUp.load() && cs != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
+        {
+            // The game now outputs HDR itself (a 10-bit swap chain switched to HDR10): shown as it is, not converted again.
+            g_hdrUp.store(false);
+            LOGI("BFI Presenter: DX11: the game switched to an HDR colour space -- SDR to HDR off");
+        }
         ApplyColorSpace11();
     }
     return hr;
@@ -7310,7 +7316,9 @@ static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 
     g_hdrUp.store(false);
     if (ok)
     {
-        const bool sdrGame = (ff == DXGI_FORMAT_R8G8B8A8_UNORM || ff == DXGI_FORMAT_B8G8R8A8_UNORM) &&
+        // 8-bit, or 10-bit with the SDR colour space (many UE4 games: Obduction). A 10-bit game that switches to HDR10
+        // later turns the conversion off again (hk_SetCS1).
+        const bool sdrGame = (ff == DXGI_FORMAT_R8G8B8A8_UNORM || ff == DXGI_FORMAT_B8G8R8A8_UNORM || ff == DXGI_FORMAT_R10G10B10A2_UNORM) &&
                              (!swapchain || swapchain->get_color_space() == reshade::api::color_space::srgb_nonlinear ||
                               swapchain->get_color_space() == reshade::api::color_space::unknown) &&
                              (g_cs11.load() < 0 || g_cs11.load() == (int)DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
@@ -7319,6 +7327,11 @@ static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 
             if (HdrDisplayFor(fac, hwnd)) g_hdrUp.store(true);
             else LOGI("BFI Presenter: %s: SDR game; the display has no HDR output (Windows HDR off?) -- staying SDR, use Gain 0.5", what);
         }
+        else if (cur.sdrToHdr && cur.output < 0)
+            LOGI("BFI Presenter: %s: SDR to HDR not used -- the game's swap chain is format %u, colour space %d (not SDR)",
+                 what, (unsigned)ff, swapchain ? (int)swapchain->get_color_space() : -1);
+        else if (cur.sdrToHdr)
+            LOGI("BFI Presenter: %s: SDR to HDR not used -- Output is set by hand (Auto needed)", what);
     }
     if (ok)
     {
@@ -7599,7 +7612,7 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
     // SDR to HDR only while the game's swap chain stays 8-bit SDR. Another add-on can upgrade it after the presenter
     // took over (AutoHDR.addon64 resizes it to scRGB or HDR10 in its own swap chain event): the game's frames are HDR
     // from then on and are shown as they are -- decoding them as SDR again would be a second conversion.
-    if (g_hdrUp.load() && ff != DXGI_FORMAT_R8G8B8A8_UNORM && ff != DXGI_FORMAT_B8G8R8A8_UNORM)
+    if (g_hdrUp.load() && ff != DXGI_FORMAT_R8G8B8A8_UNORM && ff != DXGI_FORMAT_B8G8R8A8_UNORM && ff != DXGI_FORMAT_R10G10B10A2_UNORM)
     {
         g_hdrUp.store(false);
         LOGI("BFI Presenter: DX11: the game's swap chain is now format %u (upgraded to HDR by the game or an add-on?) -- "
