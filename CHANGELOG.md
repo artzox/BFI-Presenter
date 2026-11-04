@@ -7,6 +7,19 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]** or **[Both]**. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.30] — unreleased (Manager 1.3.15)
+
+**Warnings for what's outside the game, and SDR to HDR in DirectX.**
+
+- **[Both] System check.** Every 10 s the presenter checks for things outside the game that make flashes come late, and the overlay's status box and the log say what to change. Nothing is changed for you.
+  - Windows' **Power saver** plan or the **Best power efficiency** power mode, **energy saver**, and a laptop **on battery**.
+  - **A monitor driven by another graphics card** than the one the game renders on (Optimus laptops, or a monitor plugged into the motherboard): every frame is copied across on a schedule of its own and the strobe's timing wobbles.
+  - **More than one active display**, shown while refreshes are being missed: their refresh clocks are never exactly in step, and in borderless or windowed mode Windows composes them all at one rate.
+  - The VRR warning (and the Vulkan layer's frame-limiter warning) now also names Windows' **Dynamic refresh rate**.
+- **[DX] SDR to HDR for DX11, DX9 and OpenGL games** (`SdrToHdr`, on by default as in Vulkan). An 8-bit SDR game on a display with Windows HDR on is presented as HDR10, so the lit refresh has headroom above SDR white and BFI doesn't make the picture dim. The game keeps its own swap chain; the presenter's own one is HDR10. Same settings as the Vulkan layer: SDR white, highlight expansion and its start. Not the same as Windows Auto HDR: the conversion happens before the strobe, so the lit refresh uses the headroom. DX12 games present through their own swap chain and aren't covered yet.
+- **[Both] Gamma 2.2 for SDR to HDR** (`SdrGamma22`, off by default): decodes the SDR picture as most SDR monitors and TVs show it, with deeper shadows. Off, it uses the sRGB curve, as Windows' own SDR-in-HDR and Auto HDR do.
+- **[Docs]** Settings guide: the system check; SDR to HDR in DX, gamma 2.2, and how it differs from Windows Auto HDR.
+
 ## [1.0.29] — 2026-11-04 (Manager 1.3.15)
 
 **Realtime GPU priority for the Vulkan layer.** The presenter's strobe can now run ahead of the game's GPU work in Vulkan games too, where the game leaves room for it.
