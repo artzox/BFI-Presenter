@@ -52,6 +52,7 @@
 #define ImTextureID ImU64
 #include <imgui.h>
 #include <reshade.hpp>
+#include "../common/bfi_syscheck.h"
 
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d12.lib")
@@ -77,6 +78,7 @@ static void Log(reshade::log::level lvl, const char *fmt, ...)
 }
 #define LOGI(...) Log(reshade::log::level::info, __VA_ARGS__)
 #define LOGW(...) Log(reshade::log::level::warning, __VA_ARGS__)
+static SysCheck g_sysCheck;      // power plan, GPUs, displays (checked on the watchdog thread)
 #define LOGE(...) Log(reshade::log::level::error, __VA_ARGS__)
 
 static double g_qpcFreq = 1.0;
@@ -2281,6 +2283,9 @@ static DWORD WINAPI WatchdogThread(void *)
         Sleep(500);
         DrainInfoQueue();
         const double t = Now();
+        if (g_running.load())
+            g_sysCheck.Tick(g_watchHwnd.load() ? GetAncestor(g_watchHwnd.load(), GA_ROOT) : nullptr,
+                            [](int lvl, const char *m) { if (lvl) LOGW("BFI Presenter: %s", m); else LOGI("BFI Presenter: %s", m); });
         // Learned per game: written and read here, every 2 s, once the game has a window.
         if (++learnTicks % 4 == 0 && g_iniPath[0])
         {
@@ -2537,6 +2542,27 @@ static DWORD WINAPI PresenterThread(void *)
         const bool mm = g_shared.threadBoost != 0;
         LeaveCriticalSection(&g_cfgLock);
         BoostPresenterThread(mm, "presenter");
+    }
+    if (g_device)
+    {
+        // The GPU the game renders on, for the system check (its monitor driven by another GPU).
+        const LUID rl = g_device->GetAdapterLuid();
+        char gpuName[128] = "";
+        IDXGIFactory1 *gf = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&gf)) && gf)
+        {
+            IDXGIAdapter1 *a = nullptr;
+            for (UINT k = 0; gf->EnumAdapters1(k, &a) == S_OK; k++)
+            {
+                DXGI_ADAPTER_DESC1 dd = {};
+                a->GetDesc1(&dd);
+                if (dd.AdapterLuid.LowPart == rl.LowPart && dd.AdapterLuid.HighPart == rl.HighPart)
+                    WideCharToMultiByte(CP_UTF8, 0, dd.Description, -1, gpuName, sizeof(gpuName), nullptr, nullptr);
+                a->Release();
+            }
+            gf->Release();
+        }
+        g_sysCheck.SetRenderGpu(rl, gpuName);
     }
     ID3D12DescriptorHeap *rtvHeap = nullptr, *srvHeap = nullptr;
     ID3D12CommandAllocator *alloc[kMaxBuf] = {};
@@ -3560,7 +3586,8 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     vrrLogged = true;
                     LOGW("BFI Presenter: the display is refreshing at %.1f Hz instead of %.1f Hz with no missed refreshes -- "
-                         "VRR (G-SYNC) is active. Turn G-SYNC off for this game (NVIDIA profile) or turn on Queue one refresh ahead.",
+                         "VRR (G-SYNC) or Windows' dynamic refresh rate is active. Turn G-SYNC off for this game (NVIDIA profile) and Dynamic "
+                         "refresh rate off in Windows' display settings, or turn on Queue one refresh ahead.",
                          hz, peakHz);
                 }
                 displayHz = hz;
@@ -8957,13 +8984,24 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (g_deferPresenter.load() && !g_ownPresentQueue)
             ImGui::TextColored(kAmber, "BFI starts when the game resizes its swap chain.\nIf it doesn't, change resolution or display mode once (and back).");
         if (st.vrrSuspect)
-            ImGui::TextColored(kRed, "The display is refreshing slower than it can: VRR (G-SYNC) is active.\nTurn G-SYNC off for this game in the NVIDIA profile, or turn on Queue one refresh ahead.");
+            ImGui::TextColored(kRed, "The display is refreshing slower than it can: VRR (G-SYNC) or Windows' dynamic refresh rate is active.\n"
+                               "Turn G-SYNC off for this game in the NVIDIA profile, and Dynamic refresh rate off in Windows' display\n"
+                               "settings (Advanced display), or turn on Queue one refresh ahead.");
         if (st.limitSuspect)
             ImGui::TextColored(kRed, "A frame limiter is holding the presenter below the display's refresh rate.\nSet the RTSS frame limit to 0 for this game (and check NVIDIA Profile Inspector).");
         if (st.vramOver)
             ImGui::TextColored(kRed, "The game uses more video memory than Windows gives it (%.0f of %.0f MB): the GPU stalls,\n"
                                "refreshes are missed, frame generation drops frames. Lower its texture or memory settings.",
                                st.vramUse, st.vramBudget);
+        {
+            // System check: power plan, GPUs, displays (the displays note only while refreshes are missed).
+            std::string always, withFlashes;
+            SysCheck::Lines(g_sysCheck.Get(), always, withFlashes);
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            if (!always.empty()) ImGui::TextWrapped("%s", always.c_str());
+            if (!withFlashes.empty() && st.flashHint && s.enabled) ImGui::TextWrapped("%s", withFlashes.c_str());
+            ImGui::PopStyleColor();
+        }
         if (st.glPresentBlocked)
             ImGui::TextColored(kRed, "The presenter's presents are blocked (OpenGL). In this game's NVIDIA profile set\n"
                                "Vulkan/OpenGL present method = Prefer layered on DXGI swapchain (BFI Presenter Manager does it).");

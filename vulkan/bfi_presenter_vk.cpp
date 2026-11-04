@@ -137,6 +137,10 @@ static void Log(const char *lvl, const char *fmt, ...)
 }
 #define LOGI(...) Log("INFO ", __VA_ARGS__)
 #define LOGW(...) Log("WARN ", __VA_ARGS__)
+#ifdef _WIN32
+#include "../common/bfi_syscheck.h"
+static SysCheck g_sysCheck;      // power plan, GPUs, displays (checked on the window watch thread)
+#endif
 #define LOGE(...) Log("ERROR", __VA_ARGS__)
 
 // ---------------------------------------------------------------- ini (portable, [BFI] section)
@@ -2787,8 +2791,9 @@ static void PresenterThread(Swapchain *sc)
                 {
                     limitLogged = true;
                     LOGW("BFI Presenter: the presenter is held to %.1f presents/s on a %.0f Hz display -- a frame limiter is "
-                         "acting on it (RTSS limit, or NVIDIA Control Panel / NVIDIA app 'Max Frame Rate', global or for this exe). "
-                         "Turn it off for this program: the strobe slips a refresh about %.0f times a second, which shows as flicker.",
+                         "acting on it (RTSS limit, or NVIDIA Control Panel / NVIDIA app 'Max Frame Rate', global or for this exe), or VRR (G-SYNC) "
+                         "or Windows' dynamic refresh rate slows the display. "
+                         "Turn off whichever applies for this game: the strobe slips a refresh about %.0f times a second, which shows as flicker.",
                          prate, hz, hz - prate);
                 }
                 g_status.limitSuspect = limitSecs >= 3;
@@ -3780,6 +3785,8 @@ static void WinWatchThread(Swapchain *sc)
                 LearnTick(path.c_str(), (g_exeName + " (Vulkan)").c_str(), sc->hwnd ? GetAncestor((HWND)sc->hwnd, GA_ROOT) : nullptr);
             }
         }
+        g_sysCheck.Tick(sc->hwnd ? GetAncestor((HWND)sc->hwnd, GA_ROOT) : nullptr,
+                        [](int lvl, const char *m) { if (lvl) LOGW("BFI Presenter: %s", m); else LOGI("BFI Presenter: %s", m); });
         if (!sc->winDumpReq.exchange(false)) continue;
         HWND game = sc->hwnd ? GetAncestor((HWND)sc->hwnd, GA_ROOT) : nullptr;
         if (!game) continue;
@@ -5203,6 +5210,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_CreateDevice(VkPhysicalDevice phys, co
         if (d->queue && d->setLoaderData) d->setLoaderData(*out, d->queue);
         VkPhysicalDeviceProperties pp;
         id->GetPhysicalDeviceProperties(phys, &pp);
+#ifdef _WIN32
+        {
+            // The GPU the game renders on, for the system check (its monitor driven by another GPU).
+            auto gp2 = (PFN_vkGetPhysicalDeviceProperties2)id->gipa(id->instance, "vkGetPhysicalDeviceProperties2");
+            if (!gp2) gp2 = (PFN_vkGetPhysicalDeviceProperties2)id->gipa(id->instance, "vkGetPhysicalDeviceProperties2KHR");
+            VkPhysicalDeviceIDProperties idp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+            VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+            p2.pNext = &idp;
+            if (gp2) gp2(phys, &p2);
+            if (gp2 && idp.deviceLUIDValid)
+            {
+                LUID l;
+                memcpy(&l, idp.deviceLUID, sizeof(l));
+                g_sysCheck.SetRenderGpu(l, pp.deviceName);
+            }
+        }
+#endif
         LOGI("BFI Presenter: device %s -- presenter queue: family %u index %u (%s)", pp.deviceName, family, index,
              shared ? "shared with the game, locked" : "its own");
         if (shared) LOGW("BFI Presenter: no spare queue in family %u -- the presenter shares the game's queue", family);
@@ -5533,8 +5557,20 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                "presentation slows, frame generation drops frames. Lower its texture or memory settings.",
                                st.vramUse, st.vramBudget);
         if (st.limitSuspect)
-            ImGui::TextColored(kRed, "A frame limiter is holding the presenter below the display's refresh rate.\n"
-                               "Turn off the RTSS limit and NVIDIA's Max Frame Rate (global and for this exe; check NVIDIA Profile Inspector).");
+            ImGui::TextColored(kRed, "Something holds the presenter below the display's refresh rate: a frame limiter, VRR (G-SYNC)\n"
+                               "or Windows' dynamic refresh rate. Turn off the RTSS limit and NVIDIA's Max Frame Rate (global and for\n"
+                               "this exe), G-SYNC for this game, and Dynamic refresh rate in Windows' display settings.");
+#ifdef _WIN32
+        {
+            // System check: power plan, GPUs, displays (the displays note only while refreshes are missed).
+            std::string always, withFlashes;
+            SysCheck::Lines(g_sysCheck.Get(), always, withFlashes);
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            if (!always.empty()) ImGui::TextWrapped("%s", always.c_str());
+            if (!withFlashes.empty() && st.flashHint && s.enabled) ImGui::TextWrapped("%s", withFlashes.c_str());
+            ImGui::PopStyleColor();
+        }
+#endif
         // Flash hint: when missed refreshes keep coming back, the first step that isn't done yet (the red
         // warnings above come first).
         if (st.flashHint && s.flashHints && s.enabled && !st.limitSuspect && st.layerOrder != 2)
