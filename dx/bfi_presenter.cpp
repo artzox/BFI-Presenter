@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.31-t2"
+#define BFI_ADDON_VERSION "1.0.31-t3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -147,6 +147,7 @@ struct Settings
     int   reuseBuffers = 1;   // present an already-drawn buffer again instead of redrawing it
     int   flashHints = 1;     // overlay: suggest the next step when refreshes keep being missed (flashes)
     int   waitResizeAll = 1;  // every swap chain: no BFI until the game first resizes it
+    int   nudgeResize = 0;    // ... and the game hasn't after a few seconds: send its window a size message
     int   bypassResizeHooks = 1; // move to the presenter queue with DXGI's own ResizeBuffers1
     int   showOverlays = 0;   // 1 = the presenter's presents go through overlay hooks (RTSS OSD, Steam overlay
                               // draw on the strobed frames); read once, at the presenter's first present
@@ -300,6 +301,7 @@ static void LoadSettings(Settings &s)
     s.reuseBuffers = IniInt("ReuseDrawnBuffers", 1) ? 1 : 0;
     s.flashHints = IniInt("FlashHints", 1) ? 1 : 0;
     s.waitResizeAll = IniInt("StartBFIAfterGameResize", 1) ? 1 : 0;
+    s.nudgeResize = IniInt("NudgeGameResize", 0) ? 1 : 0;
     s.bypassResizeHooks = IniInt("BypassOverlayResizeHooks", 1) ? 1 : 0;
     s.showOverlays = IniInt("ShowOverlays", 0) ? 1 : 0;
     s.reportTyped = IniInt("TypedBackBufferDesc", 1) ? 1 : 0;
@@ -474,6 +476,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FlashHints", s.flashHints);
     IniWriteInt("AutoCapOwnWithoutFg", s.autoCapOwn);
     IniWriteInt("StartBFIAfterGameResize", s.waitResizeAll);
+    IniWriteInt("NudgeGameResize", s.nudgeResize);
     IniWriteInt("BypassOverlayResizeHooks", s.bypassResizeHooks);
     IniWriteInt("ShowOverlays", s.showOverlays);
     IniWriteInt("PresenterQueuePriority", s.queuePriority);
@@ -767,6 +770,8 @@ static std::atomic<int>       g_slotWaits{0};
 // presenter's queue then happens inside that resize, and BFI starts.
 static int                    g_swapChainsManaged = 0;
 static std::atomic<bool>      g_deferPresenter{false};              // game copies that had to wait for the presenter
+static std::atomic<double>    g_deferSinceT{0.0};                   // when the wait for the game's first resize began
+static std::atomic<int>       g_nudgeStage{0};                      // NudgeGameResize: 0 not yet, 1 same size sent, 2 size changed and back, 3 gave up
 // Per-game-frame timing (written to BFIPresenter_game_<date>_<time>.csv while
 // the timing log is on). Times are Now() seconds; serialised by g_submitLock.
 static std::atomic<bool>      g_logOn{false};
@@ -2349,6 +2354,41 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
 // minute, both finding the start time already in use).
 static std::atomic<double> g_windowHungT{-1e9};
 
+// NudgeGameResize: BFI (and DX12 SDR to HDR) start inside the game's first resize of its swap chain. Most games do one
+// at start-up; some never do on their own (Hades II, Wreckfest 2; RenoDX's swap chain upgrade did it for them). After
+// 5 s of waiting the game window is told its size again (WM_SIZE), which games answer with a resize; if that isn't
+// enough, 3 s later it's told a size 2 pixels shorter and at once the real one again (two quick resizes, the last one
+// at the right size). The window itself is never moved or resized. Off by default.
+static void NudgeResizeTick(double t)
+{
+    if (!g_active.load() || g_dx11.load() || !g_deferPresenter.load() || g_ownPresentQueue) return;
+    EnterCriticalSection(&g_cfgLock);
+    const bool on = g_shared.nudgeResize != 0;
+    LeaveCriticalSection(&g_cfgLock);
+    const int stage = g_nudgeStage.load();
+    if (!on || stage >= 3) return;
+    const double waited = t - g_deferSinceT.load();
+    if (waited < (stage == 0 ? 5.0 : stage == 1 ? 8.0 : 11.0)) return;
+    HWND w = g_watchHwnd.load();
+    RECT rc = {};
+    if (!w || !IsWindow(w) || IsIconic(w) || !IsWindowVisible(w) || !GetClientRect(w, &rc) || rc.right < 64 || rc.bottom < 64) return;
+    const LPARAM real = MAKELPARAM(rc.right, rc.bottom);
+    if (stage == 0)
+    {
+        PostMessageW(w, WM_SIZE, SIZE_RESTORED, real);
+        LOGI("BFI Presenter: NudgeGameResize: no resize after 5 s -- told the game window its size again (%ldx%ld)", rc.right, rc.bottom);
+    }
+    else if (stage == 1)
+    {
+        PostMessageW(w, WM_SIZE, SIZE_RESTORED, MAKELPARAM(rc.right, rc.bottom - 2));
+        PostMessageW(w, WM_SIZE, SIZE_RESTORED, real);
+        LOGI("BFI Presenter: NudgeGameResize: still no resize -- told the game window a size 2 pixels shorter, then its own");
+    }
+    else
+        LOGW("BFI Presenter: NudgeGameResize: the game didn't resize its swap chain -- change resolution or display mode once to start BFI");
+    g_nudgeStage.store(stage + 1);
+}
+
 static DWORD WINAPI WatchdogThread(void *)
 {
     int lastPres = -1, lastGame = -1;
@@ -2366,6 +2406,7 @@ static DWORD WINAPI WatchdogThread(void *)
         Sleep(500);
         DrainInfoQueue();
         const double t = Now();
+        NudgeResizeTick(t);
         if (g_running.load())
             g_sysCheck.Tick(g_watchHwnd.load() ? GetAncestor(g_watchHwnd.load(), GA_ROOT) : nullptr,
                             [](int lvl, const char *m) { if (lvl) LOGW("BFI Presenter: %s", m); else LOGI("BFI Presenter: %s", m); });
@@ -6354,7 +6395,7 @@ static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *sc, UINT cnt, 
     if (SUCCEEDED(hr)) Hdr12ApplyColorSpace(sc, hdrWas);
     GameStage(ST_R_CREATE);
     if (g_ownPresentQueue && g_deferPresenter.exchange(false))
-        LOGI("BFI Presenter: the game resized its recreated swap chain -- BFI starts");
+        LOGI("BFI Presenter: the game resized its recreated swap chain -- BFI starts%s", g_nudgeStage.load() ? " (after NudgeGameResize)" : "");
     if (CreateFrameResources() && !g_presenterFailed.load() && !(g_deferPresenter.load() && !g_ownPresentQueue)) StartPresenter();
     LOGI("BFI Presenter: ResizeBuffers (0x%08lX)", (unsigned long)hr);
     GameStage(ST_G_OUTSIDE);
@@ -6395,7 +6436,7 @@ static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers1(IDXGISwapChain3 *sc, UINT cnt
     if (SUCCEEDED(hr)) Hdr12ApplyColorSpace(sc, hdrWas);
     GameStage(ST_R_CREATE);
     if (g_ownPresentQueue && g_deferPresenter.exchange(false))
-        LOGI("BFI Presenter: the game resized its recreated swap chain -- BFI starts");
+        LOGI("BFI Presenter: the game resized its recreated swap chain -- BFI starts%s", g_nudgeStage.load() ? " (after NudgeGameResize)" : "");
     if (CreateFrameResources() && !g_presenterFailed.load() && !(g_deferPresenter.load() && !g_ownPresentQueue)) StartPresenter();
     LOGI("BFI Presenter: ResizeBuffers1 (0x%08lX)", (unsigned long)hr);
     GameStage(ST_G_OUTSIDE);
@@ -9147,6 +9188,8 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     // starts inside that resize, on the presenter's own queue.
     g_deferPresenter.store(ok && cur.ownQueue != 0 &&
                            (cur.waitResizeAll || (cur.deferRecreated && g_swapChainsManaged > 1)));
+    g_deferSinceT.store(Now());
+    g_nudgeStage.store(0);
     if (g_deferPresenter.load())
         LOGI("BFI Presenter: %s -- the game presents its own frames (no BFI) until it resizes the swap chain; "
              "if BFI doesn't start, change resolution or display mode once",
