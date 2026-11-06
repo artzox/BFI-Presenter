@@ -53,6 +53,7 @@
 #include <imgui.h>
 #include <reshade.hpp>
 #include "../common/bfi_syscheck.h"
+#include "../common/bfi_vram.h"
 
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d12.lib")
@@ -91,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.30"
+#define BFI_ADDON_VERSION "1.0.31-t1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -531,7 +532,7 @@ struct Status
     int    deviceLost = 0;
     int    flashHint = 0;                       // missed refreshes keep coming back (3 of the last 10 s; off after 30 s without)
     int    presBufs = 0;                        // real swap chain buffers behind the presenter
-    bool   vramOver = false;                    // the game uses more video memory than its budget (DXGI)
+    bool   vramOver = false;                    // the game uses more video memory than its budget (D3DKMT)
     double vramUse = 0.0, vramBudget = 0.0;     // MB
 };
 static Status g_status;
@@ -595,37 +596,13 @@ static void CountPresent()
 
 
 
-// The game's video memory use against the budget Windows gives it (DXGI, per process, the adapter with the most
-// dedicated memory), in MB.
+// The game's video memory use and budget, in MB (common/bfi_vram.h: the kernel, D3DKMT).
 static bool VramMB(double &use, double &budget)
 {
-    static IDXGIAdapter3 *ad = nullptr; static bool tried = false;
-    if (!tried)
-    {
-        tried = true;
-        IDXGIFactory1 *fac = nullptr;
-        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&fac)) && fac)
-        {
-            IDXGIAdapter1 *a = nullptr; SIZE_T best = 0;
-            for (UINT k = 0; fac->EnumAdapters1(k, &a) == S_OK; k++)
-            {
-                DXGI_ADAPTER_DESC1 d; a->GetDesc1(&d);
-                IDXGIAdapter3 *a3 = nullptr;
-                if (d.DedicatedVideoMemory > best && SUCCEEDED(a->QueryInterface(__uuidof(IDXGIAdapter3), (void **)&a3)) && a3)
-                {
-                    if (ad) ad->Release();
-                    ad = a3; best = d.DedicatedVideoMemory;
-                }
-                a->Release();
-            }
-            fac->Release();
-        }
-    }
-    if (!ad) return false;
-    DXGI_QUERY_VIDEO_MEMORY_INFO mi = {};
-    if (FAILED(ad->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) return false;
-    use = mi.CurrentUsage / 1048576.0; budget = mi.Budget / 1048576.0;
-    return true;
+    bool unavailable = false;
+    const bool ok = bfi_vram::Query(use, budget, &unavailable);
+    if (unavailable) LOGI("BFI Presenter: video memory use not available (D3DKMT)");
+    return ok;
 }
 
 static void SetReason(int managed, const char *fmt, ...)
