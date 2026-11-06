@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.32-t1"
+#define BFI_ADDON_VERSION "1.0.32-t2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -147,7 +147,7 @@ struct Settings
     int   reuseBuffers = 1;   // present an already-drawn buffer again instead of redrawing it
     int   flashHints = 1;     // overlay: suggest the next step when refreshes keep being missed (flashes)
     int   waitResizeAll = 1;  // every swap chain: no BFI until the game first resizes it
-    int   selfResize = 0;     // ... and the game hasn't after a few seconds: the presenter resizes it (same size)
+    int   selfResize = 1;     // ... and the game hasn't after a few seconds: the presenter resizes it (same size; first swap chain)
     int   bypassResizeHooks = 1; // move to the presenter queue with DXGI's own ResizeBuffers1
     int   showOverlays = 0;   // 1 = the presenter's presents go through overlay hooks (RTSS OSD, Steam overlay
                               // draw on the strobed frames); read once, at the presenter's first present
@@ -301,7 +301,7 @@ static void LoadSettings(Settings &s)
     s.reuseBuffers = IniInt("ReuseDrawnBuffers", 1) ? 1 : 0;
     s.flashHints = IniInt("FlashHints", 1) ? 1 : 0;
     s.waitResizeAll = IniInt("StartBFIAfterGameResize", 1) ? 1 : 0;
-    s.selfResize = IniInt("PresenterResize", 0) ? 1 : 0;
+    s.selfResize = IniInt("PresenterResize", 1) ? 1 : 0;
     s.bypassResizeHooks = IniInt("BypassOverlayResizeHooks", 1) ? 1 : 0;
     s.showOverlays = IniInt("ShowOverlays", 0) ? 1 : 0;
     s.reportTyped = IniInt("TypedBackBufferDesc", 1) ? 1 : 0;
@@ -2391,6 +2391,18 @@ static void SelfResizeTick(double t)
     const bool on = g_shared.selfResize != 0;
     LeaveCriticalSection(&g_cfgLock);
     if (!on || stage >= 2) return;
+    // Only the game's first swap chain. A swap chain the game recreated (God of War Ragnarok when frame generation is
+    // turned on: 6 buffers, Streamline's frame generation presenting from its own thread) went black after the
+    // presenter's resize; there BFI waits for the game's resize as before (change resolution or display mode once).
+    if (g_swapChainsManaged > 1)
+    {
+        if (stage == 0)
+        {
+            LOGI("BFI Presenter: PresenterResize: not used on a swap chain the game recreated -- change resolution or display mode once to start BFI");
+            g_nudgeStage.store(2);
+        }
+        return;
+    }
     if (!g_selfVtbl.load()) HookSelfPresent();                                  // turned on in the overlay
     if (t - g_lastGamePresentT.load() > 0.5) { steadySince = 0.0; return; }   // loading: wait
     if (steadySince == 0.0) steadySince = t;
@@ -2435,6 +2447,11 @@ static void SelfResize(IDXGISwapChain *outer)
 {
     DXGI_SWAP_CHAIN_DESC d = {};
     if (FAILED(outer->GetDesc(&d))) { LOGW("BFI Presenter: PresenterResize: no swap chain description"); return; }
+    if (d.OutputWindow != g_watchHwnd.load())       // another swap chain behind the same wrapper type: not this one
+    {
+        g_selfResizeWanted.store(true);
+        return;
+    }
     t_selfResize++;
     const HRESULT hr = outer->ResizeBuffers(d.BufferCount, d.BufferDesc.Width, d.BufferDesc.Height, d.BufferDesc.Format, d.Flags);
     t_selfResize--;
@@ -6612,7 +6629,7 @@ static void OuterCheck(void *obj)
 {
     if (!obj) return;
     void **vt = *(void ***)obj;
-    if (vt == g_hookedVtbl || vt == g_outerVtbl) return;
+    if (vt == g_hookedVtbl || vt == g_outerVtbl || vt == g_selfVtbl.load()) return;   // already known (the last: PresenterResize's hook)
     // DXGI's own swap chain (no wrapper): the hook on the real swap chain already sees the game's presents.
     static HMODULE sysDxgi = nullptr;
     if (!sysDxgi)
