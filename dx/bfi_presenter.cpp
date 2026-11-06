@@ -1035,10 +1035,10 @@ static DWORD WINAPI LrWatchThread(void *)
         if (state != prev && (state == 2 || state == 3) && !limitOff)
         {
             if (state == 2)
-                LOGI("BFI Presenter: just-in-time release active -- game frames take %.1f ms (95th percentile), released %.1f ms "
+                LOGI("BFI Presenter: just-in-time release active -- frames finish %.1f ms after release (95th percentile, frames queued ahead included), released %.1f ms "
                      "before the refresh that shows them (cap interval %.1f ms)", est * 1000.0, (est + margin) * 1000.0, period * 1000.0);
             else
-                LOGI("BFI Presenter: just-in-time release at its limit -- game frames take %.1f ms, close to the %.1f ms cap "
+                LOGI("BFI Presenter: just-in-time release at its limit -- frames finish %.1f ms after release (frames queued ahead included), close to the %.1f ms cap "
                      "interval; %s", est * 1000.0, period * 1000.0,
                      capMode ? "released as early as the cap allows" : "released at the refresh as before");
         }
@@ -1077,7 +1077,7 @@ static DWORD WINAPI LrWatchThread(void *)
             if (limitFitSecs >= 30)
             {
                 limitOff = false; limitFitSecs = 0;
-                LOGI("BFI Presenter: just-in-time release back on -- game frames take %.1f ms", est * 1000.0);
+                LOGI("BFI Presenter: just-in-time release back on -- frames finish %.1f ms after release", est * 1000.0);
             }
         }
         if (!allowed) { limitOff = false; limitTrips = 0; limitMisses = limitMissSecs = limitFitSecs = 0; }
@@ -9566,7 +9566,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "1-then-3 cycle frames at Quarter. Light games also get fresher frames. On by default.");
             if (s.capJit && per >= 2)
             {
-                static const char *kLrNames[] = { "off (needs Wait for vblank)", "measuring", "active", "at its limit (game frames take nearly the whole interval)" };
+                static const char *kLrNames[] = { "off (needs Wait for vblank)", "measuring", "active", "at its limit (frames finish too close to the refresh)" };
                 ImGui::Indent(16.0f);
                 ImGui::TextDisabled("%s", kLrNames[st.lrState & 3]);
                 if (st.lrState >= 2)
@@ -9651,7 +9651,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (lrRfx) { ImGui::SameLine(); ImGui::TextDisabled("(not used: Reflex's frame limit paces this game)"); }
         else if (s.laterRelease && s.gameCap == 1)
         {
-            static const char *kLrNames2[] = { "off (needs Wait for vblank and Lowest latency)", "measuring", "active", "at its limit (game frames take nearly the whole refresh)" };
+            static const char *kLrNames2[] = { "off (needs Wait for vblank and Lowest latency)", "measuring", "active", "at its limit (frames finish too close to the refresh)" };
             ImGui::Indent(16.0f);
             ImGui::TextDisabled("%s", kLrNames2[st.lrState & 3]);
             ImGui::Unindent(16.0f);

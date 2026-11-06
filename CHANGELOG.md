@@ -10,6 +10,7 @@ Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply 
 ## [1.0.31] — unreleased
 
 - **[DX] Video memory check reads from the kernel, as the Vulkan layer has since 1.0.29.** The once-a-second check behind the "more video memory than Windows gives it" warning kept a DXGI adapter for the whole session; in the Vulkan layer that crashed RPCS3 once the code behind it was unloaded. Both now share one D3DKMT query (`common/bfi_vram.h`), and DXGI is used only once at start to find the GPU. The warning itself is unchanged.
+- **[DX] [Vulkan] Clearer just-in-time release lines.** The log said "game frames take 39.6 ms", which read like the game's render time; it's the time from the presenter releasing a frame to that frame being finished, including frames already queued ahead. The log and the overlay now say so.
 
 ## [1.0.30] — 2026-11-04 (Manager 1.3.15)
 
