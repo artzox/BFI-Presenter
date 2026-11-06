@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.31"
+#define BFI_ADDON_VERSION "1.0.32-t2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -147,7 +147,7 @@ struct Settings
     int   reuseBuffers = 1;   // present an already-drawn buffer again instead of redrawing it
     int   flashHints = 1;     // overlay: suggest the next step when refreshes keep being missed (flashes)
     int   waitResizeAll = 1;  // every swap chain: no BFI until the game first resizes it
-    int   selfResize = 0;     // ... and the game hasn't after a few seconds: the presenter resizes it (same size)
+    int   selfResize = 1;     // ... and the game hasn't after a few seconds: the presenter resizes it (same size; first swap chain)
     int   bypassResizeHooks = 1; // move to the presenter queue with DXGI's own ResizeBuffers1
     int   showOverlays = 0;   // 1 = the presenter's presents go through overlay hooks (RTSS OSD, Steam overlay
                               // draw on the strobed frames); read once, at the presenter's first present
@@ -301,7 +301,7 @@ static void LoadSettings(Settings &s)
     s.reuseBuffers = IniInt("ReuseDrawnBuffers", 1) ? 1 : 0;
     s.flashHints = IniInt("FlashHints", 1) ? 1 : 0;
     s.waitResizeAll = IniInt("StartBFIAfterGameResize", 1) ? 1 : 0;
-    s.selfResize = IniInt("PresenterResize", 0) ? 1 : 0;
+    s.selfResize = IniInt("PresenterResize", 1) ? 1 : 0;
     s.bypassResizeHooks = IniInt("BypassOverlayResizeHooks", 1) ? 1 : 0;
     s.showOverlays = IniInt("ShowOverlays", 0) ? 1 : 0;
     s.reportTyped = IniInt("TypedBackBufferDesc", 1) ? 1 : 0;
@@ -865,6 +865,8 @@ static PFN_SetCS1 o_SetCS1 = nullptr;
 static HRESULT STDMETHODCALLTYPE hk_SetCS1(IDXGISwapChain3 *sc, DXGI_COLOR_SPACE_TYPE cs);
 static BOOL g_fsWanted = FALSE;                    // what the game asked for (exclusive fullscreen is held off)
 static std::atomic<int> g_cs12{-1};                // colour space the game set on its managed DX12 swap chain
+static std::atomic<bool> g_hdr12Ready10{false};    // DX12, 10-bit game buffers, SdrToHdr on, HDR display: SDR to HDR
+                                                   // follows the game's colour space (SDR on, HDR10 off) without a resize
 static std::atomic<int> g_cs11{-1};                // colour space the game set on its DX11 swap chain
 
 
@@ -2389,6 +2391,18 @@ static void SelfResizeTick(double t)
     const bool on = g_shared.selfResize != 0;
     LeaveCriticalSection(&g_cfgLock);
     if (!on || stage >= 2) return;
+    // Only the game's first swap chain. A swap chain the game recreated (God of War Ragnarok when frame generation is
+    // turned on: 6 buffers, Streamline's frame generation presenting from its own thread) went black after the
+    // presenter's resize; there BFI waits for the game's resize as before (change resolution or display mode once).
+    if (g_swapChainsManaged > 1)
+    {
+        if (stage == 0)
+        {
+            LOGI("BFI Presenter: PresenterResize: not used on a swap chain the game recreated -- change resolution or display mode once to start BFI");
+            g_nudgeStage.store(2);
+        }
+        return;
+    }
     if (!g_selfVtbl.load()) HookSelfPresent();                                  // turned on in the overlay
     if (t - g_lastGamePresentT.load() > 0.5) { steadySince = 0.0; return; }   // loading: wait
     if (steadySince == 0.0) steadySince = t;
@@ -2433,6 +2447,11 @@ static void SelfResize(IDXGISwapChain *outer)
 {
     DXGI_SWAP_CHAIN_DESC d = {};
     if (FAILED(outer->GetDesc(&d))) { LOGW("BFI Presenter: PresenterResize: no swap chain description"); return; }
+    if (d.OutputWindow != g_watchHwnd.load())       // another swap chain behind the same wrapper type: not this one
+    {
+        g_selfResizeWanted.store(true);
+        return;
+    }
     t_selfResize++;
     const HRESULT hr = outer->ResizeBuffers(d.BufferCount, d.BufferDesc.Width, d.BufferDesc.Height, d.BufferDesc.Format, d.Flags);
     t_selfResize--;
@@ -4980,7 +4999,7 @@ static HRESULT SubmitGameFrameLocked()
         // SDR to HDR: the real buffers are HDR10, the game's frames 8-bit -- a copy between them isn't allowed (it
         // removes the device). Only the presenter can draw them; until it runs, the screen keeps its last picture.
         static bool s_noCopyLogged = false;
-        const bool fmtDiffers = g_hdrUp.load() && g_stageFmt != DXGI_FORMAT_UNKNOWN;
+        const bool fmtDiffers = g_hdrUp.load() && g_stageFmt != DXGI_FORMAT_UNKNOWN && g_stageFmt != g_desc.Format;
         if (fmtDiffers && !s_noCopyLogged)
         {
             s_noCopyLogged = true;
@@ -6379,8 +6398,15 @@ static DXGI_FORMAT Hdr12ResizeFormat(IDXGISwapChain *sc, DXGI_FORMAT f)
     // 8-bit buffers are always SDR (HDR10 needs 10 bits, scRGB float): the colour space the game set doesn't matter
     // here (a game that turns its HDR off resizes to 8-bit before it sets the SDR colour space again).
     const bool sdr8 = game == DXGI_FORMAT_R8G8B8A8_UNORM || game == DXGI_FORMAT_B8G8R8A8_UNORM;
-    bool on = false;
-    if (cur.sdrToHdr && cur.output < 0 && sdr8)
+    // 10-bit buffers can be SDR (Unreal Engine 4.22+ and 5 on DX12 use them in SDR too: Jusant) or HDR10: the colour space
+    // the game sets says which, and it can change without a resize (hk_SetCS1). The real buffers are already 10-bit, so
+    // only their colour space changes; nothing is resized.
+    const bool ten = game == DXGI_FORMAT_R10G10B10A2_UNORM;
+    const int cs = g_cs12.load();
+    const bool sdr10 = ten && (cs < 0 || cs == (int)DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    bool on = false, display = false;
+    g_hdr12Ready10.store(false);
+    if (cur.sdrToHdr && cur.output < 0 && (sdr8 || ten))
     {
         IDXGIFactory4 *fac = nullptr;
         HWND hwnd = nullptr;
@@ -6388,18 +6414,31 @@ static DXGI_FORMAT Hdr12ResizeFormat(IDXGISwapChain *sc, DXGI_FORMAT f)
         if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&s1))) && s1) { s1->GetHwnd(&hwnd); s1->Release(); }
         if (SUCCEEDED(sc->GetParent(IID_PPV_ARGS(&fac))) && fac)
         {
-            on = hwnd && HdrDisplayFor(fac, hwnd);
+            display = hwnd && HdrDisplayFor(fac, hwnd);
             fac->Release();
         }
-        if (!on && !was) LOGI("BFI Presenter: SDR game; the display has no HDR output (Windows HDR off?) -- staying SDR, use Gain 0.5");
+        on = display && (sdr8 || sdr10);
+        g_hdr12Ready10.store(display && ten);
+        if (!display && !was) LOGI("BFI Presenter: SDR game; the display has no HDR output (Windows HDR off?) -- staying SDR, use Gain 0.5");
+        else if (ten && !sdr10 && !was)
+            LOGI("BFI Presenter: SDR to HDR not used -- the game outputs HDR itself (10-bit, colour space %d)", cs);
     }
-    else if (cur.sdrToHdr && cur.output < 0 && !sdr8 && was)
-        LOGI("BFI Presenter: the game resized to format %u (not 8-bit SDR) -- SDR to HDR off", (unsigned)game);
+    else if (cur.sdrToHdr && cur.output < 0)
+    {
+        if (was) LOGI("BFI Presenter: the game resized to format %u (not SDR) -- SDR to HDR off", (unsigned)game);
+        else
+        {
+            static DXGI_FORMAT s_logged = DXGI_FORMAT_UNKNOWN;
+            if (s_logged != game) { s_logged = game; LOGI("BFI Presenter: SDR to HDR not used -- the game's swap chain is format %u (not SDR)", (unsigned)game); }
+        }
+    }
     g_hdrUp.store(on);
     g_stageFmt = on ? game : DXGI_FORMAT_UNKNOWN;
-    if (on && !was) LOGI("BFI Presenter: SDR to HDR: the game's format %u stays its own; the real buffers are HDR10", (unsigned)game);
+    if (on && !was)
+        LOGI(ten ? "BFI Presenter: SDR to HDR: 10-bit SDR game (format %u) -- the real buffers switch to the HDR10 colour space"
+                 : "BFI Presenter: SDR to HDR: the game's format %u stays its own; the real buffers are HDR10", (unsigned)game);
     else if (!on && was) LOGI("BFI Presenter: SDR to HDR off -- the real buffers follow the game's format again");
-    return on ? DXGI_FORMAT_R10G10B10A2_UNORM : f;
+    return (on && sdr8) ? DXGI_FORMAT_R10G10B10A2_UNORM : f;
 }
 
 // After a real resize: ST.2084 on the HDR10 buffers, or the game's own colour space again when the conversion ended.
@@ -6590,7 +6629,7 @@ static void OuterCheck(void *obj)
 {
     if (!obj) return;
     void **vt = *(void ***)obj;
-    if (vt == g_hookedVtbl || vt == g_outerVtbl) return;
+    if (vt == g_hookedVtbl || vt == g_outerVtbl || vt == g_selfVtbl.load()) return;   // already known (the last: PresenterResize's hook)
     // DXGI's own swap chain (no wrapper): the hook on the real swap chain already sees the game's presents.
     static HMODULE sysDxgi = nullptr;
     if (!sysDxgi)
@@ -6797,6 +6836,7 @@ static void ReleaseAll()
     g_hdrUp.store(false);
     g_stageFmt = DXGI_FORMAT_UNKNOWN;
     g_cs12.store(-1);
+    g_hdr12Ready10.store(false);
 }
 
 
@@ -7241,9 +7281,29 @@ static HRESULT STDMETHODCALLTYPE hk_SetCS1(IDXGISwapChain3 *sc, DXGI_COLOR_SPACE
         // DX12: remembered for the next resize. With SDR to HDR on, the real buffers stay HDR10 (the game's SDR colour
         // space would show its frames wrongly); the game is told it worked.
         if (g_cs12.exchange((int)cs) != (int)cs) LOGI("BFI Presenter: the game set colour space %d", (int)cs);
-        if (g_hdrUp.load())
+        const bool sdrCs = cs == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        if (g_hdr12Ready10.load())
         {
-            if (cs != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
+            // 10-bit game buffers: the colour space decides, at once. SDR: converted (the real buffers stay ST.2084, the
+            // game is told it worked); HDR10 or anything else: shown as it is, the game's colour space applies.
+            const bool was = g_hdrUp.exchange(sdrCs);
+            if (sdrCs)
+            {
+                g_stageFmt = DXGI_FORMAT_R10G10B10A2_UNORM;
+                if (!was)
+                {
+                    OwnCall own;
+                    o_SetCS1(sc, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                    LOGI("BFI Presenter: SDR to HDR on -- the game set the SDR colour space on its 10-bit buffers");
+                }
+                return S_OK;
+            }
+            g_stageFmt = DXGI_FORMAT_UNKNOWN;
+            if (was) LOGI("BFI Presenter: SDR to HDR off -- the game outputs HDR itself now (colour space %d)", (int)cs);
+        }
+        else if (g_hdrUp.load())
+        {
+            if (!sdrCs)
                 LOGI("BFI Presenter: SDR to HDR: the game asked for an HDR colour space on its 8-bit buffers -- off at its next resize");
             return S_OK;
         }
