@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.32-t2"
+#define BFI_ADDON_VERSION "1.0.32"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -147,7 +147,7 @@ struct Settings
     int   reuseBuffers = 1;   // present an already-drawn buffer again instead of redrawing it
     int   flashHints = 1;     // overlay: suggest the next step when refreshes keep being missed (flashes)
     int   waitResizeAll = 1;  // every swap chain: no BFI until the game first resizes it
-    int   selfResize = 1;     // ... and the game hasn't after a few seconds: the presenter resizes it (same size; first swap chain)
+    int   selfResize = 0;     // ... and the game hasn't after a few seconds: the presenter resizes it (same size; first swap chain)
     int   bypassResizeHooks = 1; // move to the presenter queue with DXGI's own ResizeBuffers1
     int   showOverlays = 0;   // 1 = the presenter's presents go through overlay hooks (RTSS OSD, Steam overlay
                               // draw on the strobed frames); read once, at the presenter's first present
@@ -301,7 +301,7 @@ static void LoadSettings(Settings &s)
     s.reuseBuffers = IniInt("ReuseDrawnBuffers", 1) ? 1 : 0;
     s.flashHints = IniInt("FlashHints", 1) ? 1 : 0;
     s.waitResizeAll = IniInt("StartBFIAfterGameResize", 1) ? 1 : 0;
-    s.selfResize = IniInt("PresenterResize", 1) ? 1 : 0;
+    s.selfResize = IniInt("PresenterResize", 0) ? 1 : 0;
     s.bypassResizeHooks = IniInt("BypassOverlayResizeHooks", 1) ? 1 : 0;
     s.showOverlays = IniInt("ShowOverlays", 0) ? 1 : 0;
     s.reportTyped = IniInt("TypedBackBufferDesc", 1) ? 1 : 0;
@@ -10008,7 +10008,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "Most games do one at start-up; some never do (Hades II, Wreckfest 2, Pragmata), and BFI waits\n"
                                                       "until you change resolution or display mode. With this on, once the game runs steadily for 3 s,\n"
                                                       "the presenter resizes the swap chain itself (same size and format), as RenoDX does.\n"
-                                                      "Off by default (PresenterResize in the ini).");
+                                                      "Only on the game's first swap chain: one the game recreates (God of War Ragnarok when frame\n"
+                                                      "generation is turned on) still waits for the game's resize. Off by default (PresenterResize in the ini).");
         if (g_deferPresenter.load() && !g_ownPresentQueue && !g_dx11.load() && s.selfResize)
         {
             ImGui::SameLine();

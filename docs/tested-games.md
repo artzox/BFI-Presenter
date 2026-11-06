@@ -34,7 +34,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
 | Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency (Refresh + automatic frame cap also works) |
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
-| Pragmata | Working | Refresh cap + automatic frame cap with FG 2× or 3× (60 of 60), or Half refresh + Apply the cap with Reflex's frame limit | v1.0.19 | To start BFI (also with FG), change the resolution once or switch the display mode to windowed and back to borderless; don't use ShortFuse's DLSS 5 add-on (even set to off it breaks frame generation's pacing) |
+| Pragmata | Working | Refresh cap + automatic frame cap with FG 2× or 3× (60 of 60), or Half refresh + Apply the cap with Reflex's frame limit | v1.0.19 | To start BFI, turn on Resize the game's swap chain to start BFI (`PresenterResize`, set by the Manager), or change the resolution once or switch the display mode to windowed and back to borderless; don't use ShortFuse's DLSS 5 add-on (even set to off it breaks frame generation's pacing) |
 | Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps. Refresh + automatic frame cap with **Presenter's own cap without frame generation** (`AutoCapOwnWithoutFg=1`): held at the frame start, a steady 27 ms from frame start to flash, 60 of 60 (v1.0.27); its Reflex limit shows frames in pairs |
 | Control | Working | Works (2×, 3×, 4× with the [Control-FG](https://github.com/Frooglemcdoo/Control-FG) mod, also with DLSS 5); Refresh cap | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54 |
 | Marvel's Spider-Man 2 | Working | Works in borderless (the game's "Fullscreen"), not in exclusive fullscreen; Refresh + automatic frame cap (v1.0.20) | v1.0.16 | Recommended without FG and ray tracing, in exclusive fullscreen (BFI starts with the game); with FG: borderless and change resolution once to start BFI |
@@ -48,7 +48,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | The Midnight Walk | Working | Not tested | v0.70 | Half refresh + Apply the cap with Reflex's frame limit (v1.0.15) + Lowest latency; DLSS needs `Engine.ini` lines (see notes) |
 | Cuphead | Working | Not tested | v0.73 | Later release on: \~5 ms less latency at 120 fps |
 | Obduction | Working | Not tested | v0.77 | Half refresh + just-in-time release; Lowest latency + Refresh is smoothest at 120 |
-| Hades II | Working | Not tested | v0.78 | GPU headroom for 120 fps (4K yes, 5K DSR no) |
+| Hades II | Working | Not tested | v0.78 | GPU headroom for 120 fps (4K yes, 5K DSR no); without RenoDX, BFI starts only with Resize the game's swap chain to start BFI (`PresenterResize`, set by the Manager) |
 | Indiana Jones and the Great Circle | Working (Vulkan) | 2× with the automatic frame cap (Reflex limit); 3× stays at Refresh | VK 1.0.24 | Keep video memory below the budget: lower Texture Pool Size (otherwise swap-chain rebuilds, Reflex limit lost, flicker) |
 | DriveClub-PC | Working (Vulkan) | Not used | VK 1.0.27 | `FrameGenDllCheck=0` (it loads DLSS-G's DLL without using it); Refresh + automatic frame cap: the game holds 60 by itself, 298 of 299 flashes with the next frame, 6–12 ms frame age, about 25 ms from release to flash with the frame start timed |
 | P.T.-PC | Working (Vulkan) | Not used | VK 1.0.27 | `FrameGenDllCheck=0` (the RenoDX DLSS add-on loads DLSS-G's DLL); Refresh + automatic frame cap: at 75–85 fps it steps down to 60, 60 of 60 flashes, about 19 ms from release to flash with the frame start timed (25 ms before) |
@@ -139,7 +139,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Unto The End | Standard setup |
 | Until Dawn (2024) | Works with DLSS 5 and FG: Refresh cap, or Half refresh at \~30 rendered fps (60 of 60 flashes, \~30 ms more latency) |
 | Untitled Goose Game | Standard setup |
-| Wreckfest 2 | Standard setup |
+| Wreckfest 2 | BFI starts only with Resize the game's swap chain to start BFI (`PresenterResize`, set by the Manager), or after changing the resolution once |
 
 ## Per-game notes
 
@@ -237,7 +237,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 - Uses REFramework (loads as `dinput8.dll`); its harmless memory-probe exceptions appear at the top of `BFIPresenter_crash.txt`.
 - Steam's overlay hooks on Present and ResizeBuffers1 hung and crashed the game until v0.34, which calls DXGI directly past them.
-- **BFI starts only after the game rebuilds its swap chain**, also with frame generation on: change the resolution once in the game's settings (and back), or switch the display mode to windowed and back to borderless.
+- **BFI starts only after the game rebuilds its swap chain**, also with frame generation on: turn on **Resize the game's swap chain to start BFI** (`PresenterResize=1`, v1.0.31; the Manager sets it for this game), or change the resolution once in the game's settings (and back), or switch the display mode to windowed and back to borderless.
 - **Before v1.0.19, with frame generation: Half refresh + Frame pacing Smooth (v1.0.16).** With DLSS FG at about 30 rendered fps, every flash showed the next generated frame (60 of 60 a second), at about 108 ms from the game's input to the flash.
 - Refresh rate + Smooth is the next best: also 60 of 60, but frame generation delivers about 65 a second, so about 5 a second are dropped (small skips), at about 117 ms. Refresh + Lowest latency repeated a frame on about 40% of flashes.
 - **v1.0.19: the automatic frame cap holds Refresh with frame generation.** The collapse under Reflex frame limits (50 → 8 fps) came from the driver counting the presenter's own presents; the presenter now applies the limit in the game's Reflex sleep call. 2× frame generation: 60 presented from 30 rendered, 57–60 new frames a second, about 21–28 ms from release to flash; 3× at Half with Reflex's limit: 60 of 60 from 20 rendered, about 23–30 ms. Earlier, Half refresh + Smooth was the recommendation.
@@ -331,6 +331,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### Hades II
 
+- **Without RenoDX, BFI starts only with Resize the game's swap chain to start BFI** (`PresenterResize=1`, v1.0.31; the Manager sets it for this game): the game never resizes its swap chain on its own, and BFI waits for that. RenoDX's swap chain upgrade did the resize for it. Changing the display mode once also works.
 - At 5K DSR the GPU was at its limit at 120 fps: dips to 94–112 fps and uneven lit refreshes. At 4K it holds \~118 fps cleanly.
 - The "does not match the strobe" warning was on permanently at 120 fps until v0.78.
 
