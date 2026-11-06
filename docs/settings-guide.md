@@ -306,6 +306,10 @@ Games that measure their own frame rate see their real frames, not BFI Presenter
 **Reuse drawn buffers** · `ReuseDrawnBuffers` · default: on\
 If the next flash would be identical to one already prepared, it's reused instead of drawn again. Less work for the graphics card, steadier timing.
 
+**Scale to the window** · `ScaleToWindow` · default: on\
+DirectX 11, DirectX 9 and OpenGL games. When the game renders at a resolution larger than its window, e.g. 5120x2880 on a 3840x2160 display for sharper edges, BFI Presenter scales each frame down to the window itself. Otherwise Windows does that scaling, and a flash that reaches it a moment too late is shown one refresh later, which swaps a lit and a dark refresh: flicker (Journey). Frames at or below the window size are untouched.\
+*When to change it:* there's no reason to, other than comparing with Windows' own scaling.
+
 **Bypass overlay hooks** · `BypassOverlayResizeHooks` · default: on\
 Overlays like Steam's or RivaTuner's don't draw on the flashed frames. This prevented hangs in some games.
 
