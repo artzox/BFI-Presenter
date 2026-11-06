@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.31"
+#define BFI_VERSION "1.0.32"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform

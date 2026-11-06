@@ -7,10 +7,13 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [1.0.32] — unreleased
+## [1.0.32] — 2026-11-07 (Manager 1.3.16)
 
-- **[DX] Resize the game's swap chain to start BFI (`PresenterResize`) is on by default,** for the game's first swap chain only. BFI now starts by itself in games that never resize their swap chain (Hades II, Wreckfest 2, Pragmata). A swap chain the game recreates still waits for the game's own resize: in God of War Ragnarok, turning frame generation on recreates it, and the presenter's resize there left the screen black. The resize is also only done for the swap chain of the game's own window.
+**SDR to HDR in 10-bit DX12 games, and a safer swap chain resize to start BFI.**
+
+- **[DX] Resize the game's swap chain to start BFI (`PresenterResize`, off by default) acts only on the game's first swap chain.** A swap chain the game recreates waits for the game's own resize, as before: in God of War Ragnarok, turning frame generation on recreates it, and the presenter's resize there left the screen black. The resize is also only done for the swap chain of the game's own window. Turn it on for games that never resize their swap chain (Hades II, Wreckfest 2, Pragmata).
 - **[DX] SDR to HDR for 10-bit DX12 games.** Unreal Engine 4.22+ and 5 games on DX12 use 10-bit buffers even in SDR (Jusant); 1.0.31 converted only 8-bit DX12 games. The buffers are already 10-bit, so only their colour space becomes HDR10, and nothing is resized. It follows the colour space the game sets, at once: SDR is converted; when the game turns its own HDR on (HDR10 colour space on the same buffers), it's shown as it is, and turning it off again brings the conversion back. The log now also says when SDR to HDR isn't used in a DX12 game and why.
+- **[Docs]** Settings guide: SDR to HDR in 10-bit DX12 games, and **Resize the game's swap chain to start BFI** acting on the first swap chain only.
 
 ## [1.0.31] — 2026-11-06 (Manager 1.3.16)
 
