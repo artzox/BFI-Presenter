@@ -997,7 +997,7 @@ static bool HttpGet(const std::wstring &url, std::string &body, std::string &err
                     std::wstring *redirectTo = nullptr);
 static std::string JsonString(const std::string &json, const std::string &key);
 
-struct PcgwEntry { long long when = 0; bool found = false; unsigned apis = 0; std::string text; };
+struct PcgwEntry { long long when = 0; bool found = false; unsigned apis = 0; std::string text; int hdr = -1; };   // hdr -1: cached before the HDR row was read
 static std::map<std::string, PcgwEntry> g_pcgw;
 static bool g_pcgwLoaded = false;
 static std::mutex g_pcgwLock;
@@ -1027,6 +1027,7 @@ static void PcgwLoad()
         e.found = c[2] == "1";
         e.apis = (unsigned)atoi(c[3].c_str());
         e.text = c[4];
+        if (c.size() >= 6) e.hdr = atoi(c[5].c_str());
         // entries from before Direct3D 8 was recognised keep "Direct3D 9, 8" in their text: set the flag from it
         if (e.found && e.text.rfind("Direct3D ", 0) == 0)
         {
@@ -1042,19 +1043,45 @@ static void PcgwSave()
 {
     std::ofstream out{fs::path(PcgwPath()), std::ios::trunc | std::ios::binary};
     for (auto &e : g_pcgw)
-        out << e.first << '\t' << e.second.when << '\t' << (e.second.found ? 1 : 0) << '\t' << e.second.apis << '\t' << e.second.text << '\n';
+        out << e.first << '\t' << e.second.when << '\t' << (e.second.found ? 1 : 0) << '\t' << e.second.apis << '\t' << e.second.text << '\t' << e.second.hdr << '\n';
 }
 
 static void PcgwApply(Game &g)
 {
     std::lock_guard<std::mutex> l(g_pcgwLock);
     PcgwLoad();
-    g.pcgwKnown = false; g.pcgwApis = 0; g.pcgwText.clear();
+    g.pcgwKnown = false; g.pcgwApis = 0; g.pcgwText.clear(); g.pcgwHdr = HdrUnknown;
     auto it = g_pcgw.find(PcgwKey(g));
     if (it == g_pcgw.end() || !it->second.found) return;
     g.pcgwKnown = true;
     g.pcgwApis = it->second.apis;
     g.pcgwText = it->second.text;
+    g.pcgwHdr = it->second.hdr < 0 ? HdrUnknown : it->second.hdr;
+}
+
+const char *HdrText(int hdr)
+{
+    switch (hdr)
+    {
+    case HdrNative: return "native";
+    case HdrNone: return "no";
+    case HdrLimited: return "limited";
+    case HdrMod: return "mod";
+    case HdrNa: return "n/a";
+    default: return "?";
+    }
+}
+
+// The {{Video}} box's "hdr" field: true / always on, false, limited, hackable (a mod or fix adds it), n/a, unknown.
+static int PcgwParseHdr(const std::string &v)
+{
+    std::string l = LowerA(v);
+    if (l == "true" || l == "always on") return HdrNative;
+    if (l == "false") return HdrNone;
+    if (l == "limited") return HdrLimited;
+    if (l == "hackable") return HdrMod;
+    if (l == "n/a" || l == "na") return HdrNa;
+    return HdrUnknown;
 }
 
 static std::string UrlEncode(const std::string &s)
@@ -1231,7 +1258,7 @@ static std::string WikiField(const std::string &wt, size_t from, size_t to, cons
 }
 
 // What a page says: its graphics APIs (the {{API}} box) and its Steam app ids (the {{Infobox game}}).
-struct WikiPage { bool hasApi = false; unsigned apis = 0; std::string text; std::set<std::string> appids; };
+struct WikiPage { bool hasApi = false; unsigned apis = 0; std::string text; std::set<std::string> appids; int hdr = HdrUnknown; };
 
 static WikiPage ParseWikiPage(const std::string &wt)
 {
@@ -1259,6 +1286,14 @@ static WikiPage ParseWikiPage(const std::string &wt)
         PcgwParseRow(WikiField(wt, ab, ae, "direct3d versions"), WikiField(wt, ab, ae, "vulkan versions"),
                      WikiField(wt, ab, ae, "opengl versions"), w.apis, w.text);
     }
+    for (size_t p = 0; (p = wt.find("{{Video", p)) != std::string::npos; p += 7)
+        if (p + 7 < wt.size() && (wt[p + 7] == '\n' || wt[p + 7] == '|' || wt[p + 7] == ' '))
+        {
+            size_t ve = wt.find("\n}}", p);
+            if (ve == std::string::npos) ve = wt.size();
+            w.hdr = PcgwParseHdr(WikiField(wt, p, ve, "hdr"));
+            break;
+        }
     return w;
 }
 
@@ -1375,7 +1410,8 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
         for (auto &g : games)
         {
             auto it = g_pcgw.find(PcgwKey(g));
-            if (it != g_pcgw.end() && now - it->second.when < (it->second.found ? 30 : 7) * 86400LL) continue;
+            if (it != g_pcgw.end() && now - it->second.when < (it->second.found ? 30 : 7) * 86400LL &&
+                !(it->second.found && it->second.hdr < 0)) continue;      // cached before the HDR row was read: once more
             want.push_back(&g);
         }
     }
@@ -1395,6 +1431,7 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
         en.found = true;                                          // the page exists; apis 0 = its API box lists none
         en.apis = w.apis;
         en.text = w.text;
+        en.hdr = w.hdr;
         if (w.hasApi && NormName(page) != NormName(g.name)) en.text += " (page \"" + page + "\")";
         std::lock_guard<std::mutex> l(g_pcgwLock);
         g_pcgw[PcgwKey(g)] = en;
@@ -1421,7 +1458,7 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
             if (!titles.empty() && len + l > 3000) break;
             len += l; titles.push_back(asks[b].second); b++;
         }
-        if (progress) progress("Looking up graphics APIs on PCGamingWiki (" + std::to_string(a) + "/" + std::to_string(asks.size()) + " names)");
+        if (progress) progress("Looking up graphics APIs and HDR on PCGamingWiki (" + std::to_string(a) + "/" + std::to_string(asks.size()) + " names)");
         WikiBatch wb;
         std::string e;
         if (!WikiFetch(titles, wb, e))
@@ -1453,7 +1490,7 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
     std::vector<std::pair<Game *, std::string>> byId;
     for (size_t k = 0; k < needAppid.size() && !stopped; k++)
     {
-        if (progress) progress("Looking up graphics APIs on PCGamingWiki (Steam ids " + std::to_string(k) + "/" + std::to_string(needAppid.size()) + ")");
+        if (progress) progress("Looking up graphics APIs and HDR on PCGamingWiki (Steam ids " + std::to_string(k) + "/" + std::to_string(needAppid.size()) + ")");
         std::string title, e;
         if (!WikiAppidTitle(needAppid[k]->appid, title, e)) { fail(e, 1); continue; }
         failedInRow = 0;

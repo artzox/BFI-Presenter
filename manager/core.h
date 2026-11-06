@@ -5,8 +5,8 @@
 #include <vector>
 #include <functional>
 
-#define MANAGER_VERSION "1.3.15"
-#define MANAGER_VERSION_W L"1.3.15"
+#define MANAGER_VERSION "1.3.16"
+#define MANAGER_VERSION_W L"1.3.16"
 
 namespace bfi {
 
@@ -59,6 +59,7 @@ struct Game {
     bool         pcgwKnown = false;
     unsigned     pcgwApis = 0;   // from PCGamingWiki
     std::string  pcgwText;       // e.g. "Direct3D 12, 11; Vulkan"
+    int          pcgwHdr = 0;    // PCGamingWiki's HDR row: one of the PcgwHdr values below
     // Detected next to the exe
     bool         reshade = false;
     DllInfo      reshadeDll;     // the ReShade DLL (any name: dxgi.dll, ReShade64.dll, ...)
@@ -134,6 +135,10 @@ std::vector<Game> FindGames(const ScanOptions &opt,
 void SaveGameList(const std::vector<Game> &games);
 bool LoadGameList(std::vector<Game> &games);    // false if there is no saved list
 void DetectAll(std::vector<Game> &games, const std::function<void(const std::string &)> &progress = nullptr);
+// PCGamingWiki's HDR row (the {{Video}} box's "hdr" field).
+enum PcgwHdr { HdrUnknown = 0, HdrNative = 1, HdrNone = 2, HdrLimited = 3, HdrMod = 4, HdrNa = 5 };
+const char *HdrText(int hdr);     // "native", "no", "limited", "mod", "n/a", "?"
+
 // PCGamingWiki: graphics APIs per game (Steam by app id, others by page name). Blocking; caches results.
 std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const std::string &)> &progress = nullptr);
 void Detect(Game &g);                          // (re)detects everything for g.exe

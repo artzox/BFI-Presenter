@@ -1248,13 +1248,15 @@ static void DrawTable(float height)
                          ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
                          ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Sortable;
     const float em = ImGui::GetFontSize();
-    if (!ImGui::BeginTable("games", 11, tf, ImVec2(0, height))) return;
+    // "games2": the HDR column was added after API (1.3.16); the old saved layout would put widths on the wrong columns.
+    if (!ImGui::BeginTable("games2", 12, tf, ImVec2(0, height))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("##pick", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize | ImGuiTableColumnFlags_NoSort, ImGui::GetFrameHeight());
     ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_NoHide, em * 15.0f);
     ImGui::TableSetupColumn("Store", ImGuiTableColumnFlags_WidthFixed, em * 4.0f);
     ImGui::TableSetupColumn("Bits", ImGuiTableColumnFlags_WidthFixed, em * 3.2f);
     ImGui::TableSetupColumn("API", ImGuiTableColumnFlags_WidthFixed, em * 8.0f);
+    ImGui::TableSetupColumn("HDR", ImGuiTableColumnFlags_WidthFixed, em * 4.5f);
     ImGui::TableSetupColumn("ReShade", ImGuiTableColumnFlags_WidthFixed, em * 5.5f);
     ImGui::TableSetupColumn("BFI Presenter", ImGuiTableColumnFlags_WidthFixed, em * 8.5f);
     ImGui::TableSetupColumn("G-SYNC", ImGuiTableColumnFlags_WidthFixed, em * 4.5f);
@@ -1282,16 +1284,17 @@ static void DrawTable(float height)
             case 2: return low(g.store);
             case 3: snprintf(b, 32, "%02d", g.bits); return b;
             case 4: return ApiText(g.apis);
-            case 5: return g.reshade ? g.reshadeDll.version : std::string();
-            case 6: return g.route == Route::Vulkan ? (g.ini ? "vulkan" : "") : g.route == Route::Shader ? g.shaderVersion : g.addonVersion;
-            case 7: return g.nvKnown ? std::string(g.nvVrrOwn ? "0" : "1") + VrrText(g.nvVrr) : "2";
-            case 8: return g.nvKnown ? std::string(g.nvVsyncOwn ? "0" : "1") + VsyncText(g.nvVsync) : "2";
-            case 9: return g.nvKnown ? std::string(g.nvPowerOwn ? "0" : "1") + PowerText(g.nvPower) : "2";
-            case 10: snprintf(b, 32, "%02d", (int)StatusOf(g)); return b;
+            case 5: { static const char *ord[] = { "9", "0", "3", "1", "2", "4" }; return g.pcgwKnown && g.pcgwHdr >= 0 && g.pcgwHdr <= 5 ? ord[g.pcgwHdr] : "9"; }
+            case 6: return g.reshade ? g.reshadeDll.version : std::string();
+            case 7: return g.route == Route::Vulkan ? (g.ini ? "vulkan" : "") : g.route == Route::Shader ? g.shaderVersion : g.addonVersion;
+            case 8: return g.nvKnown ? std::string(g.nvVrrOwn ? "0" : "1") + VrrText(g.nvVrr) : "2";
+            case 9: return g.nvKnown ? std::string(g.nvVsyncOwn ? "0" : "1") + VsyncText(g.nvVsync) : "2";
+            case 10: return g.nvKnown ? std::string(g.nvPowerOwn ? "0" : "1") + PowerText(g.nvPower) : "2";
+            case 11: snprintf(b, 32, "%02d", (int)StatusOf(g)); return b;
             default: return low(g.name);
             }
         };
-        auto ver = sortCol == 5 || sortCol == 6;
+        auto ver = sortCol == 6 || sortCol == 7;
         std::stable_sort(vis.begin(), vis.end(), [&](int a, int b) {
             const Game &x = g_app.games[a], &y = g_app.games[b];
             std::string kx = key(x), ky = key(y);
@@ -1324,7 +1327,19 @@ static void DrawTable(float height)
         if (mixed) ImGui::PopItemFlag();     // pop what was pushed, whatever the click changed
         Tooltip("Tick or clear all games shown (Ctrl+A ticks all, Esc clears)");
     }
-    for (int c = 1; c < 11; c++) { ImGui::TableSetColumnIndex(c); ImGui::TableHeader(ImGui::TableGetColumnName(c)); }
+    for (int c = 1; c < 12; c++)
+    {
+        ImGui::TableSetColumnIndex(c);
+        ImGui::TableHeader(ImGui::TableGetColumnName(c));
+        if (c == 5)
+            Tooltip("Whether the game has its own HDR output, from PCGamingWiki.\n"
+                    "native: the game outputs HDR itself; BFI Presenter strobes it as it is.\n"
+                    "no: SDR only. With Windows HDR on, BFI Presenter's SDR to HDR (SdrToHdr) gives the lit refresh "
+                    "headroom so BFI doesn't dim the picture (Vulkan, DX11, DX9 and OpenGL games).\n"
+                    "limited: HDR with caveats (see the game's PCGamingWiki page).\n"
+                    "mod: SDR, but a mod or fix adds HDR (e.g. RenoDX). With one installed, SDR to HDR stays off by itself.\n"
+                    "?: not on PCGamingWiki, or its page doesn't say.");
+    }
 
     // Keyboard: Up/Down/PageUp/PageDown/Home/End move the selection itself (Shift extends the ticks),
     // Ctrl+A ticks every game shown, Esc clears the ticks.
@@ -1374,6 +1389,9 @@ static void DrawTable(float height)
         ImGui::TableNextColumn(); ImGui::TextColored(kGrey, "%s", g.store.c_str());
         ImGui::TableNextColumn(); if (g.bits) ImGui::Text("%d", g.bits); else ImGui::TextColored(kGrey, "?");
         ImGui::TableNextColumn(); ImGui::TextUnformatted(g.exe.empty() ? "" : ApiText(g.apis).c_str());
+        ImGui::TableNextColumn();
+        if (!g.pcgwKnown || g.pcgwHdr == HdrUnknown) ImGui::TextColored(kGrey, "?");
+        else ImGui::TextColored(g.pcgwHdr == HdrNative ? kGreen : g.pcgwHdr == HdrNa ? kGrey : kText, "%s", HdrText(g.pcgwHdr));
         ImGui::TableNextColumn();
         if (g.reshade) ImGui::Text("%s", g.reshadeDll.version.empty() ? "yes" : g.reshadeDll.version.c_str());
         else if (g.route == Route::Vulkan && g.reshadeVkIni && g_app.vk.reshadeLayer) ImGui::Text("Vulkan %s", g_app.vk.reshadeVersion.c_str());
@@ -2106,6 +2124,23 @@ static void DrawDetail(HWND)
         if (t.empty()) t = "unknown";
         ImGui::PushTextWrapPos(0);
         ImGui::TextUnformatted(t.c_str());
+        ImGui::PopTextWrapPos();
+    }
+
+    // HDR
+    ImGui::TextColored(kGrey, "HDR"); ImGui::SameLine(lab);
+    {
+        const int h = g.pcgwKnown ? g.pcgwHdr : HdrUnknown;
+        const char *t = h == HdrNative ? "native (PCGamingWiki): the game outputs HDR itself"
+                      : h == HdrNone ? "SDR only (PCGamingWiki): with Windows HDR on, BFI Presenter's SDR to HDR gives the lit refresh headroom"
+                      : h == HdrLimited ? "limited (PCGamingWiki): HDR with caveats, see the game's page"
+                      : h == HdrMod ? "SDR, a mod or fix adds HDR (PCGamingWiki); with one installed, SDR to HDR stays off by itself"
+                      : h == HdrNa ? "n/a (PCGamingWiki)"
+                      : "unknown: not on PCGamingWiki, or its page doesn't say";
+        if (h == HdrNone && (g.apis & ApiD3D12) && !(g.apis & (ApiD3D11 | ApiD3D9 | ApiGL)) && g.route != Route::Vulkan)
+            t = "SDR only (PCGamingWiki). SDR to HDR isn't available for Direct3D 12 games yet";
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextUnformatted(t);
         ImGui::PopTextWrapPos();
     }
 
