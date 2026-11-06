@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.31-t1"
+#define BFI_ADDON_VERSION "1.0.31-t2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -746,7 +746,8 @@ static ID3D12CommandQueue    *g_gameQueue = nullptr;
 
 static DXGI_SWAP_CHAIN_DESC1  g_desc = {};
 static DXGI_FORMAT            g_stageFmt = DXGI_FORMAT_UNKNOWN;   // the game's frames (staging ring); g_desc.Format if unknown
-static std::atomic<bool>      g_hdrUp{false};   // DX11 / DX9 / OpenGL: SDR game presented as HDR10 (SdrToHdr)
+static std::atomic<bool>      g_hdrUp{false};   // SDR game presented as HDR10 (SdrToHdr): the presenter's own swap chain
+                                                 // (DX11 / DX9 / OpenGL), or the DX12 game's real buffers (g_stageFmt: the game's)
 static DXGI_FORMAT StageFormat() { return g_stageFmt != DXGI_FORMAT_UNKNOWN ? g_stageFmt : g_desc.Format; }
 static ID3D12Resource        *g_virt[kMaxBuf] = {};
 static UINT                   g_bufCount = 0;
@@ -849,7 +850,9 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_SetCS1)(IDXGISwapChain3 *, DXGI_COLOR_SP
 static PFN_SetFS  o_SetFS  = nullptr;
 static PFN_GetFS2 o_GetFSt = nullptr;
 static PFN_SetCS1 o_SetCS1 = nullptr;
+static HRESULT STDMETHODCALLTYPE hk_SetCS1(IDXGISwapChain3 *sc, DXGI_COLOR_SPACE_TYPE cs);
 static BOOL g_fsWanted = FALSE;                    // what the game asked for (exclusive fullscreen is held off)
+static std::atomic<int> g_cs12{-1};                // colour space the game set on its managed DX12 swap chain
 static std::atomic<int> g_cs11{-1};                // colour space the game set on its DX11 swap chain
 
 
@@ -1176,7 +1179,7 @@ static D3D12_RESOURCE_DESC *STDMETHODCALLTYPE hk_ResGetDesc(ID3D12Resource *self
         for (UINT i = 0; i < kMaxBuf; i++)
             if (g_virt[i] == self)
             {
-                const DXGI_FORMAT typed = g_desc.Format;
+                const DXGI_FORMAT typed = StageFormat();
                 if (VirtualFormat(typed) == out->Format) out->Format = typed;
                 break;
             }
@@ -1199,22 +1202,24 @@ static void HookResourceGetDesc(ID3D12Resource *r)
     g_resVtbl[freeSlot] = vt;
     vt[10] = (void *)&hk_ResGetDesc;
     VirtualProtect(&vt[10], sizeof(void *), old, &old);
-    LOGI("BFI Presenter: stand-in back buffers report their typed format (format %d)", (int)g_desc.Format);
+    LOGI("BFI Presenter: stand-in back buffers report their typed format (format %d)", (int)StageFormat());
 }
 
 static bool CreateFrameResources()
 {
-    g_sc->GetDesc1(&g_desc);
+    { OwnCall own; if (o_GetDesc1) o_GetDesc1(g_sc, &g_desc); else g_sc->GetDesc1(&g_desc); }   // the real buffers
     if (g_virtCount) g_desc.BufferCount = g_virtCount;          // stand-ins match what the game asked for
+    // SDR to HDR (DX12): the real buffers are HDR10, the stand-ins and staging frames keep the game's format.
+    const DXGI_FORMAT gf = StageFormat();
     g_bufCount = g_desc.BufferCount < kMaxBuf ? g_desc.BufferCount : kMaxBuf;
     D3D12_RESOURCE_FLAGS vf = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (g_desc.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS) vf |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     for (UINT i = 0; i < g_bufCount; i++)
-        if (!(g_virt[i] = CreateTex(g_desc, VirtualFormat(g_desc.Format), vf, L"BFI virtual back buffer", i))) return false;
-    if (g_reportTyped.load() && VirtualFormat(g_desc.Format) != g_desc.Format) HookResourceGetDesc(g_virt[0]);
+        if (!(g_virt[i] = CreateTex(g_desc, VirtualFormat(gf), vf, L"BFI virtual back buffer", i))) return false;
+    if (g_reportTyped.load() && VirtualFormat(gf) != gf) HookResourceGetDesc(g_virt[0]);
     for (UINT s = 0; s < kStage; s++)
     {
-        if (!(g_stage[s] = CreateTex(g_desc, g_desc.Format, D3D12_RESOURCE_FLAG_NONE, L"BFI staging frame", s))) return false;
+        if (!(g_stage[s] = CreateTex(g_desc, gf, D3D12_RESOURCE_FLAG_NONE, L"BFI staging frame", s))) return false;
         g_stageFence[s] = g_stageId[s] = g_readFence[s] = 0;
         g_presCurSlot = -1;
         g_stageTime[s] = 0.0;
@@ -1222,7 +1227,7 @@ static bool CreateFrameResources()
     g_cur = 0;
     g_stageNext = 0;
     LOGI("BFI Presenter: %ux%u, format %u (virtual %u), usage 0x%X, flags 0x%X, %u virtual back buffers",
-         g_desc.Width, g_desc.Height, (unsigned)g_desc.Format, (unsigned)VirtualFormat(g_desc.Format),
+         g_desc.Width, g_desc.Height, (unsigned)g_desc.Format, (unsigned)VirtualFormat(gf),
          (unsigned)g_desc.BufferUsage, (unsigned)g_desc.Flags, g_bufCount);
     EnterCriticalSection(&g_cfgLock);
     g_status.width = g_desc.Width; g_status.height = g_desc.Height;
@@ -4870,7 +4875,17 @@ static HRESULT SubmitGameFrameLocked()
         GameStage(ST_G_OWN_INDEX);
         const UINT bi = o_GetCBBI(g_sc);
         GameStage(ST_G_OWN_GETBUF);
-        if (bi < kMaxBuf && SUCCEEDED(o_GetBuffer(g_sc, bi, __uuidof(ID3D12Resource), (void **)&rb)))
+        // SDR to HDR: the real buffers are HDR10, the game's frames 8-bit -- a copy between them isn't allowed (it
+        // removes the device). Only the presenter can draw them; until it runs, the screen keeps its last picture.
+        static bool s_noCopyLogged = false;
+        const bool fmtDiffers = g_hdrUp.load() && g_stageFmt != DXGI_FORMAT_UNKNOWN;
+        if (fmtDiffers && !s_noCopyLogged)
+        {
+            s_noCopyLogged = true;
+            LOGW("BFI Presenter: SDR to HDR: the presenter isn't running, and the game's frames can't be copied to the HDR10 "
+                 "buffers -- turn SdrToHdr off if the picture stays frozen");
+        }
+        if (!fmtDiffers && bi < kMaxBuf && SUCCEEDED(o_GetBuffer(g_sc, bi, __uuidof(ID3D12Resource), (void **)&rb)))
         {
             GameStage(ST_G_OWN_COPY);
             g_gameQueue->Signal(g_gameFence, ++g_gameFenceVal);          // game frame finished
@@ -5164,14 +5179,22 @@ static bool IsManaged(void *sc) { return g_active.load() && !g_dx11.load() && sc
 static HRESULT STDMETHODCALLTYPE hk_GetDesc(IDXGISwapChain *sc, DXGI_SWAP_CHAIN_DESC *d)
 {
     const HRESULT hr = o_GetDesc(sc, d);
-    if (SUCCEEDED(hr) && d && IsManaged(sc) && g_virtCount && !t_presenterThread && !t_ownCall) d->BufferCount = g_virtCount;
+    if (SUCCEEDED(hr) && d && IsManaged(sc) && !t_presenterThread && !t_ownCall)
+    {
+        if (g_virtCount) d->BufferCount = g_virtCount;
+        if (g_hdrUp.load() && g_stageFmt != DXGI_FORMAT_UNKNOWN) d->BufferDesc.Format = g_stageFmt;   // SDR to HDR: its own format
+    }
     return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE hk_GetDesc1(IDXGISwapChain1 *sc, DXGI_SWAP_CHAIN_DESC1 *d)
 {
     const HRESULT hr = o_GetDesc1(sc, d);
-    if (SUCCEEDED(hr) && d && IsManaged(sc) && g_virtCount && !t_presenterThread && !t_ownCall) d->BufferCount = g_virtCount;
+    if (SUCCEEDED(hr) && d && IsManaged(sc) && !t_presenterThread && !t_ownCall)
+    {
+        if (g_virtCount) d->BufferCount = g_virtCount;
+        if (g_hdrUp.load() && g_stageFmt != DXGI_FORMAT_UNKNOWN) d->Format = g_stageFmt;
+    }
     return hr;
 }
 
@@ -6231,25 +6254,104 @@ template <class F> static HRESULT StuckResize(void *sc, F orig)
     return hr;
 }
 
+// SDR to HDR for DX12: the game keeps its 8-bit swap chain format as far as it can tell (GetDesc, the stand-ins,
+// ReShade); the real buffers, which only the presenter draws into, are HDR10 (R10G10B10A2, ST.2084), so the lit
+// refresh has headroom above SDR white. Decided at each of the game's resizes: on for an 8-bit format on a display
+// with Windows HDR on; off when the game resizes to a 10-bit or float format (its own HDR,
+// RenoDX, the AutoHDR add-on) or the setting is off. Returns the format for the real ResizeBuffers.
+static bool HdrDisplayFor(IDXGIFactory4 *fac, HWND hwnd);
+static DXGI_FORMAT Hdr12ResizeFormat(IDXGISwapChain *sc, DXGI_FORMAT f)
+{
+    DXGI_FORMAT game = f;
+    if (game == DXGI_FORMAT_UNKNOWN)                              // "keep the format": the game's current one
+    {
+        if (g_hdrUp.load() && g_stageFmt != DXGI_FORMAT_UNKNOWN) game = g_stageFmt;
+        else { DXGI_SWAP_CHAIN_DESC1 d = {}; OwnCall own; if (o_GetDesc1) o_GetDesc1((IDXGISwapChain1 *)sc, &d); game = d.Format; }
+    }
+    Settings cur;
+    EnterCriticalSection(&g_cfgLock);
+    cur = g_shared;
+    LeaveCriticalSection(&g_cfgLock);
+    const bool was = g_hdrUp.load();
+    // 8-bit buffers are always SDR (HDR10 needs 10 bits, scRGB float): the colour space the game set doesn't matter
+    // here (a game that turns its HDR off resizes to 8-bit before it sets the SDR colour space again).
+    const bool sdr8 = game == DXGI_FORMAT_R8G8B8A8_UNORM || game == DXGI_FORMAT_B8G8R8A8_UNORM;
+    bool on = false;
+    if (cur.sdrToHdr && cur.output < 0 && sdr8)
+    {
+        IDXGIFactory4 *fac = nullptr;
+        HWND hwnd = nullptr;
+        IDXGISwapChain1 *s1 = nullptr;
+        if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&s1))) && s1) { s1->GetHwnd(&hwnd); s1->Release(); }
+        if (SUCCEEDED(sc->GetParent(IID_PPV_ARGS(&fac))) && fac)
+        {
+            on = hwnd && HdrDisplayFor(fac, hwnd);
+            fac->Release();
+        }
+        if (!on && !was) LOGI("BFI Presenter: SDR game; the display has no HDR output (Windows HDR off?) -- staying SDR, use Gain 0.5");
+    }
+    else if (cur.sdrToHdr && cur.output < 0 && !sdr8 && was)
+        LOGI("BFI Presenter: the game resized to format %u (not 8-bit SDR) -- SDR to HDR off", (unsigned)game);
+    g_hdrUp.store(on);
+    g_stageFmt = on ? game : DXGI_FORMAT_UNKNOWN;
+    if (on && !was) LOGI("BFI Presenter: SDR to HDR: the game's format %u stays its own; the real buffers are HDR10", (unsigned)game);
+    else if (!on && was) LOGI("BFI Presenter: SDR to HDR off -- the real buffers follow the game's format again");
+    return on ? DXGI_FORMAT_R10G10B10A2_UNORM : f;
+}
+
+// After a real resize: ST.2084 on the HDR10 buffers, or the game's own colour space again when the conversion ended.
+static void Hdr12ApplyColorSpace(IDXGISwapChain *sc, bool wasOn)
+{
+    if (!o_SetCS1) return;
+    IDXGISwapChain3 *s3 = nullptr;
+    if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&s3))) || !s3) return;
+    s3->Release();
+    OwnCall own;
+    if (g_hdrUp.load())
+    {
+        const HRESULT hr = o_SetCS1(s3, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+        LOGI("BFI Presenter: SDR to HDR: real buffers set to HDR10 (0x%08lX)", (unsigned long)hr);
+    }
+    else if (wasOn)
+    {
+        const int cs = g_cs12.load();
+        o_SetCS1(s3, cs >= 0 ? (DXGI_COLOR_SPACE_TYPE)cs : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMAT f, UINT fl)
 {
     if (!t_ownCall && IsGame11(sc)) return Resize11(sc, cnt, w, h, f, fl, nullptr, nullptr, false);
     if (t_ownCall || !IsManaged(sc)) return o_ResizeBuffers(sc, cnt, w, h, f, fl);
     if (cnt) g_virtCount = cnt;
     GameStage(ST_R_STOP);
-    if (!StopPresenter()) { GameStage(ST_G_OUTSIDE); return StuckResize(sc, [&] { OwnCall own; return o_ResizeBuffers(sc, cnt, w, h, f, fl); }); }
+    if (!StopPresenter())
+    {
+        GameStage(ST_G_OUTSIDE);
+        g_hdrUp.store(false); g_stageFmt = DXGI_FORMAT_UNKNOWN;    // unmanaged from here: the game's own format
+        return StuckResize(sc, [&] { OwnCall own; return o_ResizeBuffers(sc, cnt, w, h, f, fl); });
+    }
     GameStage(ST_R_RELEASE);
     ReleaseFrameResources();
     GameStage(ST_R_REBIND);
+    const bool hdrWas = g_hdrUp.load();
+    const DXGI_FORMAT rf = Hdr12ResizeFormat(sc, f);
     // A pending move to the presenter's queue happens here: nothing holds the
     // real buffers and ReShade's lock is not held.
     const bool wantOwn = g_ownPresentQueue || g_needRebind.exchange(false);
-    HRESULT hr = wantOwn ? ResizeOnPresenterQueue((IDXGISwapChain3 *)sc, cnt, w, h, f, fl) : E_FAIL;
+    HRESULT hr = wantOwn ? ResizeOnPresenterQueue((IDXGISwapChain3 *)sc, cnt, w, h, rf, fl) : E_FAIL;
     if (wantOwn && FAILED(hr) && !g_ownPresentQueue) g_needRebind.store(true);   // try again at the next resize
     g_ownPresentQueue = SUCCEEDED(hr);
     if (wantOwn) LOGI("BFI Presenter: presenting on %s queue after resize", g_ownPresentQueue ? "its own" : "the game's");
     GameStage(ST_R_ORIG);
-    if (FAILED(hr)) { OwnCall own; hr = o_ResizeBuffers(sc, cnt, w, h, f, fl); }
+    if (FAILED(hr)) { OwnCall own; hr = o_ResizeBuffers(sc, cnt, w, h, rf, fl); }
+    if (FAILED(hr) && rf != f)
+    {
+        LOGW("BFI Presenter: SDR to HDR: HDR10 buffers refused (0x%08lX) -- the game's own format", (unsigned long)hr);
+        g_hdrUp.store(false); g_stageFmt = DXGI_FORMAT_UNKNOWN;
+        OwnCall own; hr = o_ResizeBuffers(sc, cnt, w, h, f, fl);
+    }
+    if (SUCCEEDED(hr)) Hdr12ApplyColorSpace(sc, hdrWas);
     GameStage(ST_R_CREATE);
     if (g_ownPresentQueue && g_deferPresenter.exchange(false))
         LOGI("BFI Presenter: the game resized its recreated swap chain -- BFI starts");
@@ -6266,17 +6368,31 @@ static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers1(IDXGISwapChain3 *sc, UINT cnt
     if (t_ownCall || !IsManaged(sc)) return o_ResizeBuffers1(sc, cnt, w, h, f, fl, mask, queues);
     if (cnt) g_virtCount = cnt;
     GameStage(ST_R_STOP);
-    if (!StopPresenter()) { GameStage(ST_G_OUTSIDE); return StuckResize(sc, [&] { OwnCall own; return o_ResizeBuffers1(sc, cnt, w, h, f, fl, mask, queues); }); }
+    if (!StopPresenter())
+    {
+        GameStage(ST_G_OUTSIDE);
+        g_hdrUp.store(false); g_stageFmt = DXGI_FORMAT_UNKNOWN;
+        return StuckResize(sc, [&] { OwnCall own; return o_ResizeBuffers1(sc, cnt, w, h, f, fl, mask, queues); });
+    }
     GameStage(ST_R_RELEASE);
     ReleaseFrameResources();
     GameStage(ST_R_REBIND);
+    const bool hdrWas = g_hdrUp.load();
+    const DXGI_FORMAT rf = Hdr12ResizeFormat(sc, f);
     const bool wantOwn = g_ownPresentQueue || g_needRebind.exchange(false);
-    HRESULT hr = wantOwn ? ResizeOnPresenterQueue(sc, cnt, w, h, f, fl) : E_FAIL;
+    HRESULT hr = wantOwn ? ResizeOnPresenterQueue(sc, cnt, w, h, rf, fl) : E_FAIL;
     if (wantOwn && FAILED(hr) && !g_ownPresentQueue) g_needRebind.store(true);   // try again at the next resize
     g_ownPresentQueue = SUCCEEDED(hr);
     if (wantOwn) LOGI("BFI Presenter: presenting on %s queue after resize", g_ownPresentQueue ? "its own" : "the game's");
     GameStage(ST_R_ORIG);
-    if (FAILED(hr)) { OwnCall own; hr = o_ResizeBuffers1(sc, cnt, w, h, f, fl, mask, queues); }
+    if (FAILED(hr)) { OwnCall own; hr = o_ResizeBuffers1(sc, cnt, w, h, rf, fl, mask, queues); }
+    if (FAILED(hr) && rf != f)
+    {
+        LOGW("BFI Presenter: SDR to HDR: HDR10 buffers refused (0x%08lX) -- the game's own format", (unsigned long)hr);
+        g_hdrUp.store(false); g_stageFmt = DXGI_FORMAT_UNKNOWN;
+        OwnCall own; hr = o_ResizeBuffers1(sc, cnt, w, h, f, fl, mask, queues);
+    }
+    if (SUCCEEDED(hr)) Hdr12ApplyColorSpace(sc, hdrWas);
     GameStage(ST_R_CREATE);
     if (g_ownPresentQueue && g_deferPresenter.exchange(false))
         LOGI("BFI Presenter: the game resized its recreated swap chain -- BFI starts");
@@ -6330,6 +6446,7 @@ static bool InstallHooks(IDXGISwapChain3 *sc)
     PatchSlot(vtbl, VT_GetFrameLatencyWaitableObject, (void *)&hk_GetFLWO,    (void **)&o_GetFLWO);
     PatchSlot(vtbl, VT_GetDesc,                   (void *)&hk_GetDesc,        (void **)&o_GetDesc);
     PatchSlot(vtbl, VT_GetDesc1,                  (void *)&hk_GetDesc1,       (void **)&o_GetDesc1);
+    PatchSlot(vtbl, VT_SetColorSpace1,            (void *)&hk_SetCS1,         (void **)&o_SetCS1);   // SDR to HDR (DX12)
     PatchSlot(vtbl, VT_GetFrameStatistics,        (void *)&hk_GetFS,          (void **)&o_GetFS);
     PatchSlot(vtbl, VT_GetLastPresentCount,       (void *)&hk_GetLPC,         (void **)&o_GetLPC);
     g_hookedVtbl = vtbl;
@@ -6565,6 +6682,9 @@ static void ReleaseAll()
     g_sc = nullptr;
     g_rsSwapchain = nullptr;
     g_rsCs.store(-1);
+    g_hdrUp.store(false);
+    g_stageFmt = DXGI_FORMAT_UNKNOWN;
+    g_cs12.store(-1);
 }
 
 
@@ -7004,6 +7124,18 @@ static HRESULT STDMETHODCALLTYPE hk_SetCS1(IDXGISwapChain3 *sc, DXGI_COLOR_SPACE
         return (f == &hk_SetCS1 ? o_SetCS1 : f)(sc, cs);
     }
     FsCsDepth depth;
+    if (!t_ownCall && IsManaged(sc))
+    {
+        // DX12: remembered for the next resize. With SDR to HDR on, the real buffers stay HDR10 (the game's SDR colour
+        // space would show its frames wrongly); the game is told it worked.
+        if (g_cs12.exchange((int)cs) != (int)cs) LOGI("BFI Presenter: the game set colour space %d", (int)cs);
+        if (g_hdrUp.load())
+        {
+            if (cs != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
+                LOGI("BFI Presenter: SDR to HDR: the game asked for an HDR colour space on its 8-bit buffers -- off at its next resize");
+            return S_OK;
+        }
+    }
     const HRESULT hr = o_SetCS1(sc, cs);
     if (!t_ownCall && IsGame11(sc) && SUCCEEDED(hr) && g_cs11.exchange((int)cs) != (int)cs)
     {
@@ -9049,14 +9181,14 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 static bool on_create_resource_view(reshade::api::device *, reshade::api::resource resource,
                                     reshade::api::resource_usage, reshade::api::resource_view_desc &desc)
 {
-    if (!g_active.load() || VirtualFormat(g_desc.Format) == g_desc.Format) return false;
+    if (!g_active.load() || VirtualFormat(StageFormat()) == StageFormat()) return false;
     bool ours = false;
     for (UINT i = 0; i < g_bufCount; i++)
         if (resource.handle == (uint64_t)(uintptr_t)g_virt[i]) { ours = true; break; }
     if (!ours) return false;
-    const reshade::api::format typeless = (reshade::api::format)VirtualFormat(g_desc.Format);
+    const reshade::api::format typeless = (reshade::api::format)VirtualFormat(StageFormat());
     if (desc.format != reshade::api::format::unknown && desc.format != typeless) return false;
-    desc.format = (reshade::api::format)g_desc.Format;
+    desc.format = (reshade::api::format)StageFormat();
     if (desc.type == reshade::api::resource_view_type::unknown)
     {
         desc.type = reshade::api::resource_view_type::texture_2d;
@@ -9358,19 +9490,22 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 ImGui::Text("Scene asks for: %.0f nits average   After ceiling: %.0f   Ceiling in use: %.0f nits", st.rawAvg, st.hotArea, st.ceilInUse);
             ImGui::Unindent(16.0f);
         }
-        // SDR to HDR: the presenter's own swap chain only (DX11, DX9, OpenGL); DX12 games present through their own.
+        // SDR to HDR: the presenter's own swap chain (DX11, DX9, OpenGL), or a DX12 game's real buffers.
         const bool dx12Game = st.managed && !g_dx11.load();
-        ImGui::BeginDisabled(dx12Game || s.output >= 0);
+        ImGui::BeginDisabled(s.output >= 0);
         bool sh = s.sdrToHdr != 0;
-        if (ImGui::Checkbox("SDR games: present as HDR10 (applies when the swap chain is next created)", &sh)) s.sdrToHdr = sh ? 1 : 0;
+        if (ImGui::Checkbox(dx12Game ? "SDR games: present as HDR10 (applies at the game's next resize)"
+                                     : "SDR games: present as HDR10 (applies when the swap chain is next created)", &sh)) s.sdrToHdr = sh ? 1 : 0;
         ImGui::EndDisabled();
-        if (dx12Game) ImGui::TextDisabled("DX11, DX9 and OpenGL games only for now (this game is DX12).");
-        else if (s.output >= 0) ImGui::TextDisabled("Only with Output: Auto.");
+        if (dx12Game && ImGui::IsItemHovered())
+            ImGui::SetTooltip("DX12: takes effect when the game resizes its swap chain (change resolution or display mode once,\n"
+                              "or restart the game). 8-bit SDR games only.");
+        if (s.output >= 0) ImGui::TextDisabled("Only with Output: Auto.");
         else if (g_hdrUp.load()) ImGui::TextDisabled("In use: this SDR game is shown as HDR10.");
         if (GetModuleHandleA("AutoHDR.addon64") || GetModuleHandleA("AutoHDR.addon32") || GetModuleHandleA("AutoHDR.addon"))
             ImGui::TextWrapped("AutoHDR add-on loaded: it upgrades the game's swap chain to HDR and its effect (e.g. "
                                "AdvancedAutoHDR.fx) does the conversion; BFI Presenter's SDR to HDR then stays off. Use one or the other.");
-        if (s.sdrToHdr && !dx12Game)
+        if (s.sdrToHdr)
         {
             ImGui::Indent(16.0f);
             ImGui::SliderFloat("SDR white (nits)", &s.sdrWhite, 80.0f, 600.0f, "%.0f");
