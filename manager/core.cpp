@@ -974,6 +974,14 @@ static std::string TestedFor(const std::string &game)
 {
     std::string g = NormName(game);
     if (g.empty()) return {};
+    // An exact name first: "Hades" must not get "Hades II"'s entry (it comes first in the list).
+    for (auto &t : kTested)
+        if (NormName(t.name) == g)
+        {
+            std::string s = std::string(t.status);
+            if (t.note && *t.note) s += " -- " + std::string(t.note);
+            return s;
+        }
     for (auto &t : kTested)
     {
         std::string n = NormName(t.name);
@@ -1959,6 +1967,7 @@ void Detect(Game &g)
         std::wstring p = Join(d, L"BFIPresenter.ini");
         if (Exists(p)) { g.ini = true; g.iniPath = p; break; }
     }
+    g.selfResize = g.ini ? (int)GetPrivateProfileIntW(L"BFI", L"PresenterResize", -1, g.iniPath.c_str()) : -1;
 
     // Route
     std::wstring ro = LoadSetting(RouteKey(g.root).c_str(), L"");
@@ -1966,6 +1975,7 @@ void Detect(Game &g)
     DetectShader(g);
     g.reshadeVkIni = Exists(Join(dir, L"ReShade.ini"));
     g.shaderRecommended = g.tested.find("BFI shader recommended") != std::string::npos;
+    g.selfResizeRecommended = g.tested.find("PresenterResize") != std::string::npos;
     if (ro == L"vulkan") g.route = Route::Vulkan;
     else if (ro == L"dx") g.route = g.bits == 32 ? Route::Addon32 : Route::Addon64;
     else if (ro == L"shader") g.route = Route::Shader;
@@ -2962,6 +2972,14 @@ std::string InstallOrUpdate(Game &g, const Source &src)
         if (err.empty()) err = RemoveShader(t, g);
         t.Finish();
         if (err.empty()) Log(oldV.empty() ? "install" : "update", g.name, Join(dir, name), oldV, src.dxVersion);
+        // Games the tested list says never resize their swap chain on their own: BFI starts only with PresenterResize.
+        // Set once; a value the user chose (0 or 1) is left alone.
+        if (err.empty() && g.selfResizeRecommended && g.selfResize < 0)
+        {
+            const std::wstring ini = Join(dir, L"BFIPresenter.ini");
+            if (WritePrivateProfileStringW(L"BFI", L"PresenterResize", L"1", ini.c_str()))
+                Log("PresenterResize=1 (tested list)", g.name, ini, "", "");
+        }
     }
     else if (g.route == Route::Vulkan)
     {
@@ -3060,6 +3078,17 @@ std::string Revert(Game &g)
 // ------------------------------------------------------------------ Vulkan layer
 
 static const wchar_t *kVkKey = L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers";
+
+std::string SetPresenterResize(Game &g, bool on)
+{
+    if (g.route != Route::Addon64 && g.route != Route::Addon32) return "Only for the DX add-on.";
+    std::wstring dir = !g.addonPath.empty() ? DirOf(g.addonPath) : g.reshade ? DirOf(g.reshadeDll.path) : DirOf(g.exe);
+    std::wstring ini = g.ini ? g.iniPath : Join(dir, L"BFIPresenter.ini");
+    if (!WritePrivateProfileStringW(L"BFI", L"PresenterResize", on ? L"1" : L"0", ini.c_str()))
+        return LastError("Couldn't write", ini);
+    Log(on ? "PresenterResize=1" : "PresenterResize=0", g.name, ini, "", "");
+    return {};
+}
 
 std::string InstallVulkanLayer(const Source &src)
 {

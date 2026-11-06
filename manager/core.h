@@ -5,8 +5,8 @@
 #include <vector>
 #include <functional>
 
-#define MANAGER_VERSION "1.3.16"
-#define MANAGER_VERSION_W L"1.3.16"
+#define MANAGER_VERSION "1.3.17"
+#define MANAGER_VERSION_W L"1.3.17"
 
 namespace bfi {
 
@@ -74,6 +74,8 @@ struct Game {
     bool         shaderOn = false;          // enabled in the active ReShade preset
     std::wstring shaderDir, presetPath;     // where ReShade looks for effects / its active preset
     bool         shaderRecommended = false; // the tested-games list recommends the shader for this game
+    bool         selfResizeRecommended = false;  // the tested-games list: BFI needs PresenterResize to start in this game
+    int          selfResize = -1;           // PresenterResize in the game's BFIPresenter.ini (-1: not set, the add-on's default 0)
     bool         reshadeVkIni = false;      // ReShade.ini next to the exe: ReShade's Vulkan layer is on for this game
     bool         ini = false;    // BFIPresenter.ini next to the add-on or the exe
     std::wstring iniPath;
@@ -159,6 +161,8 @@ int CompareVersions(const std::string &a, const std::string &b);   // <0, 0, >0 
 
 // ----- Actions. Each returns "" on success or an error message; every replaced file is backed up and logged.
 std::string InstallOrUpdate(Game &g, const Source &src);
+// PresenterResize ("Resize the game's swap chain to start BFI") in the game's BFIPresenter.ini, next to the add-on.
+std::string SetPresenterResize(Game &g, bool on);
 std::string Remove(Game &g, bool alsoIni);
 std::string Revert(Game &g);                  // puts back the files the last action on this game replaced
 bool CanRevert(const Game &g);
