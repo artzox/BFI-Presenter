@@ -6379,8 +6379,9 @@ template <class F> static HRESULT StuckResize(void *sc, F orig)
 // SDR to HDR for DX12: the game keeps its 8-bit swap chain format as far as it can tell (GetDesc, the stand-ins,
 // ReShade); the real buffers, which only the presenter draws into, are HDR10 (R10G10B10A2, ST.2084), so the lit
 // refresh has headroom above SDR white. Decided at each of the game's resizes: on for an 8-bit format on a display
-// with Windows HDR on; off when the game resizes to a 10-bit or float format (its own HDR,
-// RenoDX, the AutoHDR add-on) or the setting is off. Returns the format for the real ResizeBuffers.
+// with Windows HDR on, and for 10-bit buffers with the SDR colour space (or none set yet); off for float buffers, 10-bit
+// buffers with an HDR colour space (the game's own HDR, RenoDX, the AutoHDR add-on) or the setting off; hk_SetCS1 follows
+// the colour space of 10-bit buffers between resizes. Returns the format for the real ResizeBuffers.
 static bool HdrDisplayFor(IDXGIFactory4 *fac, HWND hwnd);
 static DXGI_FORMAT Hdr12ResizeFormat(IDXGISwapChain *sc, DXGI_FORMAT f)
 {
