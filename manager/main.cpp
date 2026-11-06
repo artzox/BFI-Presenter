@@ -2153,8 +2153,6 @@ static void DrawDetail(HWND)
                       : h == HdrMod ? "SDR, a mod or fix adds HDR (PCGamingWiki); with one installed, SDR to HDR stays off by itself"
                       : h == HdrNa ? "n/a (PCGamingWiki)"
                       : "unknown: not on PCGamingWiki, or its page doesn't say";
-        if (h == HdrNone && (g.apis & ApiD3D12) && !(g.apis & (ApiD3D11 | ApiD3D9 | ApiGL)) && g.route != Route::Vulkan)
-            t = "SDR only (PCGamingWiki). SDR to HDR isn't available for Direct3D 12 games yet";
         ImGui::PushTextWrapPos(0);
         ImGui::TextUnformatted(t);
         if (!g.hdrMods.empty())
