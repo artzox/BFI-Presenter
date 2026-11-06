@@ -60,6 +60,8 @@ struct Game {
     unsigned     pcgwApis = 0;   // from PCGamingWiki
     std::string  pcgwText;       // e.g. "Direct3D 12, 11; Vulkan"
     int          pcgwHdr = 0;    // PCGamingWiki's HDR row: one of the PcgwHdr values below
+    std::string  hdrMods;        // HDR mods listed for the game (RenoDX, Luma), e.g. "RenoDX; Luma (in progress)"
+    bool         hdrModWorking = false;   // at least one of them is listed as working
     // Detected next to the exe
     bool         reshade = false;
     DllInfo      reshadeDll;     // the ReShade DLL (any name: dxgi.dll, ReShade64.dll, ...)
@@ -138,6 +140,10 @@ void DetectAll(std::vector<Game> &games, const std::function<void(const std::str
 // PCGamingWiki's HDR row (the {{Video}} box's "hdr" field).
 enum PcgwHdr { HdrUnknown = 0, HdrNative = 1, HdrNone = 2, HdrLimited = 3, HdrMod = 4, HdrNa = 5 };
 const char *HdrText(int hdr);     // "native", "no", "limited", "mod", "n/a", "?"
+
+// HDR mods: the RenoDX mods list (its wiki) and Luma's (its wiki, checked against the latest release's downloads).
+// Blocking; cached for a day. Returns an error text, or empty.
+std::string FetchHdrMods(const std::function<void(const std::string &)> &progress = nullptr);
 
 // PCGamingWiki: graphics APIs per game (Steam by app id, others by page name). Blocking; caches results.
 std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const std::string &)> &progress = nullptr);

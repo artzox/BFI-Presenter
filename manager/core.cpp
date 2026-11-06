@@ -1533,6 +1533,240 @@ std::string FetchPcgw(std::vector<Game> &games, const std::function<void(const s
     return err;
 }
 
+// ------------------------------------------------------------------ HDR mods (RenoDX, Luma)
+
+// One game an HDR mod is listed for. name: as the list writes it; mod: "RenoDX", "RenoDX (Unreal Engine Extended)",
+// "Luma", "Luma (Unreal Engine)", or a related mod's name.
+struct HdrModEntry { std::string norm, mod; bool working = false; };
+static std::vector<HdrModEntry> g_hdrMods;
+static bool g_hdrModsLoaded = false;
+static std::mutex g_hdrModsLock;
+static std::wstring HdrModsPath() { return Join(DataDir(), L"hdrmods_cache.txt"); }
+
+// A table row's cells: "| a | b |" -> {"a", "b"}.
+static std::vector<std::string> MdCells(const std::string &line)
+{
+    std::vector<std::string> c;
+    size_t a = line.find('|');
+    if (a == std::string::npos) return c;
+    for (;;)
+    {
+        size_t b = line.find('|', a + 1);
+        if (b == std::string::npos) break;
+        c.push_back(Trim(line.substr(a + 1, b - a - 1)));
+        a = b;
+    }
+    return c;
+}
+
+// "[Red Dead Redemption 2 (Vulkan)](https://...)" -> "Red Dead Redemption 2 (Vulkan)"; "**x**" -> "x"
+static std::string MdText(std::string t)
+{
+    if (!t.empty() && t[0] == '[')
+    {
+        size_t e = t.find("](");
+        if (e != std::string::npos) t = t.substr(1, e - 1);
+    }
+    std::string o;
+    for (size_t i = 0; i < t.size(); i++) { if (t[i] == '*' || t[i] == '`') continue; o += t[i]; }
+    return Trim(o);
+}
+
+static void HdrModAdd(std::vector<HdrModEntry> &out, const std::string &name, const std::string &mod, bool working)
+{
+    // "Batman Arkham City + Origin", "Borderlands 2 / The Pre-Sequel": each part is a game
+    std::vector<std::string> parts{ name };
+    for (const char *sep : { " + ", " / " })
+    {
+        std::vector<std::string> next;
+        for (auto &p : parts)
+        {
+            size_t a = 0, b;
+            while ((b = p.find(sep, a)) != std::string::npos) { next.push_back(p.substr(a, b - a)); a = b + strlen(sep); }
+            next.push_back(p.substr(a));
+        }
+        parts = next;
+    }
+    for (auto &p : parts)
+    {
+        std::string n = NormName(p);
+        if (n.size() >= 3) out.push_back({ n, mod, working });
+    }
+}
+
+// RenoDX's mods list (its wiki's Mods page): the main table, the multi-game mods' tables (Unreal Engine Extended,
+// Unity, Source: games they're known to work in) and Related Mods; Deprecated mods are left out.
+static void ParseRenoDx(const std::string &md, std::vector<HdrModEntry> &out)
+{
+    std::string section = "RenoDX";
+    bool inList = false, related = false;
+    size_t a = 0;
+    while (a < md.size())
+    {
+        size_t e = md.find('\n', a);
+        std::string line = md.substr(a, (e == std::string::npos ? md.size() : e) - a);
+        a = e == std::string::npos ? md.size() : e + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("# ", 0) == 0)
+        {
+            std::string h = LowerA(line);
+            if (h.find("deprecated") != std::string::npos) break;
+            inList = h.find("list") != std::string::npos || h.find("related") != std::string::npos;
+            related = h.find("related") != std::string::npos;
+            section = "RenoDX";
+            continue;
+        }
+        if (line.rfind("## ", 0) == 0 && LowerA(line).find("multi-game") != std::string::npos) { inList = true; continue; }
+        if (line.rfind("### ", 0) == 0)
+        {
+            std::string h = Trim(line.substr(4));
+            size_t cut = h.find(" [");
+            if (cut != std::string::npos) h.resize(cut);
+            if (LowerA(h) != "legend") section = "RenoDX (" + Trim(h) + ")";
+            continue;
+        }
+        if (!inList || line.rfind("|", 0) != 0) continue;
+        auto c = MdCells(line);
+        if (c.empty()) continue;
+        std::string name = MdText(c[0]);
+        if (name.empty() || LowerA(name) == "name" || name[0] == ':' || name[0] == '-') continue;
+        const bool wip = line.find(":construction:") != std::string::npos;
+        if (related)
+        {
+            // "CONTROL - HDR Ultrawide DLSS RT Patch": the game, then the mod's name
+            size_t d = name.find(" - ");
+            std::string mod = d != std::string::npos ? Trim(name.substr(d + 3)) : name;
+            if (LowerA(mod).find("luma framework") != std::string::npos) continue;   // a pointer to Luma's own list
+            HdrModAdd(out, d != std::string::npos ? name.substr(0, d) : name, mod, !wip);
+        }
+        else HdrModAdd(out, name, section, !wip);
+    }
+}
+
+// Luma's mods list (its wiki's home page): Completed Mods, WIP Mods (planned ones left out) and the Unreal Engine
+// mod's table (rows where HDR works). A row whose download is a release file counts only if the latest release has it.
+static void ParseLuma(const std::string &md, const std::set<std::string> &assets, std::vector<HdrModEntry> &out)
+{
+    enum { None, Done, Wip, Ue } sec = None;
+    int hdrCol = -1;
+    size_t a = 0;
+    while (a < md.size())
+    {
+        size_t e = md.find('\n', a);
+        std::string line = md.substr(a, (e == std::string::npos ? md.size() : e) - a);
+        a = e == std::string::npos ? md.size() : e + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("# ", 0) == 0)
+        {
+            std::string h = LowerA(line);
+            sec = h.find("completed") != std::string::npos ? Done : h.find("wip") != std::string::npos ? Wip
+                : h.find("unreal") != std::string::npos ? Ue : None;
+            hdrCol = -1;
+            if (sec == Ue && !assets.empty() && !assets.count("luma-unreal_engine.zip")) sec = None;
+            continue;
+        }
+        if (sec == None || line.rfind("|", 0) != 0) continue;
+        auto c = MdCells(line);
+        if (c.empty()) continue;
+        std::string name = MdText(c[0]);
+        if (LowerA(name) == "name")
+        {
+            for (size_t k = 0; k < c.size(); k++) if (LowerA(c[k]) == "hdr") hdrCol = (int)k;
+            continue;
+        }
+        if (name.empty() || name[0] == '-' || name[0] == ':') continue;
+        if (sec == Ue)
+        {
+            if (hdrCol < 0 || hdrCol >= (int)c.size() || c[hdrCol].find("\xE2\x9C\x85") == std::string::npos) continue;   // ✅
+            HdrModAdd(out, name, "Luma (Unreal Engine)", true);
+            continue;
+        }
+        if (line.find("\xF0\x9F\x92\xA1") != std::string::npos) continue;           // 💡 planned
+        const bool wip = sec == Wip || line.find("\xF0\x9F\x9A\xA7") != std::string::npos;   // 🚧
+        // the release file it links to, if any
+        size_t r = line.find("releases/latest/download/");
+        if (r != std::string::npos && !assets.empty())
+        {
+            r += 25;
+            size_t q = line.find_first_of(")\" ", r);
+            if (!assets.count(LowerA(line.substr(r, q == std::string::npos ? std::string::npos : q - r)))) continue;
+        }
+        HdrModAdd(out, name, "Luma", !wip);
+    }
+}
+
+static void HdrModsLoad()
+{
+    if (g_hdrModsLoaded) return;
+    g_hdrModsLoaded = true;
+    std::ifstream in{fs::path(HdrModsPath())};
+    std::string line;
+    std::getline(in, line);                                       // when it was fetched
+    while (std::getline(in, line))
+    {
+        size_t t1 = line.find('\t'), t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1);
+        if (t2 == std::string::npos) continue;
+        g_hdrMods.push_back({ line.substr(0, t1), line.substr(t1 + 1, t2 - t1 - 1), line.substr(t2 + 1) == "1" });
+    }
+}
+
+std::string FetchHdrMods(const std::function<void(const std::string &)> &progress)
+{
+    const long long now = (long long)time(nullptr);
+    {
+        std::ifstream in{fs::path(HdrModsPath())};
+        std::string first;
+        if (std::getline(in, first) && now - atoll(first.c_str()) < 86400LL) return {};
+    }
+    if (progress) progress("Looking up HDR mods (RenoDX, Luma)...");
+    std::vector<HdrModEntry> found;
+    std::string err, body, e;
+    bool any = false;
+    if (HttpGet(L"https://raw.githubusercontent.com/wiki/clshortfuse/renodx/Mods.md", body, e)) { ParseRenoDx(body, found); any = true; }
+    else err = "RenoDX mods list: " + e;
+    std::set<std::string> assets;
+    body.clear(); e.clear();
+    if (HttpGet(L"https://api.github.com/repos/Filoppi/Luma-Framework/releases/latest", body, e))
+    {
+        Jv root; size_t i = 0;
+        if (JsonParse(body, i, root))
+            if (const Jv *as = root.get("assets")) for (auto &x : as->a) { std::string n = LowerA(x.str("name")); if (!n.empty()) assets.insert(n); }
+    }
+    body.clear(); e.clear();
+    if (HttpGet(L"https://raw.githubusercontent.com/wiki/Filoppi/Luma-Framework/Home.md", body, e)) { ParseLuma(body, assets, found); any = true; }
+    else err += std::string(err.empty() ? "" : "; ") + "Luma mods list: " + e;
+    if (!any) return "HDR mods: " + err;                          // keep the old list
+    std::lock_guard<std::mutex> l(g_hdrModsLock);
+    g_hdrMods = found;
+    g_hdrModsLoaded = true;
+    std::ofstream out{fs::path(HdrModsPath()), std::ios::trunc | std::ios::binary};
+    out << (err.empty() ? now : now - 86400LL + 3600LL) << '\n';  // a list that failed is tried again within the hour
+    for (auto &m : g_hdrMods) out << m.norm << '\t' << m.mod << '\t' << (m.working ? 1 : 0) << '\n';
+    return err.empty() ? std::string() : "HDR mods: " + err;
+}
+
+static void HdrModApply(Game &g)
+{
+    std::lock_guard<std::mutex> l(g_hdrModsLock);
+    HdrModsLoad();
+    g.hdrMods.clear(); g.hdrModWorking = false;
+    std::set<std::string> names;
+    for (auto &v : PcgwNames(PcgwCleanName(g.name))) names.insert(NormName(v));
+    std::vector<std::pair<std::string, bool>> mods;               // a mod listed twice (two tables): working wins
+    for (auto &m : g_hdrMods)
+    {
+        if (!names.count(m.norm)) continue;
+        auto it = std::find_if(mods.begin(), mods.end(), [&](const std::pair<std::string, bool> &x) { return x.first == m.mod; });
+        if (it == mods.end()) mods.push_back({ m.mod, m.working });
+        else it->second = it->second || m.working;
+    }
+    for (auto &m : mods)
+    {
+        g.hdrMods += (g.hdrMods.empty() ? "" : "; ") + m.first + (m.second ? "" : " (in progress)");
+        if (m.second) g.hdrModWorking = true;
+    }
+}
+
 // ------------------------------------------------------------------ detection
 
 // ------------------------------------------------------------------ ReShade effects and presets (BFI shader)
@@ -1664,6 +1898,7 @@ void Detect(Game &g)
     g.bits = ef.bits;
     g.exeApis = ef.apis;
     PcgwApply(g);
+    HdrModApply(g);
     g.apis = (g.pcgwKnown && g.pcgwApis) ? g.pcgwApis : g.exeApis;
     g.tested = TestedFor(g.name);
     std::wstring dir = DirOf(g.exe);

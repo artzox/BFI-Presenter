@@ -369,6 +369,8 @@ static void StartScan(bool fresh)
         if (LoadSetting(L"PCGamingWiki", L"1") == L"1")
         {
             err = FetchPcgw(games, SetBusy);
+            std::string me = FetchHdrMods(SetBusy);
+            if (!me.empty()) err += (err.empty() ? "" : "\n") + me;
             DetectAll(games, SetBusy);
         }
         SaveGameList(games);
@@ -1240,6 +1242,15 @@ static void DrawTop(HWND hwnd)
     else ImGui::TextUnformatted("");
 }
 
+// The HDR column: PCGamingWiki's row, with "mod" also when RenoDX or Luma lists the game.
+static int ShownHdr(const Game &g)
+{
+    const int h = g.pcgwKnown ? g.pcgwHdr : HdrUnknown;
+    if (h == HdrNative || h == HdrLimited) return h;
+    if (!g.hdrMods.empty()) return HdrMod;
+    return h;
+}
+
 static void DrawTable(float height)
 {
     // Columns keep their own width (drag the header borders; remembered in manager_ui.ini) and the table scrolls
@@ -1284,7 +1295,7 @@ static void DrawTable(float height)
             case 2: return low(g.store);
             case 3: snprintf(b, 32, "%02d", g.bits); return b;
             case 4: return ApiText(g.apis);
-            case 5: { static const char *ord[] = { "9", "0", "3", "1", "2", "4" }; return g.pcgwKnown && g.pcgwHdr >= 0 && g.pcgwHdr <= 5 ? ord[g.pcgwHdr] : "9"; }
+            case 5: { static const char *ord[] = { "9", "0", "3", "1", "2", "4" }; const int h = ShownHdr(g); return h >= 0 && h <= 5 ? ord[h] : "9"; }
             case 6: return g.reshade ? g.reshadeDll.version : std::string();
             case 7: return g.route == Route::Vulkan ? (g.ini ? "vulkan" : "") : g.route == Route::Shader ? g.shaderVersion : g.addonVersion;
             case 8: return g.nvKnown ? std::string(g.nvVrrOwn ? "0" : "1") + VrrText(g.nvVrr) : "2";
@@ -1337,7 +1348,8 @@ static void DrawTable(float height)
                     "no: SDR only. With Windows HDR on, BFI Presenter's SDR to HDR (SdrToHdr) gives the lit refresh "
                     "headroom so BFI doesn't dim the picture (Vulkan, DX11, DX9 and OpenGL games).\n"
                     "limited: HDR with caveats (see the game's PCGamingWiki page).\n"
-                    "mod: SDR, but a mod or fix adds HDR (e.g. RenoDX). With one installed, SDR to HDR stays off by itself.\n"
+                    "mod: SDR, but an HDR mod exists: listed by RenoDX or Luma (hover for which), or PCGamingWiki says a fix adds it. "
+                    "With one installed, SDR to HDR stays off by itself.\n"
                     "?: not on PCGamingWiki, or its page doesn't say.");
     }
 
@@ -1390,8 +1402,12 @@ static void DrawTable(float height)
         ImGui::TableNextColumn(); if (g.bits) ImGui::Text("%d", g.bits); else ImGui::TextColored(kGrey, "?");
         ImGui::TableNextColumn(); ImGui::TextUnformatted(g.exe.empty() ? "" : ApiText(g.apis).c_str());
         ImGui::TableNextColumn();
-        if (!g.pcgwKnown || g.pcgwHdr == HdrUnknown) ImGui::TextColored(kGrey, "?");
-        else ImGui::TextColored(g.pcgwHdr == HdrNative ? kGreen : g.pcgwHdr == HdrNa ? kGrey : kText, "%s", HdrText(g.pcgwHdr));
+        {
+            const int h = ShownHdr(g);
+            if (h == HdrUnknown) ImGui::TextColored(kGrey, "?");
+            else ImGui::TextColored(h == HdrNative ? kGreen : h == HdrNa ? kGrey : kText, "%s", HdrText(h));
+            if (h == HdrMod && !g.hdrMods.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", g.hdrMods.c_str());
+        }
         ImGui::TableNextColumn();
         if (g.reshade) ImGui::Text("%s", g.reshadeDll.version.empty() ? "yes" : g.reshadeDll.version.c_str());
         else if (g.route == Route::Vulkan && g.reshadeVkIni && g_app.vk.reshadeLayer) ImGui::Text("Vulkan %s", g_app.vk.reshadeVersion.c_str());
@@ -2141,6 +2157,8 @@ static void DrawDetail(HWND)
             t = "SDR only (PCGamingWiki). SDR to HDR isn't available for Direct3D 12 games yet";
         ImGui::PushTextWrapPos(0);
         ImGui::TextUnformatted(t);
+        if (!g.hdrMods.empty())
+            ImGui::Text("HDR mods: %s. With one installed, BFI Presenter's SDR to HDR stays off by itself.", g.hdrMods.c_str());
         ImGui::PopTextWrapPos();
     }
 
