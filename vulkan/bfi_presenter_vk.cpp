@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.30"
+#define BFI_VERSION "1.0.31-t1"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -139,6 +139,7 @@ static void Log(const char *lvl, const char *fmt, ...)
 #define LOGW(...) Log("WARN ", __VA_ARGS__)
 #ifdef _WIN32
 #include "../common/bfi_syscheck.h"
+#include "../common/bfi_vram.h"
 static SysCheck g_sysCheck;      // power plan, GPUs, displays (checked on the window watch thread)
 #endif
 #define LOGE(...) Log("ERROR", __VA_ARGS__)
@@ -1623,63 +1624,13 @@ static double g_lastAutoRebuildT = -1.0e9;  // ... automatically
 static double g_rebuildGap = 20.0;          // automatic rebuilds at least this far apart (doubles while they don't help)
 static int    g_rebuildMisses = 0;          // automatic rebuilds in a row after which presentation slowed again within a minute
 
-// The game's video memory use against the budget Windows gives it (DXGI, the NVIDIA adapter), in MB.
-// The game's video memory use and budget, from the kernel (D3DKMT) for the GPU with the most video memory. DXGI is
-// used once to find that GPU and released at once: a DXGI adapter kept for the session crashed RPCS3 -- the code behind
-// it had been unloaded by the time the per-second check called it.
-struct KmtQueryVideoMemoryInfo
-{
-    HANDLE   hProcess;
-    UINT     hAdapter;
-    UINT     MemorySegmentGroup;   // 0 local
-    UINT64   Budget, CurrentUsage, CurrentReservation, AvailableForReservation;
-    UINT     PhysicalAdapterIndex;
-};
-struct KmtOpenAdapterFromLuid { LUID AdapterLuid; UINT hAdapter; };
+// The game's video memory use and budget, in MB (common/bfi_vram.h: the kernel, D3DKMT).
 static bool VramMB(double &use, double &budget)
 {
-    typedef LONG (APIENTRY *PFN_Open)(KmtOpenAdapterFromLuid *);
-    typedef LONG (APIENTRY *PFN_Query)(KmtQueryVideoMemoryInfo *);
-    static PFN_Query query = nullptr; static UINT adapter = 0; static bool tried = false;
-    if (!tried)
-    {
-        tried = true;
-        LUID luid = {}; bool found = false;
-        typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void **);
-        HMODULE h = LoadLibraryA("dxgi.dll");
-        PFN_CF1 cf = h ? (PFN_CF1)(void *)GetProcAddress(h, "CreateDXGIFactory1") : nullptr;
-        IDXGIFactory1 *fac = nullptr;
-        if (cf && SUCCEEDED(cf(__uuidof(IDXGIFactory1), (void **)&fac)) && fac)
-        {
-            IDXGIAdapter1 *a = nullptr; SIZE_T best = 0;
-            for (UINT k = 0; fac->EnumAdapters1(k, &a) == S_OK; k++)
-            {
-                DXGI_ADAPTER_DESC1 d;
-                if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && d.DedicatedVideoMemory > best)
-                {
-                    best = d.DedicatedVideoMemory; luid = d.AdapterLuid; found = true;
-                }
-                a->Release();
-            }
-            fac->Release();
-        }
-        HMODULE g = GetModuleHandleA("gdi32.dll");
-        if (!g) g = LoadLibraryA("gdi32.dll");
-        PFN_Open open = g ? (PFN_Open)(void *)GetProcAddress(g, "D3DKMTOpenAdapterFromLuid") : nullptr;
-        PFN_Query q = g ? (PFN_Query)(void *)GetProcAddress(g, "D3DKMTQueryVideoMemoryInfo") : nullptr;
-        KmtOpenAdapterFromLuid oa = {};
-        oa.AdapterLuid = luid;
-        if (found && open && q && open(&oa) == 0 && oa.hAdapter) { adapter = oa.hAdapter; query = q; }
-        else LOGI("BFI Presenter: video memory use not available (D3DKMT)");
-    }
-    if (!query) return false;
-    KmtQueryVideoMemoryInfo mi = {};
-    mi.hProcess = nullptr;          // the current process
-    mi.hAdapter = adapter;
-    mi.MemorySegmentGroup = 0;
-    if (query(&mi) != 0) return false;
-    use = mi.CurrentUsage / 1048576.0; budget = mi.Budget / 1048576.0;
-    return true;
+    bool unavailable = false;
+    const bool ok = bfi_vram::Query(use, budget, &unavailable);
+    if (unavailable) LOGI("BFI Presenter: video memory use not available (D3DKMT)");
+    return ok;
 }
 
 #ifdef _WIN32
@@ -3555,10 +3506,10 @@ static void LrWatchThread(Swapchain *sc)
             else { good = (est + margin < window - 0.002) ? good + 1 : 0; if (good >= 3) { state = 2; good = 0; } }
         }
         if (state != prev && !limitOff && state == 2)
-            LOGI("BFI Presenter: just-in-time release active -- game frames take %.1f ms (95th percentile), released %.1f ms "
+            LOGI("BFI Presenter: just-in-time release active -- frames finish %.1f ms after release (95th percentile, frames queued ahead included), released %.1f ms "
                  "before the refresh that shows them (cap interval %.1f ms)", est * 1000.0, (est + margin) * 1000.0, window * 1000.0);
         else if (state != prev && !limitOff && state == 3)
-            LOGI("BFI Presenter: just-in-time release at its limit -- game frames take %.1f ms, close to the %.1f ms cap interval; %s",
+            LOGI("BFI Presenter: just-in-time release at its limit -- frames finish %.1f ms after release (frames queued ahead included), close to the %.1f ms cap interval; %s",
                  est * 1000.0, window * 1000.0, capMode ? "released as early as the cap allows" : "released at the refresh as before");
         // At its limit: at the Half / Quarter cap every frame still targets a
         // lit refresh, released as early as the cap allows; at the Refresh cap
@@ -3592,7 +3543,7 @@ static void LrWatchThread(Swapchain *sc)
             if (limitFitSecs >= 30)
             {
                 limitOff = false; limitFitSecs = 0;
-                LOGI("BFI Presenter: just-in-time release back on -- game frames take %.1f ms", est * 1000.0);
+                LOGI("BFI Presenter: just-in-time release back on -- frames finish %.1f ms after release", est * 1000.0);
             }
         }
         if (!allowed) { limitOff = false; limitTrips = 0; limitMisses = limitMissSecs = limitFitSecs = 0; }
@@ -5915,7 +5866,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "1-then-3 cycle frames at Quarter. Light games also get fresher frames. On by default.");
             if (s.capJit && per >= 2)
             {
-                static const char *kLrNames[] = { "off (needs Wait for vblank)", "measuring", "active", "at its limit (game frames take nearly the whole interval)" };
+                static const char *kLrNames[] = { "off (needs Wait for vblank)", "measuring", "active", "at its limit (frames finish too close to the refresh)" };
                 ImGui::Indent(16.0f);
                 ImGui::TextDisabled("%s", kLrNames[st.lrState & 3]);
                 if (st.lrState >= 2)
@@ -5979,7 +5930,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (lrFg) { ImGui::SameLine(); ImGui::TextDisabled("(not used: Reflex's frame limit paces this game)"); }
         else if (s.laterRelease && s.gameCap == 1)
         {
-            static const char *kLrNames2[] = { "off (needs Wait for vblank and Lowest latency)", "measuring", "active", "at its limit (game frames take nearly the whole refresh)" };
+            static const char *kLrNames2[] = { "off (needs Wait for vblank and Lowest latency)", "measuring", "active", "at its limit (frames finish too close to the refresh)" };
             ImGui::Indent(16.0f);
             ImGui::TextDisabled("%s", kLrNames2[st.lrState & 3]);
             ImGui::Unindent(16.0f);
