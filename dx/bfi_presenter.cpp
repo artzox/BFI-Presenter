@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.31-t3"
+#define BFI_ADDON_VERSION "1.0.31-t4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -771,7 +771,9 @@ static std::atomic<int>       g_slotWaits{0};
 static int                    g_swapChainsManaged = 0;
 static std::atomic<bool>      g_deferPresenter{false};              // game copies that had to wait for the presenter
 static std::atomic<double>    g_deferSinceT{0.0};                   // when the wait for the game's first resize began
-static std::atomic<int>       g_nudgeStage{0};                      // NudgeGameResize: 0 not yet, 1 same size sent, 2 size changed and back, 3 gave up
+static std::atomic<int>       g_nudgeStage{0};                      // NudgeGameResize: see NudgeResizeTick
+static std::atomic<double>    g_lastGamePresentT{0.0};              // the game's last Present on the managed swap chain
+static std::atomic<bool>      g_fs12{false};                        // DX12: the game holds exclusive fullscreen
 // Per-game-frame timing (written to BFIPresenter_game_<date>_<time>.csv while
 // the timing log is on). Times are Now() seconds; serialised by g_submitLock.
 static std::atomic<bool>      g_logOn{false};
@@ -2355,38 +2357,79 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
 static std::atomic<double> g_windowHungT{-1e9};
 
 // NudgeGameResize: BFI (and DX12 SDR to HDR) start inside the game's first resize of its swap chain. Most games do one
-// at start-up; some never do on their own (Hades II, Wreckfest 2; RenoDX's swap chain upgrade did it for them). After
-// 5 s of waiting the game window is told its size again (WM_SIZE), which games answer with a resize; if that isn't
-// enough, 3 s later it's told a size 2 pixels shorter and at once the real one again (two quick resizes, the last one
-// at the right size). The window itself is never moved or resized. Off by default.
+// at start-up; some never do on their own (Hades II, Wreckfest 2; RenoDX's swap chain upgrade did it for them). Once the
+// game has presented steadily for 3 s (not while it loads):
+//   1. its window is told its size again (WM_SIZE) -- enough for games that resize on the message;
+//   2. 3 s later, if not: windowed or borderless, the window is made 1 pixel shorter and, half a second later, its own
+//      size again (games that read the window's real size see it change); in exclusive fullscreen the window isn't
+//      touched and WM_SIZE says 2 pixels shorter, then the real size;
+//   3. 3 s later, if still not: a hint in the log. Off by default.
 static void NudgeResizeTick(double t)
 {
-    if (!g_active.load() || g_dx11.load() || !g_deferPresenter.load() || g_ownPresentQueue) return;
+    static double steadySince = 0.0, stageT = 0.0;
+    static RECT orig = {};
+    static HWND origWnd = nullptr;
+    const int stage = g_nudgeStage.load();
+    if (stage == 0 && t - g_deferSinceT.load() < 0.6) steadySince = 0.0;       // a new swap chain
+    if (!g_active.load() || g_dx11.load() || !g_deferPresenter.load() || g_ownPresentQueue)
+    {
+        if (stage == 2 && origWnd)                                              // started meanwhile: size back
+            SetWindowPos(origWnd, nullptr, 0, 0, orig.right - orig.left, orig.bottom - orig.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        if (stage == 2) g_nudgeStage.store(3);
+        return;
+    }
     EnterCriticalSection(&g_cfgLock);
     const bool on = g_shared.nudgeResize != 0;
     LeaveCriticalSection(&g_cfgLock);
-    const int stage = g_nudgeStage.load();
-    if (!on || stage >= 3) return;
-    const double waited = t - g_deferSinceT.load();
-    if (waited < (stage == 0 ? 5.0 : stage == 1 ? 8.0 : 11.0)) return;
+    if (!on || stage >= 4) return;
+    if (t - g_lastGamePresentT.load() > 0.5) { steadySince = 0.0; if (stage != 2) return; }   // loading: wait
+    if (steadySince == 0.0) steadySince = t;
     HWND w = g_watchHwnd.load();
     RECT rc = {};
     if (!w || !IsWindow(w) || IsIconic(w) || !IsWindowVisible(w) || !GetClientRect(w, &rc) || rc.right < 64 || rc.bottom < 64) return;
     const LPARAM real = MAKELPARAM(rc.right, rc.bottom);
     if (stage == 0)
     {
+        if (t - steadySince < 3.0) return;
         PostMessageW(w, WM_SIZE, SIZE_RESTORED, real);
-        LOGI("BFI Presenter: NudgeGameResize: no resize after 5 s -- told the game window its size again (%ldx%ld)", rc.right, rc.bottom);
+        LOGI("BFI Presenter: NudgeGameResize: the game presents but hasn't resized -- told its window its size again (%ldx%ld)", rc.right, rc.bottom);
+        g_nudgeStage.store(1); stageT = t;
     }
     else if (stage == 1)
     {
-        PostMessageW(w, WM_SIZE, SIZE_RESTORED, MAKELPARAM(rc.right, rc.bottom - 2));
-        PostMessageW(w, WM_SIZE, SIZE_RESTORED, real);
-        LOGI("BFI Presenter: NudgeGameResize: still no resize -- told the game window a size 2 pixels shorter, then its own");
+        if (t - stageT < 3.0) return;
+        HWND root = GetAncestor(w, GA_ROOT);
+        if (!g_fs12.load() && root && GetWindowRect(root, &orig))
+        {
+            origWnd = root;
+            SetWindowPos(root, nullptr, 0, 0, orig.right - orig.left, orig.bottom - orig.top - 1,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+            LOGI("BFI Presenter: NudgeGameResize: still no resize -- window made 1 pixel shorter for half a second");
+            g_nudgeStage.store(2);
+        }
+        else
+        {
+            PostMessageW(w, WM_SIZE, SIZE_RESTORED, MAKELPARAM(rc.right, rc.bottom - 2));
+            PostMessageW(w, WM_SIZE, SIZE_RESTORED, real);
+            LOGI("BFI Presenter: NudgeGameResize: still no resize (exclusive fullscreen) -- told the window a size 2 pixels shorter, then its own");
+            g_nudgeStage.store(3);
+        }
+        stageT = t;
     }
-    else
+    else if (stage == 2)
+    {
+        if (t - stageT < 0.5) return;
+        SetWindowPos(origWnd, nullptr, 0, 0, orig.right - orig.left, orig.bottom - orig.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        g_nudgeStage.store(3); stageT = t;
+    }
+    else if (stage == 3)
+    {
+        if (t - stageT < 3.0) return;
         LOGW("BFI Presenter: NudgeGameResize: the game didn't resize its swap chain -- change resolution or display mode once to start BFI");
-    g_nudgeStage.store(stage + 1);
+        g_nudgeStage.store(4);
+    }
 }
 
 static DWORD WINAPI WatchdogThread(void *)
@@ -5183,6 +5226,13 @@ static void FgPaceAfterPresent()
 
 static HRESULT SubmitGameFrame()
 {
+    g_lastGamePresentT.store(Now());
+    if (g_deferPresenter.load() && (g_frameId & 63) == 0 && g_sc)
+    {   // NudgeGameResize: exclusive fullscreen or not (read on the game's thread, every 64 frames while BFI waits)
+        BOOL fs = FALSE;
+        OwnCall own;
+        if (SUCCEEDED(g_sc->GetFullscreenState(&fs, nullptr))) g_fs12.store(fs != FALSE);
+    }
     CountPresent();
     CountTo(g_feCount);
     const DWORD tid = GetCurrentThreadId();
@@ -9190,6 +9240,11 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
                            (cur.waitResizeAll || (cur.deferRecreated && g_swapChainsManaged > 1)));
     g_deferSinceT.store(Now());
     g_nudgeStage.store(0);
+    {
+        BOOL fs = FALSE;
+        OwnCall own;
+        if (sc3 && SUCCEEDED(sc3->GetFullscreenState(&fs, nullptr))) g_fs12.store(fs != FALSE);
+    }
     if (g_deferPresenter.load())
         LOGI("BFI Presenter: %s -- the game presents its own frames (no BFI) until it resizes the swap chain; "
              "if BFI doesn't start, change resolution or display mode once",
