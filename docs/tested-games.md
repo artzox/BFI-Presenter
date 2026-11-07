@@ -1,6 +1,6 @@
 # BFI Presenter — Tested Games
 
-Last updated October 2026. "Min. version" is the first BFI Presenter version each game was confirmed working with; "VK" marks the Vulkan layer.
+Last updated November 2026. "Min. version" is the first BFI Presenter version each game was confirmed working with; "VK" marks the Vulkan layer.
 
 ## Required setup (all games)
 
@@ -107,7 +107,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Hotshot Racing | Standard setup |
 | INSIDE | Standard setup |
 | Jotun | Standard setup |
-| Journey | Standard setup |
+| Journey | Standard setup; at a resolution above the display's (e.g. 5120x2880 on a 3840x2160 display) BFI flickered before v1.0.33, which scales the frames to the window (`ScaleToWindow`) |
 | Layers of Fear 2 | Standard setup |
 | Legacy of Kain: Defiance Remastered | Works with DLSS 5 |
 | Little Nightmares (Enhanced Edition) | Standard setup |
