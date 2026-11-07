@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.32"
+#define BFI_ADDON_VERSION "1.0.33"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -145,6 +145,7 @@ struct Settings
     int   deferRecreated = 1; // recreated swap chains: no BFI until the game resizes (safe)
     int   virtualStats = 1;   // report frame statistics in terms of the game's own frames
     int   reuseBuffers = 1;   // present an already-drawn buffer again instead of redrawing it
+    int   fitWindow = 1;      // DX11/DX9/OpenGL: game frames larger than the window are scaled down by the presenter
     int   flashHints = 1;     // overlay: suggest the next step when refreshes keep being missed (flashes)
     int   waitResizeAll = 1;  // every swap chain: no BFI until the game first resizes it
     int   selfResize = 0;     // ... and the game hasn't after a few seconds: the presenter resizes it (same size; first swap chain)
@@ -299,6 +300,7 @@ static void LoadSettings(Settings &s)
     s.deferRecreated = IniInt("WaitForResizeOnRecreatedSwapChain", 1) ? 1 : 0;
     s.virtualStats = IniInt("GameFrameStatistics", 1) ? 1 : 0;
     s.reuseBuffers = IniInt("ReuseDrawnBuffers", 1) ? 1 : 0;
+    s.fitWindow = IniInt("ScaleToWindow", 1) ? 1 : 0;
     s.flashHints = IniInt("FlashHints", 1) ? 1 : 0;
     s.waitResizeAll = IniInt("StartBFIAfterGameResize", 1) ? 1 : 0;
     s.selfResize = IniInt("PresenterResize", 0) ? 1 : 0;
@@ -473,6 +475,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
     IniWriteInt("GameFrameStatistics", s.virtualStats);
     IniWriteInt("ReuseDrawnBuffers", s.reuseBuffers);
+    IniWriteInt("ScaleToWindow", s.fitWindow);
     IniWriteInt("FlashHints", s.flashHints);
     IniWriteInt("AutoCapOwnWithoutFg", s.autoCapOwn);
     IniWriteInt("StartBFIAfterGameResize", s.waitResizeAll);
@@ -748,6 +751,7 @@ static ID3D12Device          *g_device = nullptr;
 static ID3D12CommandQueue    *g_gameQueue = nullptr;
 
 static DXGI_SWAP_CHAIN_DESC1  g_desc = {};
+static UINT g_srcW = 0, g_srcH = 0;   // DX11/DX9/OpenGL: the game's frame size (staging); g_desc can be smaller (ScaleToWindow)
 static DXGI_FORMAT            g_stageFmt = DXGI_FORMAT_UNKNOWN;   // the game's frames (staging ring); g_desc.Format if unknown
 static std::atomic<bool>      g_hdrUp{false};   // SDR game presented as HDR10 (SdrToHdr): the presenter's own swap chain
                                                  // (DX11 / DX9 / OpenGL), or the DX12 game's real buffers (g_stageFmt: the game's)
@@ -1484,8 +1488,26 @@ cbuffer C : register(b0)
     float sdrKnee;    // highlight expansion starts here (linear, 1.0 = SDR white)
     float sdrPeak;    // SDR white highlights expand to this (80-nit units); <= sdrScale = off
     float gamut;      // outType 4: gamut expansion strength (0 = off)
+    float2 srcPerOut; // game frame pixels per output pixel: 1 = the same size; > 1 = scaled down to the window
 };
 Texture2D<float4> src : register(t0);
+SamplerState linClamp : register(s0);
+
+// The game's frame at output pixel pos. Same size: the pixel itself. Larger (a 5K frame in a 4K window): four bilinear
+// taps across the output pixel's footprint, an area filter for up to 2x.
+float3 Fetch(float2 pos)
+{
+    if (srcPerOut.x <= 1.0001 && srcPerOut.y <= 1.0001) return src.Load(int3(pos, 0)).rgb;
+    uint w, h;
+    src.GetDimensions(w, h);
+    float2 inv = 1.0 / float2(w, h);
+    float2 cp = pos * srcPerOut;
+    float2 o = 0.25 * srcPerOut;
+    return 0.25 * (src.SampleLevel(linClamp, (cp + float2(-o.x, -o.y)) * inv, 0).rgb +
+                   src.SampleLevel(linClamp, (cp + float2( o.x, -o.y)) * inv, 0).rgb +
+                   src.SampleLevel(linClamp, (cp + float2(-o.x,  o.y)) * inv, 0).rgb +
+                   src.SampleLevel(linClamp, (cp + float2( o.x,  o.y)) * inv, 0).rgb);
+}
 
 float4 VSMain(uint id : SV_VertexID) : SV_Position
 {
@@ -1727,7 +1749,7 @@ float DecayShare(uint s, float phi, float T, float n)
 
 float4 PSMain(float4 pos : SV_Position) : SV_Target
 {
-    float3 c = src.Load(int3(pos.xy, 0)).rgb;
+    float3 c = Fetch(pos.xy);
     if (method == 2) return float4(outType == 4 ? Encode(Decode(c)) : c, 1);
     float3 lin = Decode(c);
     float litGain = Inverted() ? float(frames) * gain / float(frames - 1) : float(frames) * gain;
@@ -1752,7 +1774,7 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
         uint w, h;
         src.GetDimensions(w, h);
         float n = float(frames);
-        float phi = (pos.y / float(h)) * n;
+        float phi = (pos.y * srcPerOut.y / float(h)) * n;
         float T = max(decay, 0.02);
         o = float3(0, 0, 0);
         [unroll] for (uint j = 0; j < 8; j++)
@@ -1774,7 +1796,7 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
         // the seam between two bands it is shared between their sub-frames.
         uint w, h;
         src.GetDimensions(w, h);
-        float u = (pos.y / float(h)) * float(frames);
+        float u = (pos.y * srcPerOut.y / float(h)) * float(frames);
         uint band = min((uint)u, frames - 1);
         float f = u - float(band);
         float hw = max(seam * float(frames) * 0.5, 1e-4);
@@ -1810,6 +1832,7 @@ struct Constants
     float    sdrKnee;     // highlight expansion knee (linear, 1 = SDR white)
     float    sdrPeak;     // expanded SDR white (80-nit units); <= sdrScale = off
     float    gamut;       // outType 4: gamut expansion strength (0 = off)
+    float    srcPerOutX, srcPerOutY;   // game frame pixels per output pixel (1 = same size)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -2858,9 +2881,17 @@ static DWORD WINAPI PresenterThread(void *)
         params[1].DescriptorTable.NumDescriptorRanges = 1;
         params[1].DescriptorTable.pDescriptorRanges   = &range;
         params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_STATIC_SAMPLER_DESC samp = {};
+        samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp.MaxLOD = D3D12_FLOAT32_MAX;
+        samp.ShaderRegister = 0;
+        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
         rsd.NumParameters = 2;
         rsd.pParameters   = params;
+        rsd.NumStaticSamplers = 1;
+        rsd.pStaticSamplers   = &samp;
         ok = SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsBlob, &rsErr));
         ok = ok && SUCCEEDED(g_device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
                                                            IID_PPV_ARGS(&rootSig)));
@@ -3354,6 +3385,8 @@ static DWORD WINAPI PresenterThread(void *)
 
         Constants c = {};
         c.outType = (uint32_t)ResolveOutput(s);
+        c.srcPerOutX = (g_dx11.load() && g_srcW && g_desc.Width) ? (float)g_srcW / (float)g_desc.Width : 1.0f;
+        c.srcPerOutY = (g_dx11.load() && g_srcH && g_desc.Height) ? (float)g_srcH / (float)g_desc.Height : 1.0f;
         if ((int)c.outType != lastOutType)
         {
             static const char *kOut[] = { "SDR", "HDR scRGB", "HDR10 (PQ)", "?", "SDR shown as HDR10" };
@@ -7088,6 +7121,26 @@ static void DestroyChildWindow()
     }
 }
 
+// The presenter's swap chain size for game frames of w x h. A swap chain larger than the window it shows in can't be
+// flipped to the display: Windows' compositor scales it, and a present that reaches it just after the vblank is shown a
+// refresh late, which breaks the lit/dark order (Journey at 5120x2880 on a 3840x2160 display flickered). With
+// ScaleToWindow on, frames larger than the window's client area are scaled down by the presenter's own pass instead
+// (aspect kept), so its swap chain matches the window. Smaller frames stay as they are.
+static void OutSize11(const Settings &cur, HWND hwnd, UINT w, UINT h, UINT &ow, UINT &oh)
+{
+    ow = w; oh = h;
+    if (!cur.fitWindow || !hwnd || !w || !h) return;
+    RECT r = {};
+    if (!GetClientRect(hwnd, &r) || r.right - r.left <= 0 || r.bottom - r.top <= 0) return;
+    const UINT cw = (UINT)(r.right - r.left), ch = (UINT)(r.bottom - r.top);
+    if (w <= cw && h <= ch) return;
+    const double sc = (std::min)((double)cw / w, (double)ch / h);
+    ow = (std::max)(1u, (UINT)(w * sc + 0.5));
+    oh = (std::max)(1u, (UINT)(h * sc + 0.5));
+    if (ow + 1 >= cw && ow <= cw + 1) ow = cw;        // same aspect: exactly the window
+    if (oh + 1 >= ch && oh <= ch + 1) oh = ch;
+}
+
 // Keep the child window over the game window's client area.
 static void Sync11Window()
 {
@@ -7150,8 +7203,8 @@ static bool CreateStage11()
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC rd = {};
         rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width            = g_desc.Width;
-        rd.Height           = g_desc.Height;
+        rd.Width            = g_srcW ? g_srcW : g_desc.Width;
+        rd.Height           = g_srcH ? g_srcH : g_desc.Height;
         rd.DepthOrArraySize = 1;
         rd.MipLevels        = 1;
         rd.Format           = StageFormat();
@@ -7167,7 +7220,7 @@ static bool CreateStage11()
         if (FAILED(hr))
         {
             LOGE("BFI Presenter: DX11: shared staging texture %u failed in %s (0x%08lX), %ux%u format %u", s, step,
-                 (unsigned long)hr, g_desc.Width, g_desc.Height, (unsigned)StageFormat());
+                 (unsigned long)hr, (unsigned)rd.Width, rd.Height, (unsigned)StageFormat());
             ReleaseStage11();
             return false;
         }
@@ -7177,8 +7230,10 @@ static bool CreateStage11()
     }
     g_presCurSlot = -1;
     g_stageNext = 0;
-    LOGI("BFI Presenter: DX11: presenting %ux%u, format %u, %u buffers (game: format %u, %u buffers)",
-         g_desc.Width, g_desc.Height, (unsigned)g_desc.Format, g_bufCount, (unsigned)g_desc11.Format, g_desc11.BufferCount);
+    LOGI("BFI Presenter: DX11: presenting %ux%u, format %u, %u buffers (game: %ux%u, format %u, %u buffers)%s",
+         g_desc.Width, g_desc.Height, (unsigned)g_desc.Format, g_bufCount, g_srcW ? g_srcW : g_desc.Width,
+         g_srcH ? g_srcH : g_desc.Height, (unsigned)g_desc11.Format, g_desc11.BufferCount,
+         (g_srcW && (g_srcW != g_desc.Width || g_srcH != g_desc.Height)) ? " -- the game's frames are scaled down to the window by the presenter" : "");
     EnterCriticalSection(&g_cfgLock);
     g_status.width = g_desc.Width; g_status.height = g_desc.Height;
     g_status.buffers = g_bufCount; g_status.format = (UINT)g_desc.Format;
@@ -7626,8 +7681,8 @@ static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 
     if (ok)
     {
         DXGI_SWAP_CHAIN_DESC1 sd = {};
-        sd.Width       = d.Width;
-        sd.Height      = d.Height;
+        g_srcW = d.Width; g_srcH = d.Height;
+        OutSize11(cur, hwnd, d.Width, d.Height, sd.Width, sd.Height);
         sd.Format      = g_hdrUp.load() ? DXGI_FORMAT_R10G10B10A2_UNORM : ff;
         sd.SampleDesc.Count = 1;
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -7663,7 +7718,7 @@ static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 
                 LOGW("BFI Presenter: %s: HDR10 not supported for presentation on this swap chain -- staying SDR", what);
                 g_hdrUp.store(false);
                 OwnCall own;
-                SC_DIRECT(PFN_ResizeBuffers, 13)(g_sc, 0, d.Width, d.Height, ff, 0);
+                SC_DIRECT(PFN_ResizeBuffers, 13)(g_sc, 0, sd.Width, sd.Height, ff, 0);
             }
             else LOGI("BFI Presenter: %s: SDR game presented as HDR10 (SDR white %.0f nits%s) for BFI headroom", what, cur.sdrWhite,
                       cur.sdrGamma ? ", gamma 2.2" : "");
@@ -7772,9 +7827,10 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
     ID3D11Texture2D *bb = getFrame();
     D3D11_TEXTURE2D_DESC bd = {};
     if (bb) bb->GetDesc(&bd);
-    if (!bb || bd.Width != g_desc.Width || bd.Height != g_desc.Height)
+    const UINT stW = g_srcW ? g_srcW : g_desc.Width, stH = g_srcH ? g_srcH : g_desc.Height;
+    if (!bb || bd.Width != stW || bd.Height != stH)
     {
-        if (!g_sizeLogged) { g_sizeLogged = true; LOGW("BFI Presenter: DX11: back buffer %ux%u does not match the presenter (%ux%u)", bd.Width, bd.Height, g_desc.Width, g_desc.Height); }
+        if (!g_sizeLogged) { g_sizeLogged = true; LOGW("BFI Presenter: DX11: back buffer %ux%u does not match the presenter (%ux%u)", bd.Width, bd.Height, stW, stH); }
         SafeRelease(bb);
         ReleaseGameSlot();               // no frame staged: nothing would release the slot it took
         LeaveCriticalSection(&g_submitLock);
@@ -7910,8 +7966,15 @@ static HRESULT Resize11(IDXGISwapChain *sc, UINT cnt, UINT w, UINT h, DXGI_FORMA
     }
     HRESULT hr2;
     {
+        Settings cur;
+        EnterCriticalSection(&g_cfgLock);
+        cur = g_shared;
+        LeaveCriticalSection(&g_cfgLock);
+        UINT ow = d.Width, oh = d.Height;
+        g_srcW = d.Width; g_srcH = d.Height;
+        OutSize11(cur, g_gameHwnd, d.Width, d.Height, ow, oh);
         OwnCall own;
-        hr2 = SC_DIRECT(PFN_ResizeBuffers, 13)(g_sc, 0, d.Width, d.Height, g_hdrUp.load() ? DXGI_FORMAT_R10G10B10A2_UNORM : ff, 0);
+        hr2 = SC_DIRECT(PFN_ResizeBuffers, 13)(g_sc, 0, ow, oh, g_hdrUp.load() ? DXGI_FORMAT_R10G10B10A2_UNORM : ff, 0);
     }
     LOGI("BFI Presenter: DX11: game resized to %ux%u format %u (0x%08lX); presenter swap chain 0x%08lX",
          d.Width, d.Height, (unsigned)d.Format, (unsigned long)hr, (unsigned long)hr2);

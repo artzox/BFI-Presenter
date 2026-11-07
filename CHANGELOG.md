@@ -7,6 +7,14 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.33] — 2026-11-07 (Manager 1.3.17)
+
+**No more flicker in DX11, DX9 and OpenGL games running above the display resolution.**
+
+- **[DX] No flicker in games rendering above the display resolution** (`ScaleToWindow`, on by default). In DX11, DX9 and OpenGL games whose resolution is larger than their window (e.g. 5120x2880 on a 3840x2160 display), the presenter now scales each frame down to the window itself, so its swap chain matches the screen. Before, Windows scaled it, and a flash that reached it just after the vblank was shown a refresh late, swapping a lit and a dark refresh (Journey flickered at 5K while the ABL guard was adjusting the brightness). The log says when frames are scaled.
+- **[Vulkan]** No changes; the version follows the DX add-on.
+- **[Docs]** Settings guide: **Scale to the window**. Tested games: Journey above the display resolution.
+
 ## [1.0.32] — 2026-11-07 (Manager 1.3.17)
 
 **SDR to HDR in 10-bit DX12 games, and a safer swap chain resize to start BFI.**
