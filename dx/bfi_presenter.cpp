@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.33"
+#define BFI_ADDON_VERSION "1.0.34-t1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -163,6 +163,7 @@ struct Settings
     int   reportTyped = 1;    // stand-in back buffers report the swap chain's typed format from GetDesc
     int   queuePriority = 2;  // presenter GPU queue: 0 normal, 1 high, 2 realtime if allowed else high
     int   pacing   = 1;       // 1 = wait for vblank before each present, 0 = present queue only
+    int   vrrHz    = 0;       // VrrStrobeHz (test): > 0 = with VRR on, the presenter presents on its own clock at this rate
     int   log      = 0;
     int   dx11     = 1;       // manage DX11 games (through the add-on's own D3D12 presenter)
     // SDR to HDR (DX11, DX9, OpenGL: the presenter's own swap chain): an SDR game on an HDR display is presented as
@@ -337,6 +338,8 @@ static void LoadSettings(Settings &s)
     if (s.maxAhead > 3) s.maxAhead = 3;
     g_maxAhead.store(s.autoAhead && s.maxAhead ? 1 : s.maxAhead);
     s.pacing   = IniInt("WaitForVBlank", 1);
+    s.vrrHz    = IniInt("VrrStrobeHz", 0);
+    if (s.vrrHz != 0 && (s.vrrHz < 40 || s.vrrHz > 500)) s.vrrHz = 0;
     s.log      = IniInt("Log", 0);
     s.dx11     = IniInt("DX11Support", 1) ? 1 : 0;
     s.sdrToHdr = IniInt("SdrToHdr", 1) ? 1 : 0;
@@ -493,6 +496,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("HitchGuardLoadingMs", s.hitchGapMs);
     IniWriteInt("DX11Support", s.dx11);
     IniWriteInt("WaitForVBlank", s.pacing);
+    IniWriteInt("VrrStrobeHz", s.vrrHz);
     IniWriteInt("Log", s.log);
 }
 
@@ -2965,6 +2969,21 @@ static DWORD WINAPI PresenterThread(void *)
             && dm.dmDisplayFrequency > 1)
             modeHz = ExactRefreshHz(od.DeviceName, (double)dm.dmDisplayFrequency);
     }
+    // VRR clock (VrrStrobeHz, test): with VRR (G-SYNC) on, each present starts a refresh, so presenting on an exact
+    // clock of the presenter's own sets the refresh rate -- any rate inside the VRR range, e.g. 110 Hz for a game at
+    // 55 fps with 2 frames per cycle, without a display mode for it. Each refresh's image is drawn and finished on the
+    // GPU first, then presented at its moment, so only the present itself is left to vary. The display's own flip
+    // times (frame statistics) are logged against the clock: with BFI every refresh's length is part of the
+    // brightness, so they have to stay within a few tenths of a millisecond.
+    const double modeHzDisp = modeHz;
+    double vrrHzEff = 0.0, vrrNext = 0.0, vrrLead = 0.0025, vrrWake = 0.0, vrrWinT = 0.0;
+    int    vrrSet = -1, vrrLogs = 0, vrrLateN = 0, vrrResync = 0;
+    UINT   vrrLastPC = 0; LONGLONG vrrLastQpc = 0;
+    double vrrDev[2048]; int vrrDevN = 0; double vrrSum = 0.0, vrrMax = 0.0; int vrrOff = 0;
+    double vrrCpuDev[2048]; int vrrCpuN = 0; double vrrLastCall = 0.0;
+    HANDLE vrrTimer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /*HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
+    HANDLE vrrEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    LARGE_INTEGER vrrQf; QueryPerformanceFrequency(&vrrQf);
 
     if (!ok)
     {
@@ -3224,7 +3243,40 @@ static DWORD WINAPI PresenterThread(void *)
         // at a steady 60 fps, visible judder under BFI in every pacing mode
         // (The Midnight Walk).
         bool tickedAtVb = false;
-        if ((s.pacing || vsyncOverridden) && output && !refillNow)
+        if (s.vrrHz != vrrSet)
+        {
+            vrrSet = s.vrrHz;
+            vrrHzEff = 0.0;
+            if (s.vrrHz > 0 && modeHzDisp > 0.0 && s.vrrHz > modeHzDisp - 1.0)
+                LOGW("BFI Presenter: VRR clock: %d Hz isn't below the display mode's %.1f Hz -- not used (the normal vblank pacing "
+                     "already runs at the mode's rate)", s.vrrHz, modeHzDisp);
+            else if (s.vrrHz > 0)
+            {
+                vrrHzEff = (double)s.vrrHz;
+                LOGI("BFI Presenter: VRR clock on: presenting at %d Hz on the presenter's own clock (display mode %.1f Hz); needs "
+                     "G-SYNC/VRR on for this game, for windowed and full screen mode, and %d Hz inside the display's VRR range",
+                     s.vrrHz, modeHzDisp, s.vrrHz);
+            }
+            else if (vrrHzEff <= 0.0 && vrrLogs) LOGI("BFI Presenter: VRR clock off -- vblank pacing again");
+            modeHz = vrrHzEff > 0.0 ? vrrHzEff : modeHzDisp;
+            vrrNext = 0.0; vrrLogs = 0; vrrWinT = 0.0; vrrDevN = vrrCpuN = 0; vrrSum = vrrMax = 0.0; vrrOff = vrrLateN = vrrResync = 0;
+            vrrLastPC = 0; vrrLastQpc = 0; vrrLastCall = 0.0;
+        }
+        if (vrrHzEff > 0.0 && !refillNow)
+        {
+            const double per = 1.0 / vrrHzEff;
+            const double tw = Now();
+            if (vrrNext <= 0.0 || tw > vrrNext + per) { if (vrrNext > 0.0) vrrResync++; vrrNext = tw + per; }
+            SleepUntil(vrrNext - vrrLead, vrrTimer);
+            vrrWake = Now();
+            g_strobeFrames.store(s.frames);
+            g_tickSlot.store((int)((presents - phaseShift) % (uint64_t)s.frames));
+            g_tickT.store(vrrWake);
+            g_tickCount.fetch_add(1);
+            SetEvent(g_tickEvent);
+            tickedAtVb = true;
+        }
+        else if ((s.pacing || vsyncOverridden) && output && !refillNow)
         {
             output->WaitForVBlank();
             g_strobeFrames.store(s.frames);
@@ -3580,11 +3632,60 @@ static DWORD WINAPI PresenterThread(void *)
         bufValid[bi] = true;
         }
 
+        if (vrrHzEff > 0.0)
+        {
+            // VRR clock: this refresh's image finished on the GPU, then presented at its moment.
+            WaitFence(g_presFence, bufFence[bi], vrrEv);
+            const double ready = Now(), per = 1.0 / vrrHzEff;
+            vrrLead = std::min(0.6 * per, std::max(0.001, std::max(vrrLead * 0.9995, ready - vrrWake + 0.0006)));
+            if (ready > vrrNext) vrrLateN++;
+            while (Now() < vrrNext) YieldProcessor();
+        }
         const double tSub = Now();
         PresStage(ST_PRESENT);
         HRESULT hr;
         hr = OwnPresent();
         const double tPres = Now();
+        if (vrrHzEff > 0.0)
+        {
+            const double per = 1.0 / vrrHzEff;
+            if (vrrLastCall > 0.0 && vrrCpuN < 2048) vrrCpuDev[vrrCpuN++] = fabs((tSub - vrrLastCall) - per);
+            vrrLastCall = tSub;
+            vrrNext += per;
+            // The display's flip times: consecutive presents' SyncQPCTime, against the clock's period.
+            DXGI_FRAME_STATISTICS vs = {};
+            if (SUCCEEDED(ScStats(&vs)) && vs.PresentCount != vrrLastPC)
+            {
+                if (vrrLastQpc && vs.PresentCount == vrrLastPC + 1)
+                {
+                    const double iv = (double)(vs.SyncQPCTime.QuadPart - vrrLastQpc) / (double)vrrQf.QuadPart;
+                    const double dv = fabs(iv - per);
+                    if (vrrDevN < 2048) vrrDev[vrrDevN++] = dv;
+                    vrrSum += iv; if (dv > vrrMax) vrrMax = dv; if (dv > 0.00025) vrrOff++;
+                }
+                vrrLastPC = vs.PresentCount; vrrLastQpc = vs.SyncQPCTime.QuadPart;
+            }
+            const double tN = Now();
+            if (vrrWinT <= 0.0) vrrWinT = tN;
+            const double win = vrrLogs < 5 ? 1.0 : 10.0;
+            if (tN - vrrWinT >= win)
+            {
+                auto pct = [](double *a, int n, double q) { if (n <= 0) return -1.0; std::sort(a, a + n); return a[std::min(n - 1, (int)(q * n))]; };
+                const int nd = vrrDevN;
+                const double mean = nd ? vrrSum / nd : 0.0;
+                const double p50 = pct(vrrDev, nd, 0.5), p99 = pct(vrrDev, nd, 0.99);
+                const double c99 = pct(vrrCpuDev, vrrCpuN, 0.99);
+                LOGI("BFI Presenter: VRR clock %.0f Hz (%.2f ms): %d refreshes measured, mean %.3f ms (%.1f Hz); off by median %.3f, "
+                     "99%% %.3f, worst %.3f ms; %d off by more than 0.25 ms; presents late %d, clock restarts %d; present calls "
+                     "off by 99%% %.3f ms; draw lead %.2f ms", vrrHzEff, per * 1000.0, nd, mean * 1000.0, mean > 0.0 ? 1.0 / mean : 0.0,
+                     p50 * 1000.0, p99 * 1000.0, vrrMax * 1000.0, vrrOff, vrrLateN, vrrResync, c99 * 1000.0, vrrLead * 1000.0);
+                if (nd >= 20 && fabs(mean - per) > 0.03 * per)
+                    LOGW("BFI Presenter: VRR clock: the display's refreshes average %.1f Hz, not %.0f Hz -- they aren't following the "
+                         "presenter's presents. Is G-SYNC/VRR on for this game, for windowed and full screen mode, and %.0f Hz inside "
+                         "the display's VRR range?", 1.0 / mean, vrrHzEff, vrrHzEff);
+                vrrLogs++; vrrWinT = tN; vrrDevN = vrrCpuN = 0; vrrSum = vrrMax = 0.0; vrrOff = vrrLateN = vrrResync = 0;
+            }
+        }
         if (tPres - tSub > 0.75 / (modeHz > 0.0 ? modeHz : 120.0)) secSlowPres++;
         PresStage(ST_IDLE);
         g_lastPresentHr.store(hr);
@@ -3657,7 +3758,7 @@ static DWORD WINAPI PresenterThread(void *)
             g_tickCount.fetch_add(1);
             SetEvent(g_tickEvent);
         }
-        if (s.pacing && s.queueAhead && n >= 3 && !vsyncOverridden)
+        if (s.pacing && s.queueAhead && n >= 3 && !vsyncOverridden && vrrHzEff <= 0.0)
         {
             UINT lastPC = 0;
             DXGI_FRAME_STATISTICS qs = {};
@@ -4772,6 +4873,8 @@ static DWORD WINAPI PresenterThread(void *)
     SafeRelease(rtvHeap);
     CloseHandle(ev);
     if (llEv) CloseHandle(llEv);
+    if (vrrTimer) CloseHandle(vrrTimer);
+    if (vrrEv) CloseHandle(vrrEv);
     EnterCriticalSection(&g_cfgLock);
     g_status.running = 0;
     LeaveCriticalSection(&g_cfgLock);
