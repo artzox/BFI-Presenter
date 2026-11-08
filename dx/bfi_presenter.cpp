@@ -115,6 +115,18 @@ struct Settings
     int   lcdDriftSec = 10;  // Gradual at 2 frames: seconds one drift to the other refresh takes (2-60)
     float rollSeam = 0.0f;    // blended zone between bands, fraction of the screen height
     float rollDecay = 0.2f;   // rolling scan phosphor decay, in sub-frames (0 = off: hard bands + seam)
+    int   splitTest = 0;      // SplitTest: perception test, the left half strobes at splitLeft, the right half in full
+    float splitLeft = 0.0f;   // SplitTestLeft: left half's strobe strength, 0..1 (0 = steady picture, 1 = as the right half)
+    int   splitSeamPx = 0;    // SplitTestSeamPx: width of a soft seam in output pixels (0 = hard edge)
+    int   motionMode = 0;     // MotionMode: DLSS Motion Vector Strobing: 0 = off (no hook), 1 = global strength, 2 = per object, 3 = debug heatmap
+    int   motionEdgeBlurPx = 24; // MotionEdgeBlurPx: per object: radius the edges of strobed areas fade over, in pixels of a 1920-wide picture
+    int   motionBlurPx = 12;  // MotionBlurPx: motion blur accepted per held image, in pixels of a 1920-wide picture
+    int   motionRiseMs = 100; // MotionRiseMs: global: time for the strength to go from 0 to 100 %
+    int   motionFallMs = 500; // MotionFallMs: global: time for the strength to go from 100 % to 0
+    int   motionCenterPct = 50;  // MotionCenterPct: share of the screen's area, around its centre, that is measured (100 = all of it)
+    int   motionIgnorePct = 10;  // MotionIgnoreTopPct: the fastest part of the screen left out (small fast objects, bad vectors)
+    int   motionAveragePct = 20; // MotionAveragePct: the part of the screen below that which is averaged into the speed
+    int   motionSmoothMs = 80;   // MotionSmoothMs: smoothing of the measured speed
     float knee     = 0.75f;
     float peakNits = 1400.0f; // display peak (HDR ceiling)
     int   output   = -1;      // -1 auto, 0 SDR, 1 scRGB, 2 HDR10
@@ -265,6 +277,18 @@ static void LoadSettings(Settings &s)
     s.rollSeam = IniFloat("RollingSeam", 0.0f);
     if (s.rollSeam < 0.0f) s.rollSeam = 0.0f;
     if (s.rollSeam > 0.5f) s.rollSeam = 0.5f;
+    s.splitTest = IniInt("SplitTest", 0) ? 1 : 0;
+    s.splitLeft = (float)std::min(100, std::max(0, IniInt("SplitTestLeft", 0))) / 100.0f;
+    s.splitSeamPx = std::min(200, std::max(0, IniInt("SplitTestSeamPx", 0)));
+    s.motionMode = s.splitTest ? 0 : std::min(3, std::max(0, IniInt("MotionMode", 0)));   // the same dropdown: one or the other
+    s.motionEdgeBlurPx = std::min(64, std::max(0, IniInt("MotionEdgeBlurPx", 24)));
+    s.motionBlurPx = std::min(16, std::max(2, IniInt("MotionBlurPx", 12)));
+    s.motionRiseMs = std::min(2000, std::max(20, IniInt("MotionRiseMs", 100)));
+    s.motionFallMs = std::min(4000, std::max(20, IniInt("MotionFallMs", 500)));
+    s.motionCenterPct = std::min(100, std::max(20, IniInt("MotionCenterPct", 50)));
+    s.motionIgnorePct = std::min(50, std::max(0, IniInt("MotionIgnoreTopPct", 10)));
+    s.motionAveragePct = std::min(50, std::max(1, IniInt("MotionAveragePct", 20)));
+    s.motionSmoothMs = std::min(500, std::max(0, IniInt("MotionSmoothMs", 80)));
     s.rollDecay = IniFloat("RollingPhosphorDecay", 0.2f);
     if (s.rollDecay < 0.0f) s.rollDecay = 0.0f;
     if (s.rollDecay > 1.0f) s.rollDecay = 1.0f;
@@ -434,6 +458,18 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("InvertCycle", s.invert);
     IniWriteInt("HighlightRolloff", s.rolloff);
     IniWriteInt("RollingScan", s.rolling);
+    IniWriteInt("SplitTest", s.splitTest);
+    IniWriteInt("SplitTestLeft", (int)floor(s.splitLeft * 100.0f + 0.5f));
+    IniWriteInt("SplitTestSeamPx", s.splitSeamPx);
+    IniWriteInt("MotionMode", s.motionMode);
+    IniWriteInt("MotionEdgeBlurPx", s.motionEdgeBlurPx);
+    IniWriteInt("MotionBlurPx", s.motionBlurPx);
+    IniWriteInt("MotionRiseMs", s.motionRiseMs);
+    IniWriteInt("MotionFallMs", s.motionFallMs);
+    IniWriteInt("MotionCenterPct", s.motionCenterPct);
+    IniWriteInt("MotionIgnoreTopPct", s.motionIgnorePct);
+    IniWriteInt("MotionAveragePct", s.motionAveragePct);
+    IniWriteInt("MotionSmoothMs", s.motionSmoothMs);
     IniWriteInt("LcdPhaseSwap", s.lcdSwap);
     IniWriteInt("LcdPhaseSwapSeconds", s.lcdSwapSec);
     IniWriteInt("LcdSaverGradual", s.lcdGradual);
@@ -765,6 +801,70 @@ static UINT64                 g_stageFence[kStage] = {};   // game-queue fence v
 static UINT64                 g_stageId[kStage] = {};      // game frame number (0 = empty)
 static double                 g_stageTime[kStage] = {};
 static UINT64                 g_readFence[kStage] = {};    // presenter fence value of the last read
+// MotionSource: the game's motion vectors for each game frame, copied out of its DLSS call into a ring of our own.
+// g_mvLock guards everything here and is never held while taking another lock.
+static const UINT kMvRing = 4;
+struct MvEntry
+{
+    UINT64 frameId;                 // game frame these vectors belong to (0 = not yet tied to one)
+    UINT   renderW, renderH;        // size of the picture DLSS got
+    UINT   outW, outH;              // size DLSS produces
+    float  scaleX, scaleY;          // vector x scale = render pixels
+    UINT   baseX, baseY;            // origin of the active MV subrect in the texture
+    bool   renderPixelVectors;     // verified Streamline convention, including high-resolution MV textures
+    int    flags;                   // DLSS feature flags
+    bool   flagsKnown;              // the DLSS call reported them
+    double time;
+};
+struct MvStatus
+{
+    int    source;                  // 0 none, 1 NGX (DLSS Evaluate, also reached through Streamline)
+    int    calls;                   // DLSS calls seen in total
+    UINT   texW, texH;
+    int    format;
+    float  scaleX, scaleY;
+    int    age;                     // game frames between the frame shown and its vectors; -1 = none in use
+    float  fastestPx, fastestPxS;   // fastest vector in the frame: output pixels per game frame, per second
+    float  averagePx;
+    float  bandPxS;                 // the speed that decides the strength (see MvBandAverage), output pixels per second
+    float  startPxS;                // the speed the game's frame rate can still show cleanly
+    float  needHz;                  // clarity that speed takes
+    float  heldHz;                  // the rate the picture is shown at unstrobed: colours start above it
+    float  fastestNeedHz;           // clarity the fastest vector anywhere on the screen would take
+    bool   zeroButMoving;           // the game has never filled in its vectors although the picture changes
+    double lastCallT;               // when DLSS last ran
+    bool   unavailable;             // no vectors to use at the moment (DLSS not running): full strobe
+    int    stagedSec, noCopySec;    // game frames this second, and those without a copy of their vectors
+    float  noCopyPct1, noCopyPct5;  // share of game frames without a copy: last 1 s, last 5 s
+    float  missPct1, missPct5;      // share of strobe cycles shown without usable vectors: last 1 s, last 5 s
+    double firstCallT;              // when DLSS was first seen: nothing is reported for the first seconds after it
+    const char *fallback;           // why the full strobe was last used instead of the vectors (nullptr = not yet)
+    double fallbackEndT;            // when it last ended
+};
+static CRITICAL_SECTION       g_mvLock;
+static ID3D12Resource        *g_mvRing[kMvRing] = {};
+struct MvRetired
+{
+    ID3D12Resource *resource;
+    UINT64 afterStage, gameFence, presFence;
+};
+static std::vector<MvRetired>  g_mvRetired;
+static UINT64                 g_mvStageSerial = 0;       // g_mvLock; includes eight future staged frames before retirement
+static int                    g_mvPresenterSlot = -1;    // CPU selection pin, until its read fence is published (or reuse)
+static UINT64                 g_mvShownId = 0;             // game frame the presenter last showed: newer vectors are still needed
+static UINT                   g_mvRingW = 0, g_mvRingH = 0;
+static DXGI_FORMAT            g_mvRingFmt = DXGI_FORMAT_UNKNOWN;
+static UINT64                 g_mvGen = 0;                 // changes when the ring's textures change
+static MvEntry                g_mvEntry[kMvRing] = {};
+static UINT64                 g_mvReadFence[kMvRing] = {}; // presenter fence value of the last read
+static int                    g_stageMv[kStage] = {};      // ring entry + 1 of each staging slot's frame (0 = none)
+static int                    g_mvPending = -1, g_mvNext = 0;
+static MvStatus               g_mvStatus = {};
+static std::atomic<int>       g_mvWanted{0};               // 0: the hook only passes the call on
+static std::atomic<int>       g_mvHooked{0};               // 0 waiting for DLSS to load, 1 hooked, -1 can't be hooked
+#ifdef _WIN64
+static void MvTryHook();
+#endif
 static int                    g_presCurSlot = -1;          // staging slot the presenter is showing (g_lock)
 static std::atomic<int>       g_slotWaits{0};
 // Swap chains the game recreates (God of War Ragnarok on loading) hung when
@@ -1265,10 +1365,27 @@ static bool RefreshRealDesc()
     return g_bufCount > 0;
 }
 
+static void ReleaseMotionVectors()
+{
+    EnterCriticalSection(&g_mvLock);
+    for (UINT i = 0; i < kMvRing; i++) { SafeRelease(g_mvRing[i]); g_mvEntry[i] = MvEntry{}; g_mvReadFence[i] = 0; }
+    for (auto &old : g_mvRetired) SafeRelease(old.resource);
+    g_mvRetired.clear();
+    g_mvStageSerial = 0;
+    g_mvPresenterSlot = -1;
+    g_mvShownId = 0;
+    for (UINT s = 0; s < kStage; s++) g_stageMv[s] = 0;
+    g_mvPending = -1;
+    g_mvRingW = g_mvRingH = 0;
+    g_mvGen++;
+    LeaveCriticalSection(&g_mvLock);
+}
+
 static void ReleaseFrameResources()
 {
     for (UINT i = 0; i < kMaxBuf; i++) SafeRelease(g_virt[i]);
     for (UINT s = 0; s < kStage; s++) SafeRelease(g_stage[s]);
+    ReleaseMotionVectors();
     g_bufCount = 0;
 }
 
@@ -1489,8 +1606,22 @@ cbuffer C : register(b0)
     float sdrPeak;    // SDR white highlights expand to this (80-nit units); <= sdrScale = off
     float gamut;      // outType 4: gamut expansion strength (0 = off)
     float2 srcPerOut; // game frame pixels per output pixel: 1 = the same size; > 1 = scaled down to the window
+    uint  splitOn;    // 1 = split-strobe test active
+    float splitW;     // left half strobe strength 0..1 (right half always 1)
+    float splitX;     // seam position in output pixels
+    float splitSeam;  // soft seam width in output pixels (0 = hard)
+    uint  mvOn;       // bits: 1 heatmap, 2 per-object mask, 4 energy-correct adaptive BFI fade
+    float mvToOutX, mvToOutY;   // a vector's value -> output pixels per game frame
+    float mvPosX, mvPosY;       // output pixel -> texel of the vector texture
+    float mvExtX, mvExtY;       // the part of the vector texture in use, in texels
+    float mvHeatStart, mvHeatFull;   // heatmap: output pixels per game frame where colour starts, and where it is red
+    float mvEdgeTiles;   // per object: radius the mask's edges fade over, in its 16-pixel tiles
+    float mvBaseX, mvBaseY; // active subrect origin; does not affect vector lengths
+    float mvGlobalW; // bit 4 of mvOn: separate adaptive fade, preserving the existing LCD fade
 };
 Texture2D<float4> src : register(t0);
+Texture2D<float4> mvTex : register(t1);
+Texture2D<float> mvMask : register(t2);
 SamplerState linClamp : register(s0);
 
 // The game's frame at output pixel pos. Same size: the pixel itself. Larger (a 5K frame in a 4K window): four bilinear
@@ -1747,6 +1878,85 @@ float DecayShare(uint s, float phi, float T, float n)
     return (exp(-a / T) - exp(-n / T) + 1.0 - exp(-(b - n) / T)) / norm;
 }
 
+// A motion vector's length in output pixels per game frame. DLSS's camera jitter stays in it (a fraction of a pixel,
+// and only its length is used for speed thresholds).
+float MvSpeedAt(float2 texel)
+{
+    // The last 16x16 mask tile can extend past the picture. Clamp to the active subrect so its samples
+    // neither read zero outside the texture nor pick up unused texels in a larger allocation.
+    texel = clamp(texel, float2(0, 0), float2(mvExtX, mvExtY) - 1.0) + float2(mvBaseX, mvBaseY);
+    return length(mvTex.Load(int3(texel, 0)).rg * float2(mvToOutX, mvToOutY));
+}
+
+// Debug view of the whole picture, pixel by pixel: what the game's frame rate shows cleanly stays uncoloured; above that
+// blue -> cyan -> yellow -> red, red being the speed that takes the full strobe.
+float3 MvHeat(float3 o, float2 pos)
+{
+    float v = MvSpeedAt(pos * float2(mvPosX, mvPosY));
+    if (v <= mvHeatStart) return o;
+    float t = saturate((v - mvHeatStart) / (mvHeatFull - mvHeatStart));
+    float3 col = t < 0.33 ? lerp(float3(0, 0, 1), float3(0, 1, 1), t / 0.33)
+               : t < 0.66 ? lerp(float3(0, 1, 1), float3(1, 1, 0), (t - 0.33) / 0.33)
+                          : lerp(float3(1, 1, 0), float3(1, 0, 0), (t - 0.66) / 0.34);
+    return lerp(o, col * (outType == 0 ? 0.5 : 1.25), 0.75 * saturate((v - mvHeatStart) / max(0.25 * mvHeatStart, 0.01)));
+}
+
+// Per object: the strobe's strength for one tile of 16x16 output pixels, from the frame's own vectors. The tile counts
+// as fast as its fastest quarter (each an average of 4 samples), so a single stray vector doesn't light up a tile.
+float PSMvMask(float4 pos : SV_Position) : SV_Target
+{
+    float best = 0.0;
+    float2 corner = floor(pos.xy) * 16.0;
+    [unroll] for (int qy = 0; qy < 2; qy++)
+    [unroll] for (int qx = 0; qx < 2; qx++)
+    {
+        float sum = 0.0;
+        [unroll] for (int y = 0; y < 2; y++)
+        [unroll] for (int x = 0; x < 2; x++)
+            sum += MvSpeedAt((corner + float2(qx, qy) * 8.0 + (float2(x, y) + 0.5) * 4.0) * float2(mvPosX, mvPosY));
+        best = max(best, sum / 4.0);
+    }
+    // Same threshold and scale as the heatmap, aggregated per tile and then spatially blurred.
+    // Linear control curve, not measured MPRT: a 100 Hz target at 72 fps / 144 Hz requests 39 % strength.
+    return saturate((best - mvHeatStart) / max(mvHeatFull - mvHeatStart, 0.001));
+}
+
+// Per object: fades the mask's edges. Works on the small mask, so its cost doesn't depend on the radius or the resolution.
+float PSMvMaskBlur(float4 pos : SV_Position) : SV_Target
+{
+    uint mw, mh;
+    mvMask.GetDimensions(mw, mh);
+    float2 inv = 1.0 / float2(mw, mh), uv = pos.xy * inv;
+    float sum = mvMask.SampleLevel(linClamp, uv, 0);
+    [unroll] for (int i = 0; i < 16; i++)
+    {
+        float a = float(i) * 2.39996323;                     // golden angle: an even spread over the disc
+        float r = sqrt((float(i) + 0.5) / 16.0) * mvEdgeTiles;
+        sum += mvMask.SampleLevel(linClamp, uv + float2(cos(a), sin(a)) * r * inv, 0);
+    }
+    return sum / 17.0;
+}
+
+// Readout, 64x36 cells of 4x4 samples: the fastest vector (x) and the cell's average (y) in output pixels per game
+// frame, and its brightness (z), which shows whether the picture changes although every vector is zero.
+float4 PSMvStats(float4 pos : SV_Position) : SV_Target
+{
+    uint w, h;
+    src.GetDimensions(w, h);
+    float best = 0.0, sum = 0.0, luma = 0.0;
+    [unroll] for (int y = 0; y < 4; y++)
+    [unroll] for (int x = 0; x < 4; x++)
+    {
+        float2 f = (floor(pos.xy) + (float2(x, y) + 0.5) / 4.0) / float2(64.0, 36.0);
+        float v = MvSpeedAt(f * float2(mvExtX, mvExtY));
+        best = max(best, v);
+        sum += v;
+        luma += dot(max(src.Load(int3(f * float2(w, h), 0)).rgb, 0), float3(0.2126, 0.7152, 0.0722));
+    }
+    luma /= 16.0;
+    return float4(best, sum / 16.0, saturate(outType == 1 ? sqrt(luma / 12.5) : luma), 0.0);   // scRGB is linear
+}
+
 float4 PSMain(float4 pos : SV_Position) : SV_Target
 {
     float3 c = Fetch(pos.xy);
@@ -1807,14 +2017,49 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
         if (wn > 0.0) o = lerp(o, Strobe(lin, (slot + frames - nb) % frames, litGain), wn);
     }
     else o = Strobe(lin, slot, litGain);
-    if (soften > 0.0 && method < 2)
+    float hold = soften;
+    float adaptiveW = (mvOn & 4) != 0 ? mvGlobalW : 1.0;
+    if (splitOn != 0)
+    {
+        // Split-strobe test: the left half strobes at strength splitW, the right half in full. It uses the fade
+        // below, so the left half keeps the light of the cycle and the existing fade still acts on both halves.
+        float t = splitSeam > 0.0 ? smoothstep(splitX - 0.5 * splitSeam, splitX + 0.5 * splitSeam, pos.x) : step(splitX, pos.x);
+        hold = 1.0 - (1.0 - soften) * lerp(splitW, 1.0, t);
+    }
+    if ((mvOn & 2) != 0)
+    {
+        // Per object: the strobe only where the picture moves too fast for its frame rate. The light of the cycle stays
+        // the same here too. Bilinear, so the 16-pixel tiles blend into each other.
+        uint mw, mh;
+        mvMask.GetDimensions(mw, mh);
+        float w = mvMask.SampleLevel(linClamp, pos.xy / (16.0 * float2(mw, mh)), 0);
+        if ((mvOn & 4) != 0) adaptiveW *= w;
+        else hold = 1.0 - (1.0 - hold) * w;
+    }
+    if ((mvOn & 4) != 0 && method == 0 && adaptiveW < 1.0)
+    {
+        // Adaptive BFI alone: average the light actually emitted after highlight roll-off.
+        // Keep the existing LCD/split fade below and the hitch guard above unchanged. No MprtScale loop.
+        float3 average = float3(0, 0, 0);
+        if ((flags & 16) != 0)
+            average = (Rolloff(lin, litGain, ceilLin, knee) + lin * dfloor * float(frames - 1)) / float(frames);
+        else
+        {
+            [unroll] for (uint j = 0; j < 8; j++)
+                if (j < frames) average += Rolloff(lin, Target(j, litGain, dfloor), ceilLin, knee);
+            average /= float(frames);
+        }
+        o = lerp(average, o, adaptiveW);
+    }
+    if (hold > 0.0 && method < 2)
     {
         // LCD phase swap: fade toward the steady average picture (the hitch guard's), which keeps the light
         // of every cycle the same while the strobe's depth goes down and back up.
         float a = 0.0;
         [unroll] for (uint j = 0; j < 8; j++) if (j < frames) a += Target(j, litGain, dfloor);
-        o = lerp(o, lin * (a / float(frames)), soften);
+        o = lerp(o, lin * (a / float(frames)), hold);
     }
+    if ((mvOn & 1) != 0) o = MvHeat(o, pos.xy);
     return float4(Encode(o), 1);
 }
 )HLSL";
@@ -1833,7 +2078,64 @@ struct Constants
     float    sdrPeak;     // expanded SDR white (80-nit units); <= sdrScale = off
     float    gamut;       // outType 4: gamut expansion strength (0 = off)
     float    srcPerOutX, srcPerOutY;   // game frame pixels per output pixel (1 = same size)
+    uint32_t splitOn;     // 1 = split-strobe test active
+    float    splitW;      // left half strobe strength 0..1 (right half always 1)
+    float    splitX;      // seam position in output pixels
+    float    splitSeam;   // soft seam width in output pixels (0 = hard)
+    uint32_t mvOn;        // bits: 1 heatmap, 2 per-object mask, 4 energy-correct adaptive BFI fade
+    float    mvToOutX, mvToOutY;   // a vector's value -> output pixels per game frame
+    float    mvPosX, mvPosY;       // output pixel -> texel of the vector texture
+    float    mvExtX, mvExtY;       // the part of the vector texture in use, in texels
+    float    mvHeatStart, mvHeatFull;   // heatmap: output pixels per game frame where colour starts, and where it is red
+    float    mvEdgeTiles; // per object: radius the mask's edges fade over, in its 16-pixel tiles
+    float    mvBaseX, mvBaseY;
+    float    mvGlobalW;
 };
+
+// DLSS Motion Vector Strobing, global mode: the speed that decides is an average just below the fastest part of the screen. The
+// very fastest cells are left out, so a car driving past or a bad vector doesn't raise the strobe for the whole picture.
+static float MvBandAverage(float *cells, int n, int ignorePct, int averagePct)
+{
+    std::sort(cells, cells + n);
+    const int hi = std::max(1, n - n * ignorePct / 100);
+    const int lo = std::max(0, hi - std::max(1, n * averagePct / 100));
+    float sum = 0.0f;
+    for (int i = lo; i < hi; i++) sum += cells[i];
+    return sum / (float)(hi - lo);
+}
+
+// Only an ellipse around the screen's centre is measured, which is where the player looks. On a flat projection the
+// edges of the picture run about twice as fast as its centre when the camera turns (90 degrees of field of view), and a
+// door frame passing at the side is not what matters. Returns the ellipse's radius for a share of the screen's area,
+// with 1 reaching the screen's edges; 100 % takes in the corners too.
+static float MvCentreRadius(int areaPct)
+{
+    if (areaPct >= 100) return 2.0f;
+    const double area = (double)areaPct / 100.0, pi = 3.141592653589793;
+    if (area <= pi / 4.0) return (float)sqrt(area * 4.0 / pi);
+    // Above pi/4 the ellipse extends past the screen. In normalized coordinates, invert the area
+    // of a disc clipped to [-1,1]^2, rather than counting its off-screen circular segments too.
+    double lo = 1.0, hi = sqrt(2.0);
+    for (int i = 0; i < 24; i++)
+    {
+        const double r = (lo + hi) * 0.5;
+        const double covered = sqrt(r * r - 1.0) + r * r * (asin(1.0 / r) - pi / 4.0);
+        if (covered < area) lo = r;
+        else hi = r;
+    }
+    return (float)((lo + hi) * 0.5);
+}
+
+// A held image of a picture moving at v pixels/s smears v / Hz pixels, so keeping the smear to the accepted blur takes
+// needHz = v / blur as a target. Interpolate the requested strength between heldHz and refreshHz.
+// This is a control curve, not a physical prediction of MPRT or a guarantee of the blur budget:
+// at 144 Hz / 72 fps a 100 Hz target requests 39 %. The actual light profile also matters.
+static float MvStrength(double needHz, double heldHz, double refreshHz)
+{
+    if (refreshHz <= heldHz) return 1.0f;
+    return (float)std::min(1.0, std::max(0.0, (needHz - heldHz) / (refreshHz - heldHz)));
+}
+static std::atomic<float> g_motionStrength{1.0f};   // for the overlay
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
 // every 32x18 cell's lit value is capped at C. Plain strobe: the lit refresh.
@@ -2801,6 +3103,16 @@ static DWORD WINAPI PresenterThread(void *)
     ID3D12Resource *measRt = nullptr, *measRb = nullptr;
     ID3D12DescriptorHeap *measHeap = nullptr;
     UINT64 measFence = 0;
+    ID3DBlob *psMask = nullptr, *psMaskB = nullptr;
+    ID3D12PipelineState *psoMask = nullptr, *psoMaskB = nullptr;
+    ID3D12Resource *maskRt = nullptr, *maskRtB = nullptr;      // the mask, and the mask with its edges faded (what the picture uses)
+    ID3D12DescriptorHeap *maskHeap = nullptr;
+    const UINT maskW = (g_desc.Width + 15) / 16, maskH = (g_desc.Height + 15) / 16;
+    ID3DBlob *psMvS = nullptr;
+    ID3D12PipelineState *psoMvS = nullptr;
+    ID3D12Resource *mvsRt = nullptr, *mvsRb = nullptr;
+    ID3D12DescriptorHeap *mvsHeap = nullptr;
+    UINT64 mvsFence = 0;
     IDXGIOutput *output = nullptr;
     UINT64 bufFence[kMaxBuf] = {};
     // What each real buffer currently holds. A refresh that would draw the
@@ -2824,7 +3136,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage;
+    hd.NumDescriptors = kStage + kMvRing + 2;      // + the per-object strobe's two masks
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
 
@@ -2854,6 +3166,17 @@ static DWORD WINAPI PresenterThread(void *)
             g_device->CreateShaderResourceView(g_stage[s], &svd, sh);
             sh.ptr += srvStride;
         }
+        // The motion vector ring's views: empty until the game's DLSS call has shown what the vectors look like.
+        svd.Format = DXGI_FORMAT_R16G16_FLOAT;
+        for (UINT r = 0; r < kMvRing; r++)
+        {
+            g_device->CreateShaderResourceView(nullptr, &svd, sh);
+            sh.ptr += srvStride;
+        }
+        svd.Format = DXGI_FORMAT_R8_UNORM;
+        g_device->CreateShaderResourceView(nullptr, &svd, sh);
+        sh.ptr += srvStride;
+        g_device->CreateShaderResourceView(nullptr, &svd, sh);
     }
     if (ok)
         ok = SUCCEEDED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[0], nullptr, IID_PPV_ARGS(&list)));
@@ -2865,6 +3188,9 @@ static DWORD WINAPI PresenterThread(void *)
     if (ok && !compile) { LOGE("BFI Presenter: d3dcompiler_47.dll not available"); ok = false; }
     ok = ok && Compile(compile, "VSMain", "vs_5_0", &vs) && Compile(compile, "PSMain", "ps_5_0", &ps);
     if (ok && !Compile(compile, "PSMeasure", "ps_5_0", &psMeas)) psMeas = nullptr;   // ABL guard optional
+    if (ok && !Compile(compile, "PSMvStats", "ps_5_0", &psMvS)) psMvS = nullptr;     // motion vector readout optional
+    if (ok && !Compile(compile, "PSMvMask", "ps_5_0", &psMask)) psMask = nullptr;    // per-object strobe optional
+    if (ok && !Compile(compile, "PSMvMaskBlur", "ps_5_0", &psMaskB)) psMaskB = nullptr;
 
     if (ok)
     {
@@ -2872,7 +3198,19 @@ static DWORD WINAPI PresenterThread(void *)
         range.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         range.NumDescriptors     = 1;
         range.BaseShaderRegister = 0;
-        D3D12_ROOT_PARAMETER params[2] = {};
+        D3D12_DESCRIPTOR_RANGE rangeMv = range;
+        rangeMv.BaseShaderRegister = 1;
+        D3D12_DESCRIPTOR_RANGE rangeMask = range;
+        rangeMask.BaseShaderRegister = 2;
+        D3D12_ROOT_PARAMETER params[4] = {};
+        params[3].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[3].DescriptorTable.NumDescriptorRanges = 1;
+        params[3].DescriptorTable.pDescriptorRanges   = &rangeMask;
+        params[3].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[2].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2].DescriptorTable.NumDescriptorRanges = 1;
+        params[2].DescriptorTable.pDescriptorRanges   = &rangeMv;
+        params[2].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
         params[0].Constants.Num32BitValues = sizeof(Constants) / 4;
@@ -2888,7 +3226,7 @@ static DWORD WINAPI PresenterThread(void *)
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 2;
+        rsd.NumParameters = 4;
         rsd.pParameters   = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers   = &samp;
@@ -2947,6 +3285,93 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 LOGW("BFI Presenter: ABL guard unavailable (could not create its measurement objects)");
                 SafeRelease(psoMeas); SafeRelease(measRt); SafeRelease(measRb); SafeRelease(measHeap);
+            }
+            pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+            pd.RTVFormats[0] = g_desc.Format;
+        }
+        // Per-object strobe: one 8-bit strength per 16x16 output pixels. It rests in the shader-read state.
+        if (ok && psMask && psMaskB)
+        {
+            pd.PS = { psMask->GetBufferPointer(), psMask->GetBufferSize() };
+            pd.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
+            bool m = SUCCEEDED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoMask)));
+            pd.PS = { psMaskB->GetBufferPointer(), psMaskB->GetBufferSize() };
+            m = m && SUCCEEDED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoMaskB)));
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width = maskW; rd.Height = maskH; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_R8_UNORM; rd.SampleDesc.Count = 1;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            m = m && SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&maskRt)));
+            m = m && SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&maskRtB)));
+            D3D12_DESCRIPTOR_HEAP_DESC mh = {};
+            mh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; mh.NumDescriptors = 2;
+            m = m && SUCCEEDED(g_device->CreateDescriptorHeap(&mh, IID_PPV_ARGS(&maskHeap)));
+            if (m)
+            {
+                maskRt->SetName(L"BFI per-object strobe mask");
+                maskRtB->SetName(L"BFI per-object strobe mask, edges faded");
+                D3D12_CPU_DESCRIPTOR_HANDLE rt = maskHeap->GetCPUDescriptorHandleForHeapStart();
+                g_device->CreateRenderTargetView(maskRt, nullptr, rt);
+                rt.ptr += rtvStride;
+                g_device->CreateRenderTargetView(maskRtB, nullptr, rt);
+                D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                sh.ptr += (SIZE_T)(kStage + kMvRing) * srvStride;
+                D3D12_SHADER_RESOURCE_VIEW_DESC svd = {};
+                svd.Format = DXGI_FORMAT_R8_UNORM;
+                svd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                svd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                svd.Texture2D.MipLevels = 1;
+                g_device->CreateShaderResourceView(maskRt, &svd, sh);
+                sh.ptr += srvStride;
+                g_device->CreateShaderResourceView(maskRtB, &svd, sh);
+            }
+            else
+            {
+                LOGW("BFI Presenter: per-object strobe unavailable (could not create its mask)");
+                SafeRelease(psoMask); SafeRelease(psoMaskB); SafeRelease(maskRt); SafeRelease(maskRtB); SafeRelease(maskHeap);
+            }
+            pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+            pd.RTVFormats[0] = g_desc.Format;
+        }
+        // Motion vector readout: a 64x36 float target, its view and a readback buffer.
+        if (ok && psMvS)
+        {
+            pd.PS = { psMvS->GetBufferPointer(), psMvS->GetBufferSize() };
+            pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            bool m = SUCCEEDED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoMvS)));
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width = 64; rd.Height = 36; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; rd.SampleDesc.Count = 1;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            m = m && SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                    D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&mvsRt)));
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC bd = {};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = 1024 * 36; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            m = m && SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&mvsRb)));
+            D3D12_DESCRIPTOR_HEAP_DESC mh = {};
+            mh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; mh.NumDescriptors = 1;
+            m = m && SUCCEEDED(g_device->CreateDescriptorHeap(&mh, IID_PPV_ARGS(&mvsHeap)));
+            if (m)
+            {
+                mvsRt->SetName(L"BFI motion vector readout");
+                g_device->CreateRenderTargetView(mvsRt, nullptr, mvsHeap->GetCPUDescriptorHandleForHeapStart());
+            }
+            else
+            {
+                LOGW("BFI Presenter: motion vector readout unavailable (could not create its objects)");
+                SafeRelease(psoMvS); SafeRelease(mvsRt); SafeRelease(mvsRb); SafeRelease(mvsHeap);
             }
             pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
             pd.RTVFormats[0] = g_desc.Format;
@@ -3095,6 +3520,27 @@ static DWORD WINAPI PresenterThread(void *)
     UINT lastSync = 0, lastPC = 0;
     bool haveStats = false;
     bool kb = false, km = false, kr = false, krs = false, kk = false;
+    bool kst = false, kadd = false, ksub = false;
+    double splitKeyT = Now();
+    // Split-strobe test as used by the current cycle: taken at the cycle's first refresh only, so its lit and dark
+    // refreshes share one strength and the light per cycle stays balanced.
+    bool  splitOnNow = false;
+    float splitWNow = 0.0f;
+    // DLSS Motion Vector Strobing, global mode: strength now, where it is heading, and what the current cycle uses (taken at its first
+    // refresh, as above).
+    float motionW = 1.0f, motionTarget = 1.0f, motionWNow = 1.0f;
+    double motionT = Now(), motionLastT = 0.0;
+    // DLSS motion vectors: the ring's views as last written, and the readout's last frame.
+    UINT64 mvGenSeen = ~0ull, mvsPendId = 0, mvsPrevId = 0;
+    double mvsPendT = 0.0, mvsPrevT = 0.0, mvsDtEma = 0.0, mvsBand = 0.0, mvsBrokenT = -1.0;
+    bool mvsBroken = false, mvsEverMoved = false;
+    bool kmv = false;
+    bool maskNow = false;     // per-object strobe: decided at the cycle's first refresh, so its refreshes all use one mask
+    bool maskValid = false;   // ... and the mask holds a usable picture
+    bool mvAvailable = true;  // there are vectors to use (false: DLSS isn't running, so the full strobe)
+    // Strobe cycles shown, and those without usable vectors; the last 5 seconds of those and of the game frames.
+    int secMvCycles = 0, secMvMiss = 0, mvWinI = 0;
+    int mvWinCycles[5] = {}, mvWinMiss[5] = {}, mvWinStaged[5] = {}, mvWinNoCopy[5] = {};
 
     while (ok && g_running.load())
     {
@@ -3109,6 +3555,18 @@ static DWORD WINAPI PresenterThread(void *)
             LeaveCriticalSection(&g_cfgLock);
         }
         krs = rs;
+        {
+            // Ctrl+Shift+V: DLSS motion vector modes: off, global, per object, heatmap.
+            const bool mv = KeyCombo('V');
+            if (mv && !kmv)
+            {
+                EnterCriticalSection(&g_cfgLock);
+                g_shared.motionMode = (g_shared.motionMode + 1) % 4;
+                g_shared.splitTest = 0;
+                LeaveCriticalSection(&g_cfgLock);
+            }
+            kmv = mv;
+        }
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
         // Ctrl+Shift+K: a marker in the log with the last second's state, to find a moment the player noticed (a
         // stutter, a lost frame limit) in a long session.
@@ -3118,15 +3576,48 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 EnterCriticalSection(&g_cfgLock);
                 const Status ms = g_status;
+                const int msSplit = g_shared.splitTest;
+                const float msLeft = g_shared.splitLeft;
+                const int msMotion = g_shared.motionMode;
                 LeaveCriticalSection(&g_cfgLock);
+                EnterCriticalSection(&g_mvLock);
+                const float msNeed = g_mvStatus.needHz, msFast = g_mvStatus.fastestPxS;
+                LeaveCriticalSection(&g_mvLock);
                 LOGI("BFI Presenter: ---- Ctrl+Shift+K marker ---- game %.1f fps, refreshes %.1f/s, %d missed, frame age %.1f ms, "
-                     "frame generation %s, Reflex limit %d us, frames ahead %d%s, video memory %.0f of %.0f MB",
+                     "frame generation %s, Reflex limit %d us, frames ahead %d%s, video memory %.0f of %.0f MB, split test %d, left %.0f%%, motion vector strobing mode %d, needs %.0f Hz, fastest %.0f px/s, strength %.0f%%",
                      ms.gameFps, ms.refreshHz, ms.late, ms.frameAgeMs, ms.fgActive ? "active" : "off", ms.rfxLimitUs,
-                     ms.aheadInUse, ms.hitchPaused ? ", hitch guard paused" : "", ms.vramUse, ms.vramBudget);
+                     ms.aheadInUse, ms.hitchPaused ? ", hitch guard paused" : "", ms.vramUse, ms.vramBudget, msSplit, msLeft * 100.0f,
+                     msMotion, msNeed, msFast, g_motionStrength.load() * 100.0f);
             }
             kk = k;
         }
         kb = b; km = m; kr = r;
+        // Ctrl+Shift+T: split-strobe test on / off, starting at 0 % so the difference shows at once. While it is on,
+        // Numpad + / - held move the left half's strength: 1 % on the press, then 50 % per second of real time, so
+        // the ramp is the same at any refresh rate.
+        {
+            const bool st = KeyCombo('T');
+            const bool add = (GetAsyncKeyState(VK_ADD) & 0x8000) != 0, sub = (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) != 0;
+            const double keyT = Now(), keyDt = std::min(keyT - splitKeyT, 0.1);
+            splitKeyT = keyT;
+            if ((st && !kst) || add || sub)
+            {
+                EnterCriticalSection(&g_cfgLock);
+                if (st && !kst)
+                {
+                    g_shared.splitTest = !g_shared.splitTest;
+                    if (g_shared.splitTest) { g_shared.splitLeft = 0.0f; g_shared.motionMode = 0; }
+                }
+                if (g_shared.splitTest)
+                {
+                    const float ramp = (float)(0.5 * keyDt);
+                    const float d = (add ? (kadd ? ramp : 0.01f) : 0.0f) - (sub ? (ksub ? ramp : 0.01f) : 0.0f);
+                    g_shared.splitLeft = std::min(1.0f, std::max(0.0f, g_shared.splitLeft + d));
+                }
+                LeaveCriticalSection(&g_cfgLock);
+            }
+            kst = st; kadd = add; ksub = sub;
+        }
 
         EnterCriticalSection(&g_cfgLock);
         s = g_shared;
@@ -3169,6 +3660,43 @@ static DWORD WINAPI PresenterThread(void *)
         g_lrPeriod.store(1.0 / (modeHz > 0.0 ? modeHz : 120.0));
         g_gameCap.store(s.gameCap);
     g_capPer.store(CapPeriod(s.gameCap, s.frames, s.capDivisor));
+
+        // DLSS motion vectors: the ring's views follow its textures. No list in flight may still use the old views.
+        g_mvWanted.store(s.motionMode > 0 ? 1 : 0);
+        if (s.motionMode > 0)
+        {
+            ID3D12Resource *mvRes[kMvRing];
+            DXGI_FORMAT mvFmt;
+            EnterCriticalSection(&g_mvLock);
+            const UINT64 mvGen = g_mvGen;
+            for (UINT r2 = 0; r2 < kMvRing; r2++)
+            {
+                mvRes[r2] = g_mvRing[r2];
+                if (mvRes[r2]) mvRes[r2]->AddRef(); // ring may retire while the presenter waits below
+            }
+            mvFmt = g_mvRingFmt;
+            LeaveCriticalSection(&g_mvLock);
+            if (mvGen != mvGenSeen)
+            {
+                WaitFence(g_presFence, g_presFenceVal, ev);
+                D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                sh.ptr += (SIZE_T)kStage * srvStride;
+                D3D12_SHADER_RESOURCE_VIEW_DESC svd = {};
+                svd.Format = mvFmt == DXGI_FORMAT_R16G16_TYPELESS ? DXGI_FORMAT_R16G16_FLOAT
+                           : mvFmt == DXGI_FORMAT_R32G32_TYPELESS ? DXGI_FORMAT_R32G32_FLOAT
+                           : mvRes[0] ? mvFmt : DXGI_FORMAT_R16G16_FLOAT;
+                svd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                svd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                svd.Texture2D.MipLevels = 1;
+                for (UINT r2 = 0; r2 < kMvRing; r2++)
+                {
+                    g_device->CreateShaderResourceView(mvRes[r2], &svd, sh);
+                    sh.ptr += srvStride;
+                }
+                mvGenSeen = mvGen;
+            }
+            for (UINT r2 = 0; r2 < kMvRing; r2++) SafeRelease(mvRes[r2]);
+        }
 
         PresStage(ST_VBLANK);
         // Timing log, switchable at any time from the overlay. Each session
@@ -3397,7 +3925,117 @@ static DWORD WINAPI PresenterThread(void *)
         c.frames  = (uint32_t)s.frames;
         c.slot    = slotNow;
         c.method  = !s.enabled ? 2u : hitchPaused ? 3u : (uint32_t)s.method;
-        c.soften = (c.method < 2u) ? soften : 0.0f;   // LCD phase swap fade
+        // MotionSource: the vectors of the frame this refresh shows, or the nearest earlier ones up to 2 game frames
+        // old. Older ones (or none) mean no vectors at all; the strobe must never depend on stale data.
+        int mvSlot = -1;
+        ID3D12Resource *mvRes = nullptr;
+        if (s.motionMode > 0)
+        {
+            EnterCriticalSection(&g_mvLock);
+            g_mvShownId = pickId;
+            auto mvUsable = [&](int e2) { return e2 >= 0 && g_mvRing[e2] && g_mvEntry[e2].frameId && g_mvEntry[e2].frameId <= pickId &&
+                                                 pickId - g_mvEntry[e2].frameId <= 2; };
+            int mvBest = g_stageMv[pick] - 1;
+            if (!mvUsable(mvBest))
+            {
+                mvBest = -1;
+                for (UINT r2 = 0; r2 < kMvRing; r2++)
+                    if (mvUsable((int)r2) && (mvBest < 0 || g_mvEntry[r2].frameId > g_mvEntry[mvBest].frameId)) mvBest = (int)r2;
+            }
+            g_mvStatus.age = -1;
+            if (mvBest >= 0 && mvGenSeen == g_mvGen)
+            {
+                const MvEntry &e = g_mvEntry[mvBest];
+                mvSlot = mvBest;
+                mvRes = g_mvRing[mvBest];
+                g_mvPresenterSlot = mvBest; // reserve before releasing the selection lock, including fallback vectors
+                g_mvStatus.age = (int)(pickId - e.frameId);
+                // Vectors at render resolution unless DLSS was told they are at its output size.
+                const bool lowRes = e.flagsKnown ? (e.flags & 2) != 0 : g_mvRingW < e.outW;
+                const float spaceW = (float)std::min(g_mvRingW - e.baseX,
+                    (lowRes ? e.renderW : e.outW) ? (lowRes ? e.renderW : e.outW) : g_mvRingW - e.baseX);
+                const float spaceH = (float)std::min(g_mvRingH - e.baseY,
+                    (lowRes ? e.renderH : e.outH) ? (lowRes ? e.renderH : e.outH) : g_mvRingH - e.baseY);
+                // Sampling resolution and vector units are independent. Streamline scales to render pixels
+                // even for a full-resolution MV texture. Preserve native NGX's high-res convention otherwise.
+                const float vectorW = !lowRes && e.renderPixelVectors && e.renderW ? (float)e.renderW : spaceW;
+                const float vectorH = !lowRes && e.renderPixelVectors && e.renderH ? (float)e.renderH : spaceH;
+                c.mvOn     = s.motionMode == 3 ? 1u : 0u;
+                c.mvToOutX = e.scaleX * ((float)g_desc.Width / vectorW);
+                c.mvToOutY = e.scaleY * ((float)g_desc.Height / vectorH);
+                c.mvPosX   = spaceW / (float)g_desc.Width;
+                c.mvPosY   = spaceH / (float)g_desc.Height;
+                c.mvExtX   = spaceW;
+                c.mvExtY   = spaceH;
+                c.mvBaseX  = (float)e.baseX;
+                c.mvBaseY  = (float)e.baseY;
+                // The heatmap's colours start at the speed the game's frame rate can still show. In quarter pixels,
+                // so the refreshes of one game frame keep equal constants and can reuse a drawn buffer.
+                const double heatHz = modeHz > 0.0 ? modeHz : 120.0;
+                const double heatFps = mvsDtEma > 0.0 ? 1.0 / mvsDtEma : heatHz / (double)s.frames;
+                const double heatHeld = std::min(heatFps, heatHz / (double)s.frames);
+                const double heatBlur = (double)s.motionBlurPx * (double)g_desc.Width / 1920.0;
+                c.mvHeatStart = (float)(floor(heatBlur * heatHeld / heatFps * 4.0 + 0.5) / 4.0);
+                c.mvHeatFull  = std::max(c.mvHeatStart + 0.25f, (float)(floor(heatBlur * heatHz / heatFps * 4.0 + 0.5) / 4.0));
+                c.mvEdgeTiles = (float)s.motionEdgeBlurPx * (float)g_desc.Width / 1920.0f / 16.0f;
+            }
+            LeaveCriticalSection(&g_mvLock);
+        }
+        // A frame without vectors keeps what the last good one decided: some are expected, and they are only counted, for
+        // the overlay. The full strobe takes over only when there are no vectors to use at all: DLSS isn't running
+        // (a menu, a pause, loading), or the game has never filled them in.
+        const char *mvFall = nullptr;
+        if (s.motionMode > 0 && slotNow == 0)
+        {
+            const double tMiss = Now();
+            secMvCycles++;
+            if (mvSlot < 0) secMvMiss++;
+            EnterCriticalSection(&g_mvLock);
+            const bool dlssOff = mvSlot < 0 && tMiss - g_mvStatus.lastCallT > 1.0;
+            const bool available = !mvsBroken && !dlssOff;
+            // The first seconds don't count: until the hook is in and DLSS has been seen, there is nothing to report.
+            const bool report = g_mvStatus.firstCallT > 0.0 && tMiss - g_mvStatus.firstCallT >= 5.0;
+            if (!available && report)
+            {
+                const char *why = mvsBroken ? "the game has not filled in its vectors" : "DLSS is not running (menu, pause, loading or DLSS off)";
+                g_mvStatus.fallback = why;
+                if (mvAvailable) mvFall = why;
+            }
+            if (available && !mvAvailable) g_mvStatus.fallbackEndT = tMiss;
+            mvAvailable = available;
+            g_mvStatus.unavailable = !available && report;
+            LeaveCriticalSection(&g_mvLock);
+        }
+        // Per object: without a mask, the full strobe. A single missing frame keeps the last mask.
+        const bool maskWanted = slotNow == 0 && s.motionMode == 2 && psoMask && mvAvailable && c.method < 2u && s.enabled && s.frames >= 2;
+        const bool maskDraw = maskWanted && mvSlot >= 0 && !mvsBroken;
+        if (maskDraw) maskValid = true;
+        if (slotNow == 0)
+        {
+            if (!maskWanted) maskValid = false;
+            maskNow = maskWanted && maskValid;
+        }
+        if (maskNow) c.mvOn |= 2u;
+        const bool motionOn = s.motionMode == 1 && psoMvS && s.enabled && s.frames >= 2;
+        // Whole steps of 1/64, so a refresh with an unchanged strength can reuse an already-drawn buffer.
+        if (slotNow == 0) motionWNow = (float)floor(motionW * 64.0f + 0.5f) / 64.0f;
+        // LCD phase swap fade; global DLSS Motion Vector Strobing uses the same fade toward the steady picture.
+        c.soften = (c.method < 2u) ? (motionOn ? 1.0f - (1.0f - soften) * motionWNow : soften) : 0.0f;
+        const float adaptiveLitGain = s.invert && s.frames > 2 ? s.frames * s.gain / (float)(s.frames - 1) : s.frames * s.gain;
+        if (c.method == 0u && s.rolloff && adaptiveLitGain > 1.0f && (motionOn || maskNow))
+        {
+            c.mvOn |= 4u;
+            c.mvGlobalW = motionOn ? motionWNow : 1.0f;
+            c.soften = soften; // adaptive fade has its own energy-correct target; LCD fade stays as before
+        }
+        if (slotNow == 0) { splitOnNow = s.splitTest != 0; splitWNow = s.splitLeft; }
+        if (splitOnNow && c.method < 2u)
+        {
+            c.splitOn   = 1u;
+            c.splitW    = splitWNow;
+            c.splitX    = (float)g_desc.Width * 0.5f;      // the presenter's output size, not the game's (ScaleToWindow)
+            c.splitSeam = (float)s.splitSeamPx;
+        }
         // ABL guard: read the last measurement (non-blocking) and steer the
         // boost so a lit refresh stays under AblGuardNits on average -- never
         // below 0.5 (the lit refresh then equals the original image).
@@ -3497,6 +4135,11 @@ static DWORD WINAPI PresenterThread(void *)
             reserve = ++g_presFenceVal;
             g_readFence[pick] = reserve;
         }
+        // Transfer the CPU pin to the GPU fence before capture can reuse the entry. No read on buffer reuse.
+        EnterCriticalSection(&g_mvLock);
+        if (mvSlot >= 0 && !reuse) g_mvReadFence[mvSlot] = reserve;
+        g_mvPresenterSlot = -1;
+        LeaveCriticalSection(&g_mvLock);
         // The game never copies into the slot being shown (g_presCurSlot), so
         // the lock can go before waiting on the GPU.
         LeaveCriticalSection(&g_lock);
@@ -3516,6 +4159,11 @@ static DWORD WINAPI PresenterThread(void *)
             Transition(real[bi], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
             Transition(g_stage[pick], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) };
         list->ResourceBarrier(2, br);
+        if (mvRes)
+        {
+            const D3D12_RESOURCE_BARRIER mvb = Transition(mvRes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &mvb);
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         rtv.ptr += (SIZE_T)bi * rtvStride;
         D3D12_GPU_DESCRIPTOR_HANDLE srv = srvHeap->GetGPUDescriptorHandleForHeapStart();
@@ -3524,6 +4172,47 @@ static DWORD WINAPI PresenterThread(void *)
         list->SetGraphicsRootSignature(rootSig);
         list->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &c, 0);
         list->SetGraphicsRootDescriptorTable(1, srv);
+        {
+            D3D12_GPU_DESCRIPTOR_HANDLE mvSrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            mvSrv.ptr += (UINT64)(kStage + (mvSlot >= 0 ? (UINT)mvSlot : 0)) * srvStride;
+            list->SetGraphicsRootDescriptorTable(2, mvSrv);
+            D3D12_GPU_DESCRIPTOR_HANDLE maskSrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            maskSrv.ptr += (UINT64)(kStage + kMvRing + 1) * srvStride;     // the mask with its edges faded
+            list->SetGraphicsRootDescriptorTable(3, maskSrv);
+        }
+        // Per object: the mask comes from the vectors of the frame about to be shown, in this same list: no added
+        // latency. Drawn at the cycle's first refresh only, so the lit and dark refreshes share it and the light balances.
+        if (maskDraw)
+        {
+            D3D12_RESOURCE_BARRIER mb = Transition(maskRt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &mb);
+            list->SetPipelineState(psoMask);
+            D3D12_CPU_DESCRIPTOR_HANDLE mrtv = maskHeap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_VIEWPORT mvp = { 0.0f, 0.0f, (float)maskW, (float)maskH, 0.0f, 1.0f };
+            D3D12_RECT msc = { 0, 0, (LONG)maskW, (LONG)maskH };
+            list->RSSetViewports(1, &mvp);
+            list->RSSetScissorRects(1, &msc);
+            list->OMSetRenderTargets(1, &mrtv, FALSE, nullptr);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->DrawInstanced(3, 1, 0, 0);
+            mb = Transition(maskRt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &mb);
+            // The edges faded, into the second mask, reading the first.
+            mb = Transition(maskRtB, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &mb);
+            D3D12_GPU_DESCRIPTOR_HANDLE maskIn = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            maskIn.ptr += (UINT64)(kStage + kMvRing) * srvStride;
+            list->SetGraphicsRootDescriptorTable(3, maskIn);
+            list->SetPipelineState(psoMaskB);
+            mrtv.ptr += rtvStride;
+            list->OMSetRenderTargets(1, &mrtv, FALSE, nullptr);
+            list->DrawInstanced(3, 1, 0, 0);
+            mb = Transition(maskRtB, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &mb);
+            maskIn.ptr += srvStride;
+            list->SetGraphicsRootDescriptorTable(3, maskIn);
+            list->SetPipelineState(pso);
+        }
         D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)g_desc.Width, (float)g_desc.Height, 0.0f, 1.0f };
         D3D12_RECT sc = { 0, 0, (LONG)g_desc.Width, (LONG)g_desc.Height };
         list->RSSetViewports(1, &vp);
@@ -3536,6 +4225,7 @@ static DWORD WINAPI PresenterThread(void *)
             Constants mc = c;
             mc.gain = s.gain;                                  // brightness at the configured boost
             mc.ceilLin = s.peakNits / 80.0f;                   // and the full ceiling
+            mc.splitOn = 0u;                                   // measured as a full strobe: the guard just stays a little cautious
             D3D12_RESOURCE_BARRIER mb = Transition(measRt, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
             list->ResourceBarrier(1, &mb);
             list->SetPipelineState(psoMeas);
@@ -3565,6 +4255,45 @@ static DWORD WINAPI PresenterThread(void *)
             mb = Transition(measRt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
             list->ResourceBarrier(1, &mb);
             measFence = reserve;
+        }
+        if (mvRes && psoMvS && !mvsFence && pickId != lastShownId)
+        {
+            D3D12_RESOURCE_BARRIER mb = Transition(mvsRt, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &mb);
+            list->SetPipelineState(psoMvS);
+            list->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &c, 0);
+            D3D12_CPU_DESCRIPTOR_HANDLE mrtv = mvsHeap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_VIEWPORT mvp = { 0.0f, 0.0f, 64.0f, 36.0f, 0.0f, 1.0f };
+            D3D12_RECT msc = { 0, 0, 64, 36 };
+            list->RSSetViewports(1, &mvp);
+            list->RSSetScissorRects(1, &msc);
+            list->OMSetRenderTargets(1, &mrtv, FALSE, nullptr);
+            list->DrawInstanced(3, 1, 0, 0);
+            mb = Transition(mvsRt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &mb);
+            D3D12_TEXTURE_COPY_LOCATION dst = {}, srcLoc = {};
+            dst.pResource = mvsRb;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Offset = 0;
+            dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            dst.PlacedFootprint.Footprint.Width = 64;
+            dst.PlacedFootprint.Footprint.Height = 36;
+            dst.PlacedFootprint.Footprint.Depth = 1;
+            dst.PlacedFootprint.Footprint.RowPitch = 1024;
+            srcLoc.pResource = mvsRt;
+            srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            srcLoc.SubresourceIndex = 0;
+            list->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
+            mb = Transition(mvsRt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(1, &mb);
+            mvsFence = reserve;
+            mvsPendId = pickId;
+            mvsPendT = pickTime;
+        }
+        if (mvRes)
+        {
+            const D3D12_RESOURCE_BARRIER mvb = Transition(mvRes, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(1, &mvb);
         }
         br[0] = Transition(real[bi], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         br[1] = Transition(g_stage[pick], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -3598,6 +4327,99 @@ static DWORD WINAPI PresenterThread(void *)
             break;
         }
         presents++;
+        if (mvFall)
+        {
+            static double fallLogT = -100.0;
+            const double fallT = Now();
+            if (fallT - fallLogT > 5.0)
+            {
+                fallLogT = fallT;
+                LOGW("BFI Presenter: motion vectors: none to use, full strobe: %s (frame %llu)", mvFall, (unsigned long long)pickId);
+            }
+        }
+        // DLSS motion vectors, after the Present so the work never delays a refresh: the frame last read out gives the
+        // overlay's figures and, in global mode, the strobe's target strength (see MvBandAverage and MvStrength).
+        if (mvsFence && mvsRb && g_presFence->GetCompletedValue() >= mvsFence)
+        {
+            float *mp = nullptr;
+            D3D12_RANGE rr = { 0, 1024 * 36 };
+            if (SUCCEEDED(mvsRb->Map(0, &rr, (void **)&mp)) && mp)
+            {
+                static float cellSpeed[64 * 36], lumaPrev[64 * 36];
+                const int cellsN = 64 * 36;
+                float fastest = 0.0f, sum = 0.0f, lumaDiff = 0.0f;
+                const float centre = MvCentreRadius(s.motionCenterPct);
+                int measured = 0;
+                for (int i = 0; i < cellsN; i++)
+                {
+                    const float *cell = mp + (i / 64) * 256 + (i % 64) * 4;
+                    if (cell[0] > fastest) fastest = cell[0];
+                    sum += cell[1];
+                    const float nx = ((float)(i % 64) + 0.5f) / 32.0f - 1.0f, ny = ((float)(i / 64) + 0.5f) / 18.0f - 1.0f;
+                    if (nx * nx + ny * ny <= centre * centre) cellSpeed[measured++] = cell[1];
+                    lumaDiff += fabsf(cell[2] - lumaPrev[i]);
+                    lumaPrev[i] = cell[2];
+                }
+                D3D12_RANGE wr = { 0, 0 };
+                mvsRb->Unmap(0, &wr);
+                const double gap = mvsPendId > mvsPrevId ? (double)(mvsPendId - mvsPrevId) : 0.0;
+                const double perFrame = (mvsPrevId && gap > 0.0) ? (mvsPendT - mvsPrevT) / gap : 0.0;
+                const bool valid = perFrame > 0.0 && perFrame < 0.25;     // not across a pause or a loading screen
+                // Averaged: when a frame is handed over jitters by far more than the game's own frame time does.
+                if (valid) mvsDtEma = mvsDtEma > 0.0 ? mvsDtEma + (perFrame - mvsDtEma) * 0.1 : perFrame;
+                const double nowV = Now();
+                // Every vector zero while the picture changes, in a game that has never produced a moving one: it isn't
+                // filling them in. Once vectors have moved, zero means still: film grain and flickering lights change
+                // the picture of a motionless scene too, and must not bring the full strobe back.
+                if (fastest > 0.5f) mvsEverMoved = true;
+                if (!(valid && !mvsEverMoved && fastest <= 0.01f && lumaDiff / (float)cellsN > 0.003f)) mvsBrokenT = -1.0;
+                else if (mvsBrokenT < 0.0) mvsBrokenT = nowV;
+                mvsBroken = mvsBrokenT >= 0.0 && nowV - mvsBrokenT > 0.5;
+                mvsPrevId = mvsPendId;
+                mvsPrevT = mvsPendT;
+                if (valid && mvsDtEma > 0.0)
+                {
+                    const double band = MvBandAverage(cellSpeed, measured, s.motionIgnorePct, s.motionAveragePct);
+                    const double tau = (double)s.motionSmoothMs / 1000.0;
+                    mvsBand = tau > 0.0 ? mvsBand + (band - mvsBand) * (1.0 - exp(-perFrame * gap / tau)) : band;
+                    const double hz = modeHz > 0.0 ? modeHz : 120.0, fps = 1.0 / mvsDtEma;
+                    const double held = std::min(fps, hz / (double)s.frames);
+                    const double blur = (double)s.motionBlurPx * (double)g_desc.Width / 1920.0;
+                    const double speed = mvsBand * fps;
+                    const double need = speed / blur;
+                    motionTarget = MvStrength(need, held, hz);
+                    motionLastT = nowV;
+                    EnterCriticalSection(&g_mvLock);
+                    g_mvStatus.bandPxS = (float)speed;
+                    g_mvStatus.startPxS = (float)(blur * held);
+                    g_mvStatus.needHz = (float)need;
+                    g_mvStatus.heldHz = (float)held;
+                    g_mvStatus.fastestNeedHz = (float)((double)fastest * fps / blur);
+                    LeaveCriticalSection(&g_mvLock);
+                }
+                EnterCriticalSection(&g_mvLock);
+                g_mvStatus.fastestPx = fastest;
+                g_mvStatus.fastestPxS = mvsDtEma > 0.0 ? fastest / (float)mvsDtEma : 0.0f;
+                g_mvStatus.averagePx = sum / (float)cellsN;
+                g_mvStatus.zeroButMoving = mvsBroken;
+                LeaveCriticalSection(&g_mvLock);
+            }
+            mvsFence = 0;
+        }
+        // The strength moves toward its target in small steps, so the change itself doesn't show.
+        {
+            const double motT = Now(), motDt = std::min(motT - motionT, 0.1);
+            motionT = motT;
+            if (!motionOn) motionW = motionTarget = 1.0f;
+            else
+            {
+                if (!mvAvailable) motionTarget = 1.0f;                  // no vectors to use: the full strobe, never none
+                else if (motT - motionLastT > 0.25) motionTarget = 0.0f; // no new game frames: nothing is moving
+                const float up = (float)(motDt * 1000.0 / (double)s.motionRiseMs), down = (float)(motDt * 1000.0 / (double)s.motionFallMs);
+                motionW = std::min(motionW + up, std::max(motionW - down, motionTarget));
+            }
+            g_motionStrength.store(motionW);
+        }
         // LCD phase swap: an LCD drives each refresh with the opposite polarity of the one before. With an
         // even cycle (lit, dark) every lit refresh gets the same polarity, the panel sees a DC bias and ions
         // build up in the liquid crystal: image retention ("burn-in") on IPS/VA. Every N seconds the strobe
@@ -3705,6 +4527,28 @@ static DWORD WINAPI PresenterThread(void *)
         else hitchPaused = false;
         if (t - secStart >= 1.0)
         {
+#ifdef _WIN64
+            if (s.motionMode > 0) MvTryHook();
+#endif
+            // DLSS Motion Vector Strobing: the share of frames without vectors, over the last second and the last 5.
+            {
+                EnterCriticalSection(&g_mvLock);
+                mvWinCycles[mvWinI] = secMvCycles;
+                mvWinMiss[mvWinI] = secMvMiss;
+                mvWinStaged[mvWinI] = g_mvStatus.stagedSec;
+                mvWinNoCopy[mvWinI] = g_mvStatus.noCopySec;
+                g_mvStatus.stagedSec = g_mvStatus.noCopySec = 0;
+                int cycles = 0, miss = 0, staged = 0, noCopy = 0;
+                for (int w = 0; w < 5; w++) { cycles += mvWinCycles[w]; miss += mvWinMiss[w]; staged += mvWinStaged[w]; noCopy += mvWinNoCopy[w]; }
+                auto pct = [](int part, int whole) { return whole > 0 ? 100.0f * (float)part / (float)whole : 0.0f; };
+                g_mvStatus.missPct1 = pct(secMvMiss, secMvCycles);
+                g_mvStatus.missPct5 = pct(miss, cycles);
+                g_mvStatus.noCopyPct1 = pct(mvWinNoCopy[mvWinI], mvWinStaged[mvWinI]);
+                g_mvStatus.noCopyPct5 = pct(noCopy, staged);
+                LeaveCriticalSection(&g_mvLock);
+                mvWinI = (mvWinI + 1) % 5;
+                secMvCycles = secMvMiss = 0;
+            }
             {
                 // Frame generation without Reflex: the game's thread (its first present thread) against all presents.
                 static int fgCand = 1, fgRun = 0, fgFact = 1;
@@ -4761,6 +5605,18 @@ static DWORD WINAPI PresenterThread(void *)
     SafeRelease(measRb);
     SafeRelease(measHeap);
     SafeRelease(psMeas);
+    SafeRelease(maskRt);
+    SafeRelease(maskRtB);
+    SafeRelease(maskHeap);
+    SafeRelease(psMask);
+    SafeRelease(psMaskB);
+    SafeRelease(psoMask);
+    SafeRelease(psoMaskB);
+    SafeRelease(mvsRt);
+    SafeRelease(mvsRb);
+    SafeRelease(mvsHeap);
+    SafeRelease(psMvS);
+    SafeRelease(psoMvS);
     SafeRelease(rootSig);
     SafeRelease(rsBlob);
     SafeRelease(rsErr);
@@ -5143,6 +5999,22 @@ static HRESULT SubmitGameFrameLocked()
     ID3D12CommandList *l[] = { g_copyList };
     g_gameQueue->ExecuteCommandLists(1, l);
     g_gameQueue->Signal(g_gameFence, ++g_gameFenceVal);
+    // MotionSource: the vectors copied during this frame belong to it: DLSS ran before its Present.
+    EnterCriticalSection(&g_mvLock);
+    ++g_mvStageSerial;
+    // Do not fence retirement at capture time: a copy may still be recorded but not submitted then.
+    // Eight subsequent staged frames put this fence after those lists on the game's queue.
+    for (auto &old : g_mvRetired)
+        if (!old.gameFence && g_mvStageSerial >= old.afterStage) old.gameFence = g_gameFenceVal;
+    g_stageMv[s] = g_mvPending + 1;
+    if (g_mvPending >= 0) g_mvEntry[g_mvPending].frameId = g_frameId + 1;
+    if (g_mvWanted.load())
+    {
+        g_mvStatus.stagedSec++;
+        if (g_mvPending < 0) g_mvStatus.noCopySec++;
+    }
+    g_mvPending = -1;
+    LeaveCriticalSection(&g_mvLock);
     EnterCriticalSection(&g_lock);            // publish: selectable from here on
     g_stageFence[s] = g_gameFenceVal;
     g_stageId[s]    = ++g_frameId;
@@ -6066,6 +6938,223 @@ static void ReflexWatch()
         g_rfxHooked = -1;
         LOGW("BFI Presenter: Reflex: the game's own sleep mode can't be watched (%s); the frame limit is sent every 2 s", why);
     }
+}
+
+// ---------------------------------------------------------------- DLSS motion vectors (MotionSource)
+// DLSS's own entry point in NVIDIA's _nvngx.dll. Games calling DLSS directly and games using Streamline (sl.dlss goes
+// through it too) both end up here, and every input is named in the parameters. On the game's command list only a copy
+// is added -- a Dispatch would disturb the pipeline state the game has bound -- and the call then goes on unchanged.
+// NVSDK_NGX_Parameter is a C++ interface built by MSVC, which lays out overloaded virtual functions in reverse order
+// within each group; its Get group starts at slot 8 (checked against how sl.dlss.dll calls the matching Set functions).
+enum { kNgxGetVoidP = 8, kNgxGetD3d12 = 9, kNgxGetInt = 11, kNgxGetUInt = 12, kNgxGetFloat = 14, kNgxOk = 1 };
+static int NgxGet(const void *p, int slot, const char *name, void *out)
+{
+    typedef int (*Fn)(const void *, const char *, void *);
+    return ((Fn)(*(void ***)p)[slot])(p, name, out);
+}
+static UINT NgxUInt(const void *p, const char *name)
+{
+    unsigned int v = 0;
+    return NgxGet(p, kNgxGetUInt, name, &v) == kNgxOk ? v : 0;
+}
+
+// The ring copies the game's vector texture exactly; a new one is made when its size or format changes.
+static bool MvEnsureRing(const D3D12_RESOURCE_DESC &md)
+{
+    EnterCriticalSection(&g_mvLock);
+    const UINT64 gameDone = g_gameFence ? g_gameFence->GetCompletedValue() : 0;
+    const UINT64 presDone = g_presFence ? g_presFence->GetCompletedValue() : 0;
+    for (auto it = g_mvRetired.begin(); it != g_mvRetired.end(); )
+    {
+        if (it->gameFence && gameDone >= it->gameFence && presDone >= it->presFence)
+        {
+            SafeRelease(it->resource);
+            it = g_mvRetired.erase(it);
+        }
+        else ++it;
+    }
+    const bool same = g_mvRing[0] && g_mvRingW == (UINT)md.Width && g_mvRingH == md.Height && g_mvRingFmt == md.Format;
+    const bool pinned = g_mvPresenterSlot >= 0;
+    LeaveCriticalSection(&g_mvLock);
+    if (same) return true;
+    if (pinned) return false; // keep the selected resource and its descriptors together until submission/reuse
+    D3D12_RESOURCE_DESC d = md;
+    d.Flags = D3D12_RESOURCE_FLAG_NONE;
+    d.Alignment = 0;
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    ID3D12Resource *fresh[kMvRing] = {};
+    for (UINT i = 0; i < kMvRing; i++)
+    {
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&fresh[i]))))
+        {
+            for (UINT k = 0; k < kMvRing; k++) SafeRelease(fresh[k]);
+            LOGW("BFI Presenter: motion vectors: could not create the copies (%llux%u, format %d)", (unsigned long long)md.Width, md.Height, (int)md.Format);
+            return false;
+        }
+        fresh[i]->SetName(L"BFI motion vectors");
+    }
+    UINT64 bytes = 0;
+    g_device->GetCopyableFootprints(&d, 0, 1, 0, nullptr, nullptr, nullptr, &bytes);
+    LOGI("BFI Presenter: motion vectors: %llux%u, format %d; %u copies, %.0f MB", (unsigned long long)md.Width, md.Height, (int)md.Format,
+         kMvRing, (double)bytes * kMvRing / (1024.0 * 1024.0));
+    EnterCriticalSection(&g_mvLock);
+    if (g_mvPresenterSlot >= 0)
+    {
+        LeaveCriticalSection(&g_mvLock);
+        for (UINT i = 0; i < kMvRing; i++) SafeRelease(fresh[i]);
+        return false;
+    }
+    for (UINT i = 0; i < kMvRing; i++)
+    {
+        if (g_mvRing[i]) g_mvRetired.push_back({ g_mvRing[i], g_mvStageSerial + 8, 0, g_mvReadFence[i] });
+        g_mvRing[i] = fresh[i];
+        g_mvEntry[i] = MvEntry{};
+        g_mvReadFence[i] = 0;
+    }
+    for (UINT s = 0; s < kStage; s++) g_stageMv[s] = 0;
+    g_mvPending = -1;
+    g_mvRingW = (UINT)md.Width;
+    g_mvRingH = md.Height;
+    g_mvRingFmt = md.Format;
+    g_mvGen++;
+    LeaveCriticalSection(&g_mvLock);
+    return true;
+}
+
+// Merely having Streamline loaded is not proof that it supplied these parameters. Restrict the
+// high-resolution units correction to a call stack originating in its DLSS/common implementation.
+static bool MvFromStreamline()
+{
+    HMODULE dlss = GetModuleHandleA("sl.dlss.dll"), common = GetModuleHandleA("sl.common.dll");
+    if (!dlss && !common) return false;
+    void *stack[16];
+    const USHORT count = RtlCaptureStackBackTrace(0, 16, stack, nullptr);
+    for (USHORT i = 0; i < count; i++)
+    {
+        HMODULE module = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              (LPCSTR)stack[i], &module) && ((dlss && module == dlss) || (common && module == common))) return true;
+    }
+    return false;
+}
+
+static void MvCapture(ID3D12GraphicsCommandList *list, const void *p)
+{
+    void *mvp = nullptr;
+    if ((NgxGet(p, kNgxGetVoidP, "MotionVectors", &mvp) != kNgxOk || !mvp) &&
+        (NgxGet(p, kNgxGetD3d12, "MotionVectors", &mvp) != kNgxOk || !mvp)) return;
+    ID3D12Resource *mv = (ID3D12Resource *)mvp;
+    const D3D12_RESOURCE_DESC d = mv->GetDesc();
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 ||
+        d.DepthOrArraySize != 1 || d.MipLevels != 1 || !g_device) return;
+    const UINT baseX = NgxUInt(p, "DLSS.Input.MV.Subrect.Base.X"), baseY = NgxUInt(p, "DLSS.Input.MV.Subrect.Base.Y");
+    if (baseX >= d.Width || baseY >= d.Height) return;
+    if (!MvEnsureRing(d)) return;
+
+    float sx = 0.0f, sy = 0.0f;
+    NgxGet(p, kNgxGetFloat, "MV.Scale.X", &sx);
+    NgxGet(p, kNgxGetFloat, "MV.Scale.Y", &sy);
+    UINT rw = NgxUInt(p, "DLSS.Render.Subrect.Dimensions.Width"), rh = NgxUInt(p, "DLSS.Render.Subrect.Dimensions.Height");
+    if (!rw || !rh) { rw = NgxUInt(p, "Width"); rh = NgxUInt(p, "Height"); }
+    int flags = 0;
+    const bool flagsKnown = NgxGet(p, kNgxGetInt, "DLSS.Feature.Create.Flags", &flags) == kNgxOk;
+    const bool renderPixels = (!flagsKnown || !(flags & 2)) && MvFromStreamline();
+
+    // A ring entry the presenter isn't reading and no earlier call this frame is waiting in.
+    const UINT64 done = g_presFence ? g_presFence->GetCompletedValue() : ~0ull;
+    int r = -1;
+    ID3D12Resource *copy = nullptr;
+    EnterCriticalSection(&g_mvLock);
+    // First an entry the presenter is finished with: never one for a frame it may still show, or the frame would come up
+    // without vectors. If frames are queued deeper than the ring, the oldest entry goes.
+    for (UINT t = 0; t < kMvRing && r < 0; t++)
+    {
+        const int c = (int)((g_mvNext + t) % kMvRing);
+        if (c != g_mvPresenterSlot && g_mvReadFence[c] <= done && c != g_mvPending && (g_mvEntry[c].frameId == 0 || g_mvEntry[c].frameId < g_mvShownId)) r = c;
+    }
+    if (r < 0)
+        for (UINT c2 = 0; c2 < kMvRing; c2++)
+            if ((int)c2 != g_mvPresenterSlot && g_mvReadFence[c2] <= done && (int)c2 != g_mvPending && (r < 0 || g_mvEntry[c2].frameId < g_mvEntry[r].frameId)) r = (int)c2;
+    g_mvStatus.source = 1;
+    g_mvStatus.calls++;
+    g_mvStatus.lastCallT = Now();
+    if (g_mvStatus.firstCallT <= 0.0) g_mvStatus.firstCallT = g_mvStatus.lastCallT;
+    g_mvStatus.texW = (UINT)d.Width;
+    g_mvStatus.texH = d.Height;
+    g_mvStatus.format = (int)d.Format;
+    g_mvStatus.scaleX = sx;
+    g_mvStatus.scaleY = sy;
+    if (r >= 0)
+    {
+        g_mvNext = (r + 1) % (int)kMvRing;
+        MvEntry &e = g_mvEntry[r];
+        e = MvEntry{};
+        e.renderW = rw; e.renderH = rh;
+        e.outW = NgxUInt(p, "OutWidth"); e.outH = NgxUInt(p, "OutHeight");
+        e.scaleX = sx; e.scaleY = sy;
+        e.baseX = baseX; e.baseY = baseY;
+        e.renderPixelVectors = renderPixels;
+        e.flags = flags; e.flagsKnown = flagsKnown;
+        e.time = Now();
+        copy = g_mvRing[r];
+    }
+    LeaveCriticalSection(&g_mvLock);
+    if (!copy) return;
+
+    // NGX expects its inputs in a shader-read state. Both read bits are named here because the caller's exact state
+    // isn't passed in; the same state is restored afterwards.
+    const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    D3D12_RESOURCE_BARRIER br[2] = { Transition(mv, read, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                     Transition(copy, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
+    list->ResourceBarrier(2, br);
+    list->CopyResource(copy, mv);
+    br[0] = Transition(mv, D3D12_RESOURCE_STATE_COPY_SOURCE, read);
+    br[1] = Transition(copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    list->ResourceBarrier(2, br);
+    EnterCriticalSection(&g_mvLock);
+    g_mvPending = r;
+    LeaveCriticalSection(&g_mvLock);
+
+    static bool first = true;
+    if (first)
+    {
+        first = false;
+        LOGI("BFI Presenter: motion vectors: first DLSS call seen: vectors %llux%u, render %ux%u, scale %.2f / %.2f, flags %s 0x%X",
+             (unsigned long long)d.Width, d.Height, rw, rh, sx, sy, flagsKnown ? "" : "(not reported)", (unsigned)flags);
+    }
+}
+
+typedef int (*PFN_NgxEval)(ID3D12GraphicsCommandList *, const void *, const void *, void *);
+static PFN_NgxEval o_NgxEval = nullptr;
+static int hk_NgxEval(ID3D12GraphicsCommandList *list, const void *handle, const void *params, void *cb)
+{
+    if (g_mvWanted.load() && list && params) MvCapture(list, params);
+    return o_NgxEval(list, handle, params, cb);
+}
+
+// Once a second from the presenter thread while motion vectors are wanted: never with MotionMode=0.
+static void MvTryHook()
+{
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOGI("BFI Presenter: motion vectors: loaded: _nvngx.dll %s, nvngx_dlss.dll %s, sl.interposer.dll %s, sl.dlss.dll %s",
+             GetModuleHandleA("_nvngx.dll") ? "yes" : "no", GetModuleHandleA("nvngx_dlss.dll") ? "yes" : "no",
+             GetModuleHandleA("sl.interposer.dll") ? "yes" : "no", GetModuleHandleA("sl.dlss.dll") ? "yes" : "no");
+    }
+    if (g_mvHooked.load() != 0) return;
+    HMODULE ngx = GetModuleHandleA("_nvngx.dll");
+    if (!ngx) return;                                              // DLSS not loaded yet: tried again each second
+    void *fn = (void *)GetProcAddress(ngx, "NVSDK_NGX_D3D12_EvaluateFeature");
+    if (!fn) { g_mvHooked.store(-1); LOGW("BFI Presenter: motion vectors: _nvngx.dll has no D3D12 evaluate function"); return; }
+    char why[96] = "";
+    void *orig = InlineHook64(fn, (void *)&hk_NgxEval, why, sizeof(why));
+    if (!orig) { g_mvHooked.store(-1); LOGW("BFI Presenter: motion vectors: can't hook DLSS (%s)", why); return; }
+    o_NgxEval = (PFN_NgxEval)orig;
+    g_mvHooked.store(1);
+    LOGI("BFI Presenter: motion vectors: hooked DLSS (_nvngx.dll)%s%s", why[0] ? ", " : "", why);
 }
 
 // Once a second, from the presenter thread. limitUs: the frame limit wanted (0 = none).
@@ -9712,6 +10801,112 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                                   "0 = hard edge, no blur. Phosphor decay (above) hides the edge without a seam.");
             ImGui::Unindent(16.0f);
         }
+
+        const char *const kSplitTip = "Perception test: the left half strobes at the strength set here, the right half in full, with the\n"
+                                      "same light per cycle. Shows whether a weaker strobe next to a full one is visible, above all\n"
+                                      "while the camera turns.\n"
+                                      "Ctrl+Shift+T: on / off (starts at 0 %). Numpad + / - held, while it is on: strength up / down.";
+        int mvChoice = s.splitTest ? 4 : s.motionMode;
+        ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+        if (ImGui::Combo("DLSS Motion Vector Strobing  <-- choose a mode here", &mvChoice,
+                         "Off (default: normal BFI on the whole picture)\0Global\0Per object\0Heatmap (debug)\0Split test (left half)\0\0"))
+        {
+            s.splitTest = mvChoice == 4 ? 1 : 0;
+            s.motionMode = mvChoice == 4 ? 0 : mvChoice;
+        }
+        ImGui::PopStyleColor();
+        if (s.splitTest)
+        {
+            ImGui::Indent(16.0f);
+            float splPct = s.splitLeft * 100.0f;
+            if (ImGui::SliderFloat("Left strength (%)", &splPct, 0.0f, 100.0f, "%.0f")) s.splitLeft = std::min(1.0f, std::max(0.0f, splPct / 100.0f));
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kSplitTip);
+            ImGui::SliderInt("Seam (px, 0 = hard edge)", &s.splitSeamPx, 0, 200);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kSplitTip);
+            ImGui::Unindent(16.0f);
+        }
+        else if (ImGui::IsItemHovered()) ImGui::SetTooltip("Experimental (hotkey: Ctrl+Shift+V). Uses the motion vectors the game hands to DLSS (DirectX 12, DLSS or DLAA on in the game).\n"
+                                                      "Off: the default: normal BFI on the whole picture; DLSS is not touched.\n"
+                                                      "Split test: the left half strobes at an adjustable strength, the right half in full (Ctrl+Shift+T).\n"
+                                                      "Global: a still picture is not strobed; as the camera turns faster, the strobe comes in\n"
+                                                      "step by step over the whole picture.\n"
+                                                      "Per object: only the parts of the picture that move too fast are strobed, at once.\n"
+                                                      "Heatmap: colours what moves too fast for the game's frame rate to show cleanly,\n"
+                                                      "red being the speed that takes the full strobe. Strobing itself stays as usual.");
+        if (s.motionMode > 0)
+        {
+            ImGui::Indent(16.0f);
+            if (s.motionMode == 2)
+            {
+                ImGui::SliderInt("Edge blur (px at 1920 wide, 0 = tile edges only)", &s.motionEdgeBlurPx, 0, 64);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("How softly strobed areas fade into the rest of the picture.\n"
+                                                              "Uses the heatmap's threshold and strength scale, averaged in 16x16 tiles and softened at the edges.\n"
+                                                              "The linear strength curve is a target, not a guarantee of remaining blur or measured MPRT.");
+            }
+            else
+            {
+                ImGui::SliderInt("Accepted blur (px at 1920 wide)", &s.motionBlurPx, 2, 16);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("How far a held image may smear before the strobe comes in and the heatmap colours it.\n"
+                                                              "Smaller = both start at slower camera speeds. Per object uses this value too.\n"
+                                                              "Strength is a linear target curve; the actual light profile determines the resulting blur.");
+                if (s.motionMode == 1)
+                {
+                    ImGui::SliderInt("Fade in (ms)", &s.motionRiseMs, 20, 2000);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Time for the strobe to go from off to full strength.");
+                    ImGui::SliderInt("Fade out (ms)", &s.motionFallMs, 20, 4000);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Time for the strobe to go from full strength to off. Slower hides the change in brightness.");
+                }
+                ImGui::SliderInt("Measured area around the centre (%)", &s.motionCenterPct, 20, 100);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Only this share of the screen decides the global strength, as an ellipse around its centre.\n"
+                                                              "The edges run faster than the centre when the camera turns. The heatmap shows the whole picture.");
+                ImGui::SliderInt("Fastest part left out (%)", &s.motionIgnorePct, 0, 50);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("The fastest part of the measured area doesn't count: something flying past stays blurred\n"
+                                                              "instead of raising the strobe for the whole picture.");
+                ImGui::SliderInt("Averaged below that (%)", &s.motionAveragePct, 1, 50);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("The share of the measured area, just below the part left out, that is averaged into the deciding speed.");
+                ImGui::SliderInt("Speed smoothing (ms)", &s.motionSmoothMs, 0, 500);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Smooths the deciding speed, so single frames don't move the strength.");
+            }
+
+            MvStatus mv;
+            EnterCriticalSection(&g_mvLock);
+            mv = g_mvStatus;
+            LeaveCriticalSection(&g_mvLock);
+#ifdef _WIN64
+            const int hooked = g_mvHooked.load();
+#else
+            const int hooked = -1;
+#endif
+            if (hooked < 0) ImGui::TextColored(kRed, "DLSS can't be hooked here (see ReShade.log)");
+            else if (hooked == 0) ImGui::TextColored(kAmber, "Waiting for DLSS to load (is it on in the game?)");
+            else if (mv.source == 0) ImGui::TextColored(kAmber, "DLSS hooked, but it has not run yet");
+            else
+            {
+                ImGui::Text("Motion vectors from DLSS: %ux%u, DXGI format %d, scale %.1f / %.1f, %d calls", mv.texW, mv.texH, mv.format, mv.scaleX, mv.scaleY, mv.calls);
+                if (mv.age < 0) ImGui::Text("Vector age: none for this frame");
+                else ImGui::Text("Vector age: %d game frame(s)", mv.age);
+                // A fixed line that stays readable: a warning shown only for the moment it happens was gone before it could be read.
+                ImGui::Text("Frames shown without vectors: %.1f %% (last 1 s), %.1f %% (last 5 s)", mv.missPct1, mv.missPct5);
+                ImGui::Text("Game frames with no vectors copied: %.1f %% (last 1 s), %.1f %% (last 5 s)", mv.noCopyPct1, mv.noCopyPct5);
+                // Only while it is happening, and for a few seconds after: an old event listed here read as a current problem.
+                if (mv.unavailable) ImGui::TextColored(kAmber, "Full strobe right now: %s", mv.fallback ? mv.fallback : "no vectors to use");
+                else if (mv.fallback && Now() - mv.fallbackEndT < 5.0) ImGui::TextDisabled("Back to normal (full strobe ended just now: %s)", mv.fallback);
+                // Figures to read, not to act on: damped by about half a second, so they don't change faster than the eye can follow.
+                static float dStart, dHeld, dFastS, dFastPx, dFastHz, dAvg, dBand, dNeed, dStrength;
+                static double dLastT = 0.0;
+                const double dNow = Now();
+                const float dA = (float)(1.0 - exp(-(dNow - dLastT) / 0.5));
+                dLastT = dNow;
+                auto damp = [dA](float &shown, float value) { shown += (value - shown) * dA; return shown; };
+                ImGui::Text("Shown cleanly up to: %.0f px/s (%.0f Hz)", damp(dStart, mv.startPxS), damp(dHeld, mv.heldHz));
+                ImGui::Text("Fastest vector: %.0f px/s (%.1f px per game frame), needs %.0f Hz", damp(dFastS, mv.fastestPxS), damp(dFastPx, mv.fastestPx), damp(dFastHz, mv.fastestNeedHz));
+                ImGui::Text("Average vector: %.1f px per game frame", damp(dAvg, mv.averagePx));
+                const float shownBand = damp(dBand, mv.bandPxS), shownNeed = damp(dNeed, mv.needHz), shownStrength = damp(dStrength, g_motionStrength.load() * 100.0f);
+                if (s.motionMode != 2) ImGui::Text("Deciding speed (measured area): %.0f px/s, needs %.0f Hz", shownBand, shownNeed);
+                if (s.motionMode == 1) ImGui::Text("Strobe strength: %.0f %%", shownStrength);
+            }
+            ImGui::Unindent(16.0f);
+        }
     }
 
     // ================================================================ 2. brightness and output
@@ -10284,6 +11479,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         if (g_diagnostics >= 2) DeleteFileA(g_debugPath);
         InitializeCriticalSection(&g_lock);
         InitializeCriticalSection(&g_cfgLock);
+        InitializeCriticalSection(&g_mvLock);
         InitializeCriticalSection(&g_submitLock);
         g_tickEvent      = CreateEventA(nullptr, FALSE, FALSE, nullptr);
         g_gameFenceEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
