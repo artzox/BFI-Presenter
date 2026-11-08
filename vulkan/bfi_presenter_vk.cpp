@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.36-t3"
+#define BFI_VERSION "1.0.36-t4"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -140,6 +140,7 @@ static void Log(const char *lvl, const char *fmt, ...)
 #ifdef _WIN32
 #include "../common/bfi_syscheck.h"
 #include "../common/bfi_vram.h"
+#include "../common/bfi_clockdrift.h"
 static SysCheck g_sysCheck;      // power plan, GPUs, displays (checked on the window watch thread)
 #endif
 #define LOGE(...) Log("ERROR", __VA_ARGS__)
@@ -464,6 +465,8 @@ struct Status
     uint32_t width = 0, height = 0, images = 0, realImages = 0;
     int    format = 0, colorSpace = 0;
     double refreshHz = 0.0, gameFps = 0.0, frameAgeMs = 0.0;
+    int    driftOn = 0;                     // the game runs on a clock of its own, a little off the display (common/bfi_clockdrift.h)
+    double driftFps = 0.0, driftHz = 0.0, driftSuggest = 0.0, driftSlip = 0.0;
     int    late = 0, frameRepeats = 0, frameSkips = 0, slotWaits = 0, reused = 0;
     int    unevenRep = 0, unevenSkip = 0;   // per second: strobe cycles short of / ahead of the expected step
     int    lrState = 0;                     // just-in-time release: 0 off, 1 measuring, 2 active, 3 at its limit
@@ -2067,6 +2070,9 @@ static void PresenterThread(Swapchain *sc)
     bool aheadLocked = false;
     double lastT = Now(), secStart = Now(), ageSum = 0.0;
     int secPresents = 0, secLate = 0;
+    ClockDrift drift;               // the game's own clock against the display's (ICO at 59.94 fps on 120 Hz)
+    double secPhC = 0.0, secPhS = 0.0; int secPhN = 0;
+    int exactProbes = 0;            // automatic frame cap: tries at Refresh in a row that came back at exactly the strobe rate
     int limitSecs = 0;
     bool limitLogged = false;
     double lateTimes[4] = {};
@@ -2820,6 +2826,11 @@ static void PresenterThread(Swapchain *sc)
         if (pickNewG && pickReadyMs > 0.0 && secReadyN < 256) secReady[secReadyN++] = pickReadyMs;
         secPresents++;
         ageSum += (t - pickTime) * 1000.0;
+        if (pickNewG && vb.modeHz > 1.0)   // clock drift check: the new frames' arrival phase over one refresh
+        {
+            const double ang = 6.283185307179586 * (t - pickTime) * vb.modeHz;
+            secPhC += cos(ang); secPhS += sin(ang); secPhN++;
+        }
         if (t - lastT > 1.5 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
         {
             secLate++;
@@ -2886,7 +2897,12 @@ static void PresenterThread(Swapchain *sc)
             if (g_rebuildMisses > 0 && g_rebuildMisses < 3 && t - g_lastAutoRebuildT > 180.0) { g_rebuildMisses = 0; g_rebuildGap = 20.0; }
             // 5 s: with the game close to its video memory budget presentation slows for 2-3 s now and then and
             // recovers by itself (Indiana Jones); a rebuild there only adds a hitch.
-            if (s.vkAutoRecover && slowRun >= 5 && !rebuildReq && g_rebuildMisses < 3)
+            // The game's clock drifting against the display: the slow returns come and go with the drift (ICO), and a
+            // rebuild only adds a hitch.
+            if (s.vkAutoRecover && slowRun == 5 && drift.on)
+                LOGI("BFI Presenter: automatic recovery -- not rebuilding: the slow returns follow the game's clock drift (set the display to %.2f Hz)",
+                     drift.suggestHz);
+            if (s.vkAutoRecover && slowRun >= 5 && !rebuildReq && g_rebuildMisses < 3 && !drift.on)
             {
                 if (t - g_lastRebuildT >= g_rebuildGap)
                 {
@@ -2925,8 +2941,23 @@ static void PresenterThread(Swapchain *sc)
         {
             std::lock_guard<std::mutex> l(g_cfgLock);
             g_status.refreshHz  = secPresents / (t - secStart);
-            g_status.gameFps    = sc->staged.exchange(0) / (t - secStart);
+            const int stagedSec = sc->staged.exchange(0);
+            g_status.gameFps    = stagedSec / (t - secStart);
             g_status.frameAgeMs = secPresents ? ageSum / secPresents : 0.0;
+            const double phase = secPhN ? atan2(secPhS, secPhC) : NAN;
+            secPhC = secPhS = 0.0; secPhN = 0;
+            if (drift.Second(stagedSec, secPresents, phase, vb.modeHz, g_status.fgActive != 0))
+            {
+                if (drift.on)
+                    LOGW("BFI Presenter: the game runs at %.2f fps on a clock of its own, the display at %.2f Hz -- its frames drift "
+                         "against the strobe cycle (a game frame slips about every %.0f s: stutter, and flashes when it lines up with "
+                         "the flip; a rebuild can't help). Set the display to %.2f Hz for this game.",
+                         drift.gameFps, vb.modeHz, drift.slipS, drift.suggestHz);
+                else LOGI("BFI Presenter: the game's frames match the display rate again");
+            }
+            g_status.driftOn = drift.on ? 1 : 0;
+            g_status.driftFps = drift.gameFps; g_status.driftHz = vb.modeHz;
+            g_status.driftSuggest = drift.suggestHz; g_status.driftSlip = drift.slipS;
             g_status.late       = secLate;
             // A frame limiter acting on the presenter's own presents (RTSS,
             // the NVIDIA "Max Frame Rate" setting): a little under the display
@@ -3256,8 +3287,17 @@ static void PresenterThread(Swapchain *sc)
                                 // 120: 5 s with every eighth frame skipped), so the next one waits 5 minutes (as the DX add-on).
                                 // Exactly the strobe rate is a limit of the game's own (an intro, a menu), not a struggle: tries
                                 // every 30 s cost nothing there (as the DX add-on).
-                                if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;
+                                // ... but a game locked to the strobe rate all along (ICO at 60) pays for each try with 4 s of
+                                // frames off the strobe cycle: after two such tries in a row the next waits 5 minutes. Not
+                                // saved: a new session tries every 30 s again.
+                                const bool exact = fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames;
+                                exactProbes = exact ? exactProbes + 1 : 0;
+                                if (exact) probeWait = exactProbes >= 2 ? 300.0 : 30.0;
                                 else if (fpsA < 0.8 * hzA) probeWait = 300.0;
+                                if (exactProbes == 2)
+                                    LOGI("BFI Presenter: automatic frame cap: the game stays at exactly %.0f fps (a limit of its own) -- "
+                                         "tries at Refresh rate every 5 minutes from now; set the cap to One game frame per strobe "
+                                         "cycle to stop them", hzA / s.frames);
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, dupSeen ? std::min(probeWait, 20.0) : probeWait);
                             }
@@ -3273,7 +3313,7 @@ static void PresenterThread(Swapchain *sc)
                             // longer; well under the refresh rate, the first try waits a minute (as the DX add-on).
                             if (t - capUpT < 30.0) probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
                             else probeWait = 30.0;
-                            if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;
+                            if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = exactProbes >= 2 ? 300.0 : 30.0;
                             else if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;
                             down = true; capDownSecs = 0; capSwitchT = t;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps) -- the game held "
@@ -5732,9 +5772,19 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::PopStyleColor();
         }
 #endif
+        // The game's own clock a little off the display's (ICO: 59.94 fps on 120.00 Hz): the cause of its flashes,
+        // so it comes before the flash hints.
+        if (st.driftOn)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            ImGui::TextWrapped("The game runs at %.2f fps on a clock of its own, the display at %.2f Hz: its frames drift against the "
+                               "strobe cycle (a slip about every %.0f s, with stutter and flashes). Set the display to %.2f Hz for "
+                               "this game.", st.driftFps, st.driftHz, st.driftSlip, st.driftSuggest);
+            ImGui::PopStyleColor();
+        }
         // Flash hint: when missed refreshes keep coming back, the first step that isn't done yet (the red
         // warnings above come first).
-        if (st.flashHint && s.flashHints && s.enabled && !st.limitSuspect && st.layerOrder != 2)
+        if (!st.driftOn && st.flashHint && s.flashHints && s.enabled && !st.limitSuspect && st.layerOrder != 2)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
             // Not when video memory is tight: each buffer is a full-size image (about 33 MB at 4K).
@@ -6131,6 +6181,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
     if (st.managed && ImGui::CollapsingHeader("Status", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::Text("Game: %.1f fps   Refreshes: %.1f/s   Frame age: %.1f ms", st.gameFps, st.refreshHz, st.frameAgeMs);
+
         ImGui::Text("Uneven strobe cycles: %d/s (a frame repeated %d, frames skipped %d)",
                     st.unevenRep + st.unevenSkip, st.unevenRep, st.unevenSkip);
         ImGui::Text("Late refreshes: %d/s", st.late);

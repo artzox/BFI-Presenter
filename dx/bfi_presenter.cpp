@@ -54,6 +54,7 @@
 #include <reshade.hpp>
 #include "../common/bfi_syscheck.h"
 #include "../common/bfi_vram.h"
+#include "../common/bfi_clockdrift.h"
 
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d12.lib")
@@ -92,7 +93,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.36-t3"
+#define BFI_ADDON_VERSION "1.0.36-t4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -533,6 +534,8 @@ struct Status
     UINT   format = 0;
     int    outType = -1;
     double refreshHz = 0.0, gameFps = 0.0, frameAgeMs = 0.0;
+    int    driftOn = 0;                     // the game runs on a clock of its own, a little off the display (common/bfi_clockdrift.h)
+    double driftFps = 0.0, driftHz = 0.0, driftSuggest = 0.0, driftSlip = 0.0;
     int    late = 0, repeats = 0;
     int    frameRepeats = 0, frameSkips = 0;
     double alignSlackMs = -1.0, alignShiftMs = 0.0;   // ReflexAlign: frames ready before the pick (10th percentile), total shift
@@ -3347,6 +3350,9 @@ static DWORD WINAPI PresenterThread(void *)
     int lastShown = -1;
     double lastT = Now(), secStart = Now(), ageSum = 0.0;
     int secPresents = 0, secLate = 0;
+    ClockDrift drift;               // the game's own clock against the display's (ICO at 59.94 fps on 120 Hz)
+    double secPhC = 0.0, secPhS = 0.0; int secPhN = 0;
+    int exactProbes = 0;            // automatic frame cap: tries at Refresh in a row that came back at exactly the strobe rate
     // Hitch guard: while the presenter misses refreshes (GPU saturated by
     // loading) or the game stops delivering frames, every refresh is shown
     // lit -- a held dark or lit frame is what flashes. BFI returns after a
@@ -4026,6 +4032,11 @@ static DWORD WINAPI PresenterThread(void *)
         }
         secPresents++;
         ageSum += (t - pickTime) * 1000.0;
+        if (pickNew && modeHz > 1.0)   // clock drift check: the new frames' arrival phase over one refresh
+        {
+            const double ang = 6.283185307179586 * (t - pickTime) * modeHz;
+            secPhC += cos(ang); secPhS += sin(ang); secPhN++;
+        }
         if (t - lastT > 1.5 / (modeHz > 0.0 ? modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
         {
             secLate++;
@@ -4204,8 +4215,24 @@ static DWORD WINAPI PresenterThread(void *)
             if (sok) { lastSync = st.SyncRefreshCount; lastPC = st.PresentCount; haveStats = true; }
             EnterCriticalSection(&g_cfgLock);
             g_status.refreshHz  = secPresents / (t - secStart);
-            g_status.gameFps    = g_stagedThisSecond.exchange(0) / (t - secStart);
+            const int stagedSec = g_stagedThisSecond.exchange(0);
+            g_status.gameFps    = stagedSec / (t - secStart);
             g_status.frameAgeMs = secPresents ? ageSum / secPresents : 0.0;
+            {
+                const double phase = secPhN ? atan2(secPhS, secPhC) : NAN;
+                secPhC = secPhS = 0.0; secPhN = 0;
+                if (drift.Second(stagedSec, secPresents, phase, modeHz, g_status.fgActive != 0))
+                {
+                    if (drift.on)
+                        LOGW("BFI Presenter: the game runs at %.2f fps on a clock of its own, the display at %.2f Hz -- its frames drift "
+                             "against the strobe cycle (a game frame slips about every %.0f s: stutter, and flashes when it lines up "
+                             "with the flip). Set the display to %.2f Hz for this game.", drift.gameFps, modeHz, drift.slipS, drift.suggestHz);
+                    else LOGI("BFI Presenter: the game's frames match the display rate again");
+                }
+                g_status.driftOn = drift.on ? 1 : 0;
+                g_status.driftFps = drift.gameFps; g_status.driftHz = modeHz;
+                g_status.driftSuggest = drift.suggestHz; g_status.driftSlip = drift.slipS;
+            }
             g_status.late       = secLate;
             g_status.repeats    = rep > 0 ? rep : 0;
             g_status.frameRepeats = secFrameRepeats;
@@ -4601,8 +4628,17 @@ static DWORD WINAPI PresenterThread(void *)
                                 // Far from the refresh rate (under 80%): each try is seconds of uneven frames and the
                                 // longest delay (Soul Reaver at 64 of 120: 53 ms from release to flash for 4 s), so the
                                 // next one waits 5 minutes.
-                                if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;   // its own limit (see above)
+                                // Its own limit (see above) -- but a game locked to the strobe rate all along (ICO at 60) pays for
+                                // each try with 4 s of frames off the strobe cycle: after two such tries in a row the next waits
+                                // 5 minutes. Not saved: a new session tries every 30 s again.
+                                const bool exact = fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames;
+                                exactProbes = exact ? exactProbes + 1 : 0;
+                                if (exact) probeWait = exactProbes >= 2 ? 300.0 : 30.0;
                                 else if (fpsA < 0.8 * hzA) probeWait = 300.0;
+                                if (exactProbes == 2)
+                                    LOGI("BFI Presenter: automatic frame cap: the game stays at exactly %.0f fps (a limit of its own) -- "
+                                         "tries at Refresh rate every 5 minutes from now; set the cap to One game frame per strobe "
+                                         "cycle to stop them", hzA / s.frames);
                                 if (fg && fgTryNeedMs > 0.0) { fgFailNeedMs = fgTryNeedMs; fgSkipLogged = false; }
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
@@ -4633,7 +4669,7 @@ static DWORD WINAPI PresenterThread(void *)
                             // Well under the refresh rate: first try after a minute -- unless the game holds exactly the strobe rate,
                             // which is a limit of its own (an intro, a menu), not a struggle: tries every 30 s cost nothing there.
                             const bool atStrobe = fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames;
-                            if (atStrobe) probeWait = 30.0;
+                            if (atStrobe) probeWait = exactProbes >= 2 ? 300.0 : 30.0;
                             else if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;
                             autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
@@ -9928,7 +9964,17 @@ static void draw_overlay(reshade::api::effect_runtime *)
         const bool redWarn = st.vrrSuspect || st.limitSuspect || st.glPresentBlocked || st.vsyncOverridden;
         // Not 4 presenter buffers when video memory is tight: each is a full-size image (about 33 MB at 4K).
         const bool vramTight = st.vramOver || (st.vramBudget > 0.0 && st.vramUse > st.vramBudget - 256.0);
-        if (st.flashHint && s.flashHints && s.enabled && !redWarn)
+        // The game's own clock a little off the display's (ICO: 59.94 fps on 120.00 Hz): the cause of its flashes,
+        // so it replaces the flash hints.
+        if (st.driftOn)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            ImGui::TextWrapped("The game runs at %.2f fps on a clock of its own, the display at %.2f Hz: its frames drift against the "
+                               "strobe cycle (a slip about every %.0f s, with stutter and flashes). Set the display to %.2f Hz for "
+                               "this game.", st.driftFps, st.driftHz, st.driftSlip, st.driftSuggest);
+            ImGui::PopStyleColor();
+        }
+        if (st.flashHint && s.flashHints && s.enabled && !redWarn && !st.driftOn)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
             if (s.queuePriority >= 2 && g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH)
