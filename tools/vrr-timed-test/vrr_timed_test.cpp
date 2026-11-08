@@ -203,20 +203,25 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     int queue   = argc > 3 ? _wtoi(argv[3]) : 3;
     int seconds = argc > 4 ? _wtoi(argv[4]) : 120;
     double loadMs = argc > 5 ? _wtof(argv[5]) : 0.0;
+    // Mode (6th argument): 0 = steady targets + preferred present duration; 1 = steady targets, no preferred duration;
+    // 2 = targets alternating 1 ms short and long (9/11 ms at 100 Hz) -- if the refreshes follow, the targets are honoured.
+    int mode = argc > 6 ? _wtoi(argv[6]) : 0;
+    if (mode < 0 || mode > 2) mode = 0;
     if (loadMs < 0 || loadMs > 100) loadMs = 0;
     if (rate < 30 || rate > 500) rate = 100; if (frames < 1 || frames > 8) frames = 2;
     if (queue < 1 || queue > 8) queue = 3; if (seconds < 5) seconds = 120;
 
     wchar_t path[MAX_PATH]; GetModuleFileNameW(nullptr, path, MAX_PATH);
-    wchar_t *sl = wcsrchr(path, L'\\'); if (sl) wcscpy(sl + 1, L"VrrTimedTest_log.txt");
+    wchar_t *sl = wcsrchr(path, L'\\'); if (sl) swprintf(sl + 1, MAX_PATH - (sl + 1 - path), L"VrrTimedTest_log_%.0fHz_load%.0f_mode%d.txt", rate, loadMs, mode);
     g_log = _wfopen(path, L"w");
     {
         typedef BOOL (WINAPI *PFN_DpiCtx)(HANDLE);
         auto setDpi = (PFN_DpiCtx)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetProcessDpiAwarenessContext");
         if (setDpi) setDpi((HANDLE)-4 /*DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2*/);
     }
-    Log("VRR timed-present test 1.2: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms",
-        rate, frames, rate / frames, queue, seconds, loadMs);
+    Log("VRR timed-present test 1.3: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms, mode %d (%s)",
+        rate, frames, rate / frames, queue, seconds, loadMs, mode,
+        mode == 0 ? "steady targets + preferred duration" : mode == 1 ? "steady targets, no preferred duration" : "targets alternating short/long");
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
@@ -333,7 +338,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     pm->EnablePresentStatisticsKind(PresentStatisticsKind_IndependentFlipFrame, 1);
     const UINT64 per = (UINT64)(1e7 / rate + 0.5);                  // interrupt time: 100 ns units
     SystemInterruptTime pd = {per}, tol = {per / 50};
-    hr = pm->SetPreferredPresentDuration(pd, tol);
+    hr = mode == 0 ? pm->SetPreferredPresentDuration(pd, tol) : S_OK;
     Log("SetPreferredPresentDuration(%.3f ms) 0x%08lX", per / 1e4, (unsigned long)hr);
 
     // The displayed times may use another clock than the interrupt time the targets are given in: sample both.
@@ -347,10 +352,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     ULONGLONG now = 0; qitp(&now);
     UINT64 nextT = now + per * 10;
     UINT64 k = 0;
-    struct Pending { UINT64 id, target; };
+    struct Pending { UINT64 id, target; double callQ; };
     std::vector<Pending> pend;                                       // presents waiting for their statistics
     UINT64 lastId = 0, lastShown = 0;
-    std::vector<double> dev_ms, late_ms, lateQ_ms; int composed = 0, iflip = 0, skipped = 0, gaps = 0;
+    std::vector<double> dev_ms, late_ms, lateQ_ms, callShow_ms, devOdd, devEven; int composed = 0, iflip = 0, skipped = 0, gaps = 0;
     ULONGLONG winStart = now; int logs = 0; ULONGLONG endT = now + (ULONGLONG)seconds * 10000000ull;
     int bi = 0;
     while (!g_quit)
@@ -386,8 +391,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
         const UINT64 id = pm->GetNextPresentId();
         hr = pm->Present();
         if (FAILED(hr)) { Log("Present 0x%08lX", (unsigned long)hr); break; }
-        pend.push_back({id, nextT});
-        nextT += per; k++;
+        LARGE_INTEGER cq; QueryPerformanceCounter(&cq);
+        pend.push_back({id, nextT, (double)cq.QuadPart * (1e7 / (double)qpf.QuadPart)});
+        // Mode 2: the next target 1 ms early or late, alternately (the average rate stays the same).
+        nextT += per; if (mode == 2) nextT += (k % 2 == 0) ? 10000 : (UINT64)-10000; k++;
 
         // Statistics.
         IPresentStatistics *ps = nullptr;
@@ -402,8 +409,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                 {
                     SystemInterruptTime shown = {}; fs->GetDisplayedTime(&shown);
                     iflip++;
-                    for (auto &p : pend) if (p.id == pid) { late_ms.push_back(((double)shown.value - (double)p.target) / 1e4); lateQ_ms.push_back(((double)shown.value - ((double)p.target + qpcMinusIt)) / 1e4); break; }
-                    if (lastId && pid == lastId + 1 && lastShown) dev_ms.push_back(((double)shown.value - (double)lastShown) / 1e4 - per / 1e4);
+                    for (auto &p : pend) if (p.id == pid) { late_ms.push_back(((double)shown.value - (double)p.target) / 1e4); lateQ_ms.push_back(((double)shown.value - ((double)p.target + qpcMinusIt)) / 1e4); callShow_ms.push_back(((double)shown.value - p.callQ) / 1e4); break; }
+                    if (lastId && pid == lastId + 1 && lastShown)
+                    {
+                        const double len = ((double)shown.value - (double)lastShown) / 1e4;
+                        dev_ms.push_back(len - per / 1e4);
+                        (pid % 2 ? devOdd : devEven).push_back(len);
+                    }
                     lastId = pid; lastShown = shown.value;
                     fs->Release();
                 }
@@ -437,8 +449,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                 "median %.3f, 99%% %.3f ms)", per / 1e4, h[0], h[1], h[2], h[3],
                 h[4], h[5], h[6], h[7], h[8], pct(late_ms, 0.5), pct(late_ms, 0.99), pct(lateQ_ms, 0.5), pct(lateQ_ms, 0.99));
             if (loadMs > 0) Log("  GPU load: %.1f ms per frame measured", g_loadGpuMs.load());
+            {
+                auto mean = [](const std::vector<double> &v) { double a = 0; for (double x : v) a += x; return v.empty() ? 0.0 : a / v.size(); };
+                Log("  Present call -> displayed (displayed time as QPC): median %.3f, 99%% %.3f ms; refresh length after odd / even "
+                    "presents: %.3f / %.3f ms%s", pct(callShow_ms, 0.5), pct(callShow_ms, 0.99), mean(devOdd), mean(devEven),
+                    mode == 2 ? " (targets honoured if these are about 1 ms apart from 10)" : "");
+            }
             if (composed > iflip) Log("  most images were composed by DWM, not flipped -- timing then follows DWM, not the targets");
-            dev_ms.clear(); late_ms.clear(); lateQ_ms.clear(); composed = iflip = skipped = gaps = 0; winStart = now; logs++;
+            dev_ms.clear(); late_ms.clear(); lateQ_ms.clear(); callShow_ms.clear(); devOdd.clear(); devEven.clear(); composed = iflip = skipped = gaps = 0; winStart = now; logs++;
         }
     }
     g_loadRun.store(false); if (lt) { WaitForSingleObject(lt, 2000); CloseHandle(lt); }
