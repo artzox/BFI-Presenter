@@ -24,9 +24,15 @@ layout(push_constant) uniform C
     uint  splitMode;  // 0 off, 1 the left side without BFI, 2 the right side
     float rfxRamp;    // SDR to HDR, RenoFX HDR Boost (flags & 256): Ramp Intensity
     float rfxColor;   // its colour blend, 0..1 (0 = brightness only)
-    float rfxAplCut;  // its APL Limiter: share of the boost taken away in bright scenes (0 = full boost, 1 = none)
+    float rfxApl;     // its APL Limiter: 1 = on (the scene average is in aplImg, measured from this frame)
 } pc;
 layout(set = 0, binding = 0) uniform sampler2D src;
+// RenoFX APL Limiter: the frame's average SDR brightness (1x1), written by apl.comp before the frame's first refresh
+#ifdef APL_WRITE
+layout(set = 0, binding = 2, r32f) uniform writeonly image2D aplImg;
+#else
+layout(set = 0, binding = 2, r32f) uniform readonly image2D aplImg;
+#endif
 
 vec3 SrgbToLin(vec3 c) { c = max(c, 0.0); return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c)); }
 vec3 LinToSrgb(vec3 l) { l = max(l, 0.0); return mix(l * 12.92, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), l)); }
@@ -197,9 +203,12 @@ vec3 SdrToHdr(vec3 lin)
 {
     // flags & 256: RenoFX's HDR Boost (peak = SDR highlights / SDR white, Start in sdrKnee); else the knee curve.
     // RenoFX's availability blends each channel between the source and the full boost, which is the same as a smaller
-    // boost: 1 + a (boost - 1). The APL Limiter's reduction (rfxAplCut = 1 - a) is applied that way.
+    // boost: 1 + a (boost - 1). The APL Limiter's availability: 1 up to a scene average of 30% of SDR white, smoothly
+    // down to 0 at 100% (RenoFX's HDR_BOOST_APL_START 30, minimum 0), from this frame's own average.
     float rfxMult = pc.sdrPeak > pc.sdrScale ? pc.sdrPeak / pc.sdrScale : 1.0;
-    rfxMult -= clamp(pc.rfxAplCut, 0.0, 1.0) * (rfxMult - 1.0);
+#ifndef APL_WRITE
+    if (pc.rfxApl > 0.5) rfxMult -= smoothstep(0.30, 1.0, clamp(imageLoad(aplImg, ivec2(0)).r, 0.0, 1.0)) * (rfxMult - 1.0);
+#endif
     vec3 o = (pc.flags & 256u) != 0u ? RfxHdrBoost(max(lin, vec3(0.0)), rfxMult,
                                                    pc.sdrKnee, pc.rfxRamp, pc.rfxColor, (pc.flags & 512u) != 0u) * pc.sdrScale
                                        : SdrExpand(lin);

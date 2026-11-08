@@ -1,0 +1,31 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// RenoFX APL Limiter: the frame's average SDR brightness (Yf, 1 = SDR white, each pixel capped at 1) over the same
+// 32x18 cells x 4x4 samples as the overlay's readout, into the 1x1 aplImg the BFI pass reads. One workgroup, run
+// before the frame's first refresh so the boost uses the frame's own average (as RenoFX does).
+#define APL_WRITE
+#include "common.glsl"
+layout(local_size_x = 64) in;
+shared float part[64];
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x;
+    vec2 cell = vec2(textureSize(src, 0)) / vec2(32.0, 18.0);
+    float yw = max(RfxYf(vec3(1.0)), 1e-6), a = 0.0;
+    for (uint i = t; i < 576u * 16u; i += 64u)
+    {
+        uint c = i / 16u, k = i % 16u;
+        vec2 cxy = vec2(float(c % 32u), float(c / 32u)), sxy = vec2(float(k % 4u), float(k / 4u));
+        ivec2 p = ivec2((cxy + (sxy + 0.5) / 4.0) * cell);
+        a += clamp(max(RfxYf(max(SdrIn(texelFetch(src, p, 0).rgb), vec3(0.0))), 0.0) / yw, 0.0, 1.0);
+    }
+    part[t] = a;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        if (t < s) part[t] += part[t + s];
+        barrier();
+    }
+    if (t == 0u) imageStore(aplImg, ivec2(0), vec4(part[0] / 9216.0));
+}

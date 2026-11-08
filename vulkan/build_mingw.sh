@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 TP=../third_party
 if command -v glslangValidator >/dev/null 2>&1; then
     tmp=$(mktemp -d)
-    for f in fullscreen.vert bfi.frag measure.frag measure.comp; do
+    for f in fullscreen.vert bfi.frag measure.frag measure.comp apl.comp; do
         glslangValidator -V "shaders/$f" -o "$tmp/$f.spv" >/dev/null
     done
     # BFI compute pass (realtime queue), one per storage format

@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.36-t2"
+#define BFI_VERSION "1.0.36-t3"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -624,7 +624,7 @@ struct Constants
     float    splitX, splitSeam;   // split comparison: seam position and soft width, output pixels
     uint32_t splitMode;           // 0 off, 1 left side without BFI, 2 right side
     float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
-    float    rfxAplCut;                 // its APL Limiter: share of the boost removed (0 = full boost)
+    float    rfxApl;                    // its APL Limiter: 1 = on (GPU-measured from the frame being shown)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -1110,6 +1110,17 @@ struct PresenterRes
     VkImage               mid = VK_NULL_HANDLE;
     VkDeviceMemory        midMem = VK_NULL_HANDLE;
     VkImageView           midView = VK_NULL_HANDLE;
+    // RenoFX APL Limiter: apl.comp writes the frame's average into the 1x1 aplImg (binding 2 of every set, GENERAL)
+    VkImage               aplImg = VK_NULL_HANDLE;
+    VkDeviceMemory        aplMem = VK_NULL_HANDLE;
+    VkImageView           aplView = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dslA = VK_NULL_HANDLE;
+    VkPipelineLayout      plA = VK_NULL_HANDLE;
+    VkDescriptorPool      dpA = VK_NULL_HANDLE;
+    VkDescriptorSet       dsA[kStage] = {};
+    VkShaderModule        csApl = VK_NULL_HANDLE;
+    VkPipeline            psoA = VK_NULL_HANDLE;   // null: the limiter is unavailable
+    bool                  aplInit = false;         // aplImg moved to GENERAL
 };
 
 static VkRenderPass MakeRenderPass(DeviceData *d, VkFormat fmt, VkImageLayout finalLayout)
@@ -1286,7 +1297,7 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
     }
     if (p)
     {
-        VkDescriptorSetLayoutBinding b[2] = {};
+        VkDescriptorSetLayoutBinding b[3] = {};
         b[0].binding = 0;
         b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[0].descriptorCount = 1;
@@ -1295,8 +1306,10 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
         b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         b[1].descriptorCount = 1;
         b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        b[2] = b[1];
+        b[2].binding = 2;                                  // the APL Limiter's value
         VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        dli.bindingCount = 2;
+        dli.bindingCount = 3;
         dli.pBindings = b;
         p = d->CreateDescriptorSetLayout(dev, &dli, nullptr, &R.dslC) == VK_SUCCESS;
         VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Constants) };
@@ -1317,7 +1330,7 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
     const bool meas = p && R.psoMeas && R.measView;
     if (p)
     {
-        VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kStage } };
+        VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * kStage } };
         VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         dpi.maxSets = 2 * kStage;
         dpi.poolSizeCount = 2;
@@ -1339,8 +1352,14 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
             {
                 VkDescriptorImageInfo src = { R.sampler, sc->stageView[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
                 VkDescriptorImageInfo dst = { VK_NULL_HANDLE, k ? R.measView : R.midView, VK_IMAGE_LAYOUT_GENERAL };
-                VkWriteDescriptorSet w[2] = { { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
-                w[0].dstSet = w[1].dstSet = k ? R.dsM[i] : R.dsC[i];
+                VkDescriptorImageInfo apl = { VK_NULL_HANDLE, R.aplView, VK_IMAGE_LAYOUT_GENERAL };
+                VkWriteDescriptorSet w[3] = { { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET },
+                                              { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
+                w[0].dstSet = w[1].dstSet = w[2].dstSet = k ? R.dsM[i] : R.dsC[i];
+                w[2].dstBinding = 2;
+                w[2].descriptorCount = 1;
+                w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                w[2].pImageInfo = &apl;
                 w[0].dstBinding = 0;
                 w[0].descriptorCount = 1;
                 w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -1349,7 +1368,7 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
                 w[1].descriptorCount = 1;
                 w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                 w[1].pImageInfo = &dst;
-                d->UpdateDescriptorSets(dev, 2, w, 0, nullptr);
+                d->UpdateDescriptorSets(dev, 3, w, 0, nullptr);
             }
         }
     }
@@ -1440,14 +1459,18 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     }
     if (p)
     {
-        VkDescriptorSetLayoutBinding b = {};
-        b.binding = 0;
-        b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        b.descriptorCount = 1;
-        b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutBinding b[2] = {};
+        b[0].binding = 0;
+        b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[0].descriptorCount = 1;
+        b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        b[1].binding = 2;                                  // the APL Limiter's value
+        b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[1].descriptorCount = 1;
+        b[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        dli.bindingCount = 1;
-        dli.pBindings = &b;
+        dli.bindingCount = 2;
+        dli.pBindings = b;
         p = d->CreateDescriptorSetLayout(dev, &dli, nullptr, &R.dsl) == VK_SUCCESS;
     }
     if (p)
@@ -1478,11 +1501,88 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     }
     if (p)
     {
-        VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kStage };
+        // RenoFX APL Limiter's 1x1 value; every set points binding 2 at it
+        VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_R32_SFLOAT;
+        ici.extent = { 1, 1, 1 };
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        p = CreateImageMem(d, ici, &R.aplImg, &R.aplMem);
+        VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vci.image = R.aplImg;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = VK_FORMAT_R32_SFLOAT;
+        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        p = p && d->CreateImageView(dev, &vci, nullptr, &R.aplView) == VK_SUCCESS;
+    }
+    if (p)
+    {
+        // its compute pass (apl.comp): runs on the presenter's queue, which needs compute (the graphics queue usually has it)
+        uint32_t nf = 0;
+        d->inst->GetPhysicalDeviceQueueFamilyProperties(d->phys, &nf, nullptr);
+        std::vector<VkQueueFamilyProperties> fp(nf);
+        if (nf) d->inst->GetPhysicalDeviceQueueFamilyProperties(d->phys, &nf, fp.data());
+        const bool comp = d->family < nf && (fp[d->family].queueFlags & VK_QUEUE_COMPUTE_BIT);
+        bool a = comp;
+        VkDescriptorSetLayoutBinding b[2] = {};
+        b[0].binding = 0;
+        b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[0].descriptorCount = 1;
+        b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        b[1].binding = 2;
+        b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[1].descriptorCount = 1;
+        b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        dli.bindingCount = 2;
+        dli.pBindings = b;
+        a = a && d->CreateDescriptorSetLayout(dev, &dli, nullptr, &R.dslA) == VK_SUCCESS;
+        VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Constants) };
+        VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &R.dslA;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pr;
+        a = a && d->CreatePipelineLayout(dev, &pli, nullptr, &R.plA) == VK_SUCCESS;
+        VkDescriptorPoolSize aps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kStage } };
         VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         dpi.maxSets = kStage;
-        dpi.poolSizeCount = 1;
-        dpi.pPoolSizes = &ps;
+        dpi.poolSizeCount = 2;
+        dpi.pPoolSizes = aps;
+        a = a && d->CreateDescriptorPool(dev, &dpi, nullptr, &R.dpA) == VK_SUCCESS;
+        VkDescriptorSetLayout l[kStage];
+        for (uint32_t i = 0; i < kStage; i++) l[i] = R.dslA;
+        VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dai.descriptorPool = R.dpA;
+        dai.descriptorSetCount = kStage;
+        dai.pSetLayouts = l;
+        a = a && d->AllocateDescriptorSets(dev, &dai, R.dsA) == VK_SUCCESS;
+        for (uint32_t i = 0; a && i < kStage; i++)
+        {
+            VkDescriptorImageInfo ii[2] = { { R.sampler, sc->stageView[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+                                            { VK_NULL_HANDLE, R.aplView, VK_IMAGE_LAYOUT_GENERAL } };
+            VkWriteDescriptorSet w[2] = { { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
+            w[0].dstSet = w[1].dstSet = R.dsA[i];
+            w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &ii[0];
+            w[1].dstBinding = 2; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &ii[1];
+            d->UpdateDescriptorSets(dev, 2, w, 0, nullptr);
+        }
+        if (a) R.csApl = MakeShader(d, kAplCompSpv, sizeof(kAplCompSpv));
+        if (a && R.csApl) R.psoA = MakeComputePipeline(d, R.plA, R.csApl);
+        if (!R.psoA)
+            LOGW("BFI Presenter: RenoFX APL limiter unavailable (%s)", comp ? "its compute pass could not be created" : "the presenter queue has no compute");
+    }
+    if (p)
+    {
+        VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kStage } };
+        VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        dpi.maxSets = kStage;
+        dpi.poolSizeCount = 2;
+        dpi.pPoolSizes = ps;
         p = d->CreateDescriptorPool(dev, &dpi, nullptr, &R.dp) == VK_SUCCESS;
         VkDescriptorSetLayout l[kStage];
         for (uint32_t i = 0; i < kStage; i++) l[i] = R.dsl;
@@ -1494,13 +1594,18 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         for (uint32_t i = 0; p && i < kStage; i++)
         {
             VkDescriptorImageInfo ii = { R.sampler, sc->stageView[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            w.dstSet = R.ds[i];
-            w.dstBinding = 0;
-            w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            w.pImageInfo = &ii;
-            d->UpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+            VkDescriptorImageInfo ai = { VK_NULL_HANDLE, R.aplView, VK_IMAGE_LAYOUT_GENERAL };
+            VkWriteDescriptorSet w[2] = { { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
+            w[0].dstSet = w[1].dstSet = R.ds[i];
+            w[0].dstBinding = 0;
+            w[0].descriptorCount = 1;
+            w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[0].pImageInfo = &ii;
+            w[1].dstBinding = 2;
+            w[1].descriptorCount = 1;
+            w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[1].pImageInfo = &ai;
+            d->UpdateDescriptorSets(dev, 2, w, 0, nullptr);
         }
     }
     if (!p)
@@ -1638,6 +1743,14 @@ static void DestroyPresenterRes(DeviceData *d, PresenterRes &R)
     if (R.midView) d->DestroyImageView(dev, R.midView, nullptr);
     if (R.mid) d->DestroyImage(dev, R.mid, nullptr);
     if (R.midMem) d->FreeMemory(dev, R.midMem, nullptr);
+    if (R.psoA) d->DestroyPipeline(dev, R.psoA, nullptr);
+    if (R.csApl) d->DestroyShaderModule(dev, R.csApl, nullptr);
+    if (R.plA) d->DestroyPipelineLayout(dev, R.plA, nullptr);
+    if (R.dslA) d->DestroyDescriptorSetLayout(dev, R.dslA, nullptr);
+    if (R.dpA) d->DestroyDescriptorPool(dev, R.dpA, nullptr);
+    if (R.aplView) d->DestroyImageView(dev, R.aplView, nullptr);
+    if (R.aplImg) d->DestroyImage(dev, R.aplImg, nullptr);
+    if (R.aplMem) d->FreeMemory(dev, R.aplMem, nullptr);
     R = PresenterRes();
 }
 
@@ -1946,9 +2059,10 @@ static void PresenterThread(Swapchain *sc)
     int repWin[30] = {}, repIdx = 0, repSum = 0, repSecsRun = 0;   // repSecsRun: the first seconds (loading) don't count
     int lastOutType = -1, lastShown = -1;
     double ceilNow = -1.0, ceilTarget = -1.0, litAvg = -1.0, rawAvg = -1.0, ablSolve = -1.0, ablT = Now(), ablLowT = 0.0;
-    double aplNow = -1.0;           // RenoFX APL Limiter: the last measured scene average (0..1 of SDR white)
+    double aplNow = -1.0;           // RenoFX APL Limiter: the last measured scene average (0..1 of SDR white), overlay only
     float  lastAplCut = 0.0f;
     bool   aplOn = false;
+    uint64_t aplFrameId = ~0ull;    // the game frame aplImg was measured from
     double aheadDropT = -1.0;
     bool aheadLocked = false;
     double lastT = Now(), secStart = Now(), ageSum = 0.0;
@@ -2295,15 +2409,18 @@ static void PresenterThread(Swapchain *sc)
             const float hi = std::min(s.sdrHiNits, s.peakNits);
             c.sdrPeak = hi > s.sdrWhite ? hi / 80.0f : 0.0f;
             // RenoFX's APL Limiter: from a scene average of 30% of SDR white the boost fades out smoothly, and is gone
-            // for an all-white screen (its HDR_BOOST_APL_START 30, minimum 0). Measured a frame or two behind.
-            aplOn = R.psoMeas && c.outType >= 4 && s.sdrMethod == 2 && s.sdrBoostApl && c.sdrPeak > c.sdrScale;
+            // for an all-white screen (its HDR_BOOST_APL_START 30, minimum 0), from the frame being shown.
+            // The shader takes the average from the frame itself (apl.comp before the BFI pass); aplNow, read back
+            // a frame or two later, is only for the overlay.
+            aplOn = R.psoA && c.outType >= 4 && s.sdrMethod == 2 && s.sdrBoostApl && c.sdrPeak > c.sdrScale;
+            c.rfxApl = aplOn ? 1.0f : 0.0f;
+            lastAplCut = 0.0f;
             if (aplOn && aplNow >= 0.0)
             {
                 const double x = std::max(0.0, std::min(1.0, (aplNow - 0.30) / 0.70));
-                c.rfxAplCut = (float)(x * x * (3.0 - 2.0 * x));
+                lastAplCut = (float)(x * x * (3.0 - 2.0 * x));
             }
-            if (!aplOn) aplNow = -1.0;
-            lastAplCut = c.rfxAplCut;
+            if (!aplOn) { aplNow = -1.0; aplFrameId = ~0ull; }
         }
 
         // real image
@@ -2355,6 +2472,27 @@ static void PresenterThread(Swapchain *sc)
             VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             d->BeginCommandBuffer(cb, &bi);
+            if (!copyMode && R.psoA && (!R.aplInit || (aplOn && pickId != aplFrameId)))
+            {
+                // RenoFX APL Limiter: the frame's average before its first refresh, so its boost uses its own
+                // average (as RenoFX does); later refreshes of the frame reuse it.
+                const VkPipelineStageFlags rd = R.rt ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                                     : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                VkImageMemoryBarrier ab = ImgBarrier(R.aplImg, R.aplInit ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                                                     VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
+                d->CmdPipelineBarrier(cb, rd | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ab);
+                R.aplInit = true;
+                if (aplOn && pickId != aplFrameId)
+                {
+                    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.psoA);
+                    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plA, 0, 1, &R.dsA[pick], 0, nullptr);
+                    d->CmdPushConstants(cb, R.plA, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(c), &c);
+                    d->CmdDispatch(cb, 1, 1, 1);
+                    aplFrameId = pickId;
+                }
+                ab = ImgBarrier(R.aplImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+                d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, rd, 0, 0, nullptr, 0, nullptr, 1, &ab);
+            }
             if (copyMode)
             {
                 VkImageMemoryBarrier br2[2] = {
@@ -5795,7 +5933,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much colour expansion the boost adds while keeping its brightness:\n0 = the source colour balance, 100 = the full result of the working space.");
                 bool apl = s.sdrBoostApl != 0;
                 if (ImGui::Checkbox("APL limiter", &apl)) s.sdrBoostApl = apl ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("RenoFX's APL Limiter: lowers the boost in bright scenes. Above an average picture level of 30%%\nof SDR white it fades out smoothly, and an all-white screen gets no boost. Measured a frame or two behind.");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("RenoFX's APL Limiter: lowers the boost in bright scenes. Above an average picture level of 30%%\nof SDR white it fades out smoothly, and an all-white screen gets no boost.");
                 if (s.sdrBoostApl && st.aplNow >= 0.0)
                 {
                     ImGui::SameLine();

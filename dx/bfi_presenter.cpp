@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.36-t2"
+#define BFI_ADDON_VERSION "1.0.36-t3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -1523,9 +1523,10 @@ cbuffer C : register(b0)
     uint  splitMode;  // 0 off, 1 the left side without BFI, 2 the right side
     float rfxRamp;    // SDR to HDR, RenoFX HDR Boost (flags & 256): Ramp Intensity
     float rfxColor;   // its colour blend, 0..1 (0 = brightness only)
-    float rfxAplCut;  // its APL Limiter: share of the boost taken away in bright scenes (0 = full boost, 1 = none)
+    float rfxApl;     // its APL Limiter: 1 = on (the scene average is in aplTex, measured from this frame)
 };
 Texture2D<float4> src : register(t0);
+Texture2D<float> aplTex : register(t1);   // APL Limiter: the scene average (1x1); for its reduction pass, the 32x18 cells
 SamplerState linClamp : register(s0);
 
 // The game's frame at output pixel pos. Same size: the pixel itself. Larger (a 5K frame in a 4K window): four bilinear
@@ -1714,9 +1715,10 @@ float3 SdrToHdr(float3 lin)
 {
     // flags & 256: RenoFX's HDR Boost (peak = SDR highlights / SDR white, Start in sdrKnee); else the knee curve.
     // RenoFX's availability blends each channel between the source and the full boost, which is the same as a smaller
-    // boost: 1 + a (boost - 1). The APL Limiter's reduction (rfxAplCut = 1 - a) is applied that way.
+    // boost: 1 + a (boost - 1). The APL Limiter's availability: 1 up to a scene average of 30% of SDR white, smoothly
+    // down to 0 at 100% (RenoFX's HDR_BOOST_APL_START 30, minimum 0), from this frame's own average.
     float rfxMult = sdrPeak > sdrScale ? sdrPeak / sdrScale : 1.0;
-    rfxMult -= saturate(rfxAplCut) * (rfxMult - 1.0);
+    if (rfxApl > 0.5) rfxMult -= smoothstep(0.30, 1.0, saturate(aplTex.Load(int3(0, 0, 0)))) * (rfxMult - 1.0);
     float3 o = (flags & 256) != 0 ? RfxHdrBoost(max(lin, 0), rfxMult, sdrKnee, rfxRamp,
                                                 rfxColor, (flags & 512) != 0) * sdrScale
                                   : SdrExpand(lin);
@@ -1843,22 +1845,40 @@ float MprtScale(uint k, float litGain, float fl, float S)
 // this frame would produce at the configured boost, over a 32x18 grid with
 // 4x4 samples per cell. Rows 18-35: RenoFX's APL Limiter -- the average of each
 // pixel's SDR brightness (Yf, 1 = SDR white, capped at 1) over the same cells.
+// APL Limiter: one 32x18 cell's average SDR brightness (Yf, 1 = SDR white, each pixel capped at 1), 4x4 samples.
+float AplCell(float2 cxy)
+{
+    uint w, h;
+    src.GetDimensions(w, h);
+    float2 cell = float2(w, h) / float2(32.0, 18.0);
+    float apl = 0.0, yw = max(RfxYf(float3(1, 1, 1)), 1e-6);
+    [unroll] for (int y = 0; y < 4; y++)
+    [unroll] for (int x = 0; x < 4; x++)
+    {
+        int2 p = int2((cxy + (float2(x, y) + 0.5) / 4.0) * cell);
+        apl += saturate(max(RfxYf(max(SdrDecode(src.Load(int3(p, 0)).rgb), 0)), 0.0) / yw);
+    }
+    return apl / 16.0;
+}
+// APL Limiter, before the frame's first refresh: its 32x18 cells, then their average into the 1x1 value PSMain reads.
+float PSAplCells(float4 pos : SV_Position) : SV_Target { return AplCell(floor(pos.xy)); }
+float PSAplReduce(float4 pos : SV_Position) : SV_Target
+{
+    float a = 0.0;
+    for (int y = 0; y < 18; y++)
+    {
+        float r = 0.0;
+        [unroll] for (int x = 0; x < 32; x++) r += aplTex.Load(int3(x, y, 0));
+        a += r;
+    }
+    return a / 576.0;
+}
 float PSMeasure(float4 pos : SV_Position) : SV_Target
 {
     uint w, h;
     src.GetDimensions(w, h);
     float2 cell = float2(w, h) / float2(32.0, 18.0);
-    if (pos.y >= 18.0)
-    {
-        float apl = 0.0, yw = max(RfxYf(float3(1, 1, 1)), 1e-6);
-        [unroll] for (int y = 0; y < 4; y++)
-        [unroll] for (int x = 0; x < 4; x++)
-        {
-            int2 p = int2((floor(pos.xy - float2(0.0, 18.0)) + (float2(x, y) + 0.5) / 4.0) * cell);
-            apl += saturate(max(RfxYf(max(SdrDecode(src.Load(int3(p, 0)).rgb), 0)), 0.0) / yw);
-        }
-        return apl / 16.0;
-    }
+    if (pos.y >= 18.0) return AplCell(floor(pos.xy - float2(0.0, 18.0)));   // rows 18-35: the overlay's readout
     float litGain = Inverted() ? float(frames) * gain / float(frames - 1) : float(frames) * gain;
     float sum = 0.0;
     [unroll] for (int y = 0; y < 4; y++)
@@ -2019,7 +2039,7 @@ struct Constants
     float    splitX, splitSeam;        // split comparison: seam position and soft width, output pixels
     uint32_t splitMode;                // 0 off, 1 left side without BFI, 2 right side
     float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
-    float    rfxAplCut;                 // its APL Limiter: share of the boost removed (0 = full boost)
+    float    rfxApl;                    // its APL Limiter: 1 = on (GPU-measured from the frame being shown)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -2984,9 +3004,15 @@ static DWORD WINAPI PresenterThread(void *)
     ID3D12GraphicsCommandList *list = nullptr;
     ID3D12RootSignature *rootSig = nullptr;
     ID3D12PipelineState *pso = nullptr, *psoMeas = nullptr;
-    ID3DBlob *vs = nullptr, *ps = nullptr, *psMeas = nullptr, *rsBlob = nullptr, *rsErr = nullptr;
+    ID3DBlob *vs = nullptr, *ps = nullptr, *psMeas = nullptr, *psAplC = nullptr, *psAplR = nullptr, *rsBlob = nullptr, *rsErr = nullptr;
     ID3D12Resource *measRt = nullptr, *measRb = nullptr;
     ID3D12DescriptorHeap *measHeap = nullptr;
+    // RenoFX APL Limiter on the GPU: the frame's 32x18 cells and their 1x1 average, drawn before its first refresh
+    ID3D12PipelineState *psoAplC = nullptr, *psoAplR = nullptr;
+    ID3D12Resource *aplCellRt = nullptr, *aplRt = nullptr;
+    ID3D12DescriptorHeap *aplRtvHeap = nullptr;
+    bool aplOk = false;
+    UINT64 aplFrameId = ~0ull;
     UINT64 measFence = 0;
     IDXGIOutput *output = nullptr;
     UINT64 bufFence[kMaxBuf] = {};
@@ -3011,7 +3037,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage;
+    hd.NumDescriptors = kStage + 2;   // the stage frames, then the APL Limiter's cells and its 1x1 average
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
 
@@ -3052,6 +3078,8 @@ static DWORD WINAPI PresenterThread(void *)
     if (ok && !compile) { LOGE("BFI Presenter: d3dcompiler_47.dll not available"); ok = false; }
     ok = ok && Compile(compile, "VSMain", "vs_5_0", &vs) && Compile(compile, "PSMain", "ps_5_0", &ps);
     if (ok && !Compile(compile, "PSMeasure", "ps_5_0", &psMeas)) psMeas = nullptr;   // ABL guard optional
+    if (ok && !Compile(compile, "PSAplCells", "ps_5_0", &psAplC)) psAplC = nullptr;  // APL Limiter optional
+    if (ok && !Compile(compile, "PSAplReduce", "ps_5_0", &psAplR)) psAplR = nullptr;
 
     if (ok)
     {
@@ -3059,7 +3087,9 @@ static DWORD WINAPI PresenterThread(void *)
         range.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         range.NumDescriptors     = 1;
         range.BaseShaderRegister = 0;
-        D3D12_ROOT_PARAMETER params[2] = {};
+        D3D12_DESCRIPTOR_RANGE rangeApl = range;
+        rangeApl.BaseShaderRegister = 1;                   // t1: the APL Limiter's value (or its cells)
+        D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
         params[0].Constants.Num32BitValues = sizeof(Constants) / 4;
@@ -3068,6 +3098,8 @@ static DWORD WINAPI PresenterThread(void *)
         params[1].DescriptorTable.NumDescriptorRanges = 1;
         params[1].DescriptorTable.pDescriptorRanges   = &range;
         params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[2] = params[1];
+        params[2].DescriptorTable.pDescriptorRanges   = &rangeApl;
         D3D12_STATIC_SAMPLER_DESC samp = {};
         samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -3075,7 +3107,7 @@ static DWORD WINAPI PresenterThread(void *)
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 2;
+        rsd.NumParameters = 3;
         rsd.pParameters   = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers   = &samp;
@@ -3137,6 +3169,59 @@ static DWORD WINAPI PresenterThread(void *)
             }
             pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
             pd.RTVFormats[0] = g_desc.Format;
+        }
+        // RenoFX APL Limiter: two tiny passes before the frame's first refresh -- 32x18 cells, then their 1x1 average,
+        // which the BFI pass reads (t1) in the same command list.
+        if (ok && psAplC && psAplR)
+        {
+            bool m = true;
+            pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
+            pd.PS = { psAplC->GetBufferPointer(), psAplC->GetBufferSize() };
+            m = m && SUCCEEDED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoAplC)));
+            pd.PS = { psAplR->GetBufferPointer(), psAplR->GetBufferSize() };
+            m = m && SUCCEEDED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoAplR)));
+            pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+            pd.RTVFormats[0] = g_desc.Format;
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width = 32; rd.Height = 18; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_R32_FLOAT; rd.SampleDesc.Count = 1;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            m = m && SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&aplCellRt)));
+            rd.Width = 1; rd.Height = 1;
+            m = m && SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&aplRt)));
+            D3D12_DESCRIPTOR_HEAP_DESC ah = {};
+            ah.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; ah.NumDescriptors = 2;
+            m = m && SUCCEEDED(g_device->CreateDescriptorHeap(&ah, IID_PPV_ARGS(&aplRtvHeap)));
+            if (m)
+            {
+                aplCellRt->SetName(L"BFI APL limiter cells");
+                aplRt->SetName(L"BFI APL limiter average");
+                D3D12_CPU_DESCRIPTOR_HANDLE h = aplRtvHeap->GetCPUDescriptorHandleForHeapStart();
+                g_device->CreateRenderTargetView(aplCellRt, nullptr, h);
+                h.ptr += rtvStride;
+                g_device->CreateRenderTargetView(aplRt, nullptr, h);
+                D3D12_SHADER_RESOURCE_VIEW_DESC av = {};
+                av.Format = DXGI_FORMAT_R32_FLOAT;
+                av.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                av.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                av.Texture2D.MipLevels = 1;
+                D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                sh.ptr += (SIZE_T)kStage * srvStride;
+                g_device->CreateShaderResourceView(aplCellRt, &av, sh);
+                sh.ptr += srvStride;
+                g_device->CreateShaderResourceView(aplRt, &av, sh);
+                aplOk = true;
+            }
+            else
+            {
+                LOGW("BFI Presenter: RenoFX APL limiter unavailable (could not create its objects)");
+                SafeRelease(psoAplC); SafeRelease(psoAplR); SafeRelease(aplCellRt); SafeRelease(aplRt); SafeRelease(aplRtvHeap);
+            }
         }
     }
     if (ok && FAILED(ScOutput(&output))) output = nullptr;
@@ -3686,15 +3771,18 @@ static DWORD WINAPI PresenterThread(void *)
             const float hi = (std::min)(s.sdrHiNits, s.peakNits);
             c.sdrPeak = hi > s.sdrWhite ? hi / 80.0f : 0.0f;
             // RenoFX's APL Limiter: from a scene average of 30% of SDR white the boost fades out smoothly, and is gone
-            // for an all-white screen (its HDR_BOOST_APL_START 30, minimum 0). Measured a frame or two behind.
-            aplOn = psoMeas && c.outType == 4 && s.sdrMethod == 2 && s.sdrBoostApl && c.sdrPeak > c.sdrScale;
+            // for an all-white screen (its HDR_BOOST_APL_START 30, minimum 0), from the frame being shown.
+            // The shader takes the average from the frame itself (see the APL passes before the BFI pass); aplNow,
+            // read back a frame or two later, is only for the overlay.
+            aplOn = aplOk && c.outType == 4 && s.sdrMethod == 2 && s.sdrBoostApl && c.sdrPeak > c.sdrScale;
+            c.rfxApl = aplOn ? 1.0f : 0.0f;
+            lastAplCut = 0.0f;
             if (aplOn && aplNow >= 0.0)
             {
                 const double x = std::max(0.0, std::min(1.0, (aplNow - 0.30) / 0.70));
-                c.rfxAplCut = (float)(x * x * (3.0 - 2.0 * x));
+                lastAplCut = (float)(x * x * (3.0 - 2.0 * x));
             }
-            lastAplCut = c.rfxAplCut;
-            if (!aplOn) aplNow = -1.0;
+            if (!aplOn) { aplNow = -1.0; aplFrameId = ~0ull; }
         }
         if (GradualSaverOn(s))
         {
@@ -3738,6 +3826,49 @@ static DWORD WINAPI PresenterThread(void *)
         list->SetGraphicsRootSignature(rootSig);
         list->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &c, 0);
         list->SetGraphicsRootDescriptorTable(1, srv);
+        D3D12_GPU_DESCRIPTOR_HANDLE aplSrv = srv;                          // unused unless the limiter is on
+        if (aplOk)
+        {
+            aplSrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            aplSrv.ptr += (UINT64)(kStage + 1) * srvStride;
+        }
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        // RenoFX APL Limiter: measure the frame before its first refresh, so the boost uses its own average (as in
+        // RenoFX). Its later refreshes reuse the value.
+        if (aplOn && pickId != aplFrameId)
+        {
+            D3D12_GPU_DESCRIPTOR_HANDLE cellSrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            cellSrv.ptr += (UINT64)kStage * srvStride;
+            D3D12_CPU_DESCRIPTOR_HANDLE artv = aplRtvHeap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_RESOURCE_BARRIER ab = Transition(aplCellRt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &ab);
+            list->SetPipelineState(psoAplC);
+            list->SetGraphicsRootDescriptorTable(2, aplSrv);
+            D3D12_VIEWPORT avp = { 0.0f, 0.0f, 32.0f, 18.0f, 0.0f, 1.0f };
+            D3D12_RECT asc = { 0, 0, 32, 18 };
+            list->RSSetViewports(1, &avp);
+            list->RSSetScissorRects(1, &asc);
+            list->OMSetRenderTargets(1, &artv, FALSE, nullptr);
+            list->DrawInstanced(3, 1, 0, 0);
+            D3D12_RESOURCE_BARRIER ab2[2] = {
+                Transition(aplCellRt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                Transition(aplRt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET) };
+            list->ResourceBarrier(2, ab2);
+            list->SetPipelineState(psoAplR);
+            list->SetGraphicsRootDescriptorTable(2, cellSrv);
+            artv.ptr += rtvStride;
+            D3D12_VIEWPORT avp1 = { 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+            D3D12_RECT asc1 = { 0, 0, 1, 1 };
+            list->RSSetViewports(1, &avp1);
+            list->RSSetScissorRects(1, &asc1);
+            list->OMSetRenderTargets(1, &artv, FALSE, nullptr);
+            list->DrawInstanced(3, 1, 0, 0);
+            ab = Transition(aplRt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &ab);
+            list->SetPipelineState(pso);
+            aplFrameId = pickId;
+        }
+        list->SetGraphicsRootDescriptorTable(2, aplSrv);
         D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)g_desc.Width, (float)g_desc.Height, 0.0f, 1.0f };
         D3D12_RECT sc = { 0, 0, (LONG)g_desc.Width, (LONG)g_desc.Height };
         list->RSSetViewports(1, &vp);
@@ -4977,6 +5108,13 @@ static DWORD WINAPI PresenterThread(void *)
     SafeRelease(measRb);
     SafeRelease(measHeap);
     SafeRelease(psMeas);
+    SafeRelease(psoAplC);
+    SafeRelease(psoAplR);
+    SafeRelease(aplCellRt);
+    SafeRelease(aplRt);
+    SafeRelease(aplRtvHeap);
+    SafeRelease(psAplC);
+    SafeRelease(psAplR);
     SafeRelease(rootSig);
     SafeRelease(rsBlob);
     SafeRelease(rsErr);
@@ -10000,7 +10138,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much colour expansion the boost adds while keeping its brightness:\n0 = the source colour balance, 100 = the full result of the working space.");
                 bool apl = s.sdrBoostApl != 0;
                 if (ImGui::Checkbox("APL limiter", &apl)) s.sdrBoostApl = apl ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("RenoFX's APL Limiter: lowers the boost in bright scenes. Above an average picture level of 30%%\nof SDR white it fades out smoothly, and an all-white screen gets no boost. Measured a frame or two behind.");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("RenoFX's APL Limiter: lowers the boost in bright scenes. Above an average picture level of 30%%\nof SDR white it fades out smoothly, and an all-white screen gets no boost.");
                 if (s.sdrBoostApl && st.aplNow >= 0.0)
                 {
                     ImGui::SameLine();
