@@ -7,6 +7,14 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.34] — 2026-11-08 (Manager 1.3.17)
+
+**Fix: low resolution in some DX11 games with 1.0.33.**
+
+- **[DX] Scale to the window compares the game's frames with the monitor, not the window.** A game can resize its swap chain while its window is still small, and with 1.0.33 the presenter's swap chain then kept that small size when the window grew: the picture was stretched up from a low resolution (Assassin's Creed Unity: 4K frames shown at 1147x645). Frames are now scaled down only when they are larger than the game window's monitor (Journey at 5120x2880 on a 3840x2160 display still is).
+- **[Vulkan]** No changes; the version follows the DX add-on.
+- **[Docs]** Settings guide: **Scale to the window** goes by the display's size.
+
 ## [1.0.33] — 2026-11-07 (Manager 1.3.17)
 
 **No more flicker in DX11, DX9 and OpenGL games running above the display resolution.**
