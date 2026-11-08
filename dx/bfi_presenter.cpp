@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.34-t1"
+#define BFI_ADDON_VERSION "1.0.34-t2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2978,7 +2978,9 @@ static DWORD WINAPI PresenterThread(void *)
     const double modeHzDisp = modeHz;
     double vrrHzEff = 0.0, vrrNext = 0.0, vrrLead = 0.0025, vrrWake = 0.0, vrrWinT = 0.0;
     int    vrrSet = -1, vrrLogs = 0, vrrLateN = 0, vrrResync = 0;
-    UINT   vrrLastPC = 0; LONGLONG vrrLastQpc = 0;
+    UINT   vrrLastPC = 0, vrrLastSync = 0; LONGLONG vrrLastQpc = 0;
+    int    vrrHist[9] = {};   // refresh length minus the period: <-2, -2..-1, -1..-0.5, -0.5..-0.25, +-0.25, ..0.5, ..1, ..2, >2 ms
+    int    vrrMerged = 0, vrrExtra = 0;   // presents that shared a refresh / refreshes with no present of their own
     double vrrDev[2048]; int vrrDevN = 0; double vrrSum = 0.0, vrrMax = 0.0; int vrrOff = 0;
     double vrrCpuDev[2048]; int vrrCpuN = 0; double vrrLastCall = 0.0;
     HANDLE vrrTimer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /*HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
@@ -3260,7 +3262,7 @@ static DWORD WINAPI PresenterThread(void *)
             else if (vrrHzEff <= 0.0 && vrrLogs) LOGI("BFI Presenter: VRR clock off -- vblank pacing again");
             modeHz = vrrHzEff > 0.0 ? vrrHzEff : modeHzDisp;
             vrrNext = 0.0; vrrLogs = 0; vrrWinT = 0.0; vrrDevN = vrrCpuN = 0; vrrSum = vrrMax = 0.0; vrrOff = vrrLateN = vrrResync = 0;
-            vrrLastPC = 0; vrrLastQpc = 0; vrrLastCall = 0.0;
+            vrrLastPC = vrrLastSync = 0; vrrLastQpc = 0; vrrLastCall = 0.0; for (int &h : vrrHist) h = 0; vrrMerged = vrrExtra = 0;
         }
         if (vrrHzEff > 0.0 && !refillNow)
         {
@@ -3656,14 +3658,21 @@ static DWORD WINAPI PresenterThread(void *)
             DXGI_FRAME_STATISTICS vs = {};
             if (SUCCEEDED(ScStats(&vs)) && vs.PresentCount != vrrLastPC)
             {
+                if (vrrLastQpc && vs.PresentCount > vrrLastPC)
+                {
+                    const UINT dp = vs.PresentCount - vrrLastPC, dr = vs.SyncRefreshCount - vrrLastSync;
+                    if (dr < dp) vrrMerged += (int)(dp - dr);
+                    else if (dr > dp) vrrExtra += (int)(dr - dp);
+                }
                 if (vrrLastQpc && vs.PresentCount == vrrLastPC + 1)
                 {
                     const double iv = (double)(vs.SyncQPCTime.QuadPart - vrrLastQpc) / (double)vrrQf.QuadPart;
-                    const double dv = fabs(iv - per);
+                    const double sd = (iv - per) * 1000.0, dv = fabs(iv - per);
+                    vrrHist[sd < -2 ? 0 : sd < -1 ? 1 : sd < -0.5 ? 2 : sd < -0.25 ? 3 : sd <= 0.25 ? 4 : sd <= 0.5 ? 5 : sd <= 1 ? 6 : sd <= 2 ? 7 : 8]++;
                     if (vrrDevN < 2048) vrrDev[vrrDevN++] = dv;
                     vrrSum += iv; if (dv > vrrMax) vrrMax = dv; if (dv > 0.00025) vrrOff++;
                 }
-                vrrLastPC = vs.PresentCount; vrrLastQpc = vs.SyncQPCTime.QuadPart;
+                vrrLastPC = vs.PresentCount; vrrLastSync = vs.SyncRefreshCount; vrrLastQpc = vs.SyncQPCTime.QuadPart;
             }
             const double tN = Now();
             if (vrrWinT <= 0.0) vrrWinT = tN;
@@ -3679,6 +3688,12 @@ static DWORD WINAPI PresenterThread(void *)
                      "99%% %.3f, worst %.3f ms; %d off by more than 0.25 ms; presents late %d, clock restarts %d; present calls "
                      "off by 99%% %.3f ms; draw lead %.2f ms", vrrHzEff, per * 1000.0, nd, mean * 1000.0, mean > 0.0 ? 1.0 / mean : 0.0,
                      p50 * 1000.0, p99 * 1000.0, vrrMax * 1000.0, vrrOff, vrrLateN, vrrResync, c99 * 1000.0, vrrLead * 1000.0);
+                LOGI("BFI Presenter: VRR clock: refresh length minus %.2f ms -- below -2 ms %d, -2..-1 %d, -1..-0.5 %d, -0.5..-0.25 %d, "
+                     "within 0.25 %d, +0.25..0.5 %d, +0.5..1 %d, +1..2 %d, above +2 ms %d; presents sharing a refresh %d, refreshes "
+                     "without a present of their own %d", per * 1000.0, vrrHist[0], vrrHist[1], vrrHist[2], vrrHist[3], vrrHist[4],
+                     vrrHist[5], vrrHist[6], vrrHist[7], vrrHist[8], vrrMerged, vrrExtra);
+                for (int &h : vrrHist) h = 0;
+                vrrMerged = vrrExtra = 0;
                 if (nd >= 20 && fabs(mean - per) > 0.03 * per)
                     LOGW("BFI Presenter: VRR clock: the display's refreshes average %.1f Hz, not %.0f Hz -- they aren't following the "
                          "presenter's presents. Is G-SYNC/VRR on for this game, for windowed and full screen mode, and %.0f Hz inside "
