@@ -206,21 +206,24 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     // Mode (6th argument): 0 = steady targets + preferred present duration; 1 = steady targets, no preferred duration;
     // 2 = targets alternating 1 ms short and long (9/11 ms at 100 Hz) -- if the refreshes follow, the targets are honoured.
     int mode = argc > 6 ? _wtoi(argv[6]) : 0;
+    // Clock for the target times (7th argument): 0 = QPC in 100 ns units (the clock the displayed times come back in),
+    // 1 = interrupt time (1.0-1.3: those targets were about half a second in the past, so images went out at once).
+    const int clk = argc > 7 ? _wtoi(argv[7]) : 0;
     if (mode < 0 || mode > 2) mode = 0;
     if (loadMs < 0 || loadMs > 100) loadMs = 0;
     if (rate < 30 || rate > 500) rate = 100; if (frames < 1 || frames > 8) frames = 2;
     if (queue < 1 || queue > 8) queue = 3; if (seconds < 5) seconds = 120;
 
     wchar_t path[MAX_PATH]; GetModuleFileNameW(nullptr, path, MAX_PATH);
-    wchar_t *sl = wcsrchr(path, L'\\'); if (sl) swprintf(sl + 1, MAX_PATH - (sl + 1 - path), L"VrrTimedTest_log_%.0fHz_load%.0f_mode%d.txt", rate, loadMs, mode);
+    wchar_t *sl = wcsrchr(path, L'\\'); if (sl) swprintf(sl + 1, MAX_PATH - (sl + 1 - path), L"VrrTimedTest_log_%.0fHz_load%.0f_mode%d_clock%d.txt", rate, loadMs, mode, clk);
     g_log = _wfopen(path, L"w");
     {
         typedef BOOL (WINAPI *PFN_DpiCtx)(HANDLE);
         auto setDpi = (PFN_DpiCtx)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetProcessDpiAwarenessContext");
         if (setDpi) setDpi((HANDLE)-4 /*DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2*/);
     }
-    Log("VRR timed-present test 1.3: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms, mode %d (%s)",
-        rate, frames, rate / frames, queue, seconds, loadMs, mode,
+    Log("VRR timed-present test 1.4: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms, target clock %s, mode %d (%s)",
+        rate, frames, rate / frames, queue, seconds, loadMs, clk ? "interrupt time" : "QPC", mode,
         mode == 0 ? "steady targets + preferred duration" : mode == 1 ? "steady targets, no preferred duration" : "targets alternating short/long");
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
@@ -349,7 +352,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     HANDLE lt = loadMs > 0 ? CreateThread(nullptr, 0, LoadThread, &la, 0, nullptr) : nullptr;
     // Strobe loop.
     const float lit = hdr ? 2.5f : 1.0f;                            // 200 nits in scRGB, white in SDR
-    ULONGLONG now = 0; qitp(&now);
+    auto nowT = [&](ULONGLONG *o) { if (clk) qitp(o); else { LARGE_INTEGER q; QueryPerformanceCounter(&q); *o = (ULONGLONG)((double)q.QuadPart * (1e7 / (double)qpf.QuadPart)); } };
+    const double clkToQpc = clk ? qpcMinusIt : 0.0;   // target clock -> displayed-time clock
+    ULONGLONG now = 0; nowT(&now);
     UINT64 nextT = now + per * 10;
     UINT64 k = 0;
     struct Pending { UINT64 id, target; double callQ; };
@@ -361,7 +366,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     while (!g_quit)
     {
         MSG m; while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
-        qitp(&now);
+        nowT(&now);
         if (now >= endT) break;
         // Keep `queue` presents ahead of the display: hand over the next one when its target is within the queue.
         if (nextT > now + per * (UINT64)queue) { Sleep(1); continue; }
@@ -409,7 +414,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                 {
                     SystemInterruptTime shown = {}; fs->GetDisplayedTime(&shown);
                     iflip++;
-                    for (auto &p : pend) if (p.id == pid) { late_ms.push_back(((double)shown.value - (double)p.target) / 1e4); lateQ_ms.push_back(((double)shown.value - ((double)p.target + qpcMinusIt)) / 1e4); callShow_ms.push_back(((double)shown.value - p.callQ) / 1e4); break; }
+                    for (auto &p : pend) if (p.id == pid) { late_ms.push_back(((double)shown.value - ((double)p.target + clkToQpc)) / 1e4); lateQ_ms.push_back(((double)shown.value - ((double)p.target + clkToQpc)) / 1e4); callShow_ms.push_back(((double)shown.value - p.callQ) / 1e4); break; }
                     if (lastId && pid == lastId + 1 && lastShown)
                     {
                         const double len = ((double)shown.value - (double)lastShown) / 1e4;
@@ -445,7 +450,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                 "off by median %.3f, 99%% %.3f ms; within 0.25 ms %d", dev_ms.size(), iflip, composed, skipped, gaps, meanLen,
                 meanLen > 0 ? 1000.0 / meanLen : 0.0, pct(ad, 0.5), pct(ad, 0.99), h[4]);
             Log("  refresh length minus %.2f ms: below -2 %d, -2..-1 %d, -1..-0.5 %d, -0.5..-0.25 %d, within 0.25 %d, +0.25..0.5 %d, "
-                "+0.5..1 %d, +1..2 %d, above +2 %d; shown after target: median %.3f, 99%% %.3f ms (taking the displayed time as QPC: "
+                "+0.5..1 %d, +1..2 %d, above +2 %d; shown after target: median %.3f, 99%% %.3f ms (both clocks as QPC: "
                 "median %.3f, 99%% %.3f ms)", per / 1e4, h[0], h[1], h[2], h[3],
                 h[4], h[5], h[6], h[7], h[8], pct(late_ms, 0.5), pct(late_ms, 0.99), pct(lateQ_ms, 0.5), pct(lateQ_ms, 0.99));
             if (loadMs > 0) Log("  GPU load: %.1f ms per frame measured", g_loadGpuMs.load());
