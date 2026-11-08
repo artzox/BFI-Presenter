@@ -125,6 +125,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 // an offscreen 4K target once per strobe cycle, steered to about loadMs of GPU time per frame (timestamp queries).
 static std::atomic<bool> g_loadRun{true};
 static std::atomic<double> g_loadGpuMs{0.0};
+static std::atomic<int> g_loadFrames{0}, g_loadMeasured{0};
 struct LoadArgs { double loadMs, fps; };
 static const char kLoadHlsl[] =
     "cbuffer C : register(b0) { uint iters; uint3 pad; };\n"
@@ -175,18 +176,20 @@ static DWORD WINAPI LoadThread(void *pv)
         c->VSSetShader(vs, nullptr, 0); c->PSSetShader(ps, nullptr, 0); c->PSSetConstantBuffers(0, 1, &cb);
         c->Draw(3, 0);
         c->End(q1[s]); c->End(qdis[s]); c->Flush();
-        fi++;
+        fi++; g_loadFrames.fetch_add(1);
         if (fi >= 4)
         {
             const int r = fi % 4;   // the oldest of the four, three frames back
             D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj; UINT64 a0, a1;
-            if (c->GetData(qdis[r], &dj, sizeof(dj), 0) == S_OK && c->GetData(q0[r], &a0, 8, 0) == S_OK &&
-                c->GetData(q1[r], &a1, 8, 0) == S_OK && !dj.Disjoint && dj.Frequency)
+            // Wait briefly for the oldest frame's queries (they used to be missed when the strobe ran at a higher priority).
+            HRESULT g = S_FALSE;
+            for (int w = 0; w < 50 && (g = c->GetData(qdis[r], &dj, sizeof(dj), 0)) == S_FALSE; w++) Sleep(1);
+            if (g == S_OK && c->GetData(q0[r], &a0, 8, 0) == S_OK && c->GetData(q1[r], &a1, 8, 0) == S_OK && !dj.Disjoint && dj.Frequency)
             {
                 const double ms = (double)(a1 - a0) * 1000.0 / dj.Frequency;
                 if (ms > 0.05) iters = std::max(1.0, std::min(1e6, iters * std::min(1.5, std::max(0.67, a.loadMs / ms))));
-                sum += ms; n++;
-                if (n >= (int)a.fps) { g_loadGpuMs.store(sum / n); sum = 0; n = 0; }
+                sum += ms; n++; g_loadMeasured.fetch_add(1);
+                if (n >= 10) { g_loadGpuMs.store(sum / n); sum = 0; n = 0; }
             }
         }
     }
@@ -228,7 +231,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
         auto setDpi = (PFN_DpiCtx)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetProcessDpiAwarenessContext");
         if (setDpi) setDpi((HANDLE)-4 /*DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2*/);
     }
-    Log("VRR timed-present test 1.6: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms, target clock %s, mode %d (%s)",
+    Log("VRR timed-present test 1.7: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms, target clock %s, mode %d (%s)",
         rate, frames, rate / frames, queue, seconds, loadMs, clk ? "interrupt time" : "QPC", mode,
         mode == 0 ? "steady targets + preferred duration" : mode == 1 ? "steady targets, no preferred duration" : "targets alternating short/long");
     timeBeginPeriod(1);
@@ -463,7 +466,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                 "+0.5..1 %d, +1..2 %d, above +2 %d; shown after target: median %.3f, 99%% %.3f ms (both clocks as QPC: "
                 "median %.3f, 99%% %.3f ms)", per / 1e4, h[0], h[1], h[2], h[3],
                 h[4], h[5], h[6], h[7], h[8], pct(late_ms, 0.5), pct(late_ms, 0.99), pct(lateQ_ms, 0.5), pct(lateQ_ms, 0.99));
-            if (loadMs > 0) Log("  GPU load: %.1f ms per frame measured", g_loadGpuMs.load());
+            if (loadMs > 0) Log("  GPU load: %d frames drawn, %d timed, %.1f ms per frame", g_loadFrames.exchange(0), g_loadMeasured.exchange(0), g_loadGpuMs.load());
             {
                 auto mean = [](const std::vector<double> &v) { double a = 0; for (double x : v) a += x; return v.empty() ? 0.0 : a / v.size(); };
                 Log("  Present call -> displayed (displayed time as QPC): median %.3f, 99%% %.3f ms; refresh length after odd / even "
