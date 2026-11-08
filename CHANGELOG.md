@@ -7,6 +7,13 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.35] — 2026-11-08 (Manager 1.3.17)
+
+**Split comparison: BFI on one side of the screen, off on the other.**
+
+- **[DX] [Vulkan] Split comparison** (`SplitCompare`, off by default, Ctrl+Shift+C, under Strobe in the overlay). One side of the screen without BFI, the other with it, at the same brightness: what BFI does to motion is visible in one picture, for videos, streams and comparisons. The side without BFI shows every refresh at the light the strobe gives over its cycle, after highlight roll-off and the panel ceiling, so the halves differ only in motion clarity and flicker. The side, the seam position and a soft seam can be set. The idea comes from [unrefined803](https://github.com/unrefined803)'s motion-vector BFI demo ([#111](https://github.com/artzox/BFI-Presenter/pull/111)).
+- **[Docs]** Settings guide: **Split comparison**, and its hotkey. README: acknowledgement.
+
 ## [1.0.34] — 2026-11-08 (Manager 1.3.17)
 
 **Fix: low resolution in some DX11 games with 1.0.33.**

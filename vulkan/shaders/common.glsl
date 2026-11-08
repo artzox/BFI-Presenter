@@ -19,6 +19,9 @@ layout(push_constant) uniform C
     float phase;      // LCD gradual saver: start of the lit window within the first sub-frame, 0..1
     uint  store;      // compute path only: 1 swap R and B (B-first swap chain format), 2 sRGB-encode (_SRGB swap chain format)
     float gamut;      // outType 4/5: gamut expansion strength (0 = off)
+    float splitX;     // split comparison: the seam, in output pixels
+    float splitSeam;  // its soft width in output pixels (0 = hard edge)
+    uint  splitMode;  // 0 off, 1 the left side without BFI, 2 the right side
 } pc;
 layout(set = 0, binding = 0) uniform sampler2D src;
 

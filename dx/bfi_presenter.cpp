@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.34"
+#define BFI_ADDON_VERSION "1.0.35"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -106,6 +106,10 @@ struct Settings
     int   invert   = 0;
     int   rolloff  = 1;       // BFI highlight roll-off
     int   rolling  = 0;       // rolling scan: one band per sub-frame, rolling down the screen
+    int   split    = 0;       // SplitCompare: one side of the screen without BFI, for comparison (idea: unrefined803, #111)
+    int   splitSide = 0;      // 0 = the left side without BFI, 1 = the right side
+    int   splitPos = 50;      // the seam, percent of the width from the left
+    int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
@@ -252,6 +256,10 @@ static void LoadSettings(Settings &s)
     s.invert   = IniInt("InvertCycle", 0);
     s.rolloff  = IniInt("HighlightRolloff", 1);
     s.rolling  = IniInt("RollingScan", 0) ? 1 : 0;
+    s.split    = IniInt("SplitCompare", 0) ? 1 : 0;
+    s.splitSide = IniInt("SplitCompareSide", 0) ? 1 : 0;
+    s.splitPos = std::max(5, std::min(95, IniInt("SplitComparePosition", 50)));
+    s.splitSeam = std::max(0, std::min(400, IniInt("SplitCompareSeamPx", 0)));
     s.lcdSwap  = IniInt("LcdPhaseSwap", 0) ? 1 : 0;
     s.lcdSwapSec = IniInt("LcdPhaseSwapSeconds", 5);
     s.lcdGradual = IniInt("LcdSaverGradual", 0) ? 1 : 0;
@@ -434,6 +442,10 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("InvertCycle", s.invert);
     IniWriteInt("HighlightRolloff", s.rolloff);
     IniWriteInt("RollingScan", s.rolling);
+    IniWriteInt("SplitCompare", s.split);
+    IniWriteInt("SplitCompareSide", s.splitSide);
+    IniWriteInt("SplitComparePosition", s.splitPos);
+    IniWriteInt("SplitCompareSeamPx", s.splitSeam);
     IniWriteInt("LcdPhaseSwap", s.lcdSwap);
     IniWriteInt("LcdPhaseSwapSeconds", s.lcdSwapSec);
     IniWriteInt("LcdSaverGradual", s.lcdGradual);
@@ -1489,6 +1501,9 @@ cbuffer C : register(b0)
     float sdrPeak;    // SDR white highlights expand to this (80-nit units); <= sdrScale = off
     float gamut;      // outType 4: gamut expansion strength (0 = off)
     float2 srcPerOut; // game frame pixels per output pixel: 1 = the same size; > 1 = scaled down to the window
+    float splitX;     // split comparison: the seam, in output pixels
+    float splitSeam;  // its soft width in output pixels (0 = hard edge)
+    uint  splitMode;  // 0 off, 1 the left side without BFI, 2 the right side
 };
 Texture2D<float4> src : register(t0);
 SamplerState linClamp : register(s0);
@@ -1807,6 +1822,20 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
         if (wn > 0.0) o = lerp(o, Strobe(lin, (slot + frames - nb) % frames, litGain), wn);
     }
     else o = Strobe(lin, slot, litGain);
+    if (splitMode != 0 && method < 2)
+    {
+        // Split comparison (idea: unrefined803, #111): one side shows every refresh at the light the strobe gives over
+        // its cycle -- the mean of what each refresh emits, after roll-off and the ceiling -- so both sides match in
+        // brightness and differ only in motion clarity and flicker.
+        float t = splitSeam > 0.0 ? smoothstep(splitX - 0.5 * splitSeam, splitX + 0.5 * splitSeam, pos.x) : step(splitX, pos.x);
+        float w = splitMode == 1 ? 1.0 - t : t;
+        if (w > 0.0)
+        {
+            float3 a = float3(0, 0, 0);
+            [unroll] for (uint j = 0; j < 8; j++) if (j < frames) a += Strobe(lin, j, litGain);
+            o = lerp(o, a / float(frames), w);
+        }
+    }
     if (soften > 0.0 && method < 2)
     {
         // LCD phase swap: fade toward the steady average picture (the hitch guard's), which keeps the light
@@ -1833,6 +1862,8 @@ struct Constants
     float    sdrPeak;     // expanded SDR white (80-nit units); <= sdrScale = off
     float    gamut;       // outType 4: gamut expansion strength (0 = off)
     float    srcPerOutX, srcPerOutY;   // game frame pixels per output pixel (1 = same size)
+    float    splitX, splitSeam;        // split comparison: seam position and soft width, output pixels
+    uint32_t splitMode;                // 0 off, 1 left side without BFI, 2 right side
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -3094,21 +3125,22 @@ static DWORD WINAPI PresenterThread(void *)
     bool   flashOn = false;
     UINT lastSync = 0, lastPC = 0;
     bool haveStats = false;
-    bool kb = false, km = false, kr = false, krs = false, kk = false;
+    bool kb = false, km = false, kr = false, krs = false, kk = false, ksp = false;
 
     while (ok && g_running.load())
     {
         // hotkeys (edge-triggered) act on the shared settings
-        bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S');
-        if ((b && !kb) || (m && !km) || (rs && !krs))
+        bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C');
+        if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp))
         {
             EnterCriticalSection(&g_cfgLock);
             if (b && !kb) g_shared.enabled = !g_shared.enabled;
             if (m && !km) g_shared.method = !g_shared.method;
             if (rs && !krs) g_shared.rolling = !g_shared.rolling;
+            if (sp && !ksp) g_shared.split = !g_shared.split;
             LeaveCriticalSection(&g_cfgLock);
         }
-        krs = rs;
+        krs = rs; ksp = sp;
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
         // Ctrl+Shift+K: a marker in the log with the last second's state, to find a moment the player noticed (a
         // stutter, a lost frame limit) in a long session.
@@ -3387,6 +3419,9 @@ static DWORD WINAPI PresenterThread(void *)
         c.outType = (uint32_t)ResolveOutput(s);
         c.srcPerOutX = (g_dx11.load() && g_srcW && g_desc.Width) ? (float)g_srcW / (float)g_desc.Width : 1.0f;
         c.srcPerOutY = (g_dx11.load() && g_srcH && g_desc.Height) ? (float)g_srcH / (float)g_desc.Height : 1.0f;
+        c.splitMode = s.split ? (s.splitSide ? 2u : 1u) : 0u;
+        c.splitX    = s.split ? (float)g_desc.Width * (float)s.splitPos / 100.0f : 0.0f;
+        c.splitSeam = s.split ? (float)s.splitSeam : 0.0f;
         if ((int)c.outType != lastOutType)
         {
             static const char *kOut[] = { "SDR", "HDR scRGB", "HDR10 (PQ)", "?", "SDR shown as HDR10" };
@@ -9710,6 +9745,21 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (s.rollDecay <= 0.0f && ImGui::IsItemHovered()) ImGui::SetTooltip("Blended zone where two bands meet. Pixels in it share their light between both\n"
                                                                   "sub-frames, so they are lit longer: visible blur along the seam in motion.\n"
                                                                   "0 = hard edge, no blur. Phosphor decay (above) hides the edge without a seam.");
+            ImGui::Unindent(16.0f);
+        }
+        bool spc = s.split != 0;
+        if (ImGui::Checkbox("Split comparison (Ctrl+Shift+C)", &spc)) s.split = spc ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("One side of the screen without BFI, the other with it, at the same brightness:\n"
+                                                      "shows what BFI does to motion in one picture (for videos and comparisons).\n"
+                                                      "Idea: unrefined803.");
+        if (s.split)
+        {
+            ImGui::Indent(16.0f);
+            int side = s.splitSide;
+            ImGui::Combo("Without BFI", &side, "Left side\0Right side\0");
+            s.splitSide = side ? 1 : 0;
+            ImGui::SliderInt("Seam position (% of width)", &s.splitPos, 5, 95);
+            ImGui::SliderInt("Seam softness (pixels, 0 = hard)", &s.splitSeam, 0, 400);
             ImGui::Unindent(16.0f);
         }
     }
