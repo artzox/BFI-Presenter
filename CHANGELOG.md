@@ -7,6 +7,10 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Unreleased]
+
+- **[DX] [Vulkan] SDR to HDR: RenoFX HDR Boost** (`SdrHighlightMethod=2`, a third choice under **Highlights stretched by**). ShortFuse's inverse tone mapping from [RenoFX](https://github.com/clshortfuse/renofx) (MIT), ported into the presenter's own pass, so it needs no swap chain upgrade add-on: SDR white is raised by SDR highlights ÷ SDR white along RenoFX's C-infinity ramp (`SdrBoostStart`, `SdrBoostRamp`), in its LMS space with hue restore or by brightness (`SdrBoostSpace`), with its colour blend (`SdrBoostColor`). Suggested by J3b240 ([#112](https://github.com/artzox/BFI-Presenter/issues/112)).
+
 ## [1.0.35] — 2026-11-08 (Manager 1.3.17)
 
 **Split comparison: BFI on one side of the screen, off on the other.**

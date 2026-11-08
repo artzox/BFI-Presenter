@@ -22,6 +22,8 @@ layout(push_constant) uniform C
     float splitX;     // split comparison: the seam, in output pixels
     float splitSeam;  // its soft width in output pixels (0 = hard edge)
     uint  splitMode;  // 0 off, 1 the left side without BFI, 2 the right side
+    float rfxRamp;    // SDR to HDR, RenoFX HDR Boost (flags & 256): Ramp Intensity
+    float rfxColor;   // its colour blend, 0..1 (0 = brightness only)
 } pc;
 layout(set = 0, binding = 0) uniform sampler2D src;
 
@@ -73,9 +75,129 @@ vec3 ExpandGamut(vec3 v, float amount)
 }
 // flags & 32: SDR decoded with gamma 2.2, flags & 64: gamma 2.4, else the sRGB curve.
 vec3 SdrDecode(vec3 c) { c = max(c, 0.0); return (pc.flags & 32u) != 0u ? pow(c, vec3(2.2)) : (pc.flags & 64u) != 0u ? pow(c, vec3(2.4)) : SrgbToLin(c); }
+float clamp01(float x) { return clamp(x, 0.0, 1.0); }
+
+// ---- RenoFX HDR Boost, ported from RenoFX by Carlos Lopez (ShortFuse), MIT licence:
+// https://github.com/clshortfuse/renofx -- Copyright (c) 2026 Carlos Lopez. Permission is hereby granted, free of charge,
+// to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the
+// Software without restriction, including without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to
+// do so, subject to the following conditions: The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+// C-infinity inverse tone mapping (HDR Boost, Start, Ramp Intensity) in the LMS working space with its hue restore, or
+// by brightness (Yf), and the boost's colour blend. In: SDR linear BT.709 (1 = SDR white); out: the same, boosted.
+float RfxTransition(float p)
+{
+    p = clamp01(p);
+    if (p <= 0.0) return 0.0;
+    if (p >= 1.0) return 1.0;
+    return 1.0 / (1.0 + exp2((1.0 - 2.0 * p) / (p * (1.0 - p))));
+}
+float RfxRampAt(float x, float start, float ri)
+{
+    if (x <= start) return 0.0;
+    float pos = (x - start) / max(1.0 - start, 1e-6);
+    float w = pos / (1.0 + pos);
+    return pos * pow(2.0 * RfxTransition(w), 1.0 / max(ri, 1e-3));
+}
+float RfxBoost1(float x, float mult, float peakRamp, float start, float ri)
+{
+    if (mult <= 1.0 || x <= start) return x;
+    return x * (1.0 + (mult - 1.0) * RfxRampAt(x, start, ri) / max(peakRamp, 1e-6));
+}
+vec3 RfxToLms(vec3 c)
+{
+    return vec3(dot(vec3(0.2896057766, 0.6972466442, 0.0763712786), c),
+                  dot(vec3(0.0901837576, 0.7073490257, 0.1122031464), c),
+                  dot(vec3(0.0155287401, 0.0536093073, 0.5097978305), c));
+}
+vec3 RfxFromLms(vec3 c)
+{
+    return vec3(dot(vec3( 4.9676196501, -4.9223795290,  0.3391991813), c),
+                  dot(vec3(-0.6196828788,  2.0517506515, -0.3587439845), c),
+                  dot(vec3(-0.0861520039, -0.0658193831,  1.9889544835), c));
+}
+const vec3 kRfxLmsW = vec3(0.68990272, 0.34832189, 0.0371597069161);
+float RfxYf(vec3 bt709) { return dot(RfxToLms(bt709), vec3(0.68990272, 0.34832189, 0.0)); }
+vec3 RfxWeightedToMb(vec3 w)
+{
+    float y = max(w.x + w.y, 0.0);
+    float iy = y > 0.0 ? 1.0 / y : 0.0;
+    return vec3(w.x * iy, w.z * iy, y);
+}
+vec3 RfxMbToWeighted(vec2 c, float y) { return vec3(c.x, 1.0 - c.x, c.y) * y; }
+vec2 RfxWhiteMb() { return RfxWeightedToMb(RfxToLms(vec3(1.0)) * kRfxLmsW).xy; }
+float RfxHalfspaceT(vec2 o, vec2 d, vec2 n, float num)
+{
+    float den = dot(n, d);
+    float an = num + dot(n, RfxWhiteMb() - o);
+    return den > 1e-8 ? an / den : 1e20;
+}
+float RfxRayExitT(vec2 o, vec2 d)
+{
+    if (dot(d, d) <= 1e-14) return 1e20;
+    float r = 1e20;
+    r = min(r, RfxHalfspaceT(o, d, vec2(-0.043889, -0.006807), 0.0065035249));
+    r = min(r, RfxHalfspaceT(o, d, vec2(-0.007821, -0.008564), 0.00104900495));
+    r = min(r, RfxHalfspaceT(o, d, vec2(-0.000604, -0.007942), 0.000207697044));
+    r = min(r, RfxHalfspaceT(o, d, vec2(0.0, -0.080835), 0.00165556648));
+    r = min(r, RfxHalfspaceT(o, d, vec2(0.953597, 0.307020), 0.252472349));
+    r = min(r, RfxHalfspaceT(o, d, vec2(-0.060969, 0.019752), 0.0241967351));
+    r = min(r, RfxHalfspaceT(o, d, vec2(-0.106895, 0.004035), 0.0199621232));
+    return max(r, 0.0);
+}
+vec3 RfxRestoreLmsHue(vec3 src, vec3 tgt)
+{
+    vec3 adapt = RfxToLms(vec3(1.0)) * 0.18;
+    vec3 srcMb = RfxWeightedToMb(src * kRfxLmsW / adapt);
+    vec3 tgtMb = RfxWeightedToMb(tgt * kRfxLmsW / adapt);
+    vec2 neutral = RfxWeightedToMb(kRfxLmsW).xy;
+    vec2 so = srcMb.xy - neutral, to = tgtMb.xy - neutral;
+    float sr2 = dot(so, so), tr2 = dot(to, to);
+    if (sr2 <= 1e-7 || tr2 <= 1e-7) return tgt;
+    float tClipT = RfxRayExitT(neutral, to), tClipS = RfxRayExitT(neutral, so);
+    float sp = tClipS > 0.0 ? clamp01(1.0 / tClipS) : 0.0;
+    float tp = tClipT > 0.0 ? clamp01(1.0 / tClipT) : 0.0;
+    float pw = sp > 1e-7 ? clamp01(tp / sp) : 1.0;
+    float sens = mix(1.0, 0.35, clamp01((tClipT - 0.20139844) / (1.02634534 - 0.20139844)));
+    float rw = sens * pw;
+    if (rw <= 0.0) return tgt;
+    float tr = sqrt(tr2);
+    vec2 dir = mix(to / tr, so * inversesqrt(sr2), clamp01(rw));
+    float dl = dot(dir, dir);
+    dir = dl > 1e-7 ? dir * inversesqrt(dl) : to / tr;
+    return RfxMbToWeighted(neutral + dir * tr, tgtMb.z) * max(adapt, vec3(1e-6)) / kRfxLmsW;
+}
+vec3 RfxHdrBoost(vec3 lin, float mult, float start, float ri, float colour, bool byYf)
+{
+    if (mult <= 1.0001) return lin;
+    float peakRamp = RfxRampAt(1.0, start, ri);
+    if (peakRamp <= 1e-6) return lin;
+    vec3 boosted;
+    if (byYf)
+    {
+        float wy = max(RfxYf(vec3(1.0)), 1e-6), sy = max(RfxYf(lin), 0.0);
+        float by = RfxBoost1(sy / wy, mult, peakRamp, start, ri) * wy;
+        boosted = sy > 1e-6 ? lin * (by / sy) : lin;
+    }
+    else
+    {
+        vec3 w = RfxToLms(lin), white = RfxToLms(vec3(1.0));
+        vec3 n = max(vec3(0.0), w / white);
+        vec3 b = vec3(RfxBoost1(n.x, mult, peakRamp, start, ri), RfxBoost1(n.y, mult, peakRamp, start, ri),
+                          RfxBoost1(n.z, mult, peakRamp, start, ri)) * white;
+        boosted = RfxFromLms(RfxRestoreLmsHue(w, b));
+    }
+    float sY = RfxYf(lin), bY = RfxYf(boosted);
+    if (sY <= 1e-6 || bY <= 1e-6) return boosted;
+    return mix(lin * (bY / sY), boosted, clamp01(colour));
+}
 vec3 SdrToHdr(vec3 lin)
 {
-    vec3 o = SdrExpand(lin);
+    // flags & 256: RenoFX's HDR Boost (peak = SDR highlights / SDR white, Start in sdrKnee); else the knee curve.
+    vec3 o = (pc.flags & 256u) != 0u ? RfxHdrBoost(max(lin, vec3(0.0)), pc.sdrPeak > pc.sdrScale ? pc.sdrPeak / pc.sdrScale : 1.0,
+                                                   pc.sdrKnee, pc.rfxRamp, pc.rfxColor, (pc.flags & 512u) != 0u) * pc.sdrScale
+                                       : SdrExpand(lin);
     if (pc.gamut > 0.0) o = ExpandGamut(o / pc.sdrScale, pc.gamut) * pc.sdrScale;
     return o;
 }

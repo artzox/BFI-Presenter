@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.35"
+#define BFI_VERSION "1.0.36-t1"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -308,7 +308,11 @@ struct Settings
     float sdrHiNits = 800.0f; // highlight expansion: SDR white highlights stretch to this (0 = off)
     float sdrKnee  = 0.65f;   // expansion starts at this SDR signal level (0..1, as the game outputs it)
     int   sdrGamma = 0;       // SdrGamma: decode the SDR picture with 0 the sRGB curve, 1 gamma 2.2, 2 gamma 2.4
-    int   sdrMethod = 0;      // SdrHighlightMethod: highlights stretched by 0 the brightest channel, 1 luminance
+    int   sdrMethod = 0;      // SdrHighlightMethod: highlights stretched by 0 the brightest channel, 1 luminance, 2 RenoFX HDR Boost
+    float sdrBoostStart = 0.15f;  // SdrBoostStart (RenoFX): where the boost begins, linear (1 = SDR white), 0.001-0.99
+    float sdrBoostRamp  = 1.0f;   // SdrBoostRamp (RenoFX Ramp Intensity), 0.25-4
+    int   sdrBoostSpace = 0;      // SdrBoostSpace (RenoFX): 0 LMS with hue restore, 1 by brightness (Yf)
+    float sdrBoostColor = 50.0f;  // SdrBoostColor (RenoFX gamut expansion of the boost), 0-100
     float sdrGamut = 0.0f;    // SdrGamutExpansion: 0..1, bright saturated colours toward wider-gamut colours (0 = off)
 };
 
@@ -408,7 +412,11 @@ static void LoadSettings(Settings &s)
     if (s.sdrHiNits > 4000.0f) s.sdrHiNits = 4000.0f;
     s.sdrKnee = Clamp(KvFloat(kv, "SdrHighlightKnee", 0.65f), 0.3f, 0.95f);
     s.sdrGamma = Clamp(KvInt(kv, "SdrGamma", 0), 0, 2);
-    s.sdrMethod = KvInt(kv, "SdrHighlightMethod", 0) ? 1 : 0;
+    s.sdrMethod = std::max(0, std::min(2, KvInt(kv, "SdrHighlightMethod", 0)));
+    s.sdrBoostStart = std::max(0.001f, std::min(0.99f, KvFloat(kv, "SdrBoostStart", 0.15f)));
+    s.sdrBoostRamp = std::max(0.25f, std::min(4.0f, KvFloat(kv, "SdrBoostRamp", 1.0f)));
+    s.sdrBoostSpace = KvInt(kv, "SdrBoostSpace", 0) ? 1 : 0;
+    s.sdrBoostColor = std::max(0.0f, std::min(100.0f, KvFloat(kv, "SdrBoostColor", 50.0f)));
     s.sdrGamut = Clamp(KvFloat(kv, "SdrGamutExpansion", 0.0f), 0.0f, 1.0f);
     auto it = kv.find("output");
     std::string out = it == kv.end() ? "auto" : it->second;
@@ -432,7 +440,7 @@ static void LoadSettings(Settings &s)
     I("AblGuardBudgetNits", s.ablBudget); k.push_back({"AblCurve", s.ablCurve}); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs); I("FlashHints", s.flashHints);
     I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue); I("PresenterQueuePriority", s.queuePriority);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
-    F("SdrHighlightKnee", s.sdrKnee); I("SdrGamma", s.sdrGamma); I("SdrHighlightMethod", s.sdrMethod); F("SdrGamutExpansion", s.sdrGamut);
+    F("SdrHighlightKnee", s.sdrKnee); I("SdrGamma", s.sdrGamma); I("SdrHighlightMethod", s.sdrMethod); F("SdrBoostStart", s.sdrBoostStart); F("SdrBoostRamp", s.sdrBoostRamp); I("SdrBoostSpace", s.sdrBoostSpace); F("SdrBoostColor", s.sdrBoostColor); F("SdrGamutExpansion", s.sdrGamut);
     return k;
 }
 static void LoadShared()
@@ -612,6 +620,7 @@ struct Constants
     float    gamut;       // SDR shown as HDR10: gamut expansion strength (0 = off)
     float    splitX, splitSeam;   // split comparison: seam position and soft width, output pixels
     uint32_t splitMode;           // 0 off, 1 left side without BFI, 2 right side
+    float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -2252,7 +2261,8 @@ static void PresenterThread(Swapchain *sc)
         c.knee    = s.knee;
         c.ceilLin = (c.outType == 0 || c.outType == 3) ? 1.0f : (float)(std::floor(ceilNow / 10.0 + 0.5) * 10.0 / 80.0);
         c.flags   = (s.rolloff ? 1u : 0u) | (s.sine ? 2u : 0u) | (s.invert ? 4u : 0u) | (s.rolling ? 8u : 0u) |
-                    (c.outType >= 4 ? (s.sdrGamma == 1 ? 32u : s.sdrGamma == 2 ? 64u : 0u) | (s.sdrMethod ? 128u : 0u) : 0u);
+                    (c.outType >= 4 ? (s.sdrGamma == 1 ? 32u : s.sdrGamma == 2 ? 64u : 0u) | (s.sdrMethod == 1 ? 128u : 0u) | (s.sdrMethod == 2 ? 256u : 0u) |
+                                             (s.sdrMethod == 2 && s.sdrBoostSpace ? 512u : 0u) : 0u);
         if (GradualSaverOn(s))
         {
             c.flags |= 16u;
@@ -2266,6 +2276,9 @@ static void PresenterThread(Swapchain *sc)
             const float k = s.sdrKnee;
             c.sdrKnee = s.sdrGamma == 1 ? std::pow(k, 2.2f) : s.sdrGamma == 2 ? std::pow(k, 2.4f)
                                          : (k <= 0.04045f ? k / 12.92f : std::pow((k + 0.055f) / 1.055f, 2.4f));
+            if (s.sdrMethod == 2) c.sdrKnee = s.sdrBoostStart;   // RenoFX: Start, already linear
+            c.rfxRamp = s.sdrBoostRamp;
+            c.rfxColor = s.sdrBoostColor / 100.0f;
             c.gamut = c.outType >= 4 ? s.sdrGamut : 0.0f;
             const float hi = std::min(s.sdrHiNits, s.peakNits);
             c.sdrPeak = hi > s.sdrWhite ? hi / 80.0f : 0.0f;
@@ -5742,10 +5755,21 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::SliderFloat("SDR white (nits)", &s.sdrWhite, 80.0f, 600.0f, "%.0f");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Windows: 80 + 4 x the 'SDR content brightness' slider (40 -> 240).");
             ImGui::SliderFloat("SDR highlights expand to (nits, 0 = off)", &s.sdrHiNits, 0.0f, 2000.0f, "%.0f");
-            ImGui::SliderFloat("Highlight expansion starts at (SDR signal)", &s.sdrKnee, 0.3f, 0.95f, "%.2f");
+            if (s.sdrMethod != 2) ImGui::SliderFloat("Highlight expansion starts at (SDR signal)", &s.sdrKnee, 0.3f, 0.95f, "%.2f");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Below this level the image is unchanged; above it the brightest parts\nstretch toward the highlight value (an HDR look for SDR games).");
-            ImGui::Combo("Highlights stretched by", &s.sdrMethod, "Brightest channel\0Luminance (mostly near-white highlights)\0");
+            ImGui::Combo("Highlights stretched by", &s.sdrMethod, "Brightest channel\0Luminance (mostly near-white highlights)\0RenoFX HDR Boost (ShortFuse)\0");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightest channel also brightens bright saturated colours (reds, blues).\nLuminance stretches mostly near-white highlights; saturated colours stay closer to SDR.");
+            if (s.sdrMethod == 2)
+            {
+                ImGui::TextDisabled("RenoFX HDR Boost (ShortFuse, MIT): boost = highlights / SDR white (e.g. 2.5x).");
+                ImGui::SliderFloat("Boost start (linear, 1 = SDR white)", &s.sdrBoostStart, 0.001f, 0.99f, "%.3f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the boost begins: lower affects more of the image, higher only the brightest parts.");
+                ImGui::SliderFloat("Ramp intensity", &s.sdrBoostRamp, 0.25f, 4.0f, "%.2f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shape of the smooth rise from the start to the peak.");
+                ImGui::Combo("Boost working space", &s.sdrBoostSpace, "LMS (RenoFX default, hue restored)\0Brightness (Yf, colour balance kept)\0");
+                ImGui::SliderFloat("Boost colour (0-100)", &s.sdrBoostColor, 0.0f, 100.0f, "%.0f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much colour expansion the boost adds while keeping its brightness:\n0 = the source colour balance, 100 = the full result of the working space.");
+            }
             ImGui::Combo("SDR decoding", &s.sdrGamma, "sRGB curve (as Windows)\0Gamma 2.2 (deeper shadows)\0Gamma 2.4 (dark-room grading)\0");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the SDR picture is turned into light. Most SDR games were made on gamma 2.2 screens:\nthe sRGB curve (Windows' own SDR-in-HDR and Auto HDR) shows their shadows a little raised.");
             ImGui::SliderFloat("Gamut expansion", &s.sdrGamut, 0.0f, 1.0f, "%.2f");
