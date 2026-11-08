@@ -133,18 +133,24 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     wchar_t path[MAX_PATH]; GetModuleFileNameW(nullptr, path, MAX_PATH);
     wchar_t *sl = wcsrchr(path, L'\\'); if (sl) wcscpy(sl + 1, L"VrrTimedTest_log.txt");
     g_log = _wfopen(path, L"w");
-    Log("VRR timed-present test 1.0: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s",
+    Log("VRR timed-present test 1.1: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s",
         rate, frames, rate / frames, queue, seconds);
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
-    HMODULE k32 = GetModuleHandleA("kernel32.dll");
-    PFN_QITP qitp = (PFN_QITP)(void *)GetProcAddress(k32, "QueryInterruptTimePrecise");
+    PFN_QITP qitp = nullptr;
+    for (const char *mod : {"kernelbase.dll", "kernel32.dll", "api-ms-win-core-realtime-l1-1-1.dll"})
+    {
+        HMODULE hm = LoadLibraryA(mod);
+        if (hm && (qitp = (PFN_QITP)(void *)GetProcAddress(hm, "QueryInterruptTimePrecise"))) break;
+    }
     HMODULE dc = LoadLibraryA("dcomp.dll");
     auto createPF = dc ? (PFN_CreatePresentationFactory)(void *)GetProcAddress(dc, "CreatePresentationFactory") : nullptr;
     auto createSH = dc ? (PFN_DCompCreateSurfaceHandle)(void *)GetProcAddress(dc, "DCompositionCreateSurfaceHandle") : nullptr;
     auto createDC = dc ? (PFN_DCompCreateDevice)(void *)GetProcAddress(dc, "DCompositionCreateDevice") : nullptr;
-    if (!qitp || !createPF || !createSH || !createDC) FAIL("Windows' presentation API is not available (Windows 10 2004 or later needed)");
+    if (!qitp || !createPF || !createSH || !createDC)
+        FAIL("Not available: %s%s%s%s(dcomp.dll %s)", qitp ? "" : "QueryInterruptTimePrecise ", createPF ? "" : "CreatePresentationFactory ",
+             createSH ? "" : "DCompositionCreateSurfaceHandle ", createDC ? "" : "DCompositionCreateDevice ", dc ? "loaded" : "not loaded");
 
     // Window: borderless over the primary monitor.
     POINT pt = {0, 0};
