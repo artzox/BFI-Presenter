@@ -78,6 +78,10 @@ Only with phosphor decay at 0. How wide the blended zone is where two bands meet
 Makes each line fade out after the "beam" passes, like the glow of a real CRT, instead of switching off sharply. No seam at all, smoother and less flickery, slightly more blur.\
 *When to change it:* 0.2–0.4 works well; 0 switches it off and gives hard bands with the seam above.
 
+**Split comparison** · `SplitCompare` · default: off\
+Shows one side of the screen without BFI and the other with it, at the same brightness, so the difference in motion is visible in one picture: pan the camera and compare the two halves. The side without BFI shows every refresh at the light the strobe gives over its cycle, after highlight roll-off and the panel ceiling, so the halves differ only in motion clarity and flicker. **Without BFI** picks the side, **Seam position** where the halves meet (percent of the width) and **Seam softness** a soft edge in pixels. Works in every API, DirectX and Vulkan. The idea comes from [unrefined803](https://github.com/unrefined803)'s demo ([#111](https://github.com/artzox/BFI-Presenter/pull/111)).\
+*When to change it:* for videos, streams and showing someone what BFI does. Hotkey: Ctrl+Shift+C. Turn it off for playing.
+
 ## Your display
 
 **LCD: prevent image retention** · `LcdPhaseSwap` · default: off\
@@ -375,6 +379,7 @@ If a game crashes, these write a short report of what went wrong (`BFIPresenter_
 | Ctrl+Shift+B | BFI on / off |
 | Ctrl+Shift+M | Switch BFI ↔ Variable MPRT |
 | Ctrl+Shift+S | Rolling scan on / off |
+| Ctrl+Shift+C | Split comparison on / off: one side of the screen without BFI |
 | Ctrl+Shift+R | Reload `BFIPresenter.ini` after editing it |
 | Ctrl+Shift+O | Vulkan: rebuild the swap chain (if flashes started after an overlay or menu) |
 | Ctrl+Shift+K | Put a marker in the log with the last second's state (frame rate, frame generation, Reflex limit, video memory), to find a moment you noticed when sending a log |

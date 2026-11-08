@@ -167,6 +167,21 @@ vec4 BfiShade(vec2 fc)
         if (w > 0.0) o = mix(o, Strobe(lin, (pc.slot + pc.frames - nb) % pc.frames, litGain), w);
     }
     else o = Strobe(lin, pc.slot, litGain);
+    if (pc.splitMode != 0u && pc.method < 2u)
+    {
+        // Split comparison (idea: unrefined803, #111): one side shows every refresh at the light the strobe gives over
+        // its cycle -- the mean of what each refresh emits, after roll-off and the ceiling -- so both sides match in
+        // brightness and differ only in motion clarity and flicker.
+        float t = pc.splitSeam > 0.0 ? smoothstep(pc.splitX - 0.5 * pc.splitSeam, pc.splitX + 0.5 * pc.splitSeam, fc.x)
+                                     : step(pc.splitX, fc.x);
+        float w = pc.splitMode == 1u ? 1.0 - t : t;
+        if (w > 0.0)
+        {
+            vec3 a = vec3(0.0);
+            for (uint j = 0u; j < 8u; j++) if (j < pc.frames) a += Strobe(lin, j, litGain);
+            o = mix(o, a / float(pc.frames), w);
+        }
+    }
     if (pc.soften > 0.0 && pc.method < 2u)
     {
         // LCD phase swap: fade toward the steady average picture (the hitch guard's), which keeps the light

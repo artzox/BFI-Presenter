@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.34"
+#define BFI_VERSION "1.0.35"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -257,6 +257,10 @@ struct Settings
     int   invert   = 0;
     int   rolloff  = 1;       // BFI highlight roll-off
     int   rolling  = 0;       // rolling scan: one band per sub-frame, rolling down the screen
+    int   split    = 0;       // SplitCompare: one side of the screen without BFI, for comparison (idea: unrefined803, #111)
+    int   splitSide = 0;      // 0 = the left side without BFI, 1 = the right side
+    int   splitPos = 50;      // the seam, percent of the width from the left
+    int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
@@ -351,6 +355,10 @@ static void LoadSettings(Settings &s)
     s.invert   = KvInt(kv, "InvertCycle", 0);
     s.rolloff  = KvInt(kv, "HighlightRolloff", 1);
     s.rolling  = KvInt(kv, "RollingScan", 0) ? 1 : 0;
+    s.split    = KvInt(kv, "SplitCompare", 0) ? 1 : 0;
+    s.splitSide = KvInt(kv, "SplitCompareSide", 0) ? 1 : 0;
+    s.splitPos = std::max(5, std::min(95, KvInt(kv, "SplitComparePosition", 50)));
+    s.splitSeam = std::max(0, std::min(400, KvInt(kv, "SplitCompareSeamPx", 0)));
     s.lcdSwap  = KvInt(kv, "LcdPhaseSwap", 0) ? 1 : 0;
     s.lcdSwapSec = Clamp(KvInt(kv, "LcdPhaseSwapSeconds", 5), 1, 300);
     s.lcdGradual = KvInt(kv, "LcdSaverGradual", 0) ? 1 : 0;
@@ -415,7 +423,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -602,6 +610,8 @@ struct Constants
     float    phase;       // LCD gradual saver: start of the lit window within the first sub-frame, 0..1
     uint32_t store;       // compute path: 1 swap R and B (B-first swap chain format), 2 sRGB-encode (_SRGB swap chain format)
     float    gamut;       // SDR shown as HDR10: gamut expansion strength (0 = off)
+    float    splitX, splitSeam;   // split comparison: seam position and soft width, output pixels
+    uint32_t splitMode;           // 0 off, 1 left side without BFI, 2 right side
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -1943,7 +1953,7 @@ static void PresenterThread(Swapchain *sc)
     int capDownSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
     double capSwitchT = -100.0, probeWait = 30.0, capUpT = -100.0;
     bool capProbe = false, fgWas = false, rfxFgKnown = false;   // rfxFgKnown: the Reflex frame counts have agreed for 3 s
-    bool kb = false, km = false, kr = false, krs = false;
+    bool kb = false, km = false, kr = false, krs = false, ksp = false;
     FILE *logf = nullptr;
     double monitorCheckT = Now();
     int dumpLeft = g_dumpFrames;
@@ -1951,15 +1961,16 @@ static void PresenterThread(Swapchain *sc)
     while (!sc->stopReq.load())
     {
         // hotkeys (edge-triggered) act on the shared settings
-        const bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S');
-        if ((b && !kb) || (m && !km) || (rs && !krs))
+        const bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C');
+        if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp))
         {
             std::lock_guard<std::mutex> l(g_cfgLock);
             if (b && !kb) g_shared.enabled = !g_shared.enabled;
             if (m && !km) g_shared.method = !g_shared.method;
             if (rs && !krs) g_shared.rolling = !g_shared.rolling;
+            if (sp && !ksp) g_shared.split = !g_shared.split;
         }
-        krs = rs;
+        krs = rs; ksp = sp;
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
         // BFIPresenter.ini edited while the game runs (no ReShade overlay in the game): picked up within a second.
         {
@@ -2192,6 +2203,9 @@ static void PresenterThread(Swapchain *sc)
         c.slot   = slotNow;
         c.method = (!s.enabled || copyMode) ? 2u : hitchPaused ? 3u : (uint32_t)s.method;
         c.soften = (c.method < 2u) ? soften : 0.0f;   // LCD phase swap fade
+        c.splitMode = s.split ? (s.splitSide ? 2u : 1u) : 0u;
+        c.splitX    = s.split ? (float)sc->extent.width * (float)s.splitPos / 100.0f : 0.0f;
+        c.splitSeam = s.split ? (float)s.splitSeam : 0.0f;
 
         // ABL guard (HDR): read the last measurement once its draw is done and
         // find the highest lit-refresh ceiling whose screen average stays
@@ -5678,6 +5692,21 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (s.rollDecay <= 0.0f && ImGui::IsItemHovered()) ImGui::SetTooltip("Blended zone where two bands meet. Pixels in it share their light between both\n"
                                                                   "sub-frames, so they are lit longer: visible blur along the seam in motion.\n"
                                                                   "0 = hard edge, no blur. Phosphor decay (above) hides the edge without a seam.");
+            ImGui::Unindent(16.0f);
+        }
+        bool spc = s.split != 0;
+        if (ImGui::Checkbox("Split comparison (Ctrl+Shift+C)", &spc)) s.split = spc ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("One side of the screen without BFI, the other with it, at the same brightness:\n"
+                                                      "shows what BFI does to motion in one picture (for videos and comparisons).\n"
+                                                      "Idea: unrefined803.");
+        if (s.split)
+        {
+            ImGui::Indent(16.0f);
+            int side = s.splitSide;
+            ImGui::Combo("Without BFI", &side, "Left side\0Right side\0");
+            s.splitSide = side ? 1 : 0;
+            ImGui::SliderInt("Seam position (% of width)", &s.splitPos, 5, 95);
+            ImGui::SliderInt("Seam softness (pixels, 0 = hard)", &s.splitSeam, 0, 400);
             ImGui::Unindent(16.0f);
         }
     }
