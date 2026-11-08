@@ -124,6 +124,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 // ---- GPU load (optional): a second D3D11 device, like a game in another process, rendering a heavy pixel shader into
 // an offscreen 4K target once per strobe cycle, steered to about loadMs of GPU time per frame (timestamp queries).
 static std::atomic<bool> g_loadRun{true};
+static std::atomic<bool> g_loadCalibrated{false};   // iterations are fixed after 3 s of steering, before the strobe starts
 static std::atomic<double> g_loadGpuMs{0.0};
 static std::atomic<int> g_loadFrames{0}, g_loadMeasured{0};
 struct LoadArgs { double loadMs, fps; };
@@ -187,7 +188,8 @@ static DWORD WINAPI LoadThread(void *pv)
             if (g == S_OK && c->GetData(q0[r], &a0, 8, 0) == S_OK && c->GetData(q1[r], &a1, 8, 0) == S_OK && !dj.Disjoint && dj.Frequency)
             {
                 const double ms = (double)(a1 - a0) * 1000.0 / dj.Frequency;
-                if (ms > 0.05) iters = std::max(1.0, std::min(1e6, iters * std::min(1.5, std::max(0.67, a.loadMs / ms))));
+                if (ms > 0.05 && !g_loadCalibrated.load()) iters = std::max(1.0, std::min(1e6, iters * std::min(1.5, std::max(0.67, a.loadMs / ms))));
+                if (!g_loadCalibrated.load() && now > 3.0) { g_loadCalibrated.store(true); Log("GPU load calibrated alone: %.0f iterations, %.1f ms per frame", iters, ms); }
                 sum += ms; n++; g_loadMeasured.fetch_add(1);
                 if (n >= 10) { g_loadGpuMs.store(sum / n); sum = 0; n = 0; }
             }
@@ -231,7 +233,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
         auto setDpi = (PFN_DpiCtx)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetProcessDpiAwarenessContext");
         if (setDpi) setDpi((HANDLE)-4 /*DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2*/);
     }
-    Log("VRR timed-present test 1.7: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms, target clock %s, mode %d (%s)",
+    Log("VRR timed-present test 1.8: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms, target clock %s, mode %d (%s)",
         rate, frames, rate / frames, queue, seconds, loadMs, clk ? "interrupt time" : "QPC", mode,
         mode == 0 ? "steady targets + preferred duration" : mode == 1 ? "steady targets, no preferred duration" : "targets alternating short/long");
     timeBeginPeriod(1);
@@ -363,6 +365,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     Log("Clocks: QPC frequency %lld; QPC (in 100 ns) minus interrupt time %.3f ms", (long long)qpf.QuadPart, qpcMinusIt / 1e4);
     static LoadArgs la; la.loadMs = loadMs; la.fps = rate / frames;
     HANDLE lt = loadMs > 0 ? CreateThread(nullptr, 0, LoadThread, &la, 0, nullptr) : nullptr;
+    if (lt) { for (int w = 0; w < 600 && !g_loadCalibrated.load(); w++) Sleep(10); }
+    qitp(&it0);   // (unused afterwards; keeps the clock sample fresh)
     // Strobe loop.
     const float lit = hdr ? 2.5f : 1.0f;                            // 200 nits in scRGB, white in SDR
     auto nowT = [&](ULONGLONG *o) { if (clk) qitp(o); else { LARGE_INTEGER q; QueryPerformanceCounter(&q); *o = (ULONGLONG)((double)q.QuadPart * (1e7 / (double)qpf.QuadPart)); } };
