@@ -92,7 +92,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.34-t2"
+#define BFI_ADDON_VERSION "1.0.35-t3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -7239,23 +7239,27 @@ static void DestroyChildWindow()
     }
 }
 
-// The presenter's swap chain size for game frames of w x h. A swap chain larger than the window it shows in can't be
+// The presenter's swap chain size for game frames of w x h. A swap chain larger than the screen it shows on can't be
 // flipped to the display: Windows' compositor scales it, and a present that reaches it just after the vblank is shown a
 // refresh late, which breaks the lit/dark order (Journey at 5120x2880 on a 3840x2160 display flickered). With
-// ScaleToWindow on, frames larger than the window's client area are scaled down by the presenter's own pass instead
-// (aspect kept), so its swap chain matches the window. Smaller frames stay as they are.
+// ScaleToWindow on, frames larger than the game window's monitor are scaled down by the presenter's own pass instead
+// (aspect kept). Measured against the monitor, not the window: a game can resize its swap chain while its window is
+// still small (Assassin's Creed Unity: 4K frames while the window was 1147x645 at start), and the presenter's swap chain
+// then stayed at that size when the window grew. Frames at or below the monitor's size stay as they are.
 static void OutSize11(const Settings &cur, HWND hwnd, UINT w, UINT h, UINT &ow, UINT &oh)
 {
     ow = w; oh = h;
     if (!cur.fitWindow || !hwnd || !w || !h) return;
-    RECT r = {};
-    if (!GetClientRect(hwnd, &r) || r.right - r.left <= 0 || r.bottom - r.top <= 0) return;
-    const UINT cw = (UINT)(r.right - r.left), ch = (UINT)(r.bottom - r.top);
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    const LONG mwL = mi.rcMonitor.right - mi.rcMonitor.left, mhL = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    if (mwL <= 0 || mhL <= 0) return;
+    const UINT cw = (UINT)mwL, ch = (UINT)mhL;
     if (w <= cw && h <= ch) return;
     const double sc = (std::min)((double)cw / w, (double)ch / h);
     ow = (std::max)(1u, (UINT)(w * sc + 0.5));
     oh = (std::max)(1u, (UINT)(h * sc + 0.5));
-    if (ow + 1 >= cw && ow <= cw + 1) ow = cw;        // same aspect: exactly the window
+    if (ow + 1 >= cw && ow <= cw + 1) ow = cw;        // same aspect: exactly the monitor
     if (oh + 1 >= ch && oh <= ch + 1) oh = ch;
 }
 
@@ -7351,7 +7355,7 @@ static bool CreateStage11()
     LOGI("BFI Presenter: DX11: presenting %ux%u, format %u, %u buffers (game: %ux%u, format %u, %u buffers)%s",
          g_desc.Width, g_desc.Height, (unsigned)g_desc.Format, g_bufCount, g_srcW ? g_srcW : g_desc.Width,
          g_srcH ? g_srcH : g_desc.Height, (unsigned)g_desc11.Format, g_desc11.BufferCount,
-         (g_srcW && (g_srcW != g_desc.Width || g_srcH != g_desc.Height)) ? " -- the game's frames are scaled down to the window by the presenter" : "");
+         (g_srcW && (g_srcW != g_desc.Width || g_srcH != g_desc.Height)) ? " -- the game's frames are scaled down to the monitor by the presenter" : "");
     EnterCriticalSection(&g_cfgLock);
     g_status.width = g_desc.Width; g_status.height = g_desc.Height;
     g_status.buffers = g_bufCount; g_status.format = (UINT)g_desc.Format;
