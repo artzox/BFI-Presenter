@@ -24,6 +24,7 @@ layout(push_constant) uniform C
     uint  splitMode;  // 0 off, 1 the left side without BFI, 2 the right side
     float rfxRamp;    // SDR to HDR, RenoFX HDR Boost (flags & 256): Ramp Intensity
     float rfxColor;   // its colour blend, 0..1 (0 = brightness only)
+    float rfxAplCut;  // its APL Limiter: share of the boost taken away in bright scenes (0 = full boost, 1 = none)
 } pc;
 layout(set = 0, binding = 0) uniform sampler2D src;
 
@@ -195,12 +196,18 @@ vec3 RfxHdrBoost(vec3 lin, float mult, float start, float ri, float colour, bool
 vec3 SdrToHdr(vec3 lin)
 {
     // flags & 256: RenoFX's HDR Boost (peak = SDR highlights / SDR white, Start in sdrKnee); else the knee curve.
-    vec3 o = (pc.flags & 256u) != 0u ? RfxHdrBoost(max(lin, vec3(0.0)), pc.sdrPeak > pc.sdrScale ? pc.sdrPeak / pc.sdrScale : 1.0,
+    // RenoFX's availability blends each channel between the source and the full boost, which is the same as a smaller
+    // boost: 1 + a (boost - 1). The APL Limiter's reduction (rfxAplCut = 1 - a) is applied that way.
+    float rfxMult = pc.sdrPeak > pc.sdrScale ? pc.sdrPeak / pc.sdrScale : 1.0;
+    rfxMult -= clamp(pc.rfxAplCut, 0.0, 1.0) * (rfxMult - 1.0);
+    vec3 o = (pc.flags & 256u) != 0u ? RfxHdrBoost(max(lin, vec3(0.0)), rfxMult,
                                                    pc.sdrKnee, pc.rfxRamp, pc.rfxColor, (pc.flags & 512u) != 0u) * pc.sdrScale
                                        : SdrExpand(lin);
     if (pc.gamut > 0.0) o = ExpandGamut(o / pc.sdrScale, pc.gamut) * pc.sdrScale;
     return o;
 }
+// The SDR signal as linear light, before SDR to HDR (outType 4/5).
+vec3 SdrIn(vec3 c) { return pc.outType == 5u ? ((pc.flags & 96u) != 0u ? SdrDecode(LinToSrgb(c)) : c) : SdrDecode(c); }
 vec3 Decode(vec3 c)
 {
     if (pc.outType == 0u) return SrgbToLin(c);

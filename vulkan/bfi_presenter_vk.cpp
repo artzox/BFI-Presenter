@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.36-t1"
+#define BFI_VERSION "1.0.36-t2"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -313,6 +313,7 @@ struct Settings
     float sdrBoostRamp  = 1.0f;   // SdrBoostRamp (RenoFX Ramp Intensity), 0.25-4
     int   sdrBoostSpace = 0;      // SdrBoostSpace (RenoFX): 0 LMS with hue restore, 1 by brightness (Yf)
     float sdrBoostColor = 50.0f;  // SdrBoostColor (RenoFX gamut expansion of the boost), 0-100
+    int   sdrBoostApl = 1;        // SdrBoostAplLimiter (RenoFX APL Limiter): less boost in bright scenes (average above 30%)
     float sdrGamut = 0.0f;    // SdrGamutExpansion: 0..1, bright saturated colours toward wider-gamut colours (0 = off)
 };
 
@@ -417,6 +418,7 @@ static void LoadSettings(Settings &s)
     s.sdrBoostRamp = std::max(0.25f, std::min(4.0f, KvFloat(kv, "SdrBoostRamp", 1.0f)));
     s.sdrBoostSpace = KvInt(kv, "SdrBoostSpace", 0) ? 1 : 0;
     s.sdrBoostColor = std::max(0.0f, std::min(100.0f, KvFloat(kv, "SdrBoostColor", 50.0f)));
+    s.sdrBoostApl = KvInt(kv, "SdrBoostAplLimiter", 1) ? 1 : 0;
     s.sdrGamut = Clamp(KvFloat(kv, "SdrGamutExpansion", 0.0f), 0.0f, 1.0f);
     auto it = kv.find("output");
     std::string out = it == kv.end() ? "auto" : it->second;
@@ -440,7 +442,7 @@ static void LoadSettings(Settings &s)
     I("AblGuardBudgetNits", s.ablBudget); k.push_back({"AblCurve", s.ablCurve}); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs); I("FlashHints", s.flashHints);
     I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue); I("PresenterQueuePriority", s.queuePriority);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
-    F("SdrHighlightKnee", s.sdrKnee); I("SdrGamma", s.sdrGamma); I("SdrHighlightMethod", s.sdrMethod); F("SdrBoostStart", s.sdrBoostStart); F("SdrBoostRamp", s.sdrBoostRamp); I("SdrBoostSpace", s.sdrBoostSpace); F("SdrBoostColor", s.sdrBoostColor); F("SdrGamutExpansion", s.sdrGamut);
+    F("SdrHighlightKnee", s.sdrKnee); I("SdrGamma", s.sdrGamma); I("SdrHighlightMethod", s.sdrMethod); F("SdrBoostStart", s.sdrBoostStart); F("SdrBoostRamp", s.sdrBoostRamp); I("SdrBoostSpace", s.sdrBoostSpace); F("SdrBoostColor", s.sdrBoostColor); I("SdrBoostAplLimiter", s.sdrBoostApl); F("SdrGamutExpansion", s.sdrGamut);
     return k;
 }
 static void LoadShared()
@@ -481,6 +483,7 @@ struct Status
     int    fgActive = 0;                    // a frame-generation DLL is loaded (the automatic cap stays at Refresh)
     int    rfxLimitUs = 0;                  // Reflex frame limit at the game's sleep (frame generation), per rendered frame
     double rawAvg = -1.0, litAvg = -1.0, ceilInUse = 0.0;
+    double aplNow = -1.0, aplCut = 0.0;   // RenoFX APL Limiter: scene average (0..1 of SDR white; -1 = off) and boost removed
     int    sharedQueue = 0;
     char   queueInfo[160] = "";     // presenter GPU queue in use (overlay)
     int    layerOrder = 0;      // 0 unknown, 1 below ReShade (good), 2 ReShade not above the layer
@@ -621,6 +624,7 @@ struct Constants
     float    splitX, splitSeam;   // split comparison: seam position and soft width, output pixels
     uint32_t splitMode;           // 0 off, 1 left side without BFI, 2 right side
     float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
+    float    rfxAplCut;                 // its APL Limiter: share of the boost removed (0 = full boost)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -1533,7 +1537,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         ici.imageType = VK_IMAGE_TYPE_2D;
         ici.format = VK_FORMAT_R32_SFLOAT;
-        ici.extent = { 32, 18, 1 };
+        ici.extent = { 32, 36, 1 };   // rows 18-35: RenoFX's APL Limiter
         ici.mipLevels = 1;
         ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1557,7 +1561,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         fbi.attachmentCount = 1;
         fbi.pAttachments = &R.measView;
         fbi.width = 32;
-        fbi.height = 18;
+        fbi.height = 36;
         fbi.layers = 1;
         m = d->CreateFramebuffer(dev, &fbi, nullptr, &R.measFb) == VK_SUCCESS;
     }
@@ -1565,7 +1569,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     if (m)
     {
         VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        bci.size = 32 * 18 * sizeof(float);
+        bci.size = 32 * 36 * sizeof(float);
         bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         m = d->CreateBuffer(dev, &bci, nullptr, &R.measBuf) == VK_SUCCESS;
         VkMemoryRequirements mr;
@@ -1942,6 +1946,9 @@ static void PresenterThread(Swapchain *sc)
     int repWin[30] = {}, repIdx = 0, repSum = 0, repSecsRun = 0;   // repSecsRun: the first seconds (loading) don't count
     int lastOutType = -1, lastShown = -1;
     double ceilNow = -1.0, ceilTarget = -1.0, litAvg = -1.0, rawAvg = -1.0, ablSolve = -1.0, ablT = Now(), ablLowT = 0.0;
+    double aplNow = -1.0;           // RenoFX APL Limiter: the last measured scene average (0..1 of SDR white)
+    float  lastAplCut = 0.0f;
+    bool   aplOn = false;
     double aheadDropT = -1.0;
     bool aheadLocked = false;
     double lastT = Now(), secStart = Now(), ageSum = 0.0;
@@ -2223,6 +2230,11 @@ static void PresenterThread(Swapchain *sc)
         {
             static float cells[32 * 18];
             for (int i = 0; i < 32 * 18; i++) cells[i] = std::max(R.measPtr[i], 0.0f) * 80.0f;
+            {
+                double a = 0.0;   // rows 18-35: the APL Limiter's cells
+                for (int i = 32 * 18; i < 32 * 36; i++) a += std::max(0.0f, std::min(1.0f, R.measPtr[i]));
+                aplNow = a / (32.0 * 18.0);
+            }
             auto avgAt = [&](double C) { return AblAvgAt(cells, C, false, s.frames, s.method == 1); };
             const double peak = s.peakNits;
             const AblCurveT curve = AblMakeCurve(s.ablCurve, peak, (double)s.ablBudget);
@@ -2282,6 +2294,16 @@ static void PresenterThread(Swapchain *sc)
             c.gamut = c.outType >= 4 ? s.sdrGamut : 0.0f;
             const float hi = std::min(s.sdrHiNits, s.peakNits);
             c.sdrPeak = hi > s.sdrWhite ? hi / 80.0f : 0.0f;
+            // RenoFX's APL Limiter: from a scene average of 30% of SDR white the boost fades out smoothly, and is gone
+            // for an all-white screen (its HDR_BOOST_APL_START 30, minimum 0). Measured a frame or two behind.
+            aplOn = R.psoMeas && c.outType >= 4 && s.sdrMethod == 2 && s.sdrBoostApl && c.sdrPeak > c.sdrScale;
+            if (aplOn && aplNow >= 0.0)
+            {
+                const double x = std::max(0.0, std::min(1.0, (aplNow - 0.30) / 0.70));
+                c.rfxAplCut = (float)(x * x * (3.0 - 2.0 * x));
+            }
+            if (!aplOn) aplNow = -1.0;
+            lastAplCut = c.rfxAplCut;
         }
 
         // real image
@@ -2388,7 +2410,7 @@ static void PresenterThread(Swapchain *sc)
                     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &pb);
                     dumpNow = true;
                 }
-                if (ablOn && !measSub && pickId != lastShownId && c.method < 2 && R.psoMC)
+                if (((ablOn && c.method < 2) || aplOn) && !measSub && pickId != lastShownId && R.psoMC)
                 {
                     Constants mc = cc;
                     mc.gain = s.gain;
@@ -2398,12 +2420,12 @@ static void PresenterThread(Swapchain *sc)
                     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.psoMC);
                     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plC, 0, 1, &R.dsM[pick], 0, nullptr);
                     d->CmdPushConstants(cb, R.plC, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mc), &mc);
-                    d->CmdDispatch(cb, 4, 3, 1);
+                    d->CmdDispatch(cb, 4, 5, 1);   // 32x36: rows 18-35 for the APL Limiter
                     qb = ImgBarrier(R.measImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
                     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &qb);
                     VkBufferImageCopy bic = {};
                     bic.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                    bic.imageExtent = { 32, 18, 1 };
+                    bic.imageExtent = { 32, 36, 1 };
                     d->CmdCopyImageToBuffer(cb, R.measImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, R.measBuf, 1, &bic);
                     VkBufferMemoryBarrier hb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
                     hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2444,26 +2466,26 @@ static void PresenterThread(Swapchain *sc)
                     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &db);
                     dumpNow = true;
                 }
-                if (ablOn && !measSub && pickId != lastShownId && c.method < 2)
+                if (((ablOn && c.method < 2) || aplOn) && !measSub && pickId != lastShownId)
                 {
                     Constants mc = c;
                     mc.gain = s.gain;                          // brightness at the configured boost
                     mc.ceilLin = s.peakNits / 80.0f;           // and the full ceiling
                     rbi.renderPass = R.rpMeas;
                     rbi.framebuffer = R.measFb;
-                    rbi.renderArea = { { 0, 0 }, { 32, 18 } };
+                    rbi.renderArea = { { 0, 0 }, { 32, 36 } };
                     d->CmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
                     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.psoMeas);
                     d->CmdPushConstants(cb, R.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(mc), &mc);
-                    VkViewport mvp = { 0.0f, 0.0f, 32.0f, 18.0f, 0.0f, 1.0f };
-                    VkRect2D mrc = { { 0, 0 }, { 32, 18 } };
+                    VkViewport mvp = { 0.0f, 0.0f, 32.0f, 36.0f, 0.0f, 1.0f };
+                    VkRect2D mrc = { { 0, 0 }, { 32, 36 } };
                     d->CmdSetViewport(cb, 0, 1, &mvp);
                     d->CmdSetScissor(cb, 0, 1, &mrc);
                     d->CmdDraw(cb, 3, 1, 0, 0);
                     d->CmdEndRenderPass(cb);
                     VkBufferImageCopy bic = {};
                     bic.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                    bic.imageExtent = { 32, 18, 1 };
+                    bic.imageExtent = { 32, 36, 1 };
                     d->CmdCopyImageToBuffer(cb, R.measImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, R.measBuf, 1, &bic);
                     VkBufferMemoryBarrier hb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
                     hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2812,6 +2834,8 @@ static void PresenterThread(Swapchain *sc)
             }
             g_status.litAvg       = (s.ablGuard && R.psoMeas) ? litAvg : -1.0;
             g_status.rawAvg       = (s.ablGuard && R.psoMeas) ? rawAvg : -1.0;
+            g_status.aplNow       = aplOn ? aplNow : -1.0;
+            g_status.aplCut       = aplOn ? lastAplCut : 0.0;
             g_status.ceilInUse    = c.ceilLin * 80.0;
             g_status.outType      = (int)c.outType;
             // Automatic frames ahead (as the D3D12 presenter): 1 normally, 2
@@ -5769,6 +5793,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 ImGui::Combo("Boost working space", &s.sdrBoostSpace, "LMS (RenoFX default, hue restored)\0Brightness (Yf, colour balance kept)\0");
                 ImGui::SliderFloat("Boost colour (0-100)", &s.sdrBoostColor, 0.0f, 100.0f, "%.0f");
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much colour expansion the boost adds while keeping its brightness:\n0 = the source colour balance, 100 = the full result of the working space.");
+                bool apl = s.sdrBoostApl != 0;
+                if (ImGui::Checkbox("APL limiter", &apl)) s.sdrBoostApl = apl ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("RenoFX's APL Limiter: lowers the boost in bright scenes. Above an average picture level of 30%%\nof SDR white it fades out smoothly, and an all-white screen gets no boost. Measured a frame or two behind.");
+                if (s.sdrBoostApl && st.aplNow >= 0.0)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("scene average %.0f%%, boost %.0f%%", st.aplNow * 100.0, (1.0 - st.aplCut) * 100.0);
+                }
             }
             ImGui::Combo("SDR decoding", &s.sdrGamma, "sRGB curve (as Windows)\0Gamma 2.2 (deeper shadows)\0Gamma 2.4 (dark-room grading)\0");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the SDR picture is turned into light. Most SDR games were made on gamma 2.2 screens:\nthe sRGB curve (Windows' own SDR-in-HDR and Auto HDR) shows their shadows a little raised.");

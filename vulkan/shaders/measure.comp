@@ -9,6 +9,6 @@ layout(set = 0, binding = 1, r32f) uniform writeonly image2D dst;
 void main()
 {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    if (p.x >= 32 || p.y >= 18) return;
+    if (p.x >= 32 || p.y >= 36) return;   // rows 18-35: APL Limiter
     imageStore(dst, p, vec4(MeasureCell(vec2(p) + 0.5), 0.0, 0.0, 0.0));
 }
