@@ -209,20 +209,24 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     // Clock for the target times (7th argument): 0 = QPC in 100 ns units (the clock the displayed times come back in),
     // 1 = interrupt time (1.0-1.3: those targets were about half a second in the past, so images went out at once).
     const int clk = argc > 7 ? _wtoi(argv[7]) : 0;
+    // Buffer scale (8th argument): the images are drawn at this fraction of the screen size and scaled up by the display
+    // hardware (an overlay plane, as video playback uses) -- 1.1 at 1280x720 on a 4K screen kept every refresh within 0.25 ms.
+    double scale = argc > 8 ? _wtof(argv[8]) : 1.0;
+    if (scale < 0.2 || scale > 1.0) scale = 1.0;
     if (mode < 0 || mode > 2) mode = 0;
     if (loadMs < 0 || loadMs > 100) loadMs = 0;
     if (rate < 30 || rate > 500) rate = 100; if (frames < 1 || frames > 8) frames = 2;
     if (queue < 1 || queue > 8) queue = 3; if (seconds < 5) seconds = 120;
 
     wchar_t path[MAX_PATH]; GetModuleFileNameW(nullptr, path, MAX_PATH);
-    wchar_t *sl = wcsrchr(path, L'\\'); if (sl) swprintf(sl + 1, MAX_PATH - (sl + 1 - path), L"VrrTimedTest_log_%.0fHz_load%.0f_mode%d_clock%d.txt", rate, loadMs, mode, clk);
+    wchar_t *sl = wcsrchr(path, L'\\'); if (sl) swprintf(sl + 1, MAX_PATH - (sl + 1 - path), L"VrrTimedTest_log_%.0fHz_load%.0f_mode%d_scale%.0f.txt", rate, loadMs, mode, scale * 100.0);
     g_log = _wfopen(path, L"w");
     {
         typedef BOOL (WINAPI *PFN_DpiCtx)(HANDLE);
         auto setDpi = (PFN_DpiCtx)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetProcessDpiAwarenessContext");
         if (setDpi) setDpi((HANDLE)-4 /*DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2*/);
     }
-    Log("VRR timed-present test 1.4: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms, target clock %s, mode %d (%s)",
+    Log("VRR timed-present test 1.5: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms, target clock %s, mode %d (%s)",
         rate, frames, rate / frames, queue, seconds, loadMs, clk ? "interrupt time" : "QPC", mode,
         mode == 0 ? "steady targets + preferred duration" : mode == 1 ? "steady targets, no preferred duration" : "targets alternating short/long");
     timeBeginPeriod(1);
@@ -282,7 +286,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
             }
         if (ad) ad->Release(); if (dd) dd->Release();
     }
-    Log("Display %dx%d, mode %.0f Hz, Windows HDR %s", W, H, modeHz, hdr ? "on (scRGB buffers)" : "off (8-bit buffers)");
+    const int BW = std::max(64, (int)(W * scale + 0.5)), BH = std::max(64, (int)(H * scale + 0.5));
+    Log("Display %dx%d, mode %.0f Hz, Windows HDR %s; images drawn at %dx%d%s", W, H, modeHz, hdr ? "on (scRGB buffers)" : "off (8-bit buffers)",
+        BW, BH, (BW != W || BH != H) ? " and scaled to the screen by the display hardware" : "");
     if (modeHz > 0 && rate > modeHz - 0.5) Log("Note: %.1f Hz is not below the display mode's %.0f Hz -- VRR has no room to act", rate, modeHz);
 
     // Presentation manager and surface, shown through DirectComposition.
@@ -315,7 +321,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     if (FAILED(hr)) FAIL("DirectComposition setup 0x%08lX", (unsigned long)hr);
     surf->SetAlphaMode(DXGI_ALPHA_MODE_IGNORE);
     surf->SetColorSpace(hdr ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-    RECT src = {0, 0, W, H}; surf->SetSourceRect(&src);
+    RECT src = {0, 0, BW, BH}; surf->SetSourceRect(&src);
+    if (BW != W || BH != H) { float tf[6] = {(float)W / BW, 0, 0, (float)H / BH, 0, 0}; surf->SetTransform(tf); }
 
     // Buffers: queue + 2, displayable textures.
     const int nb = queue + 2;
@@ -324,7 +331,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     for (int i = 0; i < nb; i++)
     {
         D3D11_TEXTURE2D_DESC td = {};
-        td.Width = W; td.Height = H; td.MipLevels = 1; td.ArraySize = 1;
+        td.Width = BW; td.Height = BH; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -383,10 +390,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
         {
             // Lit refresh: grey field with a white bar moving across (one step per cycle) to judge motion.
             const float grey[4] = {lit * 0.35f, lit * 0.35f, lit * 0.35f, 1}, white[4] = {lit, lit, lit, 1};
-            D3D11_RECT r = {0, H / 4, W, H * 3 / 4};
+            D3D11_RECT r = {0, BH / 4, BW, BH * 3 / 4};
             ctx->ClearView(rtv[found], grey, &r, 1);
-            const int cyc = (int)(k / (UINT64)frames), bw = W / 24, x = (cyc * (W / 120)) % (W + bw) - bw;
-            D3D11_RECT b = {std::max(0, x), H / 4, std::min(W, x + bw), H * 3 / 4};
+            const int cyc = (int)(k / (UINT64)frames), bw = BW / 24, x = (cyc * (BW / 120)) % (BW + bw) - bw;
+            D3D11_RECT b = {std::max(0, x), BH / 4, std::min(BW, x + bw), BH * 3 / 4};
             if (b.right > b.left) ctx->ClearView(rtv[found], white, &b, 1);
         }
         ctx->Flush();
