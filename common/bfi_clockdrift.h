@@ -5,7 +5,8 @@
 // second, so once every 15-30 s a frame lands right on the lit refresh's flip: images come back late, the hitch
 // guard pauses BFI (flashes) and a swap chain rebuild can't help. At 119.88 Hz the two match and it runs clean.
 //
-// Fed once a second with that second's game frames, presenter refreshes and the mean arrival phase of the new
+// One per process, kept across swap chain rebuilds (ICO was rebuilt every 20-40 s: a check per swap chain never
+// reached its 70 s). Fed once a second with that second's game frames, presenter refreshes and the mean arrival phase of the new
 // frames (their age when first shown, as an angle over one refresh). Two things must agree over the last 60 s:
 //  - the frame count: a steady rate a little off a whole fraction of the refresh rate, 0.06% to 0.6% (59.94
 //    against 60 is 0.1%; every 10 s stretch agrees, no second falls 5% short);
@@ -20,7 +21,7 @@ struct ClockDrift
 {
     int    f[60] = {}, p[60] = {};
     double a[60] = {};        // mean arrival phase that second (radians over one refresh); NAN = none
-    int    n = 0, head = 0, good = 0;
+    int    n = 0, head = 0, good = 0, bad = 0;
     bool   on = false;        // drift reported
     double mis = 0.0;         // game rate x refreshes per frame / refresh rate - 1
     double gameFps = 0.0;     // the game's own rate
@@ -28,8 +29,9 @@ struct ClockDrift
     double slipS = 0.0;       // a game frame slips against the strobe cycle about this often (s)
     double phaseMsS = 0.0;    // measured phase drift, ms per second
     int    per = 0;           // refreshes per game frame
+    double lastHz = 0.0;      // a new display rate starts over
 
-    void Reset() { n = head = good = 0; on = false; }
+    void Reset() { n = head = good = bad = 0; on = false; }
 
     // Least-squares slope (ms/s) of the unwrapped phase over seconds [from, to) in time order; false if too few.
     bool Slope(double hz, int from, int to, double &ms) const
@@ -64,7 +66,7 @@ struct ClockDrift
     bool Second(int frames, int presents, double phase, double hz, bool exclude)
     {
         const bool was = on;
-        if (exclude || presents <= 0 || hz <= 1.0) { Reset(); return was != on; }
+        if (exclude || presents <= 0 || hz <= 1.0 || std::fabs(hz - lastHz) > 0.005) { Reset(); lastHz = hz; return was != on; }
         f[head] = frames; p[head] = presents; a[head] = phase;
         head = (head + 1) % 60;
         if (n < 60) n++;
@@ -94,8 +96,10 @@ struct ClockDrift
         else steady = false;
         const double am = std::fabs(m);
         good = (steady && am > 0.0006 && am < 0.006) ? good + 1 : 0;
-        on = on ? (steady && am > 0.0004 && am < 0.008) : good >= 10;
-        if (on)
+        // Off again only after 10 s without it (a rebuild's first seconds aren't steady).
+        bad = (steady && am > 0.0004 && am < 0.008) ? 0 : bad + 1;
+        on = on ? bad < 10 : good >= 10;
+        if (on && bad == 0)
         {
             mis = m; per = k; phaseMsS = s0;
             gameFps = hz * (double)F / (double)P;

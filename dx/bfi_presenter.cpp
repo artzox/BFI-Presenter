@@ -3350,7 +3350,7 @@ static DWORD WINAPI PresenterThread(void *)
     int lastShown = -1;
     double lastT = Now(), secStart = Now(), ageSum = 0.0;
     int secPresents = 0, secLate = 0;
-    ClockDrift drift;               // the game's own clock against the display's (ICO at 59.94 fps on 120 Hz)
+    static ClockDrift drift;        // the game's own clock against the display's (ICO at 59.94 fps on 120 Hz); kept across rebuilds
     double secPhC = 0.0, secPhS = 0.0; int secPhN = 0;
     int exactProbes = 0;            // automatic frame cap: tries at Refresh in a row that came back at exactly the strobe rate
     // Hitch guard: while the presenter misses refreshes (GPU saturated by
