@@ -11,6 +11,7 @@
 // target.
 //
 // Usage:  VrrTimedTest.exe [rate Hz, default 100] [frames per cycle, default 2] [queue depth, default 3] [seconds, default 120]
+//                          [GPU load in ms per strobe cycle on a second device, default 0]
 // Esc quits. Needs G-SYNC/VRR on for VrrTimedTest.exe (NVIDIA profile: windowed and full screen) and VSync on.
 #include <windows.h>
 #include <d3d11_1.h>
@@ -21,6 +22,8 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <d3dcompiler.h>
 
 #ifndef D3D11_RESOURCE_MISC_SHARED_DISPLAYABLE
 #define D3D11_RESOURCE_MISC_SHARED_DISPLAYABLE 0x100000
@@ -118,6 +121,78 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     if (m == WM_SETCURSOR) { SetCursor(nullptr); return TRUE; }
     return DefWindowProcW(h, m, w, l);
 }
+// ---- GPU load (optional): a second D3D11 device, like a game in another process, rendering a heavy pixel shader into
+// an offscreen 4K target once per strobe cycle, steered to about loadMs of GPU time per frame (timestamp queries).
+static std::atomic<bool> g_loadRun{true};
+static std::atomic<double> g_loadGpuMs{0.0};
+struct LoadArgs { double loadMs, fps; };
+static const char kLoadHlsl[] =
+    "cbuffer C : register(b0) { uint iters; uint3 pad; };\n"
+    "float4 VS(uint id : SV_VertexID) : SV_Position { float2 uv = float2((id << 1) & 2, id & 2); return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); }\n"
+    "float4 PS(float4 p : SV_Position) : SV_Target { float3 v = float3(p.xy * 0.001, 0.5); [loop] for (uint i = 0; i < iters; i++) v = frac(sin(v * 12.9898 + v.yzx * 78.233) * 43758.5453); return float4(v, 1); }\n";
+static DWORD WINAPI LoadThread(void *pv)
+{
+    LoadArgs a = *(LoadArgs *)pv;
+    typedef HRESULT (WINAPI *PFN_Compile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *, ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
+    HMODULE dcm = LoadLibraryA("d3dcompiler_47.dll");
+    PFN_Compile comp = dcm ? (PFN_Compile)(void *)GetProcAddress(dcm, "D3DCompile") : nullptr;
+    ID3D11Device *d = nullptr; ID3D11DeviceContext *c = nullptr;
+    if (!comp || FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &d, nullptr, &c)))
+    { Log("GPU load: could not start (d3dcompiler_47 or device)"); return 0; }
+    ID3DBlob *vb = nullptr, *pb = nullptr, *err = nullptr;
+    comp(kLoadHlsl, sizeof(kLoadHlsl) - 1, "load", nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vb, &err);
+    comp(kLoadHlsl, sizeof(kLoadHlsl) - 1, "load", nullptr, nullptr, "PS", "ps_5_0", 0, 0, &pb, &err);
+    if (!vb || !pb) { Log("GPU load: shader compile failed"); return 0; }
+    ID3D11VertexShader *vs = nullptr; ID3D11PixelShader *ps = nullptr;
+    d->CreateVertexShader(vb->GetBufferPointer(), vb->GetBufferSize(), nullptr, &vs);
+    d->CreatePixelShader(pb->GetBufferPointer(), pb->GetBufferSize(), nullptr, &ps);
+    D3D11_TEXTURE2D_DESC td = {}; td.Width = 3840; td.Height = 2160; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; td.SampleDesc.Count = 1; td.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ID3D11Texture2D *rt = nullptr; ID3D11RenderTargetView *rv = nullptr;
+    d->CreateTexture2D(&td, nullptr, &rt); d->CreateRenderTargetView(rt, nullptr, &rv);
+    D3D11_BUFFER_DESC bd = {}; bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DYNAMIC; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ID3D11Buffer *cb = nullptr; d->CreateBuffer(&bd, nullptr, &cb);
+    D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0}, qt = {D3D11_QUERY_TIMESTAMP, 0};
+    ID3D11Query *qdis[4], *q0[4], *q1[4];
+    for (int i = 0; i < 4; i++) { d->CreateQuery(&qd, &qdis[i]); d->CreateQuery(&qt, &q0[i]); d->CreateQuery(&qt, &q1[i]); }
+    double iters = 64.0; int fi = 0; double sum = 0; int n = 0;
+    LARGE_INTEGER f, t0, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    double next = 0.0;
+    D3D11_VIEWPORT vp = {0, 0, 3840, 2160, 0, 1};
+    Log("GPU load: about %.1f ms of GPU time per frame at %.1f fps on a second device", a.loadMs, a.fps);
+    while (g_loadRun.load())
+    {
+        QueryPerformanceCounter(&t);
+        const double now = (double)(t.QuadPart - t0.QuadPart) / f.QuadPart;
+        if (now < next) { Sleep(1); continue; }
+        next = (next == 0.0 ? now : next) + 1.0 / a.fps;
+        const int s = fi % 4;
+        D3D11_MAPPED_SUBRESOURCE ms;
+        if (SUCCEEDED(c->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) { ((UINT *)ms.pData)[0] = (UINT)iters; c->Unmap(cb, 0); }
+        c->Begin(qdis[s]); c->End(q0[s]);
+        c->OMSetRenderTargets(1, &rv, nullptr); c->RSSetViewports(1, &vp);
+        c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        c->VSSetShader(vs, nullptr, 0); c->PSSetShader(ps, nullptr, 0); c->PSSetConstantBuffers(0, 1, &cb);
+        c->Draw(3, 0);
+        c->End(q1[s]); c->End(qdis[s]); c->Flush();
+        fi++;
+        if (fi >= 4)
+        {
+            const int r = fi % 4;   // the oldest of the four, three frames back
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj; UINT64 a0, a1;
+            if (c->GetData(qdis[r], &dj, sizeof(dj), 0) == S_OK && c->GetData(q0[r], &a0, 8, 0) == S_OK &&
+                c->GetData(q1[r], &a1, 8, 0) == S_OK && !dj.Disjoint && dj.Frequency)
+            {
+                const double ms = (double)(a1 - a0) * 1000.0 / dj.Frequency;
+                if (ms > 0.05) iters = std::max(1.0, std::min(1e6, iters * std::min(1.5, std::max(0.67, a.loadMs / ms))));
+                sum += ms; n++;
+                if (n >= (int)a.fps) { g_loadGpuMs.store(sum / n); sum = 0; n = 0; }
+            }
+        }
+    }
+    return 0;
+}
+
 #define FAIL(...) do { Log(__VA_ARGS__); MessageBoxA(nullptr, "VRR timed test failed -- see VrrTimedTest_log.txt", "VRR timed test", MB_OK); return 1; } while (0)
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
@@ -127,14 +202,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     int frames  = argc > 2 ? _wtoi(argv[2]) : 2;
     int queue   = argc > 3 ? _wtoi(argv[3]) : 3;
     int seconds = argc > 4 ? _wtoi(argv[4]) : 120;
+    double loadMs = argc > 5 ? _wtof(argv[5]) : 0.0;
+    if (loadMs < 0 || loadMs > 100) loadMs = 0;
     if (rate < 30 || rate > 500) rate = 100; if (frames < 1 || frames > 8) frames = 2;
     if (queue < 1 || queue > 8) queue = 3; if (seconds < 5) seconds = 120;
 
     wchar_t path[MAX_PATH]; GetModuleFileNameW(nullptr, path, MAX_PATH);
     wchar_t *sl = wcsrchr(path, L'\\'); if (sl) wcscpy(sl + 1, L"VrrTimedTest_log.txt");
     g_log = _wfopen(path, L"w");
-    Log("VRR timed-present test 1.1: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s",
-        rate, frames, rate / frames, queue, seconds);
+    {
+        typedef BOOL (WINAPI *PFN_DpiCtx)(HANDLE);
+        auto setDpi = (PFN_DpiCtx)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetProcessDpiAwarenessContext");
+        if (setDpi) setDpi((HANDLE)-4 /*DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2*/);
+    }
+    Log("VRR timed-present test 1.2: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms",
+        rate, frames, rate / frames, queue, seconds, loadMs);
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
@@ -254,6 +336,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     hr = pm->SetPreferredPresentDuration(pd, tol);
     Log("SetPreferredPresentDuration(%.3f ms) 0x%08lX", per / 1e4, (unsigned long)hr);
 
+    // The displayed times may use another clock than the interrupt time the targets are given in: sample both.
+    ULONGLONG it0 = 0; LARGE_INTEGER qpc0, qpf; qitp(&it0); QueryPerformanceCounter(&qpc0); QueryPerformanceFrequency(&qpf);
+    const double qpcMinusIt = (double)qpc0.QuadPart * (1e7 / (double)qpf.QuadPart) - (double)it0;   // 100 ns units
+    Log("Clocks: QPC frequency %lld; QPC (in 100 ns) minus interrupt time %.3f ms", (long long)qpf.QuadPart, qpcMinusIt / 1e4);
+    static LoadArgs la; la.loadMs = loadMs; la.fps = rate / frames;
+    HANDLE lt = loadMs > 0 ? CreateThread(nullptr, 0, LoadThread, &la, 0, nullptr) : nullptr;
     // Strobe loop.
     const float lit = hdr ? 2.5f : 1.0f;                            // 200 nits in scRGB, white in SDR
     ULONGLONG now = 0; qitp(&now);
@@ -262,7 +350,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     struct Pending { UINT64 id, target; };
     std::vector<Pending> pend;                                       // presents waiting for their statistics
     UINT64 lastId = 0, lastShown = 0;
-    std::vector<double> dev_ms, late_ms; int composed = 0, iflip = 0, skipped = 0, gaps = 0;
+    std::vector<double> dev_ms, late_ms, lateQ_ms; int composed = 0, iflip = 0, skipped = 0, gaps = 0;
     ULONGLONG winStart = now; int logs = 0; ULONGLONG endT = now + (ULONGLONG)seconds * 10000000ull;
     int bi = 0;
     while (!g_quit)
@@ -314,7 +402,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                 {
                     SystemInterruptTime shown = {}; fs->GetDisplayedTime(&shown);
                     iflip++;
-                    for (auto &p : pend) if (p.id == pid) { late_ms.push_back(((double)shown.value - (double)p.target) / 1e4); break; }
+                    for (auto &p : pend) if (p.id == pid) { late_ms.push_back(((double)shown.value - (double)p.target) / 1e4); lateQ_ms.push_back(((double)shown.value - ((double)p.target + qpcMinusIt)) / 1e4); break; }
                     if (lastId && pid == lastId + 1 && lastShown) dev_ms.push_back(((double)shown.value - (double)lastShown) / 1e4 - per / 1e4);
                     lastId = pid; lastShown = shown.value;
                     fs->Release();
@@ -345,12 +433,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                 "off by median %.3f, 99%% %.3f ms; within 0.25 ms %d", dev_ms.size(), iflip, composed, skipped, gaps, meanLen,
                 meanLen > 0 ? 1000.0 / meanLen : 0.0, pct(ad, 0.5), pct(ad, 0.99), h[4]);
             Log("  refresh length minus %.2f ms: below -2 %d, -2..-1 %d, -1..-0.5 %d, -0.5..-0.25 %d, within 0.25 %d, +0.25..0.5 %d, "
-                "+0.5..1 %d, +1..2 %d, above +2 %d; shown after target: median %.3f, 99%% %.3f ms", per / 1e4, h[0], h[1], h[2], h[3],
-                h[4], h[5], h[6], h[7], h[8], pct(late_ms, 0.5), pct(late_ms, 0.99));
+                "+0.5..1 %d, +1..2 %d, above +2 %d; shown after target: median %.3f, 99%% %.3f ms (taking the displayed time as QPC: "
+                "median %.3f, 99%% %.3f ms)", per / 1e4, h[0], h[1], h[2], h[3],
+                h[4], h[5], h[6], h[7], h[8], pct(late_ms, 0.5), pct(late_ms, 0.99), pct(lateQ_ms, 0.5), pct(lateQ_ms, 0.99));
+            if (loadMs > 0) Log("  GPU load: %.1f ms per frame measured", g_loadGpuMs.load());
             if (composed > iflip) Log("  most images were composed by DWM, not flipped -- timing then follows DWM, not the targets");
-            dev_ms.clear(); late_ms.clear(); composed = iflip = skipped = gaps = 0; winStart = now; logs++;
+            dev_ms.clear(); late_ms.clear(); lateQ_ms.clear(); composed = iflip = skipped = gaps = 0; winStart = now; logs++;
         }
     }
+    g_loadRun.store(false); if (lt) { WaitForSingleObject(lt, 2000); CloseHandle(lt); }
     Log("done");
     timeEndPeriod(1);
     return 0;

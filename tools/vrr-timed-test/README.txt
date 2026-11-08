@@ -11,8 +11,9 @@ Setup
 
 Run
 - run_100Hz.bat (A95L / 120 Hz displays: 100 Hz, 50 Hz strobe), or run_170Hz.bat (240 Hz monitors)
-- or: VrrTimedTest.exe <rate Hz> <frames per cycle> <presents queued ahead> <seconds>
-  e.g. VrrTimedTest.exe 110 2 3 120
+- run_100Hz_gpu_load.bat: the same with a game-like GPU load (about 14 ms of GPU work per 20 ms cycle on a second device)
+- or: VrrTimedTest.exe <rate Hz> <frames per cycle> <presents queued ahead> <seconds> <GPU load ms>
+  e.g. VrrTimedTest.exe 110 2 3 120 10
 - Esc quits. It ends by itself after the set time (default 120 s).
 
 What the log says
