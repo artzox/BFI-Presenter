@@ -1,13 +1,14 @@
-VRR timed-present test 1.5 (standalone, no game)
+VRR timed-present test 1.6 (standalone, no game)
 
-1.1 at 1280x720 (scaled up to the 4K screen by the display hardware) kept every refresh within 0.25 ms; native 4K
-did not. 1.5 draws the images at a fraction of the screen size and lets the display hardware scale them, to see
-whether that path (an overlay plane, as video playback uses) is the one that honours the target times.
+Findings so far (A95L, RTX 5080, Windows 11 24H2): with NVIDIA Vertical Sync left to the application (not Force on),
+steady targets plus a preferred present duration gave every refresh within 0.25 ms with no GPU load, and about 90%
+with a game-like load. 1.6 raises the strobe's GPU priority so its drawing goes ahead of the load.
 
-Setup: G-SYNC on (windowed and full screen) for VrrTimedTest.exe, VSync on, no frame limiter. 60 s per run.
-1_720p_scaled_load.bat                 as 1.1 (1280x720), with GPU load
-2_720p_scaled_alternating_targets.bat  the same with targets 1 ms early/late: odd/even refresh lengths about 9 / 11 ms
-                                       mean the display follows the targets
-3_1620p_scaled_load.bat                2880x1620 scaled, GPU load
-4_1944p_scaled_load.bat                3456x1944 scaled, GPU load
-Manual: VrrTimedTest.exe <rate> <frames> <queued ahead> <seconds> <GPU load ms> <mode 0/1/2> <clock 0> <scale 0.2-1>
+Setup: G-SYNC on (windowed and full screen) for VrrTimedTest.exe, Vertical Sync: Use the 3D application setting
+(NOT Force on), no frame limiter. 60 s per run, each with its own log.
+1_load_priority.bat                    GPU load, strobe at GPU priority 7, 3 presents ahead
+2_load_priority_queue5.bat             the same, 5 presents ahead
+3_no_load_no_preferred_duration.bat    no load, no preferred present duration: is the duration hint what keeps it even?
+4_load_priority_110Hz.bat              GPU load at 110 Hz
+run_170Hz_240Hz_monitor.bat            for 240 Hz monitors
+Manual: VrrTimedTest.exe <rate> <frames> <ahead> <seconds> <load ms> <mode 0/1/2> <clock 0> <scale> <GPU priority -7..7>

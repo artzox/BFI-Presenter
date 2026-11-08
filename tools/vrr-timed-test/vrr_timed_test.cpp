@@ -212,6 +212,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     // Buffer scale (8th argument): the images are drawn at this fraction of the screen size and scaled up by the display
     // hardware (an overlay plane, as video playback uses) -- 1.1 at 1280x720 on a 4K screen kept every refresh within 0.25 ms.
     double scale = argc > 8 ? _wtof(argv[8]) : 1.0;
+    // GPU priority for the strobe's own drawing (9th argument, -7..7, default 7): ahead of the load's 14 ms draws.
+    const int gprio = argc > 9 ? _wtoi(argv[9]) : 7;
     if (scale < 0.2 || scale > 1.0) scale = 1.0;
     if (mode < 0 || mode > 2) mode = 0;
     if (loadMs < 0 || loadMs > 100) loadMs = 0;
@@ -219,14 +221,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     if (queue < 1 || queue > 8) queue = 3; if (seconds < 5) seconds = 120;
 
     wchar_t path[MAX_PATH]; GetModuleFileNameW(nullptr, path, MAX_PATH);
-    wchar_t *sl = wcsrchr(path, L'\\'); if (sl) swprintf(sl + 1, MAX_PATH - (sl + 1 - path), L"VrrTimedTest_log_%.0fHz_load%.0f_mode%d_scale%.0f.txt", rate, loadMs, mode, scale * 100.0);
+    wchar_t *sl = wcsrchr(path, L'\\'); if (sl) swprintf(sl + 1, MAX_PATH - (sl + 1 - path), L"VrrTimedTest_log_%.0fHz_load%.0f_mode%d_scale%.0f_q%d_prio%d.txt", rate, loadMs, mode, scale * 100.0, queue, gprio);
     g_log = _wfopen(path, L"w");
     {
         typedef BOOL (WINAPI *PFN_DpiCtx)(HANDLE);
         auto setDpi = (PFN_DpiCtx)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetProcessDpiAwarenessContext");
         if (setDpi) setDpi((HANDLE)-4 /*DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2*/);
     }
-    Log("VRR timed-present test 1.5: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms, target clock %s, mode %d (%s)",
+    Log("VRR timed-present test 1.6: %.1f Hz, %d frames per cycle (strobe %.1f Hz), %d presents queued ahead, %d s, GPU load %.1f ms, target clock %s, mode %d (%s)",
         rate, frames, rate / frames, queue, seconds, loadMs, clk ? "interrupt time" : "QPC", mode,
         mode == 0 ? "steady targets + preferred duration" : mode == 1 ? "steady targets, no preferred duration" : "targets alternating short/long");
     timeBeginPeriod(1);
@@ -308,6 +310,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     hr = pm->CreatePresentationSurface(sh, &surf);
     if (FAILED(hr)) FAIL("CreatePresentationSurface 0x%08lX", (unsigned long)hr);
     IDXGIDevice *dxgiDev = nullptr; dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgiDev);
+    if (dxgiDev) { const HRESULT ph = dxgiDev->SetGPUThreadPriority(std::max(-7, std::min(7, gprio))); Log("GPU thread priority %d: 0x%08lX", gprio, (unsigned long)ph); }
     IDCompositionDevice *dcd = nullptr;
     hr = createDC(dxgiDev, IID_IDCompositionDevice_, (void **)&dcd);
     if (FAILED(hr)) FAIL("DCompositionCreateDevice 0x%08lX", (unsigned long)hr);
