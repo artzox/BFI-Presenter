@@ -7,6 +7,10 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Unreleased]
+
+- **[DX] Shorter black screen when a game starts.** The presenter compiled its shaders each time it started, at the highest optimisation level, and nothing could be shown meanwhile: about 1 s in 1.0.25, 1.7–2 s by 1.0.35 as the shader grew with each feature. They are now compiled once per session on a thread started as the add-on loads, usually done before the game's first frame, and kept in `BFIPresenter_shaders.bin` next to the ini (tied to the exact shader source), so from the second start of a version there's no compile at all.
+
 ## [1.0.36] — 2026-11-09 (Manager 1.3.17)
 
 **RenoFX HDR Boost for SDR to HDR, and a warning for games that run on their own clock.**
