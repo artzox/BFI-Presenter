@@ -7,6 +7,17 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Unreleased]
+
+## [1.0.36] — 2026-11-09 (Manager 1.3.17)
+
+**RenoFX HDR Boost for SDR to HDR, and a warning for games that run on their own clock.**
+
+- **[DX] [Vulkan] SDR to HDR: RenoFX HDR Boost** (`SdrHighlightMethod=2`, a third choice under **Highlights stretched by**). ShortFuse's inverse tone mapping from [RenoFX](https://github.com/clshortfuse/renofx) (MIT), ported into the presenter's own pass, so it needs no swap chain upgrade add-on: SDR white is raised by SDR highlights ÷ SDR white along RenoFX's C-infinity ramp (`SdrBoostStart`, `SdrBoostRamp`), in its LMS space with hue restore or by brightness (`SdrBoostSpace`), with its colour blend (`SdrBoostColor`) and its APL Limiter, which lowers the boost in bright scenes (`SdrBoostAplLimiter`, on by default; measured on the GPU from the frame being shown, as in RenoFX, so it adds no latency). Suggested by J3b240 ([#112](https://github.com/artzox/BFI-Presenter/issues/112)).
+- **[DX] [Vulkan] Game clock warning.** A game that times its frames on a clock of its own a little off the display (e.g. ICO at 59.94 fps on a 120.00 Hz display) drifts against the strobe cycle: every 15–30 s a frame lands on the lit refresh's flip, which shows as stutter and flashes. The presenter now recognises it, from the frame rate and the steady drift of the frames' arrival, and says in the overlay and the log which refresh rate matches the game (e.g. 119.88 Hz). The Vulkan layer no longer rebuilds the swap chain for it, since a rebuild can't help.
+- **[DX] [Vulkan] Automatic frame cap:** a game that comes back at exactly the strobe rate from two tries at the refresh rate in a row (a limit of its own, e.g. a game locked to 60 fps) is tried again every 5 minutes instead of every 30 s, so it no longer gets 4 s of frames off the strobe cycle twice a minute. A new session starts at 30 s again.
+- **[Docs]** Settings guide: **RenoFX HDR Boost** and its APL limiter, the **Game clock warning**, and the slower tries at the refresh rate for games locked to the strobe rate.
+
 ## [1.0.35] — 2026-11-08 (Manager 1.3.17)
 
 **Split comparison: BFI on one side of the screen, off on the other.**

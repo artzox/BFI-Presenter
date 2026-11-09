@@ -54,6 +54,7 @@
 #include <reshade.hpp>
 #include "../common/bfi_syscheck.h"
 #include "../common/bfi_vram.h"
+#include "../common/bfi_clockdrift.h"
 
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d12.lib")
@@ -92,7 +93,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.35"
+#define BFI_ADDON_VERSION "1.0.36"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -176,7 +177,12 @@ struct Settings
     float sdrHiNits = 800.0f; // highlights stretch toward this (0 = off)
     float sdrKnee  = 0.65f;   // expansion starts at this SDR signal level
     int   sdrGamma = 0;       // SdrGamma: SDR decoding: 0 sRGB (as Windows), 1 gamma 2.2 (deeper shadows), 2 gamma 2.4
-    int   sdrMethod = 0;      // SdrHighlightMethod: highlights stretched by 0 the brightest channel, 1 luminance
+    int   sdrMethod = 0;      // SdrHighlightMethod: highlights stretched by 0 the brightest channel, 1 luminance, 2 RenoFX HDR Boost
+    float sdrBoostStart = 0.15f;  // SdrBoostStart (RenoFX): where the boost begins, linear (1 = SDR white), 0.001-0.99
+    float sdrBoostRamp  = 1.0f;   // SdrBoostRamp (RenoFX Ramp Intensity), 0.25-4
+    int   sdrBoostSpace = 0;      // SdrBoostSpace (RenoFX): 0 LMS with hue restore, 1 by brightness (Yf)
+    float sdrBoostColor = 50.0f;  // SdrBoostColor (RenoFX gamut expansion of the boost), 0-100
+    int   sdrBoostApl = 1;        // SdrBoostAplLimiter (RenoFX APL Limiter): less boost in bright scenes (average above 30%)
     float sdrGamut = 0.0f;    // SdrGamutExpansion: 0..1 (0 = off)
 };
 
@@ -359,7 +365,12 @@ static void LoadSettings(Settings &s)
     if (s.sdrKnee > 0.95f) s.sdrKnee = 0.95f;
     s.sdrGamma = IniInt("SdrGamma", 0);
     if (s.sdrGamma < 0 || s.sdrGamma > 2) s.sdrGamma = 0;
-    s.sdrMethod = IniInt("SdrHighlightMethod", 0) ? 1 : 0;
+    s.sdrMethod = std::max(0, std::min(2, IniInt("SdrHighlightMethod", 0)));
+    s.sdrBoostStart = std::max(0.001f, std::min(0.99f, IniFloat("SdrBoostStart", 0.15f)));
+    s.sdrBoostRamp = std::max(0.25f, std::min(4.0f, IniFloat("SdrBoostRamp", 1.0f)));
+    s.sdrBoostSpace = IniInt("SdrBoostSpace", 0) ? 1 : 0;
+    s.sdrBoostColor = std::max(0.0f, std::min(100.0f, IniFloat("SdrBoostColor", 50.0f)));
+    s.sdrBoostApl = IniInt("SdrBoostAplLimiter", 1) ? 1 : 0;
     s.sdrGamut = IniFloat("SdrGamutExpansion", 0.0f);
     if (s.sdrGamut < 0.0f) s.sdrGamut = 0.0f;
     if (s.sdrGamut > 1.0f) s.sdrGamut = 1.0f;
@@ -463,6 +474,11 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("SdrHighlightKnee", s.sdrKnee);
     IniWriteInt("SdrGamma", s.sdrGamma);
     IniWriteInt("SdrHighlightMethod", s.sdrMethod);
+    IniWriteFloat("SdrBoostStart", s.sdrBoostStart);
+    IniWriteFloat("SdrBoostRamp", s.sdrBoostRamp);
+    IniWriteInt("SdrBoostSpace", s.sdrBoostSpace);
+    IniWriteFloat("SdrBoostColor", s.sdrBoostColor);
+    IniWriteInt("SdrBoostAplLimiter", s.sdrBoostApl);
     IniWriteFloat("SdrGamutExpansion", s.sdrGamut);
     IniWriteInt("CapGameToRefresh", s.gameCap);
     IniWriteInt("CapDivisor", s.capDivisor);
@@ -518,6 +534,8 @@ struct Status
     UINT   format = 0;
     int    outType = -1;
     double refreshHz = 0.0, gameFps = 0.0, frameAgeMs = 0.0;
+    int    driftOn = 0;                     // the game runs on a clock of its own, a little off the display (common/bfi_clockdrift.h)
+    double driftFps = 0.0, driftHz = 0.0, driftSuggest = 0.0, driftSlip = 0.0;
     int    late = 0, repeats = 0;
     int    frameRepeats = 0, frameSkips = 0;
     double alignSlackMs = -1.0, alignShiftMs = 0.0;   // ReflexAlign: frames ready before the pick (10th percentile), total shift
@@ -544,6 +562,8 @@ struct Status
     double rfxSimGpuMs = -1.0;                  // Reflex report: simulation start -> GPU finished (average)
     double relFlashMs = -1.0;                   // game released -> lit flash showing that frame (average)
     double rawAvg  = -1.0;                      // ABL guard: unclipped lit-refresh average (nits)
+    double aplNow  = -1.0;                      // RenoFX APL Limiter: scene average (0..1 of SDR white); -1 = off
+    double aplCut  = 0.0;                       // and the share of the boost it removes
     double hotArea = -1.0;                      // ABL guard: percent of the screen whose lit refresh exceeds the cap
     double ceilInUse = 0.0;                     // ABL guard: lit-refresh ceiling in effect (nits)                  // display refreshing slower than it can, with no missed refreshes
     int    reused = 0;                          // per second: refreshes that reused an already-drawn buffer   // per second: strobe cycles with no new game frame / frames never shown
@@ -1504,8 +1524,12 @@ cbuffer C : register(b0)
     float splitX;     // split comparison: the seam, in output pixels
     float splitSeam;  // its soft width in output pixels (0 = hard edge)
     uint  splitMode;  // 0 off, 1 the left side without BFI, 2 the right side
+    float rfxRamp;    // SDR to HDR, RenoFX HDR Boost (flags & 256): Ramp Intensity
+    float rfxColor;   // its colour blend, 0..1 (0 = brightness only)
+    float rfxApl;     // its APL Limiter: 1 = on (the scene average is in aplTex, measured from this frame)
 };
 Texture2D<float4> src : register(t0);
+Texture2D<float> aplTex : register(t1);   // APL Limiter: the scene average (1x1); for its reduction pass, the 32x18 cells
 SamplerState linClamp : register(s0);
 
 // The game's frame at output pixel pos. Same size: the pixel itself. Larger (a 5K frame in a 4K window): four bilinear
@@ -1575,9 +1599,132 @@ float3 ExpandGamut(float3 v, float amount)
                       dot(r, float3(-0.020494311, -0.091839135, 1.203626612)));
     return lerp(r, e, k) / pw;
 }
+// ---- RenoFX HDR Boost, ported from RenoFX by Carlos Lopez (ShortFuse), MIT licence:
+// https://github.com/clshortfuse/renofx -- Copyright (c) 2026 Carlos Lopez. Permission is hereby granted, free of charge,
+// to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the
+// Software without restriction, including without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to
+// do so, subject to the following conditions: The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+// C-infinity inverse tone mapping (HDR Boost, Start, Ramp Intensity) in the LMS working space with its hue restore, or
+// by brightness (Yf), and the boost's colour blend. In: SDR linear BT.709 (1 = SDR white); out: the same, boosted.
+float RfxTransition(float p)
+{
+    p = saturate(p);
+    if (p <= 0.0) return 0.0;
+    if (p >= 1.0) return 1.0;
+    return 1.0 / (1.0 + exp2((1.0 - 2.0 * p) / (p * (1.0 - p))));
+}
+float RfxRampAt(float x, float start, float ri)
+{
+    if (x <= start) return 0.0;
+    float pos = (x - start) / max(1.0 - start, 1e-6);
+    float w = pos / (1.0 + pos);
+    return pos * pow(2.0 * RfxTransition(w), 1.0 / max(ri, 1e-3));
+}
+float RfxBoost1(float x, float mult, float peakRamp, float start, float ri)
+{
+    if (mult <= 1.0 || x <= start) return x;
+    return x * (1.0 + (mult - 1.0) * RfxRampAt(x, start, ri) / max(peakRamp, 1e-6));
+}
+float3 RfxToLms(float3 c)
+{
+    return float3(dot(float3(0.2896057766, 0.6972466442, 0.0763712786), c),
+                  dot(float3(0.0901837576, 0.7073490257, 0.1122031464), c),
+                  dot(float3(0.0155287401, 0.0536093073, 0.5097978305), c));
+}
+float3 RfxFromLms(float3 c)
+{
+    return float3(dot(float3( 4.9676196501, -4.9223795290,  0.3391991813), c),
+                  dot(float3(-0.6196828788,  2.0517506515, -0.3587439845), c),
+                  dot(float3(-0.0861520039, -0.0658193831,  1.9889544835), c));
+}
+static const float3 kRfxLmsW = float3(0.68990272, 0.34832189, 0.0371597069161);
+float RfxYf(float3 bt709) { return dot(RfxToLms(bt709), float3(0.68990272, 0.34832189, 0.0)); }
+float3 RfxWeightedToMb(float3 w)
+{
+    float y = max(w.x + w.y, 0.0);
+    float iy = y > 0.0 ? 1.0 / y : 0.0;
+    return float3(w.x * iy, w.z * iy, y);
+}
+float3 RfxMbToWeighted(float2 c, float y) { return float3(c.x, 1.0 - c.x, c.y) * y; }
+float2 RfxWhiteMb() { return RfxWeightedToMb(RfxToLms(float3(1, 1, 1)) * kRfxLmsW).xy; }
+float RfxHalfspaceT(float2 o, float2 d, float2 n, float num)
+{
+    float den = dot(n, d);
+    float an = num + dot(n, RfxWhiteMb() - o);
+    return den > 1e-8 ? an / den : 1e20;
+}
+float RfxRayExitT(float2 o, float2 d)
+{
+    if (dot(d, d) <= 1e-14) return 1e20;
+    float r = 1e20;
+    r = min(r, RfxHalfspaceT(o, d, float2(-0.043889, -0.006807), 0.0065035249));
+    r = min(r, RfxHalfspaceT(o, d, float2(-0.007821, -0.008564), 0.00104900495));
+    r = min(r, RfxHalfspaceT(o, d, float2(-0.000604, -0.007942), 0.000207697044));
+    r = min(r, RfxHalfspaceT(o, d, float2(0.0, -0.080835), 0.00165556648));
+    r = min(r, RfxHalfspaceT(o, d, float2(0.953597, 0.307020), 0.252472349));
+    r = min(r, RfxHalfspaceT(o, d, float2(-0.060969, 0.019752), 0.0241967351));
+    r = min(r, RfxHalfspaceT(o, d, float2(-0.106895, 0.004035), 0.0199621232));
+    return max(r, 0.0);
+}
+float3 RfxRestoreLmsHue(float3 src, float3 tgt)
+{
+    float3 adapt = RfxToLms(float3(1, 1, 1)) * 0.18;
+    float3 srcMb = RfxWeightedToMb(src * kRfxLmsW / adapt);
+    float3 tgtMb = RfxWeightedToMb(tgt * kRfxLmsW / adapt);
+    float2 neutral = RfxWeightedToMb(kRfxLmsW).xy;
+    float2 so = srcMb.xy - neutral, to = tgtMb.xy - neutral;
+    float sr2 = dot(so, so), tr2 = dot(to, to);
+    if (sr2 <= 1e-7 || tr2 <= 1e-7) return tgt;
+    float tClipT = RfxRayExitT(neutral, to), tClipS = RfxRayExitT(neutral, so);
+    float sp = tClipS > 0.0 ? saturate(1.0 / tClipS) : 0.0;
+    float tp = tClipT > 0.0 ? saturate(1.0 / tClipT) : 0.0;
+    float pw = sp > 1e-7 ? saturate(tp / sp) : 1.0;
+    float sens = lerp(1.0, 0.35, saturate((tClipT - 0.20139844) / (1.02634534 - 0.20139844)));
+    float rw = sens * pw;
+    if (rw <= 0.0) return tgt;
+    float tr = sqrt(tr2);
+    float2 dir = lerp(to / tr, so * rsqrt(sr2), saturate(rw));
+    float dl = dot(dir, dir);
+    dir = dl > 1e-7 ? dir * rsqrt(dl) : to / tr;
+    return RfxMbToWeighted(neutral + dir * tr, tgtMb.z) * max(adapt, 1e-6) / kRfxLmsW;
+}
+float3 RfxHdrBoost(float3 lin, float mult, float start, float ri, float colour, bool byYf)
+{
+    if (mult <= 1.0001) return lin;
+    float peakRamp = RfxRampAt(1.0, start, ri);
+    if (peakRamp <= 1e-6) return lin;
+    float3 boosted;
+    if (byYf)
+    {
+        float wy = max(RfxYf(float3(1, 1, 1)), 1e-6), sy = max(RfxYf(lin), 0.0);
+        float by = RfxBoost1(sy / wy, mult, peakRamp, start, ri) * wy;
+        boosted = sy > 1e-6 ? lin * (by / sy) : lin;
+    }
+    else
+    {
+        float3 w = RfxToLms(lin), white = RfxToLms(float3(1, 1, 1));
+        float3 n = max(0.0, w / white);
+        float3 b = float3(RfxBoost1(n.x, mult, peakRamp, start, ri), RfxBoost1(n.y, mult, peakRamp, start, ri),
+                          RfxBoost1(n.z, mult, peakRamp, start, ri)) * white;
+        boosted = RfxFromLms(RfxRestoreLmsHue(w, b));
+    }
+    float sY = RfxYf(lin), bY = RfxYf(boosted);
+    if (sY <= 1e-6 || bY <= 1e-6) return boosted;
+    return lerp(lin * (bY / sY), boosted, saturate(colour));
+}
 float3 SdrToHdr(float3 lin)
 {
-    float3 o = SdrExpand(lin);
+    // flags & 256: RenoFX's HDR Boost (peak = SDR highlights / SDR white, Start in sdrKnee); else the knee curve.
+    // RenoFX's availability blends each channel between the source and the full boost, which is the same as a smaller
+    // boost: 1 + a (boost - 1). The APL Limiter's availability: 1 up to a scene average of 30% of SDR white, smoothly
+    // down to 0 at 100% (RenoFX's HDR_BOOST_APL_START 30, minimum 0), from this frame's own average.
+    float rfxMult = sdrPeak > sdrScale ? sdrPeak / sdrScale : 1.0;
+    if (rfxApl > 0.5) rfxMult -= smoothstep(0.30, 1.0, saturate(aplTex.Load(int3(0, 0, 0)))) * (rfxMult - 1.0);
+    float3 o = (flags & 256) != 0 ? RfxHdrBoost(max(lin, 0), rfxMult, sdrKnee, rfxRamp,
+                                                rfxColor, (flags & 512) != 0) * sdrScale
+                                  : SdrExpand(lin);
     if (gamut > 0) o = ExpandGamut(o / sdrScale, gamut) * sdrScale;
     return o;
 }
@@ -1699,12 +1846,42 @@ float MprtScale(uint k, float litGain, float fl, float S)
 
 // ABL guard measurement: average luminance (80-nit units) of the lit refresh
 // this frame would produce at the configured boost, over a 32x18 grid with
-// 4x4 samples per cell.
+// 4x4 samples per cell. Rows 18-35: RenoFX's APL Limiter -- the average of each
+// pixel's SDR brightness (Yf, 1 = SDR white, capped at 1) over the same cells.
+// APL Limiter: one 32x18 cell's average SDR brightness (Yf, 1 = SDR white, each pixel capped at 1), 4x4 samples.
+float AplCell(float2 cxy)
+{
+    uint w, h;
+    src.GetDimensions(w, h);
+    float2 cell = float2(w, h) / float2(32.0, 18.0);
+    float apl = 0.0, yw = max(RfxYf(float3(1, 1, 1)), 1e-6);
+    [unroll] for (int y = 0; y < 4; y++)
+    [unroll] for (int x = 0; x < 4; x++)
+    {
+        int2 p = int2((cxy + (float2(x, y) + 0.5) / 4.0) * cell);
+        apl += saturate(max(RfxYf(max(SdrDecode(src.Load(int3(p, 0)).rgb), 0)), 0.0) / yw);
+    }
+    return apl / 16.0;
+}
+// APL Limiter, before the frame's first refresh: its 32x18 cells, then their average into the 1x1 value PSMain reads.
+float PSAplCells(float4 pos : SV_Position) : SV_Target { return AplCell(floor(pos.xy)); }
+float PSAplReduce(float4 pos : SV_Position) : SV_Target
+{
+    float a = 0.0;
+    for (int y = 0; y < 18; y++)
+    {
+        float r = 0.0;
+        [unroll] for (int x = 0; x < 32; x++) r += aplTex.Load(int3(x, y, 0));
+        a += r;
+    }
+    return a / 576.0;
+}
 float PSMeasure(float4 pos : SV_Position) : SV_Target
 {
     uint w, h;
     src.GetDimensions(w, h);
     float2 cell = float2(w, h) / float2(32.0, 18.0);
+    if (pos.y >= 18.0) return AplCell(floor(pos.xy - float2(0.0, 18.0)));   // rows 18-35: the overlay's readout
     float litGain = Inverted() ? float(frames) * gain / float(frames - 1) : float(frames) * gain;
     float sum = 0.0;
     [unroll] for (int y = 0; y < 4; y++)
@@ -1864,6 +2041,8 @@ struct Constants
     float    srcPerOutX, srcPerOutY;   // game frame pixels per output pixel (1 = same size)
     float    splitX, splitSeam;        // split comparison: seam position and soft width, output pixels
     uint32_t splitMode;                // 0 off, 1 left side without BFI, 2 right side
+    float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
+    float    rfxApl;                    // its APL Limiter: 1 = on (GPU-measured from the frame being shown)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -2828,9 +3007,15 @@ static DWORD WINAPI PresenterThread(void *)
     ID3D12GraphicsCommandList *list = nullptr;
     ID3D12RootSignature *rootSig = nullptr;
     ID3D12PipelineState *pso = nullptr, *psoMeas = nullptr;
-    ID3DBlob *vs = nullptr, *ps = nullptr, *psMeas = nullptr, *rsBlob = nullptr, *rsErr = nullptr;
+    ID3DBlob *vs = nullptr, *ps = nullptr, *psMeas = nullptr, *psAplC = nullptr, *psAplR = nullptr, *rsBlob = nullptr, *rsErr = nullptr;
     ID3D12Resource *measRt = nullptr, *measRb = nullptr;
     ID3D12DescriptorHeap *measHeap = nullptr;
+    // RenoFX APL Limiter on the GPU: the frame's 32x18 cells and their 1x1 average, drawn before its first refresh
+    ID3D12PipelineState *psoAplC = nullptr, *psoAplR = nullptr;
+    ID3D12Resource *aplCellRt = nullptr, *aplRt = nullptr;
+    ID3D12DescriptorHeap *aplRtvHeap = nullptr;
+    bool aplOk = false;
+    UINT64 aplFrameId = ~0ull;
     UINT64 measFence = 0;
     IDXGIOutput *output = nullptr;
     UINT64 bufFence[kMaxBuf] = {};
@@ -2855,7 +3040,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage;
+    hd.NumDescriptors = kStage + 2;   // the stage frames, then the APL Limiter's cells and its 1x1 average
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
 
@@ -2896,6 +3081,8 @@ static DWORD WINAPI PresenterThread(void *)
     if (ok && !compile) { LOGE("BFI Presenter: d3dcompiler_47.dll not available"); ok = false; }
     ok = ok && Compile(compile, "VSMain", "vs_5_0", &vs) && Compile(compile, "PSMain", "ps_5_0", &ps);
     if (ok && !Compile(compile, "PSMeasure", "ps_5_0", &psMeas)) psMeas = nullptr;   // ABL guard optional
+    if (ok && !Compile(compile, "PSAplCells", "ps_5_0", &psAplC)) psAplC = nullptr;  // APL Limiter optional
+    if (ok && !Compile(compile, "PSAplReduce", "ps_5_0", &psAplR)) psAplR = nullptr;
 
     if (ok)
     {
@@ -2903,7 +3090,9 @@ static DWORD WINAPI PresenterThread(void *)
         range.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         range.NumDescriptors     = 1;
         range.BaseShaderRegister = 0;
-        D3D12_ROOT_PARAMETER params[2] = {};
+        D3D12_DESCRIPTOR_RANGE rangeApl = range;
+        rangeApl.BaseShaderRegister = 1;                   // t1: the APL Limiter's value (or its cells)
+        D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
         params[0].Constants.Num32BitValues = sizeof(Constants) / 4;
@@ -2912,6 +3101,8 @@ static DWORD WINAPI PresenterThread(void *)
         params[1].DescriptorTable.NumDescriptorRanges = 1;
         params[1].DescriptorTable.pDescriptorRanges   = &range;
         params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[2] = params[1];
+        params[2].DescriptorTable.pDescriptorRanges   = &rangeApl;
         D3D12_STATIC_SAMPLER_DESC samp = {};
         samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -2919,7 +3110,7 @@ static DWORD WINAPI PresenterThread(void *)
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 2;
+        rsd.NumParameters = 3;
         rsd.pParameters   = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers   = &samp;
@@ -2954,7 +3145,7 @@ static DWORD WINAPI PresenterThread(void *)
             hp.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC rd = {};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            rd.Width = 32; rd.Height = 18; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Width = 32; rd.Height = 36; rd.DepthOrArraySize = 1; rd.MipLevels = 1;   // rows 18-35: APL Limiter
             rd.Format = DXGI_FORMAT_R32_FLOAT; rd.SampleDesc.Count = 1;
             rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
             m = m && SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
@@ -2962,7 +3153,7 @@ static DWORD WINAPI PresenterThread(void *)
             hp.Type = D3D12_HEAP_TYPE_READBACK;
             D3D12_RESOURCE_DESC bd = {};
             bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = 256 * 18; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+            bd.Width = 256 * 36; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
             bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             m = m && SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&measRb)));
@@ -2981,6 +3172,59 @@ static DWORD WINAPI PresenterThread(void *)
             }
             pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
             pd.RTVFormats[0] = g_desc.Format;
+        }
+        // RenoFX APL Limiter: two tiny passes before the frame's first refresh -- 32x18 cells, then their 1x1 average,
+        // which the BFI pass reads (t1) in the same command list.
+        if (ok && psAplC && psAplR)
+        {
+            bool m = true;
+            pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
+            pd.PS = { psAplC->GetBufferPointer(), psAplC->GetBufferSize() };
+            m = m && SUCCEEDED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoAplC)));
+            pd.PS = { psAplR->GetBufferPointer(), psAplR->GetBufferSize() };
+            m = m && SUCCEEDED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoAplR)));
+            pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+            pd.RTVFormats[0] = g_desc.Format;
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width = 32; rd.Height = 18; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_R32_FLOAT; rd.SampleDesc.Count = 1;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            m = m && SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&aplCellRt)));
+            rd.Width = 1; rd.Height = 1;
+            m = m && SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&aplRt)));
+            D3D12_DESCRIPTOR_HEAP_DESC ah = {};
+            ah.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; ah.NumDescriptors = 2;
+            m = m && SUCCEEDED(g_device->CreateDescriptorHeap(&ah, IID_PPV_ARGS(&aplRtvHeap)));
+            if (m)
+            {
+                aplCellRt->SetName(L"BFI APL limiter cells");
+                aplRt->SetName(L"BFI APL limiter average");
+                D3D12_CPU_DESCRIPTOR_HANDLE h = aplRtvHeap->GetCPUDescriptorHandleForHeapStart();
+                g_device->CreateRenderTargetView(aplCellRt, nullptr, h);
+                h.ptr += rtvStride;
+                g_device->CreateRenderTargetView(aplRt, nullptr, h);
+                D3D12_SHADER_RESOURCE_VIEW_DESC av = {};
+                av.Format = DXGI_FORMAT_R32_FLOAT;
+                av.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                av.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                av.Texture2D.MipLevels = 1;
+                D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                sh.ptr += (SIZE_T)kStage * srvStride;
+                g_device->CreateShaderResourceView(aplCellRt, &av, sh);
+                sh.ptr += srvStride;
+                g_device->CreateShaderResourceView(aplRt, &av, sh);
+                aplOk = true;
+            }
+            else
+            {
+                LOGW("BFI Presenter: RenoFX APL limiter unavailable (could not create its objects)");
+                SafeRelease(psoAplC); SafeRelease(psoAplR); SafeRelease(aplCellRt); SafeRelease(aplRt); SafeRelease(aplRtvHeap);
+            }
         }
     }
     if (ok && FAILED(ScOutput(&output))) output = nullptr;
@@ -3041,6 +3285,9 @@ static DWORD WINAPI PresenterThread(void *)
     int repWin[30] = {}, repIdx = 0, repSum = 0, repSecsRun = 0;   // repSecsRun: the first seconds (loading) don't count
     int lastOutType = -1;
     double ceilNow = -1.0, ceilTarget = -1.0, hotArea = -1.0, ablSolve = -1.0, ablT = Now();
+    double aplNow = -1.0;                      // RenoFX APL Limiter: the last measured scene average (0..1 of SDR white)
+    bool   aplOn = false;                      // RenoFX APL Limiter in use (SDR to HDR with the RenoFX boost)
+    float  lastAplCut = 0.0f;
     double rawAvg = -1.0, ablLowT = 0.0;      // unclipped lit average; last time the guard was pulling down
     double aheadDropT = -1.0;      // when automatic frames ahead last went back to 1
     bool   aheadLocked = false;    // settled at 2 for this swap chain (no more switching)
@@ -3103,6 +3350,9 @@ static DWORD WINAPI PresenterThread(void *)
     int lastShown = -1;
     double lastT = Now(), secStart = Now(), ageSum = 0.0;
     int secPresents = 0, secLate = 0;
+    static ClockDrift drift;        // the game's own clock against the display's (ICO at 59.94 fps on 120 Hz); kept across rebuilds
+    double secPhC = 0.0, secPhS = 0.0; int secPhN = 0;
+    int exactProbes = 0;            // automatic frame cap: tries at Refresh in a row that came back at exactly the strobe rate
     // Hitch guard: while the presenter misses refreshes (GPU saturated by
     // loading) or the game stops delivering frames, every refresh is shown
     // lit -- a held dark or lit frame is what flashes. BFI returns after a
@@ -3439,7 +3689,7 @@ static DWORD WINAPI PresenterThread(void *)
         if (measFence && measRb && g_presFence->GetCompletedValue() >= measFence)
         {
             float *px = nullptr;
-            D3D12_RANGE rr = { 0, 256 * 18 };
+            D3D12_RANGE rr = { 0, 256 * 36 };
             if (SUCCEEDED(measRb->Map(0, &rr, (void **)&px)) && px)
             {
                 // Share of the screen (32x18 cells) whose lit refresh would be
@@ -3451,6 +3701,12 @@ static DWORD WINAPI PresenterThread(void *)
                 static float cells[32 * 18];
                 for (int y = 0; y < 18; y++)
                     for (int x = 0; x < 32; x++) cells[y * 32 + x] = std::max(px[y * 64 + x], 0.0f) * 80.0f;
+                {
+                    double a = 0.0;
+                    for (int y = 18; y < 36; y++)
+                        for (int x = 0; x < 32; x++) a += std::max(0.0f, std::min(1.0f, px[y * 64 + x]));
+                    aplNow = a / (32.0 * 18.0);
+                }
                 D3D12_RANGE wr = { 0, 0 };
                 measRb->Unmap(0, &wr);
                 auto avgAt = [&](double C) { return AblAvgAt(cells, C, false, s.frames, s.method == 1); };
@@ -3506,16 +3762,33 @@ static DWORD WINAPI PresenterThread(void *)
         c.knee    = s.knee;
         c.ceilLin = (c.outType == 0) ? 1.0f : (float)(floor(ceilNow / 10.0 + 0.5) * 10.0 / 80.0);
         c.flags   = (s.rolloff ? 1u : 0u) | (s.sine ? 2u : 0u) | (s.invert ? 4u : 0u) | (s.rolling ? 8u : 0u) |
-                    (c.outType == 4 ? (s.sdrGamma == 1 ? 32u : s.sdrGamma == 2 ? 64u : 0u) | (s.sdrMethod ? 128u : 0u) : 0u);
+                    (c.outType == 4 ? (s.sdrGamma == 1 ? 32u : s.sdrGamma == 2 ? 64u : 0u) | (s.sdrMethod == 1 ? 128u : 0u) | (s.sdrMethod == 2 ? 256u : 0u) |
+                                             (s.sdrMethod == 2 && s.sdrBoostSpace ? 512u : 0u) : 0u);
         c.sdrScale = s.sdrWhite / 80.0f;
         {
             // knee given as signal level (what the game writes); the shader works in linear light
             const float k = s.sdrKnee;
             c.sdrKnee = s.sdrGamma == 1 ? powf(k, 2.2f) : s.sdrGamma == 2 ? powf(k, 2.4f)
                                          : (k <= 0.04045f ? k / 12.92f : powf((k + 0.055f) / 1.055f, 2.4f));
+            if (s.sdrMethod == 2) c.sdrKnee = s.sdrBoostStart;   // RenoFX: Start, already linear
+            c.rfxRamp = s.sdrBoostRamp;
+            c.rfxColor = s.sdrBoostColor / 100.0f;
             c.gamut = c.outType == 4 ? s.sdrGamut : 0.0f;
             const float hi = (std::min)(s.sdrHiNits, s.peakNits);
             c.sdrPeak = hi > s.sdrWhite ? hi / 80.0f : 0.0f;
+            // RenoFX's APL Limiter: from a scene average of 30% of SDR white the boost fades out smoothly, and is gone
+            // for an all-white screen (its HDR_BOOST_APL_START 30, minimum 0), from the frame being shown.
+            // The shader takes the average from the frame itself (see the APL passes before the BFI pass); aplNow,
+            // read back a frame or two later, is only for the overlay.
+            aplOn = aplOk && c.outType == 4 && s.sdrMethod == 2 && s.sdrBoostApl && c.sdrPeak > c.sdrScale;
+            c.rfxApl = aplOn ? 1.0f : 0.0f;
+            lastAplCut = 0.0f;
+            if (aplOn && aplNow >= 0.0)
+            {
+                const double x = std::max(0.0, std::min(1.0, (aplNow - 0.30) / 0.70));
+                lastAplCut = (float)(x * x * (3.0 - 2.0 * x));
+            }
+            if (!aplOn) { aplNow = -1.0; aplFrameId = ~0ull; }
         }
         if (GradualSaverOn(s))
         {
@@ -3559,6 +3832,49 @@ static DWORD WINAPI PresenterThread(void *)
         list->SetGraphicsRootSignature(rootSig);
         list->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &c, 0);
         list->SetGraphicsRootDescriptorTable(1, srv);
+        D3D12_GPU_DESCRIPTOR_HANDLE aplSrv = srv;                          // unused unless the limiter is on
+        if (aplOk)
+        {
+            aplSrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            aplSrv.ptr += (UINT64)(kStage + 1) * srvStride;
+        }
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        // RenoFX APL Limiter: measure the frame before its first refresh, so the boost uses its own average (as in
+        // RenoFX). Its later refreshes reuse the value.
+        if (aplOn && pickId != aplFrameId)
+        {
+            D3D12_GPU_DESCRIPTOR_HANDLE cellSrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            cellSrv.ptr += (UINT64)kStage * srvStride;
+            D3D12_CPU_DESCRIPTOR_HANDLE artv = aplRtvHeap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_RESOURCE_BARRIER ab = Transition(aplCellRt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &ab);
+            list->SetPipelineState(psoAplC);
+            list->SetGraphicsRootDescriptorTable(2, aplSrv);
+            D3D12_VIEWPORT avp = { 0.0f, 0.0f, 32.0f, 18.0f, 0.0f, 1.0f };
+            D3D12_RECT asc = { 0, 0, 32, 18 };
+            list->RSSetViewports(1, &avp);
+            list->RSSetScissorRects(1, &asc);
+            list->OMSetRenderTargets(1, &artv, FALSE, nullptr);
+            list->DrawInstanced(3, 1, 0, 0);
+            D3D12_RESOURCE_BARRIER ab2[2] = {
+                Transition(aplCellRt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                Transition(aplRt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET) };
+            list->ResourceBarrier(2, ab2);
+            list->SetPipelineState(psoAplR);
+            list->SetGraphicsRootDescriptorTable(2, cellSrv);
+            artv.ptr += rtvStride;
+            D3D12_VIEWPORT avp1 = { 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+            D3D12_RECT asc1 = { 0, 0, 1, 1 };
+            list->RSSetViewports(1, &avp1);
+            list->RSSetScissorRects(1, &asc1);
+            list->OMSetRenderTargets(1, &artv, FALSE, nullptr);
+            list->DrawInstanced(3, 1, 0, 0);
+            ab = Transition(aplRt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &ab);
+            list->SetPipelineState(pso);
+            aplFrameId = pickId;
+        }
+        list->SetGraphicsRootDescriptorTable(2, aplSrv);
         D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)g_desc.Width, (float)g_desc.Height, 0.0f, 1.0f };
         D3D12_RECT sc = { 0, 0, (LONG)g_desc.Width, (LONG)g_desc.Height };
         list->RSSetViewports(1, &vp);
@@ -3566,7 +3882,7 @@ static DWORD WINAPI PresenterThread(void *)
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->DrawInstanced(3, 1, 0, 0);
-        if (ablOn && !measFence && pickId != lastShownId && c.method < 2)
+        if (((ablOn && c.method < 2) || aplOn) && !measFence && pickId != lastShownId)
         {
             Constants mc = c;
             mc.gain = s.gain;                                  // brightness at the configured boost
@@ -3576,8 +3892,8 @@ static DWORD WINAPI PresenterThread(void *)
             list->SetPipelineState(psoMeas);
             list->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &mc, 0);
             D3D12_CPU_DESCRIPTOR_HANDLE mrtv = measHeap->GetCPUDescriptorHandleForHeapStart();
-            D3D12_VIEWPORT mvp = { 0.0f, 0.0f, 32.0f, 18.0f, 0.0f, 1.0f };
-            D3D12_RECT msc = { 0, 0, 32, 18 };
+            D3D12_VIEWPORT mvp = { 0.0f, 0.0f, 32.0f, 36.0f, 0.0f, 1.0f };
+            D3D12_RECT msc = { 0, 0, 32, 36 };
             list->RSSetViewports(1, &mvp);
             list->RSSetScissorRects(1, &msc);
             list->OMSetRenderTargets(1, &mrtv, FALSE, nullptr);
@@ -3590,7 +3906,7 @@ static DWORD WINAPI PresenterThread(void *)
             dst.PlacedFootprint.Offset = 0;
             dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
             dst.PlacedFootprint.Footprint.Width = 32;
-            dst.PlacedFootprint.Footprint.Height = 18;
+            dst.PlacedFootprint.Footprint.Height = 36;
             dst.PlacedFootprint.Footprint.Depth = 1;
             dst.PlacedFootprint.Footprint.RowPitch = 256;
             srcLoc.pResource = measRt;
@@ -3716,6 +4032,11 @@ static DWORD WINAPI PresenterThread(void *)
         }
         secPresents++;
         ageSum += (t - pickTime) * 1000.0;
+        if (pickNew && modeHz > 1.0)   // clock drift check: the new frames' arrival phase over one refresh
+        {
+            const double ang = 6.283185307179586 * (t - pickTime) * modeHz;
+            secPhC += cos(ang); secPhS += sin(ang); secPhN++;
+        }
         if (t - lastT > 1.5 / (modeHz > 0.0 ? modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
         {
             secLate++;
@@ -3894,8 +4215,24 @@ static DWORD WINAPI PresenterThread(void *)
             if (sok) { lastSync = st.SyncRefreshCount; lastPC = st.PresentCount; haveStats = true; }
             EnterCriticalSection(&g_cfgLock);
             g_status.refreshHz  = secPresents / (t - secStart);
-            g_status.gameFps    = g_stagedThisSecond.exchange(0) / (t - secStart);
+            const int stagedSec = g_stagedThisSecond.exchange(0);
+            g_status.gameFps    = stagedSec / (t - secStart);
             g_status.frameAgeMs = secPresents ? ageSum / secPresents : 0.0;
+            {
+                const double phase = secPhN ? atan2(secPhS, secPhC) : NAN;
+                secPhC = secPhS = 0.0; secPhN = 0;
+                if (drift.Second(stagedSec, secPresents, phase, modeHz, g_status.fgActive != 0))
+                {
+                    if (drift.on)
+                        LOGW("BFI Presenter: the game runs at %.2f fps on a clock of its own, the display at %.2f Hz -- its frames drift "
+                             "against the strobe cycle (a game frame slips about every %.0f s: stutter, and flashes when it lines up "
+                             "with the flip). Set the display to %.2f Hz for this game.", drift.gameFps, modeHz, drift.slipS, drift.suggestHz);
+                    else LOGI("BFI Presenter: the game's frames match the display rate again");
+                }
+                g_status.driftOn = drift.on ? 1 : 0;
+                g_status.driftFps = drift.gameFps; g_status.driftHz = modeHz;
+                g_status.driftSuggest = drift.suggestHz; g_status.driftSlip = drift.slipS;
+            }
             g_status.late       = secLate;
             g_status.repeats    = rep > 0 ? rep : 0;
             g_status.frameRepeats = secFrameRepeats;
@@ -3922,6 +4259,8 @@ static DWORD WINAPI PresenterThread(void *)
             }
             g_status.hotArea      = (s.ablGuard && psoMeas) ? hotArea : -1.0;
             g_status.rawAvg       = (s.ablGuard && psoMeas) ? rawAvg : -1.0;
+            g_status.aplNow       = aplOn ? aplNow : -1.0;
+            g_status.aplCut       = aplOn ? lastAplCut : 0.0;
             g_status.ceilInUse    = c.ceilLin * 80.0;
             g_status.displayHz    = displayHz;
             g_status.vrrSuspect   = vrrSlowSecs >= 3;
@@ -4289,8 +4628,17 @@ static DWORD WINAPI PresenterThread(void *)
                                 // Far from the refresh rate (under 80%): each try is seconds of uneven frames and the
                                 // longest delay (Soul Reaver at 64 of 120: 53 ms from release to flash for 4 s), so the
                                 // next one waits 5 minutes.
-                                if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;   // its own limit (see above)
+                                // Its own limit (see above) -- but a game locked to the strobe rate all along (ICO at 60) pays for
+                                // each try with 4 s of frames off the strobe cycle: after two such tries in a row the next waits
+                                // 5 minutes. Not saved: a new session tries every 30 s again.
+                                const bool exact = fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames;
+                                exactProbes = exact ? exactProbes + 1 : 0;
+                                if (exact) probeWait = exactProbes >= 2 ? 300.0 : 30.0;
                                 else if (fpsA < 0.8 * hzA) probeWait = 300.0;
+                                if (exactProbes == 2)
+                                    LOGI("BFI Presenter: automatic frame cap: the game stays at exactly %.0f fps (a limit of its own) -- "
+                                         "tries at Refresh rate every 5 minutes from now; set the cap to One game frame per strobe "
+                                         "cycle to stop them", hzA / s.frames);
                                 if (fg && fgTryNeedMs > 0.0) { fgFailNeedMs = fgTryNeedMs; fgSkipLogged = false; }
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, probeWait);
@@ -4321,7 +4669,7 @@ static DWORD WINAPI PresenterThread(void *)
                             // Well under the refresh rate: first try after a minute -- unless the game holds exactly the strobe rate,
                             // which is a limit of its own (an intro, a menu), not a struggle: tries every 30 s cost nothing there.
                             const bool atStrobe = fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames;
-                            if (atStrobe) probeWait = 30.0;
+                            if (atStrobe) probeWait = exactProbes >= 2 ? 300.0 : 30.0;
                             else if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;
                             autoCapDown = true; capDownSecs = capUpSecs = 0; capSwitchT = t; rfxChkT = t; fpsAtDown = fpsA;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps, %s) -- the game held "
@@ -4796,6 +5144,13 @@ static DWORD WINAPI PresenterThread(void *)
     SafeRelease(measRb);
     SafeRelease(measHeap);
     SafeRelease(psMeas);
+    SafeRelease(psoAplC);
+    SafeRelease(psoAplR);
+    SafeRelease(aplCellRt);
+    SafeRelease(aplRt);
+    SafeRelease(aplRtvHeap);
+    SafeRelease(psAplC);
+    SafeRelease(psAplR);
     SafeRelease(rootSig);
     SafeRelease(rsBlob);
     SafeRelease(rsErr);
@@ -9609,7 +9964,17 @@ static void draw_overlay(reshade::api::effect_runtime *)
         const bool redWarn = st.vrrSuspect || st.limitSuspect || st.glPresentBlocked || st.vsyncOverridden;
         // Not 4 presenter buffers when video memory is tight: each is a full-size image (about 33 MB at 4K).
         const bool vramTight = st.vramOver || (st.vramBudget > 0.0 && st.vramUse > st.vramBudget - 256.0);
-        if (st.flashHint && s.flashHints && s.enabled && !redWarn)
+        // The game's own clock a little off the display's (ICO: 59.94 fps on 120.00 Hz): the cause of its flashes,
+        // so it replaces the flash hints.
+        if (st.driftOn)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            ImGui::TextWrapped("The game runs at %.2f fps on a clock of its own, the display at %.2f Hz: its frames drift against the "
+                               "strobe cycle (a slip about every %.0f s, with stutter and flashes). Set the display to %.2f Hz for "
+                               "this game.", st.driftFps, st.driftHz, st.driftSlip, st.driftSuggest);
+            ImGui::PopStyleColor();
+        }
+        if (st.flashHint && s.flashHints && s.enabled && !redWarn && !st.driftOn)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
             if (s.queuePriority >= 2 && g_queuePriority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH)
@@ -9803,10 +10168,29 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::SliderFloat("SDR white (nits)", &s.sdrWhite, 80.0f, 600.0f, "%.0f");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Windows: 80 + 4 x the 'SDR content brightness' slider (40 -> 240).");
             ImGui::SliderFloat("SDR highlights expand to (nits, 0 = off)", &s.sdrHiNits, 0.0f, 2000.0f, "%.0f");
-            ImGui::SliderFloat("Highlight expansion starts at (SDR signal)", &s.sdrKnee, 0.3f, 0.95f, "%.2f");
+            if (s.sdrMethod != 2) ImGui::SliderFloat("Highlight expansion starts at (SDR signal)", &s.sdrKnee, 0.3f, 0.95f, "%.2f");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Below this level the image is unchanged; above it the brightest parts\nstretch toward the highlight value (an HDR look for SDR games).");
-            ImGui::Combo("Highlights stretched by", &s.sdrMethod, "Brightest channel\0Luminance (mostly near-white highlights)\0");
+            ImGui::Combo("Highlights stretched by", &s.sdrMethod, "Brightest channel\0Luminance (mostly near-white highlights)\0RenoFX HDR Boost (ShortFuse)\0");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightest channel also brightens bright saturated colours (reds, blues).\nLuminance stretches mostly near-white highlights; saturated colours stay closer to SDR.");
+            if (s.sdrMethod == 2)
+            {
+                ImGui::TextDisabled("RenoFX HDR Boost (ShortFuse, MIT): boost = highlights / SDR white (e.g. 2.5x).");
+                ImGui::SliderFloat("Boost start (linear, 1 = SDR white)", &s.sdrBoostStart, 0.001f, 0.99f, "%.3f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the boost begins: lower affects more of the image, higher only the brightest parts.");
+                ImGui::SliderFloat("Ramp intensity", &s.sdrBoostRamp, 0.25f, 4.0f, "%.2f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shape of the smooth rise from the start to the peak.");
+                ImGui::Combo("Boost working space", &s.sdrBoostSpace, "LMS (RenoFX default, hue restored)\0Brightness (Yf, colour balance kept)\0");
+                ImGui::SliderFloat("Boost colour (0-100)", &s.sdrBoostColor, 0.0f, 100.0f, "%.0f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much colour expansion the boost adds while keeping its brightness:\n0 = the source colour balance, 100 = the full result of the working space.");
+                bool apl = s.sdrBoostApl != 0;
+                if (ImGui::Checkbox("APL limiter", &apl)) s.sdrBoostApl = apl ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("RenoFX's APL Limiter: lowers the boost in bright scenes. Above an average picture level of 30%%\nof SDR white it fades out smoothly, and an all-white screen gets no boost.");
+                if (s.sdrBoostApl && st.aplNow >= 0.0)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("scene average %.0f%%, boost %.0f%%", st.aplNow * 100.0, (1.0 - st.aplCut) * 100.0);
+                }
+            }
             ImGui::Combo("SDR decoding", &s.sdrGamma, "sRGB curve (as Windows)\0Gamma 2.2 (deeper shadows)\0Gamma 2.4 (dark-room grading)\0");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the SDR picture is turned into light. Most SDR games were made on gamma 2.2 screens:\nthe sRGB curve (Windows' own SDR-in-HDR and Auto HDR) shows their shadows a little raised.");
             ImGui::SliderFloat("Gamut expansion", &s.sdrGamut, 0.0f, 1.0f, "%.2f");

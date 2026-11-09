@@ -1,11 +1,23 @@
 
 // ABL guard measurement: average luminance (80-nit units) of the lit refresh
 // this frame would produce at the configured boost, over a 32x18 grid with
-// 4x4 samples per cell.
+// 4x4 samples per cell. Rows 18-35: RenoFX's APL Limiter -- the average of each
+// pixel's SDR brightness (Yf, 1 = SDR white, capped at 1) over the same cells.
 float MeasureCell(vec2 fc)
 {
     vec2 size = vec2(textureSize(src, 0));
     vec2 cell = size / vec2(32.0, 18.0);
+    if (fc.y >= 18.0)
+    {
+        float apl = 0.0, yw = max(RfxYf(vec3(1.0)), 1e-6);
+        for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++)
+        {
+            ivec2 p = ivec2((floor(fc.xy - vec2(0.0, 18.0)) + (vec2(x, y) + 0.5) / 4.0) * cell);
+            apl += clamp(max(RfxYf(max(SdrIn(texelFetch(src, p, 0).rgb), vec3(0.0))), 0.0) / yw, 0.0, 1.0);
+        }
+        return apl / 16.0;
+    }
     float litGain = LitGain();
     float sum = 0.0;
     for (int y = 0; y < 4; y++)

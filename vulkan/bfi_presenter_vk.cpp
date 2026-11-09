@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.35"
+#define BFI_VERSION "1.0.36"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -140,6 +140,7 @@ static void Log(const char *lvl, const char *fmt, ...)
 #ifdef _WIN32
 #include "../common/bfi_syscheck.h"
 #include "../common/bfi_vram.h"
+#include "../common/bfi_clockdrift.h"
 static SysCheck g_sysCheck;      // power plan, GPUs, displays (checked on the window watch thread)
 #endif
 #define LOGE(...) Log("ERROR", __VA_ARGS__)
@@ -308,7 +309,12 @@ struct Settings
     float sdrHiNits = 800.0f; // highlight expansion: SDR white highlights stretch to this (0 = off)
     float sdrKnee  = 0.65f;   // expansion starts at this SDR signal level (0..1, as the game outputs it)
     int   sdrGamma = 0;       // SdrGamma: decode the SDR picture with 0 the sRGB curve, 1 gamma 2.2, 2 gamma 2.4
-    int   sdrMethod = 0;      // SdrHighlightMethod: highlights stretched by 0 the brightest channel, 1 luminance
+    int   sdrMethod = 0;      // SdrHighlightMethod: highlights stretched by 0 the brightest channel, 1 luminance, 2 RenoFX HDR Boost
+    float sdrBoostStart = 0.15f;  // SdrBoostStart (RenoFX): where the boost begins, linear (1 = SDR white), 0.001-0.99
+    float sdrBoostRamp  = 1.0f;   // SdrBoostRamp (RenoFX Ramp Intensity), 0.25-4
+    int   sdrBoostSpace = 0;      // SdrBoostSpace (RenoFX): 0 LMS with hue restore, 1 by brightness (Yf)
+    float sdrBoostColor = 50.0f;  // SdrBoostColor (RenoFX gamut expansion of the boost), 0-100
+    int   sdrBoostApl = 1;        // SdrBoostAplLimiter (RenoFX APL Limiter): less boost in bright scenes (average above 30%)
     float sdrGamut = 0.0f;    // SdrGamutExpansion: 0..1, bright saturated colours toward wider-gamut colours (0 = off)
 };
 
@@ -408,7 +414,12 @@ static void LoadSettings(Settings &s)
     if (s.sdrHiNits > 4000.0f) s.sdrHiNits = 4000.0f;
     s.sdrKnee = Clamp(KvFloat(kv, "SdrHighlightKnee", 0.65f), 0.3f, 0.95f);
     s.sdrGamma = Clamp(KvInt(kv, "SdrGamma", 0), 0, 2);
-    s.sdrMethod = KvInt(kv, "SdrHighlightMethod", 0) ? 1 : 0;
+    s.sdrMethod = std::max(0, std::min(2, KvInt(kv, "SdrHighlightMethod", 0)));
+    s.sdrBoostStart = std::max(0.001f, std::min(0.99f, KvFloat(kv, "SdrBoostStart", 0.15f)));
+    s.sdrBoostRamp = std::max(0.25f, std::min(4.0f, KvFloat(kv, "SdrBoostRamp", 1.0f)));
+    s.sdrBoostSpace = KvInt(kv, "SdrBoostSpace", 0) ? 1 : 0;
+    s.sdrBoostColor = std::max(0.0f, std::min(100.0f, KvFloat(kv, "SdrBoostColor", 50.0f)));
+    s.sdrBoostApl = KvInt(kv, "SdrBoostAplLimiter", 1) ? 1 : 0;
     s.sdrGamut = Clamp(KvFloat(kv, "SdrGamutExpansion", 0.0f), 0.0f, 1.0f);
     auto it = kv.find("output");
     std::string out = it == kv.end() ? "auto" : it->second;
@@ -432,7 +443,7 @@ static void LoadSettings(Settings &s)
     I("AblGuardBudgetNits", s.ablBudget); k.push_back({"AblCurve", s.ablCurve}); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs); I("FlashHints", s.flashHints);
     I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue); I("PresenterQueuePriority", s.queuePriority);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
-    F("SdrHighlightKnee", s.sdrKnee); I("SdrGamma", s.sdrGamma); I("SdrHighlightMethod", s.sdrMethod); F("SdrGamutExpansion", s.sdrGamut);
+    F("SdrHighlightKnee", s.sdrKnee); I("SdrGamma", s.sdrGamma); I("SdrHighlightMethod", s.sdrMethod); F("SdrBoostStart", s.sdrBoostStart); F("SdrBoostRamp", s.sdrBoostRamp); I("SdrBoostSpace", s.sdrBoostSpace); F("SdrBoostColor", s.sdrBoostColor); I("SdrBoostAplLimiter", s.sdrBoostApl); F("SdrGamutExpansion", s.sdrGamut);
     return k;
 }
 static void LoadShared()
@@ -454,6 +465,8 @@ struct Status
     uint32_t width = 0, height = 0, images = 0, realImages = 0;
     int    format = 0, colorSpace = 0;
     double refreshHz = 0.0, gameFps = 0.0, frameAgeMs = 0.0;
+    int    driftOn = 0;                     // the game runs on a clock of its own, a little off the display (common/bfi_clockdrift.h)
+    double driftFps = 0.0, driftHz = 0.0, driftSuggest = 0.0, driftSlip = 0.0;
     int    late = 0, frameRepeats = 0, frameSkips = 0, slotWaits = 0, reused = 0;
     int    unevenRep = 0, unevenSkip = 0;   // per second: strobe cycles short of / ahead of the expected step
     int    lrState = 0;                     // just-in-time release: 0 off, 1 measuring, 2 active, 3 at its limit
@@ -473,6 +486,7 @@ struct Status
     int    fgActive = 0;                    // a frame-generation DLL is loaded (the automatic cap stays at Refresh)
     int    rfxLimitUs = 0;                  // Reflex frame limit at the game's sleep (frame generation), per rendered frame
     double rawAvg = -1.0, litAvg = -1.0, ceilInUse = 0.0;
+    double aplNow = -1.0, aplCut = 0.0;   // RenoFX APL Limiter: scene average (0..1 of SDR white; -1 = off) and boost removed
     int    sharedQueue = 0;
     char   queueInfo[160] = "";     // presenter GPU queue in use (overlay)
     int    layerOrder = 0;      // 0 unknown, 1 below ReShade (good), 2 ReShade not above the layer
@@ -612,6 +626,8 @@ struct Constants
     float    gamut;       // SDR shown as HDR10: gamut expansion strength (0 = off)
     float    splitX, splitSeam;   // split comparison: seam position and soft width, output pixels
     uint32_t splitMode;           // 0 off, 1 left side without BFI, 2 right side
+    float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
+    float    rfxApl;                    // its APL Limiter: 1 = on (GPU-measured from the frame being shown)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -1097,6 +1113,17 @@ struct PresenterRes
     VkImage               mid = VK_NULL_HANDLE;
     VkDeviceMemory        midMem = VK_NULL_HANDLE;
     VkImageView           midView = VK_NULL_HANDLE;
+    // RenoFX APL Limiter: apl.comp writes the frame's average into the 1x1 aplImg (binding 2 of every set, GENERAL)
+    VkImage               aplImg = VK_NULL_HANDLE;
+    VkDeviceMemory        aplMem = VK_NULL_HANDLE;
+    VkImageView           aplView = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dslA = VK_NULL_HANDLE;
+    VkPipelineLayout      plA = VK_NULL_HANDLE;
+    VkDescriptorPool      dpA = VK_NULL_HANDLE;
+    VkDescriptorSet       dsA[kStage] = {};
+    VkShaderModule        csApl = VK_NULL_HANDLE;
+    VkPipeline            psoA = VK_NULL_HANDLE;   // null: the limiter is unavailable
+    bool                  aplInit = false;         // aplImg moved to GENERAL
 };
 
 static VkRenderPass MakeRenderPass(DeviceData *d, VkFormat fmt, VkImageLayout finalLayout)
@@ -1273,7 +1300,7 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
     }
     if (p)
     {
-        VkDescriptorSetLayoutBinding b[2] = {};
+        VkDescriptorSetLayoutBinding b[3] = {};
         b[0].binding = 0;
         b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[0].descriptorCount = 1;
@@ -1282,8 +1309,10 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
         b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         b[1].descriptorCount = 1;
         b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        b[2] = b[1];
+        b[2].binding = 2;                                  // the APL Limiter's value
         VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        dli.bindingCount = 2;
+        dli.bindingCount = 3;
         dli.pBindings = b;
         p = d->CreateDescriptorSetLayout(dev, &dli, nullptr, &R.dslC) == VK_SUCCESS;
         VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Constants) };
@@ -1304,7 +1333,7 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
     const bool meas = p && R.psoMeas && R.measView;
     if (p)
     {
-        VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kStage } };
+        VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * kStage } };
         VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         dpi.maxSets = 2 * kStage;
         dpi.poolSizeCount = 2;
@@ -1326,8 +1355,14 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
             {
                 VkDescriptorImageInfo src = { R.sampler, sc->stageView[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
                 VkDescriptorImageInfo dst = { VK_NULL_HANDLE, k ? R.measView : R.midView, VK_IMAGE_LAYOUT_GENERAL };
-                VkWriteDescriptorSet w[2] = { { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
-                w[0].dstSet = w[1].dstSet = k ? R.dsM[i] : R.dsC[i];
+                VkDescriptorImageInfo apl = { VK_NULL_HANDLE, R.aplView, VK_IMAGE_LAYOUT_GENERAL };
+                VkWriteDescriptorSet w[3] = { { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET },
+                                              { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
+                w[0].dstSet = w[1].dstSet = w[2].dstSet = k ? R.dsM[i] : R.dsC[i];
+                w[2].dstBinding = 2;
+                w[2].descriptorCount = 1;
+                w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                w[2].pImageInfo = &apl;
                 w[0].dstBinding = 0;
                 w[0].descriptorCount = 1;
                 w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -1336,7 +1371,7 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
                 w[1].descriptorCount = 1;
                 w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                 w[1].pImageInfo = &dst;
-                d->UpdateDescriptorSets(dev, 2, w, 0, nullptr);
+                d->UpdateDescriptorSets(dev, 3, w, 0, nullptr);
             }
         }
     }
@@ -1427,14 +1462,18 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     }
     if (p)
     {
-        VkDescriptorSetLayoutBinding b = {};
-        b.binding = 0;
-        b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        b.descriptorCount = 1;
-        b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutBinding b[2] = {};
+        b[0].binding = 0;
+        b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[0].descriptorCount = 1;
+        b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        b[1].binding = 2;                                  // the APL Limiter's value
+        b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[1].descriptorCount = 1;
+        b[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        dli.bindingCount = 1;
-        dli.pBindings = &b;
+        dli.bindingCount = 2;
+        dli.pBindings = b;
         p = d->CreateDescriptorSetLayout(dev, &dli, nullptr, &R.dsl) == VK_SUCCESS;
     }
     if (p)
@@ -1465,11 +1504,88 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     }
     if (p)
     {
-        VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kStage };
+        // RenoFX APL Limiter's 1x1 value; every set points binding 2 at it
+        VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_R32_SFLOAT;
+        ici.extent = { 1, 1, 1 };
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        p = CreateImageMem(d, ici, &R.aplImg, &R.aplMem);
+        VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vci.image = R.aplImg;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = VK_FORMAT_R32_SFLOAT;
+        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        p = p && d->CreateImageView(dev, &vci, nullptr, &R.aplView) == VK_SUCCESS;
+    }
+    if (p)
+    {
+        // its compute pass (apl.comp): runs on the presenter's queue, which needs compute (the graphics queue usually has it)
+        uint32_t nf = 0;
+        d->inst->GetPhysicalDeviceQueueFamilyProperties(d->phys, &nf, nullptr);
+        std::vector<VkQueueFamilyProperties> fp(nf);
+        if (nf) d->inst->GetPhysicalDeviceQueueFamilyProperties(d->phys, &nf, fp.data());
+        const bool comp = d->family < nf && (fp[d->family].queueFlags & VK_QUEUE_COMPUTE_BIT);
+        bool a = comp;
+        VkDescriptorSetLayoutBinding b[2] = {};
+        b[0].binding = 0;
+        b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[0].descriptorCount = 1;
+        b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        b[1].binding = 2;
+        b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[1].descriptorCount = 1;
+        b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        dli.bindingCount = 2;
+        dli.pBindings = b;
+        a = a && d->CreateDescriptorSetLayout(dev, &dli, nullptr, &R.dslA) == VK_SUCCESS;
+        VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Constants) };
+        VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &R.dslA;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pr;
+        a = a && d->CreatePipelineLayout(dev, &pli, nullptr, &R.plA) == VK_SUCCESS;
+        VkDescriptorPoolSize aps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kStage } };
         VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         dpi.maxSets = kStage;
-        dpi.poolSizeCount = 1;
-        dpi.pPoolSizes = &ps;
+        dpi.poolSizeCount = 2;
+        dpi.pPoolSizes = aps;
+        a = a && d->CreateDescriptorPool(dev, &dpi, nullptr, &R.dpA) == VK_SUCCESS;
+        VkDescriptorSetLayout l[kStage];
+        for (uint32_t i = 0; i < kStage; i++) l[i] = R.dslA;
+        VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dai.descriptorPool = R.dpA;
+        dai.descriptorSetCount = kStage;
+        dai.pSetLayouts = l;
+        a = a && d->AllocateDescriptorSets(dev, &dai, R.dsA) == VK_SUCCESS;
+        for (uint32_t i = 0; a && i < kStage; i++)
+        {
+            VkDescriptorImageInfo ii[2] = { { R.sampler, sc->stageView[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+                                            { VK_NULL_HANDLE, R.aplView, VK_IMAGE_LAYOUT_GENERAL } };
+            VkWriteDescriptorSet w[2] = { { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
+            w[0].dstSet = w[1].dstSet = R.dsA[i];
+            w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &ii[0];
+            w[1].dstBinding = 2; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &ii[1];
+            d->UpdateDescriptorSets(dev, 2, w, 0, nullptr);
+        }
+        if (a) R.csApl = MakeShader(d, kAplCompSpv, sizeof(kAplCompSpv));
+        if (a && R.csApl) R.psoA = MakeComputePipeline(d, R.plA, R.csApl);
+        if (!R.psoA)
+            LOGW("BFI Presenter: RenoFX APL limiter unavailable (%s)", comp ? "its compute pass could not be created" : "the presenter queue has no compute");
+    }
+    if (p)
+    {
+        VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kStage } };
+        VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        dpi.maxSets = kStage;
+        dpi.poolSizeCount = 2;
+        dpi.pPoolSizes = ps;
         p = d->CreateDescriptorPool(dev, &dpi, nullptr, &R.dp) == VK_SUCCESS;
         VkDescriptorSetLayout l[kStage];
         for (uint32_t i = 0; i < kStage; i++) l[i] = R.dsl;
@@ -1481,13 +1597,18 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         for (uint32_t i = 0; p && i < kStage; i++)
         {
             VkDescriptorImageInfo ii = { R.sampler, sc->stageView[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            w.dstSet = R.ds[i];
-            w.dstBinding = 0;
-            w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            w.pImageInfo = &ii;
-            d->UpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+            VkDescriptorImageInfo ai = { VK_NULL_HANDLE, R.aplView, VK_IMAGE_LAYOUT_GENERAL };
+            VkWriteDescriptorSet w[2] = { { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
+            w[0].dstSet = w[1].dstSet = R.ds[i];
+            w[0].dstBinding = 0;
+            w[0].descriptorCount = 1;
+            w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[0].pImageInfo = &ii;
+            w[1].dstBinding = 2;
+            w[1].descriptorCount = 1;
+            w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[1].pImageInfo = &ai;
+            d->UpdateDescriptorSets(dev, 2, w, 0, nullptr);
         }
     }
     if (!p)
@@ -1524,7 +1645,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         ici.imageType = VK_IMAGE_TYPE_2D;
         ici.format = VK_FORMAT_R32_SFLOAT;
-        ici.extent = { 32, 18, 1 };
+        ici.extent = { 32, 36, 1 };   // rows 18-35: RenoFX's APL Limiter
         ici.mipLevels = 1;
         ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1548,7 +1669,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         fbi.attachmentCount = 1;
         fbi.pAttachments = &R.measView;
         fbi.width = 32;
-        fbi.height = 18;
+        fbi.height = 36;
         fbi.layers = 1;
         m = d->CreateFramebuffer(dev, &fbi, nullptr, &R.measFb) == VK_SUCCESS;
     }
@@ -1556,7 +1677,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     if (m)
     {
         VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        bci.size = 32 * 18 * sizeof(float);
+        bci.size = 32 * 36 * sizeof(float);
         bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         m = d->CreateBuffer(dev, &bci, nullptr, &R.measBuf) == VK_SUCCESS;
         VkMemoryRequirements mr;
@@ -1625,6 +1746,14 @@ static void DestroyPresenterRes(DeviceData *d, PresenterRes &R)
     if (R.midView) d->DestroyImageView(dev, R.midView, nullptr);
     if (R.mid) d->DestroyImage(dev, R.mid, nullptr);
     if (R.midMem) d->FreeMemory(dev, R.midMem, nullptr);
+    if (R.psoA) d->DestroyPipeline(dev, R.psoA, nullptr);
+    if (R.csApl) d->DestroyShaderModule(dev, R.csApl, nullptr);
+    if (R.plA) d->DestroyPipelineLayout(dev, R.plA, nullptr);
+    if (R.dslA) d->DestroyDescriptorSetLayout(dev, R.dslA, nullptr);
+    if (R.dpA) d->DestroyDescriptorPool(dev, R.dpA, nullptr);
+    if (R.aplView) d->DestroyImageView(dev, R.aplView, nullptr);
+    if (R.aplImg) d->DestroyImage(dev, R.aplImg, nullptr);
+    if (R.aplMem) d->FreeMemory(dev, R.aplMem, nullptr);
     R = PresenterRes();
 }
 
@@ -1933,10 +2062,17 @@ static void PresenterThread(Swapchain *sc)
     int repWin[30] = {}, repIdx = 0, repSum = 0, repSecsRun = 0;   // repSecsRun: the first seconds (loading) don't count
     int lastOutType = -1, lastShown = -1;
     double ceilNow = -1.0, ceilTarget = -1.0, litAvg = -1.0, rawAvg = -1.0, ablSolve = -1.0, ablT = Now(), ablLowT = 0.0;
+    double aplNow = -1.0;           // RenoFX APL Limiter: the last measured scene average (0..1 of SDR white), overlay only
+    float  lastAplCut = 0.0f;
+    bool   aplOn = false;
+    uint64_t aplFrameId = ~0ull;    // the game frame aplImg was measured from
     double aheadDropT = -1.0;
     bool aheadLocked = false;
     double lastT = Now(), secStart = Now(), ageSum = 0.0;
     int secPresents = 0, secLate = 0;
+    static ClockDrift drift;        // the game's own clock against the display's (ICO at 59.94 fps on 120 Hz); kept across rebuilds
+    double secPhC = 0.0, secPhS = 0.0; int secPhN = 0;
+    int exactProbes = 0;            // automatic frame cap: tries at Refresh in a row that came back at exactly the strobe rate
     int limitSecs = 0;
     bool limitLogged = false;
     double lateTimes[4] = {};
@@ -2214,6 +2350,11 @@ static void PresenterThread(Swapchain *sc)
         {
             static float cells[32 * 18];
             for (int i = 0; i < 32 * 18; i++) cells[i] = std::max(R.measPtr[i], 0.0f) * 80.0f;
+            {
+                double a = 0.0;   // rows 18-35: the APL Limiter's cells
+                for (int i = 32 * 18; i < 32 * 36; i++) a += std::max(0.0f, std::min(1.0f, R.measPtr[i]));
+                aplNow = a / (32.0 * 18.0);
+            }
             auto avgAt = [&](double C) { return AblAvgAt(cells, C, false, s.frames, s.method == 1); };
             const double peak = s.peakNits;
             const AblCurveT curve = AblMakeCurve(s.ablCurve, peak, (double)s.ablBudget);
@@ -2252,7 +2393,8 @@ static void PresenterThread(Swapchain *sc)
         c.knee    = s.knee;
         c.ceilLin = (c.outType == 0 || c.outType == 3) ? 1.0f : (float)(std::floor(ceilNow / 10.0 + 0.5) * 10.0 / 80.0);
         c.flags   = (s.rolloff ? 1u : 0u) | (s.sine ? 2u : 0u) | (s.invert ? 4u : 0u) | (s.rolling ? 8u : 0u) |
-                    (c.outType >= 4 ? (s.sdrGamma == 1 ? 32u : s.sdrGamma == 2 ? 64u : 0u) | (s.sdrMethod ? 128u : 0u) : 0u);
+                    (c.outType >= 4 ? (s.sdrGamma == 1 ? 32u : s.sdrGamma == 2 ? 64u : 0u) | (s.sdrMethod == 1 ? 128u : 0u) | (s.sdrMethod == 2 ? 256u : 0u) |
+                                             (s.sdrMethod == 2 && s.sdrBoostSpace ? 512u : 0u) : 0u);
         if (GradualSaverOn(s))
         {
             c.flags |= 16u;
@@ -2266,9 +2408,25 @@ static void PresenterThread(Swapchain *sc)
             const float k = s.sdrKnee;
             c.sdrKnee = s.sdrGamma == 1 ? std::pow(k, 2.2f) : s.sdrGamma == 2 ? std::pow(k, 2.4f)
                                          : (k <= 0.04045f ? k / 12.92f : std::pow((k + 0.055f) / 1.055f, 2.4f));
+            if (s.sdrMethod == 2) c.sdrKnee = s.sdrBoostStart;   // RenoFX: Start, already linear
+            c.rfxRamp = s.sdrBoostRamp;
+            c.rfxColor = s.sdrBoostColor / 100.0f;
             c.gamut = c.outType >= 4 ? s.sdrGamut : 0.0f;
             const float hi = std::min(s.sdrHiNits, s.peakNits);
             c.sdrPeak = hi > s.sdrWhite ? hi / 80.0f : 0.0f;
+            // RenoFX's APL Limiter: from a scene average of 30% of SDR white the boost fades out smoothly, and is gone
+            // for an all-white screen (its HDR_BOOST_APL_START 30, minimum 0), from the frame being shown.
+            // The shader takes the average from the frame itself (apl.comp before the BFI pass); aplNow, read back
+            // a frame or two later, is only for the overlay.
+            aplOn = R.psoA && c.outType >= 4 && s.sdrMethod == 2 && s.sdrBoostApl && c.sdrPeak > c.sdrScale;
+            c.rfxApl = aplOn ? 1.0f : 0.0f;
+            lastAplCut = 0.0f;
+            if (aplOn && aplNow >= 0.0)
+            {
+                const double x = std::max(0.0, std::min(1.0, (aplNow - 0.30) / 0.70));
+                lastAplCut = (float)(x * x * (3.0 - 2.0 * x));
+            }
+            if (!aplOn) { aplNow = -1.0; aplFrameId = ~0ull; }
         }
 
         // real image
@@ -2320,6 +2478,27 @@ static void PresenterThread(Swapchain *sc)
             VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             d->BeginCommandBuffer(cb, &bi);
+            if (!copyMode && R.psoA && (!R.aplInit || (aplOn && pickId != aplFrameId)))
+            {
+                // RenoFX APL Limiter: the frame's average before its first refresh, so its boost uses its own
+                // average (as RenoFX does); later refreshes of the frame reuse it.
+                const VkPipelineStageFlags rd = R.rt ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                                     : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                VkImageMemoryBarrier ab = ImgBarrier(R.aplImg, R.aplInit ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                                                     VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
+                d->CmdPipelineBarrier(cb, rd | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ab);
+                R.aplInit = true;
+                if (aplOn && pickId != aplFrameId)
+                {
+                    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.psoA);
+                    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plA, 0, 1, &R.dsA[pick], 0, nullptr);
+                    d->CmdPushConstants(cb, R.plA, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(c), &c);
+                    d->CmdDispatch(cb, 1, 1, 1);
+                    aplFrameId = pickId;
+                }
+                ab = ImgBarrier(R.aplImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+                d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, rd, 0, 0, nullptr, 0, nullptr, 1, &ab);
+            }
             if (copyMode)
             {
                 VkImageMemoryBarrier br2[2] = {
@@ -2375,7 +2554,7 @@ static void PresenterThread(Swapchain *sc)
                     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &pb);
                     dumpNow = true;
                 }
-                if (ablOn && !measSub && pickId != lastShownId && c.method < 2 && R.psoMC)
+                if (((ablOn && c.method < 2) || aplOn) && !measSub && pickId != lastShownId && R.psoMC)
                 {
                     Constants mc = cc;
                     mc.gain = s.gain;
@@ -2385,12 +2564,12 @@ static void PresenterThread(Swapchain *sc)
                     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.psoMC);
                     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plC, 0, 1, &R.dsM[pick], 0, nullptr);
                     d->CmdPushConstants(cb, R.plC, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mc), &mc);
-                    d->CmdDispatch(cb, 4, 3, 1);
+                    d->CmdDispatch(cb, 4, 5, 1);   // 32x36: rows 18-35 for the APL Limiter
                     qb = ImgBarrier(R.measImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
                     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &qb);
                     VkBufferImageCopy bic = {};
                     bic.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                    bic.imageExtent = { 32, 18, 1 };
+                    bic.imageExtent = { 32, 36, 1 };
                     d->CmdCopyImageToBuffer(cb, R.measImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, R.measBuf, 1, &bic);
                     VkBufferMemoryBarrier hb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
                     hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2431,26 +2610,26 @@ static void PresenterThread(Swapchain *sc)
                     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &db);
                     dumpNow = true;
                 }
-                if (ablOn && !measSub && pickId != lastShownId && c.method < 2)
+                if (((ablOn && c.method < 2) || aplOn) && !measSub && pickId != lastShownId)
                 {
                     Constants mc = c;
                     mc.gain = s.gain;                          // brightness at the configured boost
                     mc.ceilLin = s.peakNits / 80.0f;           // and the full ceiling
                     rbi.renderPass = R.rpMeas;
                     rbi.framebuffer = R.measFb;
-                    rbi.renderArea = { { 0, 0 }, { 32, 18 } };
+                    rbi.renderArea = { { 0, 0 }, { 32, 36 } };
                     d->CmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
                     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.psoMeas);
                     d->CmdPushConstants(cb, R.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(mc), &mc);
-                    VkViewport mvp = { 0.0f, 0.0f, 32.0f, 18.0f, 0.0f, 1.0f };
-                    VkRect2D mrc = { { 0, 0 }, { 32, 18 } };
+                    VkViewport mvp = { 0.0f, 0.0f, 32.0f, 36.0f, 0.0f, 1.0f };
+                    VkRect2D mrc = { { 0, 0 }, { 32, 36 } };
                     d->CmdSetViewport(cb, 0, 1, &mvp);
                     d->CmdSetScissor(cb, 0, 1, &mrc);
                     d->CmdDraw(cb, 3, 1, 0, 0);
                     d->CmdEndRenderPass(cb);
                     VkBufferImageCopy bic = {};
                     bic.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                    bic.imageExtent = { 32, 18, 1 };
+                    bic.imageExtent = { 32, 36, 1 };
                     d->CmdCopyImageToBuffer(cb, R.measImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, R.measBuf, 1, &bic);
                     VkBufferMemoryBarrier hb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
                     hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2647,6 +2826,11 @@ static void PresenterThread(Swapchain *sc)
         if (pickNewG && pickReadyMs > 0.0 && secReadyN < 256) secReady[secReadyN++] = pickReadyMs;
         secPresents++;
         ageSum += (t - pickTime) * 1000.0;
+        if (pickNewG && vb.modeHz > 1.0)   // clock drift check: the new frames' arrival phase over one refresh
+        {
+            const double ang = 6.283185307179586 * (t - pickTime) * vb.modeHz;
+            secPhC += cos(ang); secPhS += sin(ang); secPhN++;
+        }
         if (t - lastT > 1.5 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
         {
             secLate++;
@@ -2713,7 +2897,12 @@ static void PresenterThread(Swapchain *sc)
             if (g_rebuildMisses > 0 && g_rebuildMisses < 3 && t - g_lastAutoRebuildT > 180.0) { g_rebuildMisses = 0; g_rebuildGap = 20.0; }
             // 5 s: with the game close to its video memory budget presentation slows for 2-3 s now and then and
             // recovers by itself (Indiana Jones); a rebuild there only adds a hitch.
-            if (s.vkAutoRecover && slowRun >= 5 && !rebuildReq && g_rebuildMisses < 3)
+            // The game's clock drifting against the display: the slow returns come and go with the drift (ICO), and a
+            // rebuild only adds a hitch.
+            if (s.vkAutoRecover && slowRun == 5 && drift.on)
+                LOGI("BFI Presenter: automatic recovery -- not rebuilding: the slow returns follow the game's clock drift (set the display to %.2f Hz)",
+                     drift.suggestHz);
+            if (s.vkAutoRecover && slowRun >= 5 && !rebuildReq && g_rebuildMisses < 3 && !drift.on)
             {
                 if (t - g_lastRebuildT >= g_rebuildGap)
                 {
@@ -2752,8 +2941,23 @@ static void PresenterThread(Swapchain *sc)
         {
             std::lock_guard<std::mutex> l(g_cfgLock);
             g_status.refreshHz  = secPresents / (t - secStart);
-            g_status.gameFps    = sc->staged.exchange(0) / (t - secStart);
+            const int stagedSec = sc->staged.exchange(0);
+            g_status.gameFps    = stagedSec / (t - secStart);
             g_status.frameAgeMs = secPresents ? ageSum / secPresents : 0.0;
+            const double phase = secPhN ? atan2(secPhS, secPhC) : NAN;
+            secPhC = secPhS = 0.0; secPhN = 0;
+            if (drift.Second(stagedSec, secPresents, phase, vb.modeHz, g_status.fgActive != 0))
+            {
+                if (drift.on)
+                    LOGW("BFI Presenter: the game runs at %.2f fps on a clock of its own, the display at %.2f Hz -- its frames drift "
+                         "against the strobe cycle (a game frame slips about every %.0f s: stutter, and flashes when it lines up with "
+                         "the flip; a rebuild can't help). Set the display to %.2f Hz for this game.",
+                         drift.gameFps, vb.modeHz, drift.slipS, drift.suggestHz);
+                else LOGI("BFI Presenter: the game's frames match the display rate again");
+            }
+            g_status.driftOn = drift.on ? 1 : 0;
+            g_status.driftFps = drift.gameFps; g_status.driftHz = vb.modeHz;
+            g_status.driftSuggest = drift.suggestHz; g_status.driftSlip = drift.slipS;
             g_status.late       = secLate;
             // A frame limiter acting on the presenter's own presents (RTSS,
             // the NVIDIA "Max Frame Rate" setting): a little under the display
@@ -2799,6 +3003,8 @@ static void PresenterThread(Swapchain *sc)
             }
             g_status.litAvg       = (s.ablGuard && R.psoMeas) ? litAvg : -1.0;
             g_status.rawAvg       = (s.ablGuard && R.psoMeas) ? rawAvg : -1.0;
+            g_status.aplNow       = aplOn ? aplNow : -1.0;
+            g_status.aplCut       = aplOn ? lastAplCut : 0.0;
             g_status.ceilInUse    = c.ceilLin * 80.0;
             g_status.outType      = (int)c.outType;
             // Automatic frames ahead (as the D3D12 presenter): 1 normally, 2
@@ -3081,8 +3287,17 @@ static void PresenterThread(Swapchain *sc)
                                 // 120: 5 s with every eighth frame skipped), so the next one waits 5 minutes (as the DX add-on).
                                 // Exactly the strobe rate is a limit of the game's own (an intro, a menu), not a struggle: tries
                                 // every 30 s cost nothing there (as the DX add-on).
-                                if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;
+                                // ... but a game locked to the strobe rate all along (ICO at 60) pays for each try with 4 s of
+                                // frames off the strobe cycle: after two such tries in a row the next waits 5 minutes. Not
+                                // saved: a new session tries every 30 s again.
+                                const bool exact = fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames;
+                                exactProbes = exact ? exactProbes + 1 : 0;
+                                if (exact) probeWait = exactProbes >= 2 ? 300.0 : 30.0;
                                 else if (fpsA < 0.8 * hzA) probeWait = 300.0;
+                                if (exactProbes == 2)
+                                    LOGI("BFI Presenter: automatic frame cap: the game stays at exactly %.0f fps (a limit of its own) -- "
+                                         "tries at Refresh rate every 5 minutes from now; set the cap to One game frame per strobe "
+                                         "cycle to stop them", hzA / s.frames);
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
                                      "at Refresh); next try in %.0f s", fpsA, hzA, dupSeen ? std::min(probeWait, 20.0) : probeWait);
                             }
@@ -3098,7 +3313,7 @@ static void PresenterThread(Swapchain *sc)
                             // longer; well under the refresh rate, the first try waits a minute (as the DX add-on).
                             if (t - capUpT < 30.0) probeWait = probeWait * 2.0 > 120.0 ? 120.0 : probeWait * 2.0;
                             else probeWait = 30.0;
-                            if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = 30.0;
+                            if (fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames) probeWait = exactProbes >= 2 ? 300.0 : 30.0;
                             else if (fpsA < 0.8 * hzA && probeWait < 60.0) probeWait = 60.0;
                             down = true; capDownSecs = 0; capSwitchT = t;
                             LOGI("BFI Presenter: automatic frame cap: one game frame per strobe cycle (%.0f fps) -- the game held "
@@ -5557,9 +5772,19 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::PopStyleColor();
         }
 #endif
+        // The game's own clock a little off the display's (ICO: 59.94 fps on 120.00 Hz): the cause of its flashes,
+        // so it comes before the flash hints.
+        if (st.driftOn)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+            ImGui::TextWrapped("The game runs at %.2f fps on a clock of its own, the display at %.2f Hz: its frames drift against the "
+                               "strobe cycle (a slip about every %.0f s, with stutter and flashes). Set the display to %.2f Hz for "
+                               "this game.", st.driftFps, st.driftHz, st.driftSlip, st.driftSuggest);
+            ImGui::PopStyleColor();
+        }
         // Flash hint: when missed refreshes keep coming back, the first step that isn't done yet (the red
         // warnings above come first).
-        if (st.flashHint && s.flashHints && s.enabled && !st.limitSuspect && st.layerOrder != 2)
+        if (!st.driftOn && st.flashHint && s.flashHints && s.enabled && !st.limitSuspect && st.layerOrder != 2)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
             // Not when video memory is tight: each buffer is a full-size image (about 33 MB at 4K).
@@ -5742,10 +5967,29 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::SliderFloat("SDR white (nits)", &s.sdrWhite, 80.0f, 600.0f, "%.0f");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Windows: 80 + 4 x the 'SDR content brightness' slider (40 -> 240).");
             ImGui::SliderFloat("SDR highlights expand to (nits, 0 = off)", &s.sdrHiNits, 0.0f, 2000.0f, "%.0f");
-            ImGui::SliderFloat("Highlight expansion starts at (SDR signal)", &s.sdrKnee, 0.3f, 0.95f, "%.2f");
+            if (s.sdrMethod != 2) ImGui::SliderFloat("Highlight expansion starts at (SDR signal)", &s.sdrKnee, 0.3f, 0.95f, "%.2f");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Below this level the image is unchanged; above it the brightest parts\nstretch toward the highlight value (an HDR look for SDR games).");
-            ImGui::Combo("Highlights stretched by", &s.sdrMethod, "Brightest channel\0Luminance (mostly near-white highlights)\0");
+            ImGui::Combo("Highlights stretched by", &s.sdrMethod, "Brightest channel\0Luminance (mostly near-white highlights)\0RenoFX HDR Boost (ShortFuse)\0");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brightest channel also brightens bright saturated colours (reds, blues).\nLuminance stretches mostly near-white highlights; saturated colours stay closer to SDR.");
+            if (s.sdrMethod == 2)
+            {
+                ImGui::TextDisabled("RenoFX HDR Boost (ShortFuse, MIT): boost = highlights / SDR white (e.g. 2.5x).");
+                ImGui::SliderFloat("Boost start (linear, 1 = SDR white)", &s.sdrBoostStart, 0.001f, 0.99f, "%.3f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the boost begins: lower affects more of the image, higher only the brightest parts.");
+                ImGui::SliderFloat("Ramp intensity", &s.sdrBoostRamp, 0.25f, 4.0f, "%.2f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shape of the smooth rise from the start to the peak.");
+                ImGui::Combo("Boost working space", &s.sdrBoostSpace, "LMS (RenoFX default, hue restored)\0Brightness (Yf, colour balance kept)\0");
+                ImGui::SliderFloat("Boost colour (0-100)", &s.sdrBoostColor, 0.0f, 100.0f, "%.0f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much colour expansion the boost adds while keeping its brightness:\n0 = the source colour balance, 100 = the full result of the working space.");
+                bool apl = s.sdrBoostApl != 0;
+                if (ImGui::Checkbox("APL limiter", &apl)) s.sdrBoostApl = apl ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("RenoFX's APL Limiter: lowers the boost in bright scenes. Above an average picture level of 30%%\nof SDR white it fades out smoothly, and an all-white screen gets no boost.");
+                if (s.sdrBoostApl && st.aplNow >= 0.0)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("scene average %.0f%%, boost %.0f%%", st.aplNow * 100.0, (1.0 - st.aplCut) * 100.0);
+                }
+            }
             ImGui::Combo("SDR decoding", &s.sdrGamma, "sRGB curve (as Windows)\0Gamma 2.2 (deeper shadows)\0Gamma 2.4 (dark-room grading)\0");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the SDR picture is turned into light. Most SDR games were made on gamma 2.2 screens:\nthe sRGB curve (Windows' own SDR-in-HDR and Auto HDR) shows their shadows a little raised.");
             ImGui::SliderFloat("Gamut expansion", &s.sdrGamut, 0.0f, 1.0f, "%.2f");
@@ -5937,6 +6181,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
     if (st.managed && ImGui::CollapsingHeader("Status", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::Text("Game: %.1f fps   Refreshes: %.1f/s   Frame age: %.1f ms", st.gameFps, st.refreshHz, st.frameAgeMs);
+
         ImGui::Text("Uneven strobe cycles: %d/s (a frame repeated %d, frames skipped %d)",
                     st.unevenRep + st.unevenSkip, st.unevenRep, st.unevenSkip);
         ImGui::Text("Late refreshes: %d/s", st.late);
