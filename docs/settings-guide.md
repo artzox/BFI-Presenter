@@ -375,6 +375,9 @@ Writes a detailed timing file while you play. Only useful when reporting a probl
 **Diagnostics** and **crash log** · `Diagnostics`, `CrashLog` · default: 1, on\
 If a game crashes, these write a short report of what went wrong (`BFIPresenter_crash.txt` and friends). Tiny overhead; leave on, and send the files along with a bug report.
 
+**Shader cache** (DX, v1.0.37, no setting)\
+The DX add-on compiles its shaders once per session, while the game starts up, and keeps them in `BFIPresenter_shaders.bin` next to `BFIPresenter.ini`, so the screen isn't black for a second or two while they compile. A new version makes a new one by itself; deleting the file is harmless (it's made again at the next start). `ReShade.log` says whether they were compiled or loaded, and how long it took.
+
 ## Hotkeys
 
 | Keys | Does |

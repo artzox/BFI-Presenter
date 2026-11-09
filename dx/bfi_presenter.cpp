@@ -93,7 +93,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.36"
+#define BFI_ADDON_VERSION "1.0.37"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2176,6 +2176,142 @@ static bool Compile(PFN_D3DCompile compile, const char *entry, const char *targe
     return true;
 }
 
+// ---- Shader cache. The presenter's HLSL is compiled at the highest optimisation level, and the source has grown with
+// every feature (all of it is compiled whether a feature is on or not): 1-2 s by 1.0.35, more with 1.0.36, during which
+// the presenter can't show anything -- a black screen at every start and every presenter restart. Now the shaders are
+// compiled once per session on a thread started when the add-on loads (the game takes seconds to its first frame, so
+// they are usually ready), and kept on disk in BFIPresenter_shaders.bin next to the ini, keyed to the exact source and
+// compile flags: from the second start of a version there is no compile at all.
+static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce" };
+static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
+static const int kShN = 5;
+static ID3DBlob *g_shBlob[kShN] = {};
+static HANDLE volatile g_shThread = nullptr;
+static volatile LONG g_shStarted = 0, g_shDone = 0;
+static char      g_shPath[MAX_PATH] = {};
+typedef HRESULT (WINAPI *PFN_D3DCreateBlob)(SIZE_T, ID3DBlob **);
+
+static uint64_t ShaderKey()
+{
+    uint64_t h = 1469598103934665603ull;                      // FNV-1a over the source, the flags and the entry points
+    auto mix = [&](const void *p, size_t n) { const uint8_t *b = (const uint8_t *)p; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; } };
+    mix(kShader, sizeof(kShader) - 1);
+    const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    mix(&flags, sizeof(flags));
+    for (int i = 0; i < kShN; i++) { mix(kShEntry[i], strlen(kShEntry[i])); mix(kShTarget[i], strlen(kShTarget[i])); }
+    return h;
+}
+
+// File: "BFISH001", key (8 bytes), then per shader a 4-byte size (0 = failed to compile) and its bytes.
+static bool ShaderCacheLoad(HMODULE dc, uint64_t key)
+{
+    PFN_D3DCreateBlob mk = dc ? (PFN_D3DCreateBlob)(void *)GetProcAddress(dc, "D3DCreateBlob") : nullptr;
+    if (!mk) return false;
+    HANDLE f = CreateFileA(g_shPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    std::vector<uint8_t> d;
+    LARGE_INTEGER sz = {};
+    bool ok = GetFileSizeEx(f, &sz) && sz.QuadPart > 16 && sz.QuadPart < 16 * 1024 * 1024;
+    DWORD got = 0;
+    if (ok) { d.resize((size_t)sz.QuadPart); ok = ReadFile(f, d.data(), (DWORD)d.size(), &got, nullptr) && got == d.size(); }
+    CloseHandle(f);
+    uint64_t k = 0;
+    if (ok) memcpy(&k, d.data() + 8, 8);
+    ok = ok && memcmp(d.data(), "BFISH001", 8) == 0 && k == key;
+    size_t at = 16;
+    ID3DBlob *b[kShN] = {};
+    for (int i = 0; ok && i < kShN; i++)
+    {
+        uint32_t n = 0;
+        if (at + 4 > d.size()) { ok = false; break; }
+        memcpy(&n, d.data() + at, 4); at += 4;
+        if (at + n > d.size()) { ok = false; break; }
+        if (n && SUCCEEDED(mk(n, &b[i])) && b[i]) memcpy(b[i]->GetBufferPointer(), d.data() + at, n);
+        at += n;
+    }
+    ok = ok && b[0] && b[1];
+    for (int i = 0; i < kShN; i++) { if (ok) g_shBlob[i] = b[i]; else SafeRelease(b[i]); }
+    return ok;
+}
+
+static void ShaderCacheSave(uint64_t key)
+{
+    std::vector<uint8_t> d(16);
+    memcpy(d.data(), "BFISH001", 8);
+    memcpy(d.data() + 8, &key, 8);
+    for (int i = 0; i < kShN; i++)
+    {
+        const uint32_t n = g_shBlob[i] ? (uint32_t)g_shBlob[i]->GetBufferSize() : 0;
+        const size_t at = d.size();
+        d.resize(at + 4 + n);
+        memcpy(d.data() + at, &n, 4);
+        if (n) memcpy(d.data() + at + 4, g_shBlob[i]->GetBufferPointer(), n);
+    }
+    char tmp[MAX_PATH + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", g_shPath);
+    HANDLE f = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;                     // a read-only game folder: compiled each session instead
+    DWORD wr = 0;
+    const bool ok = WriteFile(f, d.data(), (DWORD)d.size(), &wr, nullptr) && wr == d.size();
+    CloseHandle(f);
+    if (!ok || !MoveFileExA(tmp, g_shPath, MOVEFILE_REPLACE_EXISTING)) DeleteFileA(tmp);
+}
+
+static bool Compile(PFN_D3DCompile compile, const char *entry, const char *target, ID3DBlob **out);
+static DWORD WINAPI ShaderThread(void *self)
+{
+    const double t0 = Now();
+    HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
+    const uint64_t key = ShaderKey();
+    if (ShaderCacheLoad(dc, key))
+        LOGI("BFI Presenter: shaders loaded from BFIPresenter_shaders.bin (%.0f ms)", (Now() - t0) * 1000.0);
+    else
+    {
+        PFN_D3DCompile compile = dc ? (PFN_D3DCompile)(void *)GetProcAddress(dc, "D3DCompile") : nullptr;
+        if (!compile) LOGE("BFI Presenter: d3dcompiler_47.dll not available");
+        for (int i = 0; compile && i < kShN; i++)
+            if (!Compile(compile, kShEntry[i], kShTarget[i], &g_shBlob[i])) g_shBlob[i] = nullptr;
+        LOGI("BFI Presenter: shaders compiled in %.0f ms%s", (Now() - t0) * 1000.0,
+             g_shBlob[0] && g_shBlob[1] ? " -- kept in BFIPresenter_shaders.bin for the next start" : "");
+        if (g_shBlob[0] && g_shBlob[1]) ShaderCacheSave(key);
+    }
+    InterlockedExchange(&g_shDone, 1);
+    if (self) FreeLibraryAndExitThread((HMODULE)self, 0);    // the reference taken in ShaderPrepare
+    return 0;
+}
+
+// Starts the compile (or cache load) once per session. Called when the add-on loads; the presenter calls it too, in
+// case it wasn't.
+static void ShaderPrepare()
+{
+    if (InterlockedCompareExchange(&g_shStarted, 1, 0) != 0) return;
+    snprintf(g_shPath, sizeof(g_shPath), "%s", g_iniPath);
+    if (char *s = strrchr(g_shPath, '\\')) s[1] = '\0';
+    strncat(g_shPath, "BFIPresenter_shaders.bin", MAX_PATH - strlen(g_shPath) - 1);
+    // The thread holds a reference on the add-on, so it can't be unloaded under it.
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCSTR)&ShaderPrepare, &self);
+    g_shThread = CreateThread(nullptr, 0, ShaderThread, self, 0, nullptr);
+    if (!g_shThread) { if (self) FreeLibrary(self); ShaderThread(nullptr); }
+}
+
+// The presenter's copies (AddRef'd, released with its other objects). Waits for the thread if it is still at work.
+static bool ShaderGet(ID3DBlob **out)
+{
+    ShaderPrepare();
+    // Another thread may have just started it and not stored the handle yet.
+    while (!g_shThread && !g_shDone) Sleep(1);
+    if (g_shThread)
+    {
+        const double t0 = Now();
+        WaitForSingleObject(g_shThread, INFINITE);
+        const double w = (Now() - t0) * 1000.0;
+        if (w > 20.0) LOGI("BFI Presenter: presenter waited %.0f ms for its shaders", w);
+    }
+    for (int i = 0; i < kShN; i++) { out[i] = g_shBlob[i]; if (out[i]) out[i]->AddRef(); }
+    return out[0] && out[1];
+}
+
 // The display mode's exact refresh rate: EnumDisplaySettings gives whole numbers, so 119.88 Hz read as 119 (a strobe
 // cycle of 16.81 ms against the real 16.68 ms: the frame-start search, drift detection and learned data used the wrong
 // cycle). The active display path has it as a fraction (119880/1000). Falls back to the whole number.
@@ -3075,14 +3211,14 @@ static DWORD WINAPI PresenterThread(void *)
         ok = SUCCEEDED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[0], nullptr, IID_PPV_ARGS(&list)));
     if (ok) { list->SetName(L"BFI present list"); list->Close(); }
 
-    // --- shaders (d3dcompiler_47 ships with Windows 10/11)
-    HMODULE dc = ok ? LoadLibraryA("d3dcompiler_47.dll") : nullptr;
-    PFN_D3DCompile compile = dc ? (PFN_D3DCompile)(void *)GetProcAddress(dc, "D3DCompile") : nullptr;
-    if (ok && !compile) { LOGE("BFI Presenter: d3dcompiler_47.dll not available"); ok = false; }
-    ok = ok && Compile(compile, "VSMain", "vs_5_0", &vs) && Compile(compile, "PSMain", "ps_5_0", &ps);
-    if (ok && !Compile(compile, "PSMeasure", "ps_5_0", &psMeas)) psMeas = nullptr;   // ABL guard optional
-    if (ok && !Compile(compile, "PSAplCells", "ps_5_0", &psAplC)) psAplC = nullptr;  // APL Limiter optional
-    if (ok && !Compile(compile, "PSAplReduce", "ps_5_0", &psAplR)) psAplR = nullptr;
+    // --- shaders (d3dcompiler_47 ships with Windows 10/11): compiled once per session, or loaded from the cache (above)
+    if (ok)
+    {
+        ID3DBlob *sh[kShN] = {};
+        ok = ShaderGet(sh);
+        vs = sh[0]; ps = sh[1]; psMeas = sh[2]; psAplC = sh[3]; psAplR = sh[4];   // ABL guard, APL Limiter optional
+        if (!ok) LOGE("BFI Presenter: the presenter's shaders are not available");
+    }
 
     if (ok)
     {
@@ -10728,6 +10864,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
         RegisterDx9Events(true);
         reshade::register_overlay("BFI Presenter", draw_overlay);
+        ShaderPrepare();                                // compiled (or loaded) while the game starts up
         // DRED must be switched on before the game creates its device; a
         // thread avoids calling into D3D12 under the loader lock.
         {
