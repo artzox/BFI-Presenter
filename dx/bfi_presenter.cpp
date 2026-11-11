@@ -93,7 +93,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.37"
+#define BFI_ADDON_VERSION "1.0.38-t1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2174,6 +2174,30 @@ static bool Compile(PFN_D3DCompile compile, const char *entry, const char *targe
     }
     SafeRelease(err);
     return true;
+}
+
+// ---- Trace file (BFIPresenter_trace.txt next to the ini): each line written and closed at once, for games that end
+// without a crash record (Avatar: Frontiers of Pandora closed itself while creating its swap chain; ReShade's log
+// may not be flushed by then). Only for the outer swap chain hook's steps.
+static void Trace(const char *fmt, ...)
+{
+    if (!g_iniPath[0]) return;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s", g_iniPath);
+    if (char *s = strrchr(path, '\\')) s[1] = '\0';
+    strncat(path, "BFIPresenter_trace.txt", MAX_PATH - strlen(path) - 1);
+    char line[512];
+    int n = snprintf(line, sizeof(line), "%10.3f [%5lu] ", Now(), GetCurrentThreadId());
+    va_list ap; va_start(ap, fmt);
+    n += vsnprintf(line + n, sizeof(line) - n - 3, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(line) - 3) n = (int)sizeof(line) - 3;
+    line[n++] = '\r'; line[n++] = '\n';
+    HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wr = 0;
+    WriteFile(f, line, (DWORD)n, &wr, nullptr);
+    CloseHandle(f);
 }
 
 // ---- Shader cache. The presenter's HLSL is compiled at the highest optimisation level, and the source has grown with
@@ -5554,6 +5578,13 @@ static HRESULT SubmitGameFrameLocked()
         ID3D12Resource *rb = nullptr;
         GameStage(ST_G_OWN_INDEX);
         const UINT bi = o_GetCBBI(g_sc);
+        // Pass-through diagnostics (Avatar: the picture stayed black on a recreated swap chain): once a second for
+        // the first 30 s of a swap chain, what the pass-through did.
+        static int s_ptPres = 0, s_ptCopy = 0;
+        static double s_ptT = 0.0;
+        static HRESULT s_ptHr = S_OK;
+        const bool ptLog = Now() - g_deferSinceT.load() < 30.0;
+        s_ptPres++;
         GameStage(ST_G_OWN_GETBUF);
         // SDR to HDR: the real buffers are HDR10, the game's frames 8-bit -- a copy between them isn't allowed (it
         // removes the device). Only the presenter can draw them; until it runs, the screen keeps its last picture.
@@ -5592,11 +5623,23 @@ static HRESULT SubmitGameFrameLocked()
             g_fbFence[bi] = v;
             if (q != g_gameQueue) g_gameQueue->Wait(g_presFence, v);   // copy done before reuse
             rb->Release();
+            s_ptCopy++;
         }
+        const UINT stand = g_cur;
         g_cur = (g_cur + 1) % g_bufCount;
         ReleaseGameSlot();
         GameStage(ST_G_OWN_PRESENT);
-        return OwnPresent();
+        const HRESULT phr = OwnPresent();
+        if (FAILED(phr)) s_ptHr = phr;
+        const double tn = Now();
+        if (ptLog && tn - s_ptT >= 1.0)
+        {
+            LOGI("BFI Presenter: pass-through: %d presents, %d copied to the real buffer (real index %u, stand-in %u of %u, "
+                 "%s queue, formats %d -> %d, last failed present 0x%08lX)", s_ptPres, s_ptCopy, bi, stand, g_bufCount,
+                 q == g_gameQueue ? "game" : "presenter", (int)g_stageFmt, (int)g_desc.Format, (unsigned long)s_ptHr);
+            s_ptT = tn; s_ptPres = s_ptCopy = 0; s_ptHr = S_OK;
+        }
+        return phr;
     }
 
     // Staging slot for this frame: the oldest one the presenter is neither
@@ -7242,9 +7285,11 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSC(IDXGIFactory *f, IUnknown *dev, DX
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
     t_scCreateDepth++;
+    Trace("FCreateSC: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSC);
     const HRESULT hr = o_FCreateSC(f, dev, d, out);
     const int depth = t_scCreateDepth--;
-    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    Trace("FCreateSC: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) { OuterCheck(*out); Trace("FCreateSC: outer check done"); }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hk_FCreateSCHwnd(IDXGIFactory2 *f, IUnknown *dev, HWND w, const DXGI_SWAP_CHAIN_DESC1 *d,
@@ -7253,9 +7298,11 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSCHwnd(IDXGIFactory2 *f, IUnknown *de
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
     t_scCreateDepth++;
+    Trace("FCreateSCHwnd: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSCHwnd);
     const HRESULT hr = o_FCreateSCHwnd(f, dev, w, d, fs, o, out);
     const int depth = t_scCreateDepth--;
-    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    Trace("FCreateSCHwnd: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) { OuterCheck(*out); Trace("FCreateSCHwnd: outer check done"); }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hk_FCreateSCCore(IDXGIFactory2 *f, IUnknown *dev, IUnknown *win, const DXGI_SWAP_CHAIN_DESC1 *d,
@@ -7264,9 +7311,11 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSCCore(IDXGIFactory2 *f, IUnknown *de
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
     t_scCreateDepth++;
+    Trace("FCreateSCCore: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSCCore);
     const HRESULT hr = o_FCreateSCCore(f, dev, win, d, o, out);
     const int depth = t_scCreateDepth--;
-    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    Trace("FCreateSCCore: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) { OuterCheck(*out); Trace("FCreateSCCore: outer check done"); }
     return hr;
 }
 // The function the game itself imports from dxgi.dll (its own import table): with OptiScaler that is
@@ -7321,6 +7370,7 @@ static void InstallOuterFactoryHook()
     char mod[64];
     ModuleOf(vt[15], mod, sizeof(mod));
     PatchSlot(vt, 10, (void *)&hk_FCreateSC,     (void **)&o_FCreateSC);
+    Trace("outer hook: factory %p vtable %p, CreateSwapChainForHwnd %p", (void *)f, (void *)vt, vt[15]);
     PatchSlot(vt, 15, (void *)&hk_FCreateSCHwnd, (void **)&o_FCreateSCHwnd);
     PatchSlot(vt, 16, (void *)&hk_FCreateSCCore, (void **)&o_FCreateSCCore);
     f->Release();
