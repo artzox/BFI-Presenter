@@ -93,7 +93,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.37"
+#define BFI_ADDON_VERSION "1.0.38-t1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -798,6 +798,7 @@ static UINT64                 g_stageId[kStage] = {};      // game frame number 
 static double                 g_stageTime[kStage] = {};
 static UINT64                 g_readFence[kStage] = {};    // presenter fence value of the last read
 static int                    g_presCurSlot = -1;          // staging slot the presenter is showing (g_lock)
+static int                    g_presCurSlot2 = -1;         // split comparison: the newer frame its side without BFI shows (g_lock)
 static std::atomic<int>       g_slotWaits{0};
 // Swap chains the game recreates (God of War Ragnarok on loading) hung when
 // the presenter presented on the game's own queue, and also when moved to
@@ -1271,7 +1272,7 @@ static bool CreateFrameResources()
     {
         if (!(g_stage[s] = CreateTex(g_desc, gf, D3D12_RESOURCE_FLAG_NONE, L"BFI staging frame", s))) return false;
         g_stageFence[s] = g_stageId[s] = g_readFence[s] = 0;
-        g_presCurSlot = -1;
+        g_presCurSlot = -1; g_presCurSlot2 = -1;
         g_stageTime[s] = 0.0;
     }
     g_cur = 0;
@@ -1529,7 +1530,8 @@ cbuffer C : register(b0)
     float rfxApl;     // its APL Limiter: 1 = on (the scene average is in aplTex, measured from this frame)
 };
 Texture2D<float4> src : register(t0);
-Texture2D<float> aplTex : register(t1);   // APL Limiter: the scene average (1x1); for its reduction pass, the 32x18 cells
+Texture2D<float> aplTex : register(t1);
+Texture2D<float4> srcNew : register(t2);  // split comparison: the newest game frame, for the side without BFI   // APL Limiter: the scene average (1x1); for its reduction pass, the 32x18 cells
 SamplerState linClamp : register(s0);
 
 // The game's frame at output pixel pos. Same size: the pixel itself. Larger (a 5K frame in a 4K window): four bilinear
@@ -1546,6 +1548,21 @@ float3 Fetch(float2 pos)
                    src.SampleLevel(linClamp, (cp + float2( o.x, -o.y)) * inv, 0).rgb +
                    src.SampleLevel(linClamp, (cp + float2(-o.x,  o.y)) * inv, 0).rgb +
                    src.SampleLevel(linClamp, (cp + float2( o.x,  o.y)) * inv, 0).rgb);
+}
+
+// The same for the newest game frame (split comparison, side without BFI).
+float3 FetchNew(float2 pos)
+{
+    if (srcPerOut.x <= 1.0001 && srcPerOut.y <= 1.0001) return srcNew.Load(int3(pos, 0)).rgb;
+    uint w, h;
+    srcNew.GetDimensions(w, h);
+    float2 inv = 1.0 / float2(w, h);
+    float2 cp = pos * srcPerOut;
+    float2 o = 0.25 * srcPerOut;
+    return 0.25 * (srcNew.SampleLevel(linClamp, (cp + float2(-o.x, -o.y)) * inv, 0).rgb +
+                   srcNew.SampleLevel(linClamp, (cp + float2( o.x, -o.y)) * inv, 0).rgb +
+                   srcNew.SampleLevel(linClamp, (cp + float2(-o.x,  o.y)) * inv, 0).rgb +
+                   srcNew.SampleLevel(linClamp, (cp + float2( o.x,  o.y)) * inv, 0).rgb);
 }
 
 float4 VSMain(uint id : SV_VertexID) : SV_Position
@@ -2003,13 +2020,16 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
     {
         // Split comparison (idea: unrefined803, #111): one side shows every refresh at the light the strobe gives over
         // its cycle -- the mean of what each refresh emits, after roll-off and the ceiling -- so both sides match in
-        // brightness and differ only in motion clarity and flicker.
+        // brightness and differ only in motion clarity and flicker. It shows the newest game frame at every refresh, as a
+        // display without BFI would (120 fps at 120 Hz: a new frame each refresh), while the BFI side keeps one frame per
+        // strobe cycle.
         float t = splitSeam > 0.0 ? smoothstep(splitX - 0.5 * splitSeam, splitX + 0.5 * splitSeam, pos.x) : step(splitX, pos.x);
         float w = splitMode == 1 ? 1.0 - t : t;
         if (w > 0.0)
         {
             float3 a = float3(0, 0, 0);
-            [unroll] for (uint j = 0; j < 8; j++) if (j < frames) a += Strobe(lin, j, litGain);
+            float3 linNew = Decode(FetchNew(pos.xy));
+            [unroll] for (uint j = 0; j < 8; j++) if (j < frames) a += Strobe(linNew, j, litGain);
             o = lerp(o, a / float(frames), w);
         }
     }
@@ -3159,7 +3179,8 @@ static DWORD WINAPI PresenterThread(void *)
     // same game frame with the same settings into a buffer that already has
     // it just presents it again -- no GPU work, so a GPU busy with the game
     // (a hitch, shader compilation) can't hold the strobe up.
-    UINT64   bufFrame[kMaxBuf] = {};
+    UINT64   bufFrame[kMaxBuf] = {}, bufFrame2[kMaxBuf] = {};
+    int      pickNew2 = -1;                  // split comparison: the slot its side without BFI shows
     Constants bufConst[kMaxBuf] = {};
     bool     bufValid[kMaxBuf] = {};
     int      secReused = 0;
@@ -3228,7 +3249,9 @@ static DWORD WINAPI PresenterThread(void *)
         range.BaseShaderRegister = 0;
         D3D12_DESCRIPTOR_RANGE rangeApl = range;
         rangeApl.BaseShaderRegister = 1;                   // t1: the APL Limiter's value (or its cells)
-        D3D12_ROOT_PARAMETER params[3] = {};
+        D3D12_DESCRIPTOR_RANGE rangeNew = range;
+        rangeNew.BaseShaderRegister = 2;                   // t2: split comparison's newest game frame
+        D3D12_ROOT_PARAMETER params[4] = {};
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
         params[0].Constants.Num32BitValues = sizeof(Constants) / 4;
@@ -3239,6 +3262,8 @@ static DWORD WINAPI PresenterThread(void *)
         params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
         params[2] = params[1];
         params[2].DescriptorTable.pDescriptorRanges   = &rangeApl;
+        params[3] = params[1];
+        params[3].DescriptorTable.pDescriptorRanges   = &rangeNew;
         D3D12_STATIC_SAMPLER_DESC samp = {};
         samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -3246,7 +3271,7 @@ static DWORD WINAPI PresenterThread(void *)
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 3;
+        rsd.NumParameters = 4;
         rsd.pParameters   = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers   = &samp;
@@ -3753,6 +3778,11 @@ static DWORD WINAPI PresenterThread(void *)
                 pick = oldestNew;
         }
         if (pick >= 0) { pickId = g_stageId[pick]; g_presCurSlot = pick; }
+        // Split comparison: its side without BFI shows the newest finished game frame at every refresh, like a display
+        // without BFI (120 fps at 120 Hz: every frame), while the BFI side keeps one frame per strobe cycle.
+        pickNew2 = pick;
+        if (s.split && pick >= 0 && newest >= 0 && newestId > pickId) pickNew2 = newest;
+        g_presCurSlot2 = pickNew2 != pick ? pickNew2 : -1;
         if (pick < 0)
         {
             int staged = 0;
@@ -3934,12 +3964,15 @@ static DWORD WINAPI PresenterThread(void *)
         c.seam    = s.rollSeam;
         c.decay   = s.rollDecay;
 
-        const bool reuse = s.reuseBuffers && bufValid[bi] && bufFrame[bi] == pickId &&
+        if (pickNew2 < 0) pickNew2 = pick;                       // picked later (the wait above): the same frame
+        const UINT64 pickId2 = pickNew2 >= 0 ? g_stageId[pickNew2] : 0;
+        const bool reuse = s.reuseBuffers && bufValid[bi] && bufFrame[bi] == pickId && bufFrame2[bi] == pickId2 &&
                            memcmp(&bufConst[bi], &c, sizeof(c)) == 0;
         if (!reuse)
         {
             reserve = ++g_presFenceVal;
             g_readFence[pick] = reserve;
+            if (pickNew2 != pick) g_readFence[pickNew2] = reserve;
         }
         // The game never copies into the slot being shown (g_presCurSlot), so
         // the lock can go before waiting on the GPU.
@@ -3960,6 +3993,11 @@ static DWORD WINAPI PresenterThread(void *)
             Transition(real[bi], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
             Transition(g_stage[pick], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) };
         list->ResourceBarrier(2, br);
+        if (pickNew2 != pick)
+        {
+            D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &b2);
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         rtv.ptr += (SIZE_T)bi * rtvStride;
         D3D12_GPU_DESCRIPTOR_HANDLE srv = srvHeap->GetGPUDescriptorHandleForHeapStart();
@@ -4011,6 +4049,11 @@ static DWORD WINAPI PresenterThread(void *)
             aplFrameId = pickId;
         }
         list->SetGraphicsRootDescriptorTable(2, aplSrv);
+        {
+            D3D12_GPU_DESCRIPTOR_HANDLE nsrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            nsrv.ptr += (UINT64)(pickNew2 >= 0 ? pickNew2 : pick) * srvStride;
+            list->SetGraphicsRootDescriptorTable(3, nsrv);
+        }
         D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)g_desc.Width, (float)g_desc.Height, 0.0f, 1.0f };
         D3D12_RECT sc = { 0, 0, (LONG)g_desc.Width, (LONG)g_desc.Height };
         list->RSSetViewports(1, &vp);
@@ -4056,6 +4099,11 @@ static DWORD WINAPI PresenterThread(void *)
         br[0] = Transition(real[bi], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         br[1] = Transition(g_stage[pick], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         list->ResourceBarrier(2, br);
+        if (pickNew2 != pick)
+        {
+            D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(1, &b2);
+        }
         if (FAILED(list->Close())) LOGE("BFI Presenter: presenter draw list failed to record (Close) -- see BFIPresenter_debug.txt with Diagnostics=2");
 
         ID3D12CommandList *lists[] = { list };
@@ -4063,6 +4111,7 @@ static DWORD WINAPI PresenterThread(void *)
         queue->Signal(g_presFence, reserve);
         bufFence[bi] = reserve;
         bufFrame[bi] = pickId;
+        bufFrame2[bi] = pickId2;
         bufConst[bi] = c;
         bufValid[bi] = true;
         }
@@ -5613,7 +5662,7 @@ static HRESULT SubmitGameFrameLocked()
         EnterCriticalSection(&g_lock);
         for (UINT i = 0; i < kStage; i++)
         {
-            if ((int)i == g_presCurSlot) continue;
+            if ((int)i == g_presCurSlot || (int)i == g_presCurSlot2) continue;
             if (g_readFence[i] > pdone || g_stageFence[i] > gdone) continue;
             if (g_stageId[i] < bestId) { best = (int)i; bestId = g_stageId[i]; }
         }
@@ -7758,7 +7807,7 @@ static bool CreateStage11()
         g_stageFence[s] = g_stageId[s] = g_readFence[s] = 0;
         g_stageTime[s] = 0.0;
     }
-    g_presCurSlot = -1;
+    g_presCurSlot = -1; g_presCurSlot2 = -1;
     g_stageNext = 0;
     LOGI("BFI Presenter: DX11: presenting %ux%u, format %u, %u buffers (game: %ux%u, format %u, %u buffers)%s",
          g_desc.Width, g_desc.Height, (unsigned)g_desc.Format, g_bufCount, g_srcW ? g_srcW : g_desc.Width,
@@ -8377,7 +8426,7 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
         EnterCriticalSection(&g_lock);
         for (UINT i = 0; i < kStage; i++)
         {
-            if ((int)i == g_presCurSlot) continue;
+            if ((int)i == g_presCurSlot || (int)i == g_presCurSlot2) continue;
             if (g_readFence[i] > pdone || g_stageFence[i] > gdone) continue;
             if (g_stageId[i] < bestId) { best = (int)i; bestId = g_stageId[i]; }
         }

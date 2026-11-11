@@ -7,6 +7,10 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Unreleased]
+
+- **[DX] [Vulkan] Split comparison: the side without BFI shows every game frame.** It took one game frame per strobe cycle, like the BFI side, so at 120 fps on a 120 Hz display with 2 frames per cycle both sides showed the same 60 frames a second and the side without BFI was frame doubling, not what the game looks like without BFI. It now shows the newest frame at every refresh, as a display without BFI would: all 120 frames, against BFI's 60. At Half refresh nothing changes (both sides show the same 60).
+
 ## [1.0.37] — 2026-11-09 (Manager 1.3.17)
 
 **No more black screen while the presenter compiles its shaders at game start.**

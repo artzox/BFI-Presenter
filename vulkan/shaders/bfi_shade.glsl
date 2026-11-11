@@ -1,5 +1,8 @@
 // BFI per-pixel work, shared by bfi.frag (graphics queue) and bfi.comp (realtime compute queue).
 
+// Split comparison: the newest game frame, for the side without BFI (set 1).
+layout(set = 1, binding = 0) uniform sampler2D srcNew;
+
 // BFI highlight roll-off: hue-preserving shoulder toward the ceiling P.
 vec3 Rolloff(vec3 lin, float g, float P, float k)
 {
@@ -171,14 +174,17 @@ vec4 BfiShade(vec2 fc)
     {
         // Split comparison (idea: unrefined803, #111): one side shows every refresh at the light the strobe gives over
         // its cycle -- the mean of what each refresh emits, after roll-off and the ceiling -- so both sides match in
-        // brightness and differ only in motion clarity and flicker.
+        // brightness and differ only in motion clarity and flicker. It shows the newest game frame at every refresh, as a
+        // display without BFI would (120 fps at 120 Hz: a new frame each refresh), while the BFI side keeps one frame per
+        // strobe cycle.
         float t = pc.splitSeam > 0.0 ? smoothstep(pc.splitX - 0.5 * pc.splitSeam, pc.splitX + 0.5 * pc.splitSeam, fc.x)
                                      : step(pc.splitX, fc.x);
         float w = pc.splitMode == 1u ? 1.0 - t : t;
         if (w > 0.0)
         {
             vec3 a = vec3(0.0);
-            for (uint j = 0u; j < 8u; j++) if (j < pc.frames) a += Strobe(lin, j, litGain);
+            vec3 linNew = Decode(texelFetch(srcNew, ivec2(fc.xy), 0).rgb);
+            for (uint j = 0u; j < 8u; j++) if (j < pc.frames) a += Strobe(linNew, j, litGain);
             o = mix(o, a / float(pc.frames), w);
         }
     }
