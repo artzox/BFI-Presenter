@@ -93,7 +93,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t2"
+#define BFI_ADDON_VERSION "1.0.38-t3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -7421,12 +7421,78 @@ static void *GameDxgiImport(const char *fn)
     }
     return nullptr;
 }
+// OptiScaler in this game: its ini next to the game's exe, a module named OptiScaler, or a module whose version
+// information says OptiScaler (it usually loads as dxgi.dll, winmm.dll, version.dll ... next to the exe). Returns what
+// was found, or nullptr.
+static const char *OptiScalerFound(char *buf, size_t n)
+{
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return nullptr;
+    wchar_t dir[MAX_PATH];
+    wcscpy(dir, exe);
+    if (wchar_t *s = wcsrchr(dir, L'\\')) s[1] = 0;
+    wchar_t ini[MAX_PATH];
+    _snwprintf(ini, MAX_PATH, L"%sOptiScaler.ini", dir);
+    if (GetFileAttributesW(ini) != INVALID_FILE_ATTRIBUTES) { snprintf(buf, n, "OptiScaler.ini next to the game"); return buf; }
+    typedef DWORD (WINAPI *PFN_GFVIS)(LPCWSTR, LPDWORD);
+    typedef BOOL (WINAPI *PFN_GFVI)(LPCWSTR, DWORD, DWORD, LPVOID);
+    typedef BOOL (WINAPI *PFN_VQV)(LPCVOID, LPCWSTR, LPVOID *, PUINT);
+    HMODULE ver = LoadLibraryA("version.dll");
+    PFN_GFVIS gs = ver ? (PFN_GFVIS)(void *)GetProcAddress(ver, "GetFileVersionInfoSizeW") : nullptr;
+    PFN_GFVI  gi = ver ? (PFN_GFVI)(void *)GetProcAddress(ver, "GetFileVersionInfoW") : nullptr;
+    PFN_VQV   vq = ver ? (PFN_VQV)(void *)GetProcAddress(ver, "VerQueryValueW") : nullptr;
+    const char *found = nullptr;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap != INVALID_HANDLE_VALUE)
+    {
+        MODULEENTRY32W me = { sizeof(me) };
+        for (BOOL ok = Module32FirstW(snap, &me); ok && !found; ok = Module32NextW(snap, &me))
+        {
+            if (_wcsnicmp(me.szModule, L"optiscaler", 10) == 0) { snprintf(buf, n, "%ls loaded", me.szModule); found = buf; break; }
+            if (_wcsnicmp(me.szExePath, dir, wcslen(dir)) != 0 || !gs || !gi || !vq) continue;   // only modules next to the exe
+            DWORD h = 0, sz = gs(me.szExePath, &h);
+            if (!sz || sz > 1 << 20) continue;
+            std::vector<BYTE> vi(sz);
+            if (!gi(me.szExePath, 0, sz, vi.data())) continue;
+            struct LangCp { WORD lang, cp; } *tr = nullptr;
+            UINT tl = 0;
+            if (!vq(vi.data(), L"\\VarFileInfo\\Translation", (LPVOID *)&tr, &tl) || tl < sizeof(LangCp)) continue;
+            static const wchar_t *const keys[] = { L"ProductName", L"FileDescription", L"InternalName", L"OriginalFilename" };
+            for (const wchar_t *k : keys)
+            {
+                wchar_t q[96];
+                _snwprintf(q, 96, L"\\StringFileInfo\\%04x%04x\\%ls", tr->lang, tr->cp, k);
+                wchar_t *v = nullptr; UINT vl = 0;
+                if (vq(vi.data(), q, (LPVOID *)&v, &vl) && v && vl)
+                {
+                    std::wstring s(v);
+                    for (auto &c : s) c = (wchar_t)towlower(c);
+                    if (s.find(L"optiscaler") != std::wstring::npos) { snprintf(buf, n, "%ls (OptiScaler)", me.szModule); found = buf; break; }
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    return found;
+}
+
 static void InstallOuterFactoryHook()
 {
     static bool done = false;
     if (done) return;
     done = true;
-    if (!GetPrivateProfileIntA("BFI", "HookOuterSwapChain", 1, g_iniPath)) { LOGI("BFI Presenter: outer swap chain hook off (ini)"); return; }
+    // HookOuterSwapChain: 0 off; 1 (default) only with OptiScaler -- the hook is there for FSR frame generation through
+    // OptiScaler (1.0.26) and does nothing anywhere else, while hooking every DX game's swap chain creation could meet
+    // another add-on's hook on the same function (Elden Ring with ERSS-FG, #119; Avatar); 2 every game, as 1.0.26-1.0.37.
+    const int mode = (int)GetPrivateProfileIntA("BFI", "HookOuterSwapChain", 1, g_iniPath);
+    if (mode == 0) { LOGI("BFI Presenter: outer swap chain hook off (ini)"); return; }
+    if (mode == 1)
+    {
+        char why[160];
+        const char *opti = OptiScalerFound(why, sizeof(why));
+        if (!opti) { LOGI("BFI Presenter: outer swap chain hook not needed (no OptiScaler in this game; HookOuterSwapChain=2 forces it)"); return; }
+        LOGI("BFI Presenter: OptiScaler found (%s) -- outer swap chain hook for FSR frame generation", opti);
+    }
     typedef HRESULT (WINAPI *PFN_CF2)(UINT, REFIID, void **);
     typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void **);
     const char *from = "the game's import";

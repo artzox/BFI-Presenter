@@ -7,6 +7,10 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Unreleased]
+
+- **[DX] Fix: crash on start with other add-ons that hook swap chain creation** (Elden Ring with ERSS-FG, [#119](https://github.com/artzox/BFI-Presenter/issues/119); most likely Avatar: Frontiers of Pandora). Since 1.0.26 the DX add-on hooked the DXGI factory every game uses to create its swap chain, for FSR frame generation through OptiScaler. When another add-on hooked the same function after it and saved BFI Presenter's hook as its original, the two called each other until the stack ran out (3,993 nested calls in the trace). The hook is now installed only when OptiScaler is in the game (`HookOuterSwapChain=1`, the default; `2` installs it in every game as before, `0` turns it off), and where it is installed, DXGI's own function is read from dxgi.dll and called directly when such a loop shows up.
+
 ## [1.0.37] — 2026-11-09 (Manager 1.3.17)
 
 **No more black screen while the presenter compiles its shaders at game start.**
