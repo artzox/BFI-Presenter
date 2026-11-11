@@ -93,7 +93,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t1"
+#define BFI_ADDON_VERSION "1.0.38-t2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -861,6 +861,8 @@ BFI_TLS(int, t_ownCall);
 BFI_TLS(int, t_selfResize);         // inside the presenter's own resize of the game's swap chain (PresenterResize)
 BFI_TLS(int, t_inOuter);            // inside the game-facing (outer) swap chain's Present
 BFI_TLS(int, t_scCreateDepth);      // nested CreateSwapChain* calls through the factory hook (outermost = 1)
+BFI_TLS(void *, t_scLoopF);          // the factory and result pointer of the outermost call (hook ping-pong check)
+BFI_TLS(void *, t_scLoopOut);
 struct OwnCall { OwnCall() { t_ownCall++; } ~OwnCall() { t_ownCall--; } };
 static HRESULT OwnPresent();
 static std::atomic<bool>      g_needRebind{false};        // move presentation to g_presQueue on the first frame
@@ -7272,6 +7274,74 @@ static void OuterCheck(void *obj)
     LOGI("BFI Presenter: the game presents to FSR frame generation's swap chain (%s) -- its presents are counted there "
          "(FSR presents every frame from a thread of its own)", mod);
 }
+// A vtable slot's original function, read from the module file the vtable lives in (DXGI's own, in dxgi.dll): the value
+// in the file, relocated to where the module is loaded. Another add-on can sit on the same slot and re-hook it after us,
+// saving our hook as its "original" -- then its hook and ours call each other until the stack runs out (Elden Ring with
+// ERSS-FG, #119: 3993 nested calls; most likely Avatar too, which closed without a crash record). The real function
+// from the file breaks that loop. nullptr when the vtable isn't in a file on disk or the value doesn't check out.
+static std::atomic<bool> g_scLoopLogged{false};
+static void *PristineVtableSlot(void **vtbl, int idx)
+{
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)vtbl, &m) || !m)
+        return nullptr;
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(m, path, MAX_PATH)) return nullptr;
+    BYTE *base = (BYTE *)m;
+    auto *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    const ULONGLONG prefBase = nt->OptionalHeader.ImageBase;
+    const DWORD rva = (DWORD)((BYTE *)&vtbl[idx] - base);
+    // the file offset of that RVA
+    auto *sec = IMAGE_FIRST_SECTION(nt);
+    DWORD off = 0;
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+        if (rva >= sec->VirtualAddress && rva + sizeof(void *) <= sec->VirtualAddress + sec->SizeOfRawData)
+        { off = rva - sec->VirtualAddress + sec->PointerToRawData; break; }
+    if (!off) return nullptr;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return nullptr;
+    ULONGLONG raw = 0;
+    DWORD got = 0;
+    LARGE_INTEGER pos; pos.QuadPart = off;
+    const bool ok = SetFilePointerEx(f, pos, nullptr, FILE_BEGIN) && ReadFile(f, &raw, sizeof(void *), &got, nullptr) && got == sizeof(void *);
+    CloseHandle(f);
+    if (!ok || !raw) return nullptr;
+    BYTE *fn = (BYTE *)(uintptr_t)(raw - prefBase + (ULONGLONG)(uintptr_t)base);
+    // must point into that module's executable code
+    sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+        if ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) && fn >= base + sec->VirtualAddress && fn < base + sec->VirtualAddress + sec->Misc.VirtualSize)
+            return fn;
+    return nullptr;
+}
+static void *g_pristineSC = nullptr, *g_pristineSCHwnd = nullptr, *g_pristineSCCore = nullptr;
+static void **g_scFactoryVt = nullptr;   // the factory vtable the hooks sit on
+// Another add-on re-hooked the slot over ours with ours as its original, while ours still has its hook as the original:
+// each would call the other. Then ours goes straight to DXGI's own function (it is called by that add-on's hook, which
+// has done its part already).
+static bool ScPingPong(int idx, void *hook, void *orig)
+{
+    if (!g_scFactoryVt) return false;
+    void *cur = g_scFactoryVt[idx];
+    if (cur == hook || cur != orig) return false;
+    if (!g_scLoopLogged.exchange(true))
+        LOGW("BFI Presenter: another add-on hooked swap chain creation on top of BFI Presenter with BFI Presenter's hook as "
+             "its original -- going to DXGI's own function from there, so the two don't call each other in a loop");
+    return true;
+}
+
+// The hook was entered again for the same factory and result pointer inside its own call: another add-on's hook on the
+// same slot has ours as its "original". Go to DXGI's real function instead of round again.
+static bool ScLoop(void *f, void *out)
+{
+    if (t_scCreateDepth < 1 || f != t_scLoopF || out != t_scLoopOut) return false;
+    if (!g_scLoopLogged.exchange(true))
+        LOGW("BFI Presenter: another add-on's hook on swap chain creation calls ours back (each saved the other as the "
+             "original) -- calling DXGI's own function to break the loop");
+    Trace("hook loop at depth %d: calling DXGI's own function", (int)t_scCreateDepth);
+    return true;
+}
+
 typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSC)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSCHwnd)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *,
                                                         const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
@@ -7284,6 +7354,9 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSC(IDXGIFactory *f, IUnknown *dev, DX
 {
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
+    if (g_pristineSC && (ScPingPong(10, (void *)&hk_FCreateSC, (void *)o_FCreateSC) || ScLoop((void *)f, (void *)out)))
+        return ((decltype(o_FCreateSC))g_pristineSC)(f, dev, d, out);
+    if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
     Trace("FCreateSC: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSC);
     const HRESULT hr = o_FCreateSC(f, dev, d, out);
@@ -7297,6 +7370,9 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSCHwnd(IDXGIFactory2 *f, IUnknown *de
 {
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
+    if (g_pristineSCHwnd && (ScPingPong(15, (void *)&hk_FCreateSCHwnd, (void *)o_FCreateSCHwnd) || ScLoop((void *)f, (void *)out)))
+        return ((decltype(o_FCreateSCHwnd))g_pristineSCHwnd)(f, dev, w, d, fs, o, out);
+    if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
     Trace("FCreateSCHwnd: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSCHwnd);
     const HRESULT hr = o_FCreateSCHwnd(f, dev, w, d, fs, o, out);
@@ -7310,6 +7386,9 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSCCore(IDXGIFactory2 *f, IUnknown *de
 {
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
+    if (g_pristineSCCore && (ScPingPong(16, (void *)&hk_FCreateSCCore, (void *)o_FCreateSCCore) || ScLoop((void *)f, (void *)out)))
+        return ((decltype(o_FCreateSCCore))g_pristineSCCore)(f, dev, win, d, o, out);
+    if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
     Trace("FCreateSCCore: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSCCore);
     const HRESULT hr = o_FCreateSCCore(f, dev, win, d, o, out);
@@ -7369,6 +7448,13 @@ static void InstallOuterFactoryHook()
     void **vt = *(void ***)f;
     char mod[64];
     ModuleOf(vt[15], mod, sizeof(mod));
+    // DXGI's own functions for these slots, from dxgi.dll's file (see PristineVtableSlot), before anything is patched.
+    g_pristineSC = PristineVtableSlot(vt, 10);
+    g_pristineSCHwnd = PristineVtableSlot(vt, 15);
+    g_pristineSCCore = PristineVtableSlot(vt, 16);
+    Trace("outer hook: DXGI's own functions %p %p %p (slots now %p %p %p)", g_pristineSC, g_pristineSCHwnd, g_pristineSCCore,
+          vt[10], vt[15], vt[16]);
+    g_scFactoryVt = vt;
     PatchSlot(vt, 10, (void *)&hk_FCreateSC,     (void **)&o_FCreateSC);
     Trace("outer hook: factory %p vtable %p, CreateSwapChainForHwnd %p", (void *)f, (void *)vt, vt[15]);
     PatchSlot(vt, 15, (void *)&hk_FCreateSCHwnd, (void **)&o_FCreateSCHwnd);
