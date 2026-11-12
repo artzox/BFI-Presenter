@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t14"
+#define BFI_ADDON_VERSION "1.0.38-t13"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -7460,80 +7460,17 @@ static PFN_FCreateSCCore o_FCreateSCCore = nullptr;
 // present thread, which waits on the game's call: all three stopped. The presenter holds its presents while such a
 // call runs (from before it reaches the wrappers below), so the old swap chain is idle; the game presents again as soon
 // as it returns, and the old swap chain's release stops the presenter as usual.
-// Hand-over (Onimusha with OptiScaler and Streamline's DLSS frame generation): the game creates a new swap chain for
-// its window while the old one is still alive -- Streamline rebuilding its frame generation on the same real swap
-// chain when it is switched on or off. Holding the presenter's presents was enough for switching it off, but switching
-// it on still stopped: Streamline's call waited for DLSS-G's present thread, which waited on a lock the game's call held.
-// Without the presenter there was no stop, so for that call the real swap chain goes back to how it is when a game
-// starts: the presenter stopped, presentation back on the game's queue, the game's frames copied to it and shown without
-// BFI (the pass-through every game starts with), and BFI again at the game's next resize, as at the start (or after a
-// resolution or display mode change). The stand-ins the game renders into are kept. Only with Streamline's frame
-// generation in the game, only for the window the presenter shows on, and only from the outer swap chain hook (on
-// when OptiScaler is found).
-static bool StreamlineFgLoaded()
-{
-    return GetModuleHandleA("sl.dlss_g.dll") != nullptr || GetModuleHandleA("nvngx_dlssg.dll") != nullptr;
-}
-static bool HandBackToGame(HWND w)
-{
-    if (!w || w != g_watchHwnd.load() || !g_active.load() || g_dx11.load() || !g_ownPresentQueue || !g_gameQueue || !g_sc)
-        return false;
-    if (!StreamlineFgLoaded()) return false;
-    // The game's presents are serialised by g_submitLock; another thread (DLSS-G's) may hold it and be waiting itself,
-    // so only a short try -- otherwise the presents are held instead (PresentHold).
-    bool locked = false;
-    for (int i = 0; i < 100 && !(locked = TryEnterCriticalSection(&g_submitLock) != 0); i++) Sleep(2);
-    if (!locked) { LOGW("BFI Presenter: hand-over to the game's queue skipped -- another thread is presenting"); return false; }
-    bool ok = false;
-    if (StopPresenter())
-    {
-        DXGI_SWAP_CHAIN_DESC1 d = {};
-        { OwnCall own; o_GetDesc1(g_sc, &d); }
-        UINT count = d.BufferCount;
-        if (count == 0 || count > kMaxBuf) count = g_virtCount ? g_virtCount : 2;
-        UINT masks[kMaxBuf];
-        IUnknown *queues[kMaxBuf];
-        for (UINT i = 0; i < count; i++) { masks[i] = 1; queues[i] = g_gameQueue; }
-        HRESULT hr;
-        {
-            OwnCall own;
-            PrepareDirectCalls();
-            hr = g_directResize1 ? g_directResize1(g_sc, count, d.Width, d.Height, d.Format, d.Flags, masks, queues) : E_FAIL;
-            if (FAILED(hr)) hr = o_ResizeBuffers1(g_sc, count, d.Width, d.Height, d.Format, d.Flags, masks, queues);
-        }
-        if (SUCCEEDED(hr))
-        {
-            g_ownPresentQueue = false;
-            g_needRebind.store(true);
-            g_deferPresenter.store(true);
-            g_deferSinceT.store(Now());
-            g_sleepLimitUs.store(0);                 // no frame limit while the game shows its own frames
-#ifdef _WIN64
-            g_rfxWantLimitUs.store(0);
-#endif
-            RefreshRealDesc();
-            Hdr12ApplyColorSpace(g_sc, g_hdrUp.load());
-            ok = true;
-        }
-        LOGI("BFI Presenter: the game creates a new swap chain for its window (Streamline frame generation) -- presentation "
-             "handed back to the game's queue (%u buffers): 0x%08lX; BFI again at the game's next resize", count, (unsigned long)hr);
-    }
-    else LOGW("BFI Presenter: hand-over to the game's queue skipped -- the presenter didn't stop");
-    LeaveCriticalSection(&g_submitLock);
-    return ok;
-}
-
 struct PresentHold
 {
     bool on = false;
     PresentHold(HWND w)
     {
-        if (!w || !g_active.load() || w != g_watchHwnd.load()) return;   // (the presenter may start again inside the call)
+        if (!w || !g_active.load() || !g_running.load() || w != g_watchHwnd.load()) return;
         on = true;
         g_holdPresents.fetch_add(1);
         const double t0 = Now();
         while (g_presStage.load() == ST_PRESENT && Now() - t0 < 0.1) Sleep(1);   // a Present under way finishes first
-        if (g_running.load()) LOGI("BFI Presenter: the game creates a new swap chain for its window -- presents held until it returns");
+        LOGI("BFI Presenter: the game creates a new swap chain for its window -- presents held until it returns");
     }
     ~PresentHold() { if (on) g_holdPresents.fetch_sub(1); }
 };
@@ -7547,9 +7484,7 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSC(IDXGIFactory *f, IUnknown *dev, DX
     if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
     Trace("FCreateSC: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSC);
-    const HWND hw = t_scCreateDepth == 1 && !t_ownCall && d ? d->OutputWindow : nullptr;
-    HandBackToGame(hw);
-    PresentHold hold(hw);
+    PresentHold hold(t_scCreateDepth == 1 && !t_ownCall && d ? d->OutputWindow : nullptr);
     const HRESULT hr = o_FCreateSC(f, dev, d, out);
     const int depth = t_scCreateDepth--;
     Trace("FCreateSC: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
@@ -7566,9 +7501,7 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSCHwnd(IDXGIFactory2 *f, IUnknown *de
     if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
     Trace("FCreateSCHwnd: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSCHwnd);
-    const HWND hw = t_scCreateDepth == 1 && !t_ownCall ? w : nullptr;
-    HandBackToGame(hw);
-    PresentHold hold(hw);
+    PresentHold hold(t_scCreateDepth == 1 && !t_ownCall ? w : nullptr);
     const HRESULT hr = o_FCreateSCHwnd(f, dev, w, d, fs, o, out);
     const int depth = t_scCreateDepth--;
     Trace("FCreateSCHwnd: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
