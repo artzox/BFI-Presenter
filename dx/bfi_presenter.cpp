@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t15-phase1"
+#define BFI_ADDON_VERSION "1.0.38-t15-phase2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -5316,15 +5316,18 @@ static DWORD WINAPI PresenterThread(void *)
                     // repeated soon after -- 3 ms back and 2 ms more to spare. Without frame generation, at most every 10 s.
                     {
                         static int drvSecs = 0;
-                        static double drvT = -1e9, drvTarget = 0.005;
+                        static double drvT = -1e9, drvTarget = 0.006;
                         const bool nudging = t < phaseUntil;
+                        // the earlier nudge moves the frames ~9 ms itself: no move of this one for 10 s after it, and no
+                        // "3 ms back" on top of it (Onimusha, phase1: both fired for the same repeats)
+                        const bool nudgedLately = t - (phaseNextT - 4.0) < 10.0;
                         const double drvFps = baseLimitUs > 0 ? 1e6 / baseLimitUs : 0.0;
                         const bool drvOn = s.reflexAlignDriver && !s.reflexAlign && baseLimitUs > 0 && rsLast.limitUs > 0 &&
                                            !g_sleepActive.load() && !fgOn && !stNow.fgActive && s.pacingMode == 1;
                         const bool drvHolds = drvFps > 0.0 && stNow.gameFps > 0.95 * drvFps && stNow.gameFps < 1.05 * drvFps;
                         if (drvOn && drvHolds && !nudging && t >= drvShiftUntil && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * drvFps))
                         {
-                            if (t - drvT < 10.0 && stNow.frameRepeats >= 2 && p10 < 0.002)
+                            if (t - drvT < 10.0 && stNow.frameRepeats >= 2 && p10 < 0.002 && !nudgedLately)
                             {
                                 drvShiftUs = -(int)(0.003 * baseLimitUs + 0.5); drvShiftUntil = t + 1.5;
                                 alignShiftTot -= 0.003;
@@ -5336,9 +5339,11 @@ static DWORD WINAPI PresenterThread(void *)
                             else
                             {
                                 drvSecs = (p10 > drvTarget + 0.003 && stNow.frameRepeats == 0) ? drvSecs + 1 : 0;
-                                if (drvSecs >= 3 && t - drvT >= 10.0)
+                                if (drvSecs >= 3 && t - drvT >= 10.0 && !nudgedLately)
                                 {
-                                    const double step = std::min(p10 - drvTarget, 0.9 * cyc);
+                                    // half the excess, at most 4 ms: the frames' readiness drifts by several ms on its own
+                                    // (Onimusha, phase1: a full step to 5 ms ended at the pick within 3 s, twice out of four)
+                                    const double step = std::min(std::min(0.5 * (p10 - drvTarget), 0.004), 0.9 * cyc);
                                     drvShiftUs = (int)(step * baseLimitUs + 0.5);      // step spread over one second of frames
                                     drvShiftUntil = t + 1.5;                           // applied at the next tick only
                                     alignShiftTot += step;
