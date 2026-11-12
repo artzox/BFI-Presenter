@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t15"
+#define BFI_ADDON_VERSION "1.0.38-t15-phase1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -144,6 +144,7 @@ struct Settings
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   reflexAlign = 0;    // Reflex frame limit at the sleep point lined up with the lit refresh's pick (test)
     int   reflexAlignCoarse = 1; // ReflexAlignCoarse: frames ready far ahead of the pick are moved closer once (ReflexAlign off)
+    int   reflexAlignDriver = 1; // ReflexAlignDriver: the same with the driver's Reflex frame limit (test)
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
     int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
@@ -315,6 +316,7 @@ static void LoadSettings(Settings &s)
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
     s.reflexAlign = IniInt("ReflexAlign", 0) ? 1 : 0;
     s.reflexAlignCoarse = IniInt("ReflexAlignCoarse", 1) ? 1 : 0;
+    s.reflexAlignDriver = IniInt("ReflexAlignDriver", 1) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
@@ -513,6 +515,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("CapWithReflex", s.capReflex);
     IniWriteInt("ReflexAlign", s.reflexAlign);
     IniWriteInt("ReflexAlignCoarse", s.reflexAlignCoarse);
+    IniWriteInt("ReflexAlignDriver", s.reflexAlignDriver);
     IniWriteInt("FrameGenLimitWithoutReflex", s.fgLimitNoReflex);
     IniWriteInt("AutoCapAtFrameStart", s.autoCapFrameStart);
     IniWriteInt("LearnPerGame", s.learnPerGame);
@@ -3560,6 +3563,8 @@ static DWORD WINAPI PresenterThread(void *)
     int    alignCleanSecs = 0, alignExcessSecs = 0;
     double alignLogSlack = -1.0, alignPrevP10 = -1.0, alignLastStep = 0.0;
     double phaseUntil = 0.0, phaseNextT = 0.0;   // Reflex limit phase nudge (see the per-second block)
+    double drvShiftUntil = 0.0;                   // driver limit moved for one second (ReflexAlignDriver)
+    int    drvShiftUs = 0;
     int    phaseNudges = 0;     // last second's presents (goes with the rendered count taken then)
     ReflexSecond rsLast;           // last second's Reflex reports (frames == 0: the game doesn't use Reflex)
     double rsEverT = -1.0;         // last time this swap chain had Reflex reports
@@ -5016,7 +5021,9 @@ static DWORD WINAPI PresenterThread(void *)
                         LOGI("BFI Presenter: Reflex frame limit: game frames arrive at the lit refresh's pick (%d repeated, %d skipped "
                              "last second) -- moving them earlier", stNow.frameRepeats, stNow.frameSkips);
                 }
+                const int baseLimitUs = limitUs;          // before the phase moves below
                 if (limitUs > 0 && t < phaseUntil) limitUs -= 150;
+                else if (limitUs > 0 && t < drvShiftUntil) limitUs += drvShiftUs;
                 // ReflexAlign (test): the limiter paces the game on its own clock, so a game frame is ready
                 // anywhere up to a whole cap interval before the presenter picks it for the lit refresh -- time
                 // it only waits. Line the wake-up up so frames are ready just before the pick: each second the
@@ -5298,6 +5305,50 @@ static DWORD WINAPI PresenterThread(void *)
                             }
                         }
                         else coarseSecs = 0;
+                    }
+                    // The same with the driver's Reflex frame limit (ReflexAlignDriver, test), where the game's sleep isn't
+                    // paced by the presenter -- e.g. OptiScaler makes two sleep calls per frame (Onimusha), so the limit
+                    // goes to the driver and the frames land wherever its clock puts them: 10-14 ms before the pick for
+                    // a minute, against 1-5 ms in other stretches. The driver's limit can't be shifted, only lengthened:
+                    // for one second it is made longer by step / frames-per-second each frame, which moves the frames
+                    // later by about the step (the nudge above does the same the other way: 0.15 ms shorter, ~9 ms
+                    // earlier). Same rule as the coarse one: 3 s in a row above 8 ms, to 5 ms before the pick; frames
+                    // repeated soon after -- 3 ms back and 2 ms more to spare. Without frame generation, at most every 10 s.
+                    {
+                        static int drvSecs = 0;
+                        static double drvT = -1e9, drvTarget = 0.005;
+                        const bool nudging = t < phaseUntil;
+                        const double drvFps = baseLimitUs > 0 ? 1e6 / baseLimitUs : 0.0;
+                        const bool drvOn = s.reflexAlignDriver && !s.reflexAlign && baseLimitUs > 0 && rsLast.limitUs > 0 &&
+                                           !g_sleepActive.load() && !fgOn && !stNow.fgActive && s.pacingMode == 1;
+                        const bool drvHolds = drvFps > 0.0 && stNow.gameFps > 0.95 * drvFps && stNow.gameFps < 1.05 * drvFps;
+                        if (drvOn && drvHolds && !nudging && t >= drvShiftUntil && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * drvFps))
+                        {
+                            if (t - drvT < 10.0 && stNow.frameRepeats >= 2 && p10 < 0.002)
+                            {
+                                drvShiftUs = -(int)(0.003 * baseLimitUs + 0.5); drvShiftUntil = t + 1.5;
+                                alignShiftTot -= 0.003;
+                                drvTarget = std::min(0.008, drvTarget + 0.002);
+                                drvT = -1e9; drvSecs = 0;
+                                LOGI("BFI Presenter: Reflex frame limit (driver): frames repeated after moving them later -- 3 ms back, "
+                                     "%.0f ms to spare from now on", drvTarget * 1000.0);
+                            }
+                            else
+                            {
+                                drvSecs = (p10 > drvTarget + 0.003 && stNow.frameRepeats == 0) ? drvSecs + 1 : 0;
+                                if (drvSecs >= 3 && t - drvT >= 10.0)
+                                {
+                                    const double step = std::min(p10 - drvTarget, 0.9 * cyc);
+                                    drvShiftUs = (int)(step * baseLimitUs + 0.5);      // step spread over one second of frames
+                                    drvShiftUntil = t + 1.5;                           // applied at the next tick only
+                                    alignShiftTot += step;
+                                    drvT = t; drvSecs = 0;
+                                    LOGI("BFI Presenter: Reflex frame limit (driver): game frames ready %.1f ms before the lit refresh's "
+                                         "pick -- moving them %.1f ms later (limit +%d us for one second)", p10 * 1000.0, step * 1000.0, drvShiftUs);
+                                }
+                            }
+                        }
+                        else if (!drvOn || !drvHolds) drvSecs = 0;
                     }
                     EnterCriticalSection(&g_cfgLock);
                     g_status.alignSlackMs = p10 >= 0.0 ? p10 * 1000.0 : -1.0;
