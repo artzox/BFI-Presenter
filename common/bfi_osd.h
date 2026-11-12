@@ -129,9 +129,11 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
         for (int i = 0; i < kHist; i++) { v[i] = g_ms[(h + i) % kHist]; mx = v[i] > mx ? v[i] : mx; }
         const float tgtMs = target > 0.0 ? (float)(1000.0 / target) : 16.7f;
         const float top = mx > 2.0f * tgtMs ? mx : 2.0f * tgtMs;
-        char ov[48];
-        snprintf(ov, sizeof(ov), "frame time (max %.1f ms)", mx);
-        ImGui::PlotLines("##bfiosdft", v, kHist, 0, ov, 0.0f, top, ImVec2(260.0f * scale, 48.0f * scale));
+        ImGui::TextDisabled("frame time, last %d frames (max %.1f ms)", kHist, mx);
+        // the panel's full width (it is sized by the text lines), so the graph and its label aren't cut off
+        float w = ImGui::GetContentRegionAvail().x;
+        if (w < 200.0f * scale) w = 200.0f * scale;
+        ImGui::PlotLines("##bfiosdft", v, kHist, 0, nullptr, 0.0f, top, ImVec2(w, 48.0f * scale));
     }
     if (loads)
     {
