@@ -32,6 +32,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Riven (2023) | Working | Works (OptiScaler XeSS FG; Refresh + the presenter's frame limit since v1.0.25) | v0.13 | A steady 60 fps for smooth motion; with DLSS 5 at 4K, XeSS frame generation through OptiScaler (see the notes below) |
 | Onimusha | Working | Works (2×, 3×); with DLSS 5 (ShortFuse's injector or OptiScaler NR) and 2×: Refresh + automatic frame cap, 60 of 60 (v1.0.19) | v0.27 | Resize the game's swap chain to start BFI (`PresenterResize=2`, set by the Manager); without frame generation it holds 60 real fps and responds best (see the notes) |
 | 007 First Light | Working | Works (2×, 3×) | v1.0.37 | Standard setup |
+| Silent Hill: Townfall | Working | XeSS frame generation 2× through OptiScaler (the game has none): 60 shown / 30 rendered, Refresh + automatic frame cap | v1.0.37 | ReShade as `dxgi.dll`, OptiScaler as `d3d12.dll` with `LoadReShade = false` (see the notes) |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
 | Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency (Refresh + automatic frame cap also works) |
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
@@ -217,6 +218,12 @@ Also tested and working with the standard setup above. Their notes weren't recor
   - `ReflexAlign=1` cut about 4 ms (34.7 against 38.8 ms from release to flash) at the cost of a few more repeated frames; `ReflexAlign=0` (the coarse alignment) is the smoother of the two.
   - Delete `OptiScaler.ini` from the game folder too when OptiScaler is removed: the presenter takes it as OptiScaler being there.
 - **With OptiScaler and REFramework, switching DLSS frame generation in the game's menu can freeze the game** after a few switches, also without BFI Presenter (a lock between REFramework, OptiScaler and Streamline). Set frame generation before starting the game. Since v1.0.38 the presenter no longer makes the first switch freeze.
+
+### Silent Hill: Townfall
+
+- The game has no frame generation; XeSS frame generation (XeFG) with XeLL through OptiScaler works: 60 shown / 30 rendered a second at the Refresh rate cap with the automatic frame cap (v1.0.37).
+- **Load ReShade itself, not through OptiScaler:** ReShade as `dxgi.dll`, OptiScaler as `d3d12.dll`, `LoadReShade = false` in `OptiScaler.ini`. With OptiScaler loading `ReShade64.dll`, XeFG created the real swap chain on a GPU queue ReShade hadn't wrapped (ReShade.log: "Skipping swap chain because it was created without a proxy Direct3D device"), so neither ReShade's effects nor BFI ran.
+- SCSKiller's recorder also puts a `d3d12.dll` in the game folder: leave its recorder off for this game, or load OptiScaler under another of its names.
 
 ### Resonance: A Plague Tale
 
