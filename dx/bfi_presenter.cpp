@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t15-phase2"
+#define BFI_ADDON_VERSION "1.0.38-t15-phase3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -332,7 +332,8 @@ static void LoadSettings(Settings &s)
     s.fitWindow = IniInt("ScaleToWindow", 1) ? 1 : 0;
     s.flashHints = IniInt("FlashHints", 1) ? 1 : 0;
     s.waitResizeAll = IniInt("StartBFIAfterGameResize", 1) ? 1 : 0;
-    s.selfResize = IniInt("PresenterResize", 0) ? 1 : 0;
+    s.selfResize = IniInt("PresenterResize", 0);
+    if (s.selfResize < 0 || s.selfResize > 2) s.selfResize = 1;
     s.bypassResizeHooks = IniInt("BypassOverlayResizeHooks", 1) ? 1 : 0;
     s.showOverlays = IniInt("ShowOverlays", 0) ? 1 : 0;
     s.reportTyped = IniInt("TypedBackBufferDesc", 1) ? 1 : 0;
@@ -2825,13 +2826,16 @@ static void SelfResizeTick(double t)
     if (stage == 0 && t - g_deferSinceT.load() < 0.6) steadySince = 0.0;       // a new swap chain
     if (!g_active.load() || g_dx11.load() || !g_deferPresenter.load() || g_ownPresentQueue) { g_selfResizeWanted.store(false); return; }
     EnterCriticalSection(&g_cfgLock);
-    const bool on = g_shared.selfResize != 0;
+    const int mode = g_shared.selfResize;
     LeaveCriticalSection(&g_cfgLock);
+    const bool on = mode != 0;
     if (!on || stage >= 2) return;
     // Only the game's first swap chain. A swap chain the game recreated (God of War Ragnarok when frame generation is
     // turned on: 6 buffers, Streamline's frame generation presenting from its own thread) went black after the
     // presenter's resize; there BFI waits for the game's resize as before (change resolution or display mode once).
-    if (g_swapChainsManaged > 1)
+    // PresenterResize=2 (test): also a recreated swap chain -- Onimusha recreates its swap chain at 4K once after
+    // starting and never resizes it (no frame generation there).
+    if (g_swapChainsManaged > 1 && mode < 2)
     {
         if (stage == 0)
         {
