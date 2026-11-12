@@ -131,7 +131,12 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
         const float top = mx > 2.0f * tgtMs ? mx : 2.0f * tgtMs;
         ImGui::TextDisabled("frame time, last %d frames (max %.1f ms)", kHist, mx);
         // the panel's full width (it is sized by the text lines), so the graph and its label aren't cut off
-        float w = ImGui::GetContentRegionAvail().x;
+        // (GetContentRegionAvail returns ImVec2: ReShade is built with MSVC, which returns it through a hidden
+        // pointer, so it is called that way -- a plain call from MinGW writes through a null pointer)
+        typedef ImVec2 *(*AvailMsvc)(ImVec2 *);
+        ImVec2 av(0.0f, 0.0f);
+        reinterpret_cast<AvailMsvc>(imgui_function_table_instance()->GetContentRegionAvail)(&av);
+        float w = av.x;
         if (w < 200.0f * scale) w = 200.0f * scale;
         ImGui::PlotLines("##bfiosdft", v, kHist, 0, nullptr, 0.0f, top, ImVec2(w, 48.0f * scale));
     }
