@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t5"
+#define BFI_ADDON_VERSION "1.0.38-t6"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -10284,8 +10284,23 @@ static void KofiButton()
 }
 
 // The in-game OSD (common/bfi_osd.h), every frame through ReShade's overlay event.
-static void on_osd(reshade::api::effect_runtime *)
+static void on_osd(reshade::api::effect_runtime *rt)
 {
+    // One runtime only. ReShade draws its overlay for every swap chain it wraps, and with FSR frame generation (Callisto
+    // Protocol through OptiScaler) that is two -- the game's, presented on the game's thread, and the real one, presented
+    // on FSR's thread -- at the same time, while ImGui's context is shared: drawing on both crashed the game. The swap
+    // chain the presenter manages when there is one, otherwise the first runtime that draws (another takes over after
+    // it has been quiet for a second).
+    {
+        static std::atomic<void *> s_rt{nullptr};
+        static std::atomic<double> s_rtT{0.0};
+        void *nat = reinterpret_cast<void *>(rt->get_native());
+        const bool managed = (g_sc && nat == (void *)g_sc) || (g_sc11 && nat == (void *)g_sc11);
+        const bool anyManaged = g_sc != nullptr || g_sc11 != nullptr;
+        const double now = Now();
+        if (anyManaged ? !managed : (s_rt.load() && s_rt.load() != (void *)rt && now - s_rtT.load() < 1.0)) return;
+        s_rt.store((void *)rt); s_rtT.store(now);
+    }
     EnterCriticalSection(&g_cfgLock);
     const bool on = g_shared.osd != 0;
     const int corner = g_shared.osdCorner, graph = g_shared.osdGraph, loads = g_shared.osdLoads;

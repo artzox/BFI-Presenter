@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.38-t5"
+#define BFI_VERSION "1.0.38-t6"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -5786,8 +5786,17 @@ static bool RelimiterLoaded()
 }
 
 // The in-game OSD (common/bfi_osd.h), every frame through ReShade's overlay event.
-static void on_osd(reshade::api::effect_runtime *)
+static void on_osd(reshade::api::effect_runtime *rt)
 {
+    // One runtime only (ImGui's context is shared between ReShade's runtimes; see the DX add-on): the first that draws,
+    // another after it has been quiet for a second.
+    {
+        static std::atomic<void *> s_rt{nullptr};
+        static std::atomic<double> s_rtT{0.0};
+        const double now = Now();
+        if (s_rt.load() && s_rt.load() != (void *)rt && now - s_rtT.load() < 1.0) return;
+        s_rt.store((void *)rt); s_rtT.store(now);
+    }
     OsdData d;
     bool on; int corner, graph, loads; float scale;
     {
