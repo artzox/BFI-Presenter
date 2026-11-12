@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t11"
+#define BFI_ADDON_VERSION "1.0.38-t12"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -7670,6 +7670,13 @@ static void ReleaseAll()
         return;
     }
     g_active.store(false);
+    // The frame limits are set by the presenter thread once a second; with it stopped they must not stay on, or a
+    // recreated swap chain's pass-through (no BFI until the game resizes it) ran at the old cap (Onimusha: 30 fps,
+    // the 2x frame generation limit, after the game recreated its swap chain).
+    if (g_sleepLimitUs.exchange(0) > 0) LOGI("BFI Presenter: frame limit at the game's Reflex sleep off (presenter stopped)");
+#ifdef _WIN64
+    g_rfxWantLimitUs.store(0);
+#endif
     ReleaseFrameResources();
     for (UINT s = 0; s < kStage; s++) SafeRelease(g_copyAlloc[s]);
     SafeRelease(g_copyList);
