@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.38-t7"
+#define BFI_VERSION "1.0.38-t8"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -385,7 +385,7 @@ static void LoadSettings(Settings &s)
     s.rollSeam = Clamp(KvFloat(kv, "RollingSeam", 0.0f), 0.0f, 0.5f);
     s.rollDecay = Clamp(KvFloat(kv, "RollingPhosphorDecay", 0.2f), 0.0f, 1.0f);
     s.knee     = KvFloat(kv, "RolloffKnee", 0.75f);
-    s.peakNits = Clamp(KvFloat(kv, "DisplayPeakNits", 1400.0f), 80.0f, 10000.0f);
+    s.peakNits = Clamp(KvFloat(kv, "DisplayPeakNits", 1400.0f), 50.0f, 10000.0f);
     s.gameCap  = KvInt(kv, "CapGameToRefresh", 1);
     if (s.gameCap < 0 || s.gameCap > 5) s.gameCap = 1;
     s.capDivisor = Clamp(KvInt(kv, "CapDivisor", 3), 1, 8);
@@ -405,7 +405,7 @@ static void LoadSettings(Settings &s)
     s.vkExclusive = KvInt(kv, "VulkanExclusiveFullscreen", 1) ? 1 : 0;
     s.vkAutoRecover = KvInt(kv, "VulkanAutoRecover", 1) ? 1 : 0;
     s.ablGuard = KvInt(kv, "AblGuard", 1) ? 1 : 0;
-    s.ablBudget = Clamp(KvInt(kv, "AblGuardBudgetNits", 250), 100, 1500);
+    s.ablBudget = Clamp(KvInt(kv, "AblGuardBudgetNits", 250), 50, 1500);
     {
         auto it = kv.find("ablcurve");
         snprintf(s.ablCurve, sizeof(s.ablCurve), "%s", it == kv.end() ? "" : it->second.c_str());
@@ -2423,7 +2423,7 @@ static void PresenterThread(Swapchain *sc)
             if (loadAt(peak) <= 1.0) ablSolve = peak;
             else
             {
-                double lo = 100.0, hi = peak;
+                double lo = 50.0, hi = peak;
                 for (int it = 0; it < 24; it++)
                 {
                     const double mid = 0.5 * (lo + hi);
@@ -6051,15 +6051,31 @@ static void draw_overlay(reshade::api::effect_runtime *)
     {
         int out = s.output + 1;
         if (ImGui::Combo("Output", &out, kOutputNames)) s.output = out - 1;
-        ImGui::SliderFloat("Display peak (nits)", &s.peakNits, 100.0f, 4000.0f, "%.0f");
+        ImGui::SliderFloat("Display peak (nits)", &s.peakNits, 50.0f, 4000.0f, "%.0f");
+        if (s.peakNits < 100.0f)
+        {
+            // below 100 only on purpose: say what it does, in red
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.3f, 1.0f));
+            ImGui::TextWrapped("Below 100 nits: the lit refresh can't reach SDR white (80 nits or more), so the picture is darker "
+                               "than with BFI off and highlights are flattened to this ceiling. Only for a dim display or a "
+                               "deliberately dim picture.");
+            ImGui::PopStyleColor();
+        }
         bool ag = s.ablGuard != 0;
         if (ImGui::Checkbox("ABL guard (keep bright scenes within the panel's budget)", &ag)) s.ablGuard = ag ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("OLED panels dim the picture when a refresh puts out too much light overall (area x brightness).\nWith BFI the lit refresh carries the boost, so bright skies and white screens can trigger it.\nThe lit-refresh ceiling is lowered just enough to stay within the budget. HDR only.");
         if (s.ablGuard)
         {
             ImGui::Indent(16.0f);
-            ImGui::SliderInt("Panel budget (average nits of a lit refresh)", &s.ablBudget, 100, 1500);
+            ImGui::SliderInt("Panel budget (average nits of a lit refresh)", &s.ablBudget, 50, 1500);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Your panel's full-screen (100%% window) white brightness. Bright areas are held to what the\npanel sustains at their size: from Peak brightness at 10%% of the screen down to this budget at\n100%% (AblCurve in the ini takes your panel's measured curve). The ceiling is lowered just enough;\nsmall highlights keep the full one. Lower it if bright scenes still darken.");
+            if (s.ablBudget < 100)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.3f, 1.0f));
+                ImGui::TextWrapped("Below 100 nits: bright scenes are cut hard, so the brightness swings between dark and "
+                                   "bright scenes get larger. Only if your panel really holds this little on a full white screen.");
+                ImGui::PopStyleColor();
+            }
             if (st.litAvg >= 0.0)
                 ImGui::Text("Scene asks for: %.0f nits average   After ceiling: %.0f   Ceiling in use: %.0f nits", st.rawAvg, st.litAvg, st.ceilInUse);
             ImGui::Unindent(16.0f);

@@ -141,11 +141,13 @@ Whether the game's picture is SDR or HDR (and which HDR format). Auto reads it f
 
 **Display peak** · `DisplayPeakNits` · default: 1400\
 The brightest your screen can get, in nits. In HDR, the boosted lit frame never asks for more than this.\
-*When to change it:* set it to your display's real peak brightness (check a review such as RTINGS). Too high and highlights clip; too low and you waste brightness.
+*When to change it:* set it to your display's real peak brightness (check a review such as RTINGS). Too high and highlights clip; too low and you waste brightness.\
+It goes down to 50 (v1.0.38). Below 100 a red warning shows under the slider: the lit refresh can't reach SDR white any more, so the picture is darker than with BFI off and highlights are flattened. Only for a dim display or a deliberately dim picture.
 
 **ABL guard** and **budget** · `AblGuard`, `AblGuardBudgetNits` · default: on, 250\
 OLED screens have a power limit: when a lot of the screen is bright at once, the TV dims everything (that's "ABL"). With BFI the lit frame is extra bright, so that limit can kick in and make bright scenes pump or flash. The guard watches how much bright area is on screen and gently lowers the boost in very bright scenes, so the TV never hits its limit. It knows that a panel holds more brightness on a small area than on the whole screen: by default it assumes your **Peak brightness** on 10% of the screen, falling to the budget on all of it (v1.0.20).\
-*When to change it:* set the budget to your screen's full-white brightness: about 250 for the Sony A95L and similar QD-OLEDs, 150–200 for many LG-panel OLEDs. If a review lists your panel's sustained brightness by window size, enter it as `AblCurve` in the ini (e.g. `AblCurve=10:1400,25:600,50:400,100:250`).
+*When to change it:* set the budget to your screen's full-white brightness: about 250 for the Sony A95L and similar QD-OLEDs, 150–200 for many LG-panel OLEDs. If a review lists your panel's sustained brightness by window size, enter it as `AblCurve` in the ini (e.g. `AblCurve=10:1400,25:600,50:400,100:250`).\
+The budget goes down to 50 (v1.0.38), with a red warning below 100: bright scenes are cut hard, so the brightness swings between dark and bright scenes get larger. Use it only if your panel really holds that little on a full white screen.
 
 ## Smoothness and latency
 
