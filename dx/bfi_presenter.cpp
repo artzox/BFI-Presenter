@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t12"
+#define BFI_ADDON_VERSION "1.0.38-t13"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2442,6 +2442,7 @@ enum { ST_IDLE, ST_VBLANK, ST_BUFFENCE, ST_SUBMIT, ST_PRESENT, ST_G_SLOT, ST_G_C
        ST_G_OWN_INDEX, ST_G_OWN_GETBUF, ST_G_OWN_COPY, ST_G_OWN_PRESENT,
        ST_R_STOP, ST_R_RELEASE, ST_R_REBIND, ST_R_ORIG, ST_R_CREATE };
 static std::atomic<int>    g_presStage{ST_IDLE}, g_gameStage{ST_IDLE};
+static std::atomic<int>    g_holdPresents{0};          // > 0: the game is creating a swap chain for the window (see PresentHold)
 static std::atomic<int>    g_dbgStaged{0};                 // presenter idle: staged frames seen
 static std::atomic<UINT64> g_dbgDone{0}, g_dbgNeed{0};     // game fence completed vs needed
 static std::atomic<double> g_presStageT{0.0}, g_gameStageT{0.0};
@@ -4188,6 +4189,12 @@ static DWORD WINAPI PresenterThread(void *)
         bufValid[bi] = true;
         }
 
+        if (g_holdPresents.load() > 0)
+        {
+            // the game is creating a new swap chain for this window: no Present on the old one meanwhile (at most 2 s)
+            const double th = Now();
+            while (g_holdPresents.load() > 0 && g_running.load() && Now() - th < 2.0) Sleep(1);
+        }
         const double tSub = Now();
         PresStage(ST_PRESENT);
         HRESULT hr;
@@ -7447,6 +7454,27 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSCCore)(IDXGIFactory2 *, IUnknown
 static PFN_FCreateSC     o_FCreateSC = nullptr;
 static PFN_FCreateSCHwnd o_FCreateSCHwnd = nullptr;
 static PFN_FCreateSCCore o_FCreateSCCore = nullptr;
+// The game creates a new swap chain for the window the presenter is showing on (Onimusha switching DLSS frame
+// generation off: Streamline makes a new one while the old is still alive). With OptiScaler and Streamline that call
+// waits for the old swap chain to go quiet, while the presenter's next Present on it waits in the driver for DLSS-G's
+// present thread, which waits on the game's call: all three stopped. The presenter holds its presents while such a
+// call runs (from before it reaches the wrappers below), so the old swap chain is idle; the game presents again as soon
+// as it returns, and the old swap chain's release stops the presenter as usual.
+struct PresentHold
+{
+    bool on = false;
+    PresentHold(HWND w)
+    {
+        if (!w || !g_active.load() || !g_running.load() || w != g_watchHwnd.load()) return;
+        on = true;
+        g_holdPresents.fetch_add(1);
+        const double t0 = Now();
+        while (g_presStage.load() == ST_PRESENT && Now() - t0 < 0.1) Sleep(1);   // a Present under way finishes first
+        LOGI("BFI Presenter: the game creates a new swap chain for its window -- presents held until it returns");
+    }
+    ~PresentHold() { if (on) g_holdPresents.fetch_sub(1); }
+};
+
 static HRESULT STDMETHODCALLTYPE hk_FCreateSC(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out)
 {
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
@@ -7456,6 +7484,7 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSC(IDXGIFactory *f, IUnknown *dev, DX
     if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
     Trace("FCreateSC: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSC);
+    PresentHold hold(t_scCreateDepth == 1 && !t_ownCall && d ? d->OutputWindow : nullptr);
     const HRESULT hr = o_FCreateSC(f, dev, d, out);
     const int depth = t_scCreateDepth--;
     Trace("FCreateSC: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
@@ -7472,6 +7501,7 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSCHwnd(IDXGIFactory2 *f, IUnknown *de
     if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
     Trace("FCreateSCHwnd: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSCHwnd);
+    PresentHold hold(t_scCreateDepth == 1 && !t_ownCall ? w : nullptr);
     const HRESULT hr = o_FCreateSCHwnd(f, dev, w, d, fs, o, out);
     const int depth = t_scCreateDepth--;
     Trace("FCreateSCHwnd: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
