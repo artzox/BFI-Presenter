@@ -878,6 +878,8 @@ BFI_TLS(int, t_ownCall);
 BFI_TLS(int, t_selfResize);         // inside the presenter's own resize of the game's swap chain (PresenterResize)
 BFI_TLS(int, t_inOuter);            // inside the game-facing (outer) swap chain's Present
 BFI_TLS(int, t_scCreateDepth);      // nested CreateSwapChain* calls through the factory hook (outermost = 1)
+BFI_TLS(void *, t_scLoopF);          // the factory and result pointer of the outermost call (hook ping-pong check)
+BFI_TLS(void *, t_scLoopOut);
 struct OwnCall { OwnCall() { t_ownCall++; } ~OwnCall() { t_ownCall--; } };
 static HRESULT OwnPresent();
 static std::atomic<bool>      g_needRebind{false};        // move presentation to g_presQueue on the first frame
@@ -2210,6 +2212,30 @@ static bool Compile(PFN_D3DCompile compile, const char *entry, const char *targe
     }
     SafeRelease(err);
     return true;
+}
+
+// ---- Trace file (BFIPresenter_trace.txt next to the ini): each line written and closed at once, for games that end
+// without a crash record (Avatar: Frontiers of Pandora closed itself while creating its swap chain; ReShade's log
+// may not be flushed by then). Only for the outer swap chain hook's steps.
+static void Trace(const char *fmt, ...)
+{
+    if (!g_iniPath[0]) return;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s", g_iniPath);
+    if (char *s = strrchr(path, '\\')) s[1] = '\0';
+    strncat(path, "BFIPresenter_trace.txt", MAX_PATH - strlen(path) - 1);
+    char line[512];
+    int n = snprintf(line, sizeof(line), "%10.3f [%5lu] ", Now(), GetCurrentThreadId());
+    va_list ap; va_start(ap, fmt);
+    n += vsnprintf(line + n, sizeof(line) - n - 3, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(line) - 3) n = (int)sizeof(line) - 3;
+    line[n++] = '\r'; line[n++] = '\n';
+    HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wr = 0;
+    WriteFile(f, line, (DWORD)n, &wr, nullptr);
+    CloseHandle(f);
 }
 
 // ---- Shader cache. The presenter's HLSL is compiled at the highest optimisation level, and the source has grown with
@@ -5620,6 +5646,13 @@ static HRESULT SubmitGameFrameLocked()
         ID3D12Resource *rb = nullptr;
         GameStage(ST_G_OWN_INDEX);
         const UINT bi = o_GetCBBI(g_sc);
+        // Pass-through diagnostics (Avatar: the picture stayed black on a recreated swap chain): once a second for
+        // the first 30 s of a swap chain, what the pass-through did.
+        static int s_ptPres = 0, s_ptCopy = 0;
+        static double s_ptT = 0.0;
+        static HRESULT s_ptHr = S_OK;
+        const bool ptLog = Now() - g_deferSinceT.load() < 30.0;
+        s_ptPres++;
         GameStage(ST_G_OWN_GETBUF);
         // SDR to HDR: the real buffers are HDR10, the game's frames 8-bit -- a copy between them isn't allowed (it
         // removes the device). Only the presenter can draw them; until it runs, the screen keeps its last picture.
@@ -5658,11 +5691,23 @@ static HRESULT SubmitGameFrameLocked()
             g_fbFence[bi] = v;
             if (q != g_gameQueue) g_gameQueue->Wait(g_presFence, v);   // copy done before reuse
             rb->Release();
+            s_ptCopy++;
         }
+        const UINT stand = g_cur;
         g_cur = (g_cur + 1) % g_bufCount;
         ReleaseGameSlot();
         GameStage(ST_G_OWN_PRESENT);
-        return OwnPresent();
+        const HRESULT phr = OwnPresent();
+        if (FAILED(phr)) s_ptHr = phr;
+        const double tn = Now();
+        if (ptLog && tn - s_ptT >= 1.0)
+        {
+            LOGI("BFI Presenter: pass-through: %d presents, %d copied to the real buffer (real index %u, stand-in %u of %u, "
+                 "%s queue, formats %d -> %d, last failed present 0x%08lX)", s_ptPres, s_ptCopy, bi, stand, g_bufCount,
+                 q == g_gameQueue ? "game" : "presenter", (int)g_stageFmt, (int)g_desc.Format, (unsigned long)s_ptHr);
+            s_ptT = tn; s_ptPres = s_ptCopy = 0; s_ptHr = S_OK;
+        }
+        return phr;
     }
 
     // Staging slot for this frame: the oldest one the presenter is neither
@@ -7296,6 +7341,74 @@ static void OuterCheck(void *obj)
     LOGI("BFI Presenter: the game presents to FSR frame generation's swap chain (%s) -- its presents are counted there "
          "(FSR presents every frame from a thread of its own)", mod);
 }
+// A vtable slot's original function, read from the module file the vtable lives in (DXGI's own, in dxgi.dll): the value
+// in the file, relocated to where the module is loaded. Another add-on can sit on the same slot and re-hook it after us,
+// saving our hook as its "original" -- then its hook and ours call each other until the stack runs out (Elden Ring with
+// ERSS-FG, #119: 3993 nested calls; most likely Avatar too, which closed without a crash record). The real function
+// from the file breaks that loop. nullptr when the vtable isn't in a file on disk or the value doesn't check out.
+static std::atomic<bool> g_scLoopLogged{false};
+static void *PristineVtableSlot(void **vtbl, int idx)
+{
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)vtbl, &m) || !m)
+        return nullptr;
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(m, path, MAX_PATH)) return nullptr;
+    BYTE *base = (BYTE *)m;
+    auto *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    const ULONGLONG prefBase = nt->OptionalHeader.ImageBase;
+    const DWORD rva = (DWORD)((BYTE *)&vtbl[idx] - base);
+    // the file offset of that RVA
+    auto *sec = IMAGE_FIRST_SECTION(nt);
+    DWORD off = 0;
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+        if (rva >= sec->VirtualAddress && rva + sizeof(void *) <= sec->VirtualAddress + sec->SizeOfRawData)
+        { off = rva - sec->VirtualAddress + sec->PointerToRawData; break; }
+    if (!off) return nullptr;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return nullptr;
+    ULONGLONG raw = 0;
+    DWORD got = 0;
+    LARGE_INTEGER pos; pos.QuadPart = off;
+    const bool ok = SetFilePointerEx(f, pos, nullptr, FILE_BEGIN) && ReadFile(f, &raw, sizeof(void *), &got, nullptr) && got == sizeof(void *);
+    CloseHandle(f);
+    if (!ok || !raw) return nullptr;
+    BYTE *fn = (BYTE *)(uintptr_t)(raw - prefBase + (ULONGLONG)(uintptr_t)base);
+    // must point into that module's executable code
+    sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+        if ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) && fn >= base + sec->VirtualAddress && fn < base + sec->VirtualAddress + sec->Misc.VirtualSize)
+            return fn;
+    return nullptr;
+}
+static void *g_pristineSC = nullptr, *g_pristineSCHwnd = nullptr, *g_pristineSCCore = nullptr;
+static void **g_scFactoryVt = nullptr;   // the factory vtable the hooks sit on
+// Another add-on re-hooked the slot over ours with ours as its original, while ours still has its hook as the original:
+// each would call the other. Then ours goes straight to DXGI's own function (it is called by that add-on's hook, which
+// has done its part already).
+static bool ScPingPong(int idx, void *hook, void *orig)
+{
+    if (!g_scFactoryVt) return false;
+    void *cur = g_scFactoryVt[idx];
+    if (cur == hook || cur != orig) return false;
+    if (!g_scLoopLogged.exchange(true))
+        LOGW("BFI Presenter: another add-on hooked swap chain creation on top of BFI Presenter with BFI Presenter's hook as "
+             "its original -- going to DXGI's own function from there, so the two don't call each other in a loop");
+    return true;
+}
+
+// The hook was entered again for the same factory and result pointer inside its own call: another add-on's hook on the
+// same slot has ours as its "original". Go to DXGI's real function instead of round again.
+static bool ScLoop(void *f, void *out)
+{
+    if (t_scCreateDepth < 1 || f != t_scLoopF || out != t_scLoopOut) return false;
+    if (!g_scLoopLogged.exchange(true))
+        LOGW("BFI Presenter: another add-on's hook on swap chain creation calls ours back (each saved the other as the "
+             "original) -- calling DXGI's own function to break the loop");
+    Trace("hook loop at depth %d: calling DXGI's own function", (int)t_scCreateDepth);
+    return true;
+}
+
 typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSC)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSCHwnd)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *,
                                                         const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
@@ -7308,10 +7421,15 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSC(IDXGIFactory *f, IUnknown *dev, DX
 {
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
+    if (g_pristineSC && (ScPingPong(10, (void *)&hk_FCreateSC, (void *)o_FCreateSC) || ScLoop((void *)f, (void *)out)))
+        return ((decltype(o_FCreateSC))g_pristineSC)(f, dev, d, out);
+    if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
+    Trace("FCreateSC: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSC);
     const HRESULT hr = o_FCreateSC(f, dev, d, out);
     const int depth = t_scCreateDepth--;
-    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    Trace("FCreateSC: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) { OuterCheck(*out); Trace("FCreateSC: outer check done"); }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hk_FCreateSCHwnd(IDXGIFactory2 *f, IUnknown *dev, HWND w, const DXGI_SWAP_CHAIN_DESC1 *d,
@@ -7319,10 +7437,15 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSCHwnd(IDXGIFactory2 *f, IUnknown *de
 {
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
+    if (g_pristineSCHwnd && (ScPingPong(15, (void *)&hk_FCreateSCHwnd, (void *)o_FCreateSCHwnd) || ScLoop((void *)f, (void *)out)))
+        return ((decltype(o_FCreateSCHwnd))g_pristineSCHwnd)(f, dev, w, d, fs, o, out);
+    if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
+    Trace("FCreateSCHwnd: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSCHwnd);
     const HRESULT hr = o_FCreateSCHwnd(f, dev, w, d, fs, o, out);
     const int depth = t_scCreateDepth--;
-    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    Trace("FCreateSCHwnd: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) { OuterCheck(*out); Trace("FCreateSCHwnd: outer check done"); }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hk_FCreateSCCore(IDXGIFactory2 *f, IUnknown *dev, IUnknown *win, const DXGI_SWAP_CHAIN_DESC1 *d,
@@ -7330,10 +7453,15 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSCCore(IDXGIFactory2 *f, IUnknown *de
 {
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
+    if (g_pristineSCCore && (ScPingPong(16, (void *)&hk_FCreateSCCore, (void *)o_FCreateSCCore) || ScLoop((void *)f, (void *)out)))
+        return ((decltype(o_FCreateSCCore))g_pristineSCCore)(f, dev, win, d, o, out);
+    if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
+    Trace("FCreateSCCore: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSCCore);
     const HRESULT hr = o_FCreateSCCore(f, dev, win, d, o, out);
     const int depth = t_scCreateDepth--;
-    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    Trace("FCreateSCCore: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) { OuterCheck(*out); Trace("FCreateSCCore: outer check done"); }
     return hr;
 }
 // The function the game itself imports from dxgi.dll (its own import table): with OptiScaler that is
@@ -7360,12 +7488,78 @@ static void *GameDxgiImport(const char *fn)
     }
     return nullptr;
 }
+// OptiScaler in this game: its ini next to the game's exe, a module named OptiScaler, or a module whose version
+// information says OptiScaler (it usually loads as dxgi.dll, winmm.dll, version.dll ... next to the exe). Returns what
+// was found, or nullptr.
+static const char *OptiScalerFound(char *buf, size_t n)
+{
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return nullptr;
+    wchar_t dir[MAX_PATH];
+    wcscpy(dir, exe);
+    if (wchar_t *s = wcsrchr(dir, L'\\')) s[1] = 0;
+    wchar_t ini[MAX_PATH];
+    _snwprintf(ini, MAX_PATH, L"%sOptiScaler.ini", dir);
+    if (GetFileAttributesW(ini) != INVALID_FILE_ATTRIBUTES) { snprintf(buf, n, "OptiScaler.ini next to the game"); return buf; }
+    typedef DWORD (WINAPI *PFN_GFVIS)(LPCWSTR, LPDWORD);
+    typedef BOOL (WINAPI *PFN_GFVI)(LPCWSTR, DWORD, DWORD, LPVOID);
+    typedef BOOL (WINAPI *PFN_VQV)(LPCVOID, LPCWSTR, LPVOID *, PUINT);
+    HMODULE ver = LoadLibraryA("version.dll");
+    PFN_GFVIS gs = ver ? (PFN_GFVIS)(void *)GetProcAddress(ver, "GetFileVersionInfoSizeW") : nullptr;
+    PFN_GFVI  gi = ver ? (PFN_GFVI)(void *)GetProcAddress(ver, "GetFileVersionInfoW") : nullptr;
+    PFN_VQV   vq = ver ? (PFN_VQV)(void *)GetProcAddress(ver, "VerQueryValueW") : nullptr;
+    const char *found = nullptr;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap != INVALID_HANDLE_VALUE)
+    {
+        MODULEENTRY32W me = { sizeof(me) };
+        for (BOOL ok = Module32FirstW(snap, &me); ok && !found; ok = Module32NextW(snap, &me))
+        {
+            if (_wcsnicmp(me.szModule, L"optiscaler", 10) == 0) { snprintf(buf, n, "%ls loaded", me.szModule); found = buf; break; }
+            if (_wcsnicmp(me.szExePath, dir, wcslen(dir)) != 0 || !gs || !gi || !vq) continue;   // only modules next to the exe
+            DWORD h = 0, sz = gs(me.szExePath, &h);
+            if (!sz || sz > 1 << 20) continue;
+            std::vector<BYTE> vi(sz);
+            if (!gi(me.szExePath, 0, sz, vi.data())) continue;
+            struct LangCp { WORD lang, cp; } *tr = nullptr;
+            UINT tl = 0;
+            if (!vq(vi.data(), L"\\VarFileInfo\\Translation", (LPVOID *)&tr, &tl) || tl < sizeof(LangCp)) continue;
+            static const wchar_t *const keys[] = { L"ProductName", L"FileDescription", L"InternalName", L"OriginalFilename" };
+            for (const wchar_t *k : keys)
+            {
+                wchar_t q[96];
+                _snwprintf(q, 96, L"\\StringFileInfo\\%04x%04x\\%ls", tr->lang, tr->cp, k);
+                wchar_t *v = nullptr; UINT vl = 0;
+                if (vq(vi.data(), q, (LPVOID *)&v, &vl) && v && vl)
+                {
+                    std::wstring s(v);
+                    for (auto &c : s) c = (wchar_t)towlower(c);
+                    if (s.find(L"optiscaler") != std::wstring::npos) { snprintf(buf, n, "%ls (OptiScaler)", me.szModule); found = buf; break; }
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    return found;
+}
+
 static void InstallOuterFactoryHook()
 {
     static bool done = false;
     if (done) return;
     done = true;
-    if (!GetPrivateProfileIntA("BFI", "HookOuterSwapChain", 1, g_iniPath)) { LOGI("BFI Presenter: outer swap chain hook off (ini)"); return; }
+    // HookOuterSwapChain: 0 off; 1 (default) only with OptiScaler -- the hook is there for FSR frame generation through
+    // OptiScaler (1.0.26) and does nothing anywhere else, while hooking every DX game's swap chain creation could meet
+    // another add-on's hook on the same function (Elden Ring with ERSS-FG, #119; Avatar); 2 every game, as 1.0.26-1.0.37.
+    const int mode = (int)GetPrivateProfileIntA("BFI", "HookOuterSwapChain", 1, g_iniPath);
+    if (mode == 0) { LOGI("BFI Presenter: outer swap chain hook off (ini)"); return; }
+    if (mode == 1)
+    {
+        char why[160];
+        const char *opti = OptiScalerFound(why, sizeof(why));
+        if (!opti) { LOGI("BFI Presenter: outer swap chain hook not needed (no OptiScaler in this game; HookOuterSwapChain=2 forces it)"); return; }
+        LOGI("BFI Presenter: OptiScaler found (%s) -- outer swap chain hook for FSR frame generation", opti);
+    }
     typedef HRESULT (WINAPI *PFN_CF2)(UINT, REFIID, void **);
     typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void **);
     const char *from = "the game's import";
@@ -7387,7 +7581,15 @@ static void InstallOuterFactoryHook()
     void **vt = *(void ***)f;
     char mod[64];
     ModuleOf(vt[15], mod, sizeof(mod));
+    // DXGI's own functions for these slots, from dxgi.dll's file (see PristineVtableSlot), before anything is patched.
+    g_pristineSC = PristineVtableSlot(vt, 10);
+    g_pristineSCHwnd = PristineVtableSlot(vt, 15);
+    g_pristineSCCore = PristineVtableSlot(vt, 16);
+    Trace("outer hook: DXGI's own functions %p %p %p (slots now %p %p %p)", g_pristineSC, g_pristineSCHwnd, g_pristineSCCore,
+          vt[10], vt[15], vt[16]);
+    g_scFactoryVt = vt;
     PatchSlot(vt, 10, (void *)&hk_FCreateSC,     (void **)&o_FCreateSC);
+    Trace("outer hook: factory %p vtable %p, CreateSwapChainForHwnd %p", (void *)f, (void *)vt, vt[15]);
     PatchSlot(vt, 15, (void *)&hk_FCreateSCHwnd, (void **)&o_FCreateSCHwnd);
     PatchSlot(vt, 16, (void *)&hk_FCreateSCCore, (void **)&o_FCreateSCCore);
     f->Release();
