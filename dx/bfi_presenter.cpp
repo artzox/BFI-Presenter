@@ -54,6 +54,7 @@
 #include <reshade.hpp>
 #include "../common/bfi_syscheck.h"
 #include "../common/bfi_vram.h"
+#include "../common/bfi_osd.h"
 #include "../common/bfi_clockdrift.h"
 
 #ifdef _MSC_VER
@@ -93,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.37"
+#define BFI_ADDON_VERSION "1.0.38-t4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -111,6 +112,11 @@ struct Settings
     int   splitSide = 0;      // 0 = the left side without BFI, 1 = the right side
     int   splitPos = 50;      // the seam, percent of the width from the left
     int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
+    int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
+    int   osdCorner = 1;      // OsdCorner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
+    int   osdGraph = 1;       // OsdGraph: frame-time graph
+    int   osdLoads = 1;       // OsdLoads: CPU / GPU load
+    float osdScale = 1.0f;    // OsdScale: text size
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
@@ -266,6 +272,11 @@ static void LoadSettings(Settings &s)
     s.splitSide = IniInt("SplitCompareSide", 0) ? 1 : 0;
     s.splitPos = std::max(5, std::min(95, IniInt("SplitComparePosition", 50)));
     s.splitSeam = std::max(0, std::min(400, IniInt("SplitCompareSeamPx", 0)));
+    s.osd = IniInt("Osd", 0) ? 1 : 0;
+    s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
+    s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
+    s.osdLoads = IniInt("OsdLoads", 1) ? 1 : 0;
+    s.osdScale = std::max(0.75f, std::min(2.5f, IniFloat("OsdScale", 1.0f)));
     s.lcdSwap  = IniInt("LcdPhaseSwap", 0) ? 1 : 0;
     s.lcdSwapSec = IniInt("LcdPhaseSwapSeconds", 5);
     s.lcdGradual = IniInt("LcdSaverGradual", 0) ? 1 : 0;
@@ -457,6 +468,11 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("SplitCompareSide", s.splitSide);
     IniWriteInt("SplitComparePosition", s.splitPos);
     IniWriteInt("SplitCompareSeamPx", s.splitSeam);
+    IniWriteInt("Osd", s.osd);
+    IniWriteInt("OsdCorner", s.osdCorner);
+    IniWriteInt("OsdGraph", s.osdGraph);
+    IniWriteInt("OsdLoads", s.osdLoads);
+    IniWriteFloat("OsdScale", s.osdScale);
     IniWriteInt("LcdPhaseSwap", s.lcdSwap);
     IniWriteInt("LcdPhaseSwapSeconds", s.lcdSwapSec);
     IniWriteInt("LcdSaverGradual", s.lcdGradual);
@@ -3511,22 +3527,23 @@ static DWORD WINAPI PresenterThread(void *)
     bool   flashOn = false;
     UINT lastSync = 0, lastPC = 0;
     bool haveStats = false;
-    bool kb = false, km = false, kr = false, krs = false, kk = false, ksp = false;
+    bool kb = false, km = false, kr = false, krs = false, kk = false, ksp = false, kosd = false;
 
     while (ok && g_running.load())
     {
         // hotkeys (edge-triggered) act on the shared settings
-        bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C');
-        if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp))
+        bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C'), ko = KeyCombo('F');
+        if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp) || (ko && !kosd))
         {
             EnterCriticalSection(&g_cfgLock);
+            if (ko && !kosd) g_shared.osd = !g_shared.osd;
             if (b && !kb) g_shared.enabled = !g_shared.enabled;
             if (m && !km) g_shared.method = !g_shared.method;
             if (rs && !krs) g_shared.rolling = !g_shared.rolling;
             if (sp && !ksp) g_shared.split = !g_shared.split;
             LeaveCriticalSection(&g_cfgLock);
         }
-        krs = rs; ksp = sp;
+        krs = rs; ksp = sp; kosd = ko;
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
         // Ctrl+Shift+K: a marker in the log with the last second's state, to find a moment the player noticed (a
         // stutter, a lost frame limit) in a long session.
@@ -5681,6 +5698,7 @@ static HRESULT SubmitGameFrameLocked()
     g_stageNext = (s + 1) % kStage;
     g_cur = (g_cur + 1) % g_bufCount;
     g_stagedThisSecond.fetch_add(1);
+    Osd::FramePush(Now());
     if (!g_firstStaged.exchange(true)) LOGI("BFI Presenter: first game frame received");
     if ((g_frameId & 31) == 1) ReadRsColorSpace();     // for the presenter thread (see g_rsCs)
     if (g_gameFence->GetCompletedValue() == UINT64_MAX) DumpDeviceRemoved(g_device, "game Present");
@@ -8409,6 +8427,7 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
     bb->Release();
     g_stageNext = (s + 1) % kStage;
     g_stagedThisSecond.fetch_add(1);
+    Osd::FramePush(Now());
     if (!g_firstStaged.exchange(true)) LOGI("BFI Presenter: DX11: first game frame received");
     if ((g_frameId & 31) == 1) ReadRsColorSpace();     // for the presenter thread (see g_rsCs)
 
@@ -10013,6 +10032,21 @@ static void KofiButton()
         ImGui::SetTooltip("BFI Presenter is free. If it helps you, you can support its development on Ko-fi\n(ko-fi.com/artzox). Opens in your browser.");
 }
 
+// The in-game OSD (common/bfi_osd.h), every frame through ReShade's overlay event.
+static void on_osd(reshade::api::effect_runtime *)
+{
+    EnterCriticalSection(&g_cfgLock);
+    const bool on = g_shared.osd != 0;
+    const int corner = g_shared.osdCorner, graph = g_shared.osdGraph, loads = g_shared.osdLoads;
+    const float scale = g_shared.osdScale;
+    OsdData d;
+    d.gameFps = g_status.gameFps; d.refreshHz = g_status.refreshHz; d.frames = g_shared.frames;
+    d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late;
+    d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
+    LeaveCriticalSection(&g_cfgLock);
+    if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
+}
+
 static void draw_overlay(reshade::api::effect_runtime *)
 {
     Status st;
@@ -10261,6 +10295,22 @@ static void draw_overlay(reshade::api::effect_runtime *)
             s.splitSide = side ? 1 : 0;
             ImGui::SliderInt("Seam position (% of width)", &s.splitPos, 5, 95);
             ImGui::SliderInt("Seam softness (pixels, 0 = hard)", &s.splitSeam, 0, 400);
+            ImGui::Unindent(16.0f);
+        }
+        bool osd = s.osd != 0;
+        if (ImGui::Checkbox("On-screen display (Ctrl+Shift+F)", &osd)) s.osd = osd ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A small panel over the game: its frame rate and frame time, the presenter's lost and repeated\n"
+                                                      "frames and missed refreshes, a frame-time graph and CPU / GPU load (GPU: NVIDIA).\n"
+                                                      "For changing the game's settings without RTSS or opening this menu.");
+        if (s.osd)
+        {
+            ImGui::Indent(16.0f);
+            ImGui::Combo("Corner", &s.osdCorner, "Top left\0Top right\0Bottom left\0Bottom right\0");
+            bool og = s.osdGraph != 0, ol = s.osdLoads != 0;
+            if (ImGui::Checkbox("Frame-time graph", &og)) s.osdGraph = og ? 1 : 0;
+            ImGui::SameLine();
+            if (ImGui::Checkbox("CPU / GPU load", &ol)) s.osdLoads = ol ? 1 : 0;
+            ImGui::SliderFloat("Size", &s.osdScale, 0.75f, 2.5f, "%.2f");
             ImGui::Unindent(16.0f);
         }
     }
@@ -10784,6 +10834,7 @@ static void UnregisterAll(HMODULE hModule)
     reshade::unregister_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
     RegisterDx9Events(false);
     reshade::unregister_overlay("BFI Presenter", draw_overlay);
+    reshade::unregister_event<reshade::addon_event::reshade_overlay>(on_osd);
     RemoveHooks();
     reshade::unregister_addon(hModule);
 }
@@ -10808,6 +10859,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
     RegisterDx9Events(true);
     reshade::register_overlay("BFI Presenter", draw_overlay);
+    reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
     if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
     return true;
 }
@@ -10864,6 +10916,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
         RegisterDx9Events(true);
         reshade::register_overlay("BFI Presenter", draw_overlay);
+        reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
         ShaderPrepare();                                // compiled (or loaded) while the game starts up
         // DRED must be switched on before the game creates its device; a
         // thread avoids calling into D3D12 under the loader lock.

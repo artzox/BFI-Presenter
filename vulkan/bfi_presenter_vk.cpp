@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.37"
+#define BFI_VERSION "1.0.38-t4"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -141,6 +141,7 @@ static void Log(const char *lvl, const char *fmt, ...)
 #include "../common/bfi_syscheck.h"
 #include "../common/bfi_vram.h"
 #include "../common/bfi_clockdrift.h"
+namespace Osd { inline void FramePush(double tNowSec); }   // common/bfi_osd.h (included with ImGui further down)
 static SysCheck g_sysCheck;      // power plan, GPUs, displays (checked on the window watch thread)
 #endif
 #define LOGE(...) Log("ERROR", __VA_ARGS__)
@@ -262,6 +263,11 @@ struct Settings
     int   splitSide = 0;      // 0 = the left side without BFI, 1 = the right side
     int   splitPos = 50;      // the seam, percent of the width from the left
     int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
+    int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
+    int   osdCorner = 1;      // OsdCorner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
+    int   osdGraph = 1;       // OsdGraph: frame-time graph
+    int   osdLoads = 1;       // OsdLoads: CPU / GPU load
+    float osdScale = 1.0f;    // OsdScale: text size
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
@@ -365,6 +371,11 @@ static void LoadSettings(Settings &s)
     s.splitSide = KvInt(kv, "SplitCompareSide", 0) ? 1 : 0;
     s.splitPos = std::max(5, std::min(95, KvInt(kv, "SplitComparePosition", 50)));
     s.splitSeam = std::max(0, std::min(400, KvInt(kv, "SplitCompareSeamPx", 0)));
+    s.osd = KvInt(kv, "Osd", 0) ? 1 : 0;
+    s.osdCorner = std::max(0, std::min(3, KvInt(kv, "OsdCorner", 1)));
+    s.osdGraph = KvInt(kv, "OsdGraph", 1) ? 1 : 0;
+    s.osdLoads = KvInt(kv, "OsdLoads", 1) ? 1 : 0;
+    s.osdScale = std::max(0.75f, std::min(2.5f, KvFloat(kv, "OsdScale", 1.0f)));
     s.lcdSwap  = KvInt(kv, "LcdPhaseSwap", 0) ? 1 : 0;
     s.lcdSwapSec = Clamp(KvInt(kv, "LcdPhaseSwapSeconds", 5), 1, 300);
     s.lcdGradual = KvInt(kv, "LcdSaverGradual", 0) ? 1 : 0;
@@ -434,7 +445,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -2089,7 +2100,7 @@ static void PresenterThread(Swapchain *sc)
     int capDownSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
     double capSwitchT = -100.0, probeWait = 30.0, capUpT = -100.0;
     bool capProbe = false, fgWas = false, rfxFgKnown = false;   // rfxFgKnown: the Reflex frame counts have agreed for 3 s
-    bool kb = false, km = false, kr = false, krs = false, ksp = false;
+    bool kb = false, km = false, kr = false, krs = false, ksp = false, kosd = false;
     FILE *logf = nullptr;
     double monitorCheckT = Now();
     int dumpLeft = g_dumpFrames;
@@ -2097,16 +2108,17 @@ static void PresenterThread(Swapchain *sc)
     while (!sc->stopReq.load())
     {
         // hotkeys (edge-triggered) act on the shared settings
-        const bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C');
-        if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp))
+        const bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C'), ko = KeyCombo('F');
+        if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp) || (ko && !kosd))
         {
             std::lock_guard<std::mutex> l(g_cfgLock);
+            if (ko && !kosd) g_shared.osd = !g_shared.osd;
             if (b && !kb) g_shared.enabled = !g_shared.enabled;
             if (m && !km) g_shared.method = !g_shared.method;
             if (rs && !krs) g_shared.rolling = !g_shared.rolling;
             if (sp && !ksp) g_shared.split = !g_shared.split;
         }
-        krs = rs; ksp = sp;
+        krs = rs; ksp = sp; kosd = ko;
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
         // BFIPresenter.ini edited while the game runs (no ReShade overlay in the game): picked up within a second.
         {
@@ -4219,6 +4231,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
     sc->lrStaged.store(id);
     sc->lrCv.notify_one();
     sc->staged.fetch_add(1);
+    Osd::FramePush(Now());
     if (!sc->firstFrameLogged) { sc->firstFrameLogged = true; LOGI("BFI Presenter: first game frame received"); }
 
     // Latency limit: before the game starts its next frame, the frame from
@@ -5633,6 +5646,7 @@ BFI_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BFI_vkGetDeviceProcAddr(VkDe
 #ifdef _WIN32
 #include <imgui.h>
 #include <reshade.hpp>
+#include "../common/bfi_osd.h"
 
 extern "C" __declspec(dllexport) const char *NAME;
 const char *NAME = "BFI Presenter (Vulkan)";
@@ -5713,6 +5727,21 @@ static bool RelimiterLoaded()
         return true;
     }
     return false;
+}
+
+// The in-game OSD (common/bfi_osd.h), every frame through ReShade's overlay event.
+static void on_osd(reshade::api::effect_runtime *)
+{
+    OsdData d;
+    bool on; int corner, graph, loads; float scale;
+    {
+        std::lock_guard<std::mutex> l(g_cfgLock);
+        on = g_shared.osd != 0; corner = g_shared.osdCorner; graph = g_shared.osdGraph; loads = g_shared.osdLoads; scale = g_shared.osdScale;
+        d.gameFps = g_status.gameFps; d.refreshHz = g_status.refreshHz; d.frames = g_shared.frames;
+        d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late;
+        d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running;
+    }
+    if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
 }
 
 static void draw_overlay(reshade::api::effect_runtime *)
@@ -5932,6 +5961,22 @@ static void draw_overlay(reshade::api::effect_runtime *)
             s.splitSide = side ? 1 : 0;
             ImGui::SliderInt("Seam position (% of width)", &s.splitPos, 5, 95);
             ImGui::SliderInt("Seam softness (pixels, 0 = hard)", &s.splitSeam, 0, 400);
+            ImGui::Unindent(16.0f);
+        }
+        bool osd = s.osd != 0;
+        if (ImGui::Checkbox("On-screen display (Ctrl+Shift+F)", &osd)) s.osd = osd ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A small panel over the game: its frame rate and frame time, the presenter's lost and repeated\n"
+                                                      "frames and missed refreshes, a frame-time graph and CPU / GPU load (GPU: NVIDIA).\n"
+                                                      "For changing the game's settings without RTSS or opening this menu.");
+        if (s.osd)
+        {
+            ImGui::Indent(16.0f);
+            ImGui::Combo("Corner", &s.osdCorner, "Top left\0Top right\0Bottom left\0Bottom right\0");
+            bool og = s.osdGraph != 0, ol = s.osdLoads != 0;
+            if (ImGui::Checkbox("Frame-time graph", &og)) s.osdGraph = og ? 1 : 0;
+            ImGui::SameLine();
+            if (ImGui::Checkbox("CPU / GPU load", &ol)) s.osdLoads = ol ? 1 : 0;
+            ImGui::SliderFloat("Size", &s.osdScale, 0.75f, 2.5f, "%.2f");
             ImGui::Unindent(16.0f);
         }
     }
@@ -6326,6 +6371,9 @@ static void TryRegisterReShade()
     }
     imgui_function_table_instance() = table;
     ov("BFI Presenter (Vulkan)", draw_overlay);
+    // the in-game OSD: ReShade's overlay event, every frame
+    if (auto ev = (void (*)(reshade::addon_event, void *))(void *)GetProcAddress(rs, "ReShadeRegisterEvent"))
+        ev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
     static bool pinned = false;
     if (!pinned)
     {
@@ -6346,6 +6394,8 @@ static void UnregisterReShade()
     auto uov = (void (*)(const char *, void (*)(reshade::api::effect_runtime *)))(void *)GetProcAddress(g_rsModule, "ReShadeUnregisterOverlay");
     auto ureg = (void (*)(HMODULE))(void *)GetProcAddress(g_rsModule, "ReShadeUnregisterAddon");
     if (uov) uov("BFI Presenter (Vulkan)", draw_overlay);
+    if (auto uev = (void (*)(reshade::addon_event, void *))(void *)GetProcAddress(g_rsModule, "ReShadeUnregisterEvent"))
+        uev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
     if (ureg) ureg(g_module);
     g_rsModule = nullptr;
 }
