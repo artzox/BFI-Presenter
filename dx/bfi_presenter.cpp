@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t9"
+#define BFI_ADDON_VERSION "1.0.38-t10"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -10304,8 +10304,12 @@ static void on_osd(reshade::api::effect_runtime *rt)
         static std::atomic<void *> s_rt{nullptr};
         static std::atomic<double> s_rtT{0.0};
         void *nat = reinterpret_cast<void *>(rt->get_native());
-        const bool managed = (g_sc && nat == (void *)g_sc) || (g_sc11 && nat == (void *)g_sc11);
-        const bool anyManaged = g_sc != nullptr || g_sc11 != nullptr;
+        // The game's own swap chain the presenter manages: DX12's (g_sc), or DX11's (g_sc11). In DX9 and OpenGL games
+        // g_sc is the presenter's own DX11 swap chain, which has no ReShade runtime -- there ReShade's runtime is the
+        // game's DX9 / OpenGL one, so the first runtime draws.
+        void *gameSc = g_dx11.load() ? (void *)g_sc11 : (void *)g_sc;
+        const bool managed = gameSc && nat == gameSc;
+        const bool anyManaged = gameSc != nullptr;
         const double now = Now();
         if (anyManaged ? !managed : (s_rt.load() && s_rt.load() != (void *)rt && now - s_rtT.load() < 1.0)) return;
         s_rt.store((void *)rt); s_rtT.store(now);
