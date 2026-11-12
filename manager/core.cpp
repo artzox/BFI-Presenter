@@ -1976,6 +1976,7 @@ void Detect(Game &g)
     g.reshadeVkIni = Exists(Join(dir, L"ReShade.ini"));
     g.shaderRecommended = g.tested.find("BFI shader recommended") != std::string::npos;
     g.selfResizeRecommended = g.tested.find("PresenterResize") != std::string::npos;
+    g.selfResizeValue = g.tested.find("PresenterResize=2") != std::string::npos ? 2 : 1;
     if (ro == L"vulkan") g.route = Route::Vulkan;
     else if (ro == L"dx") g.route = g.bits == 32 ? Route::Addon32 : Route::Addon64;
     else if (ro == L"shader") g.route = Route::Shader;
@@ -2973,12 +2974,14 @@ std::string InstallOrUpdate(Game &g, const Source &src)
         t.Finish();
         if (err.empty()) Log(oldV.empty() ? "install" : "update", g.name, Join(dir, name), oldV, src.dxVersion);
         // Games the tested list says never resize their swap chain on their own: BFI starts only with PresenterResize.
-        // Set once; a value the user chose (0 or 1) is left alone.
+        // Set once; a value the user chose (0, 1 or 2) is left alone. 2 where the list says so: the game recreates its
+        // swap chain after starting and doesn't resize that one either (Onimusha).
         if (err.empty() && g.selfResizeRecommended && g.selfResize < 0)
         {
             const std::wstring ini = Join(dir, L"BFIPresenter.ini");
-            if (WritePrivateProfileStringW(L"BFI", L"PresenterResize", L"1", ini.c_str()))
-                Log("PresenterResize=1 (tested list)", g.name, ini, "", "");
+            const wchar_t *v = g.selfResizeValue == 2 ? L"2" : L"1";
+            if (WritePrivateProfileStringW(L"BFI", L"PresenterResize", v, ini.c_str()))
+                Log(g.selfResizeValue == 2 ? "PresenterResize=2 (tested list)" : "PresenterResize=1 (tested list)", g.name, ini, "", "");
         }
     }
     else if (g.route == Route::Vulkan)
@@ -3084,9 +3087,11 @@ std::string SetPresenterResize(Game &g, bool on)
     if (g.route != Route::Addon64 && g.route != Route::Addon32) return "Only for the DX add-on.";
     std::wstring dir = !g.addonPath.empty() ? DirOf(g.addonPath) : g.reshade ? DirOf(g.reshadeDll.path) : DirOf(g.exe);
     std::wstring ini = g.ini ? g.iniPath : Join(dir, L"BFIPresenter.ini");
-    if (!WritePrivateProfileStringW(L"BFI", L"PresenterResize", on ? L"1" : L"0", ini.c_str()))
+    // on: 1, or 2 where the tested list says the game also recreates its swap chain
+    const bool two = on && g.selfResizeRecommended && g.selfResizeValue == 2;
+    if (!WritePrivateProfileStringW(L"BFI", L"PresenterResize", !on ? L"0" : two ? L"2" : L"1", ini.c_str()))
         return LastError("Couldn't write", ini);
-    Log(on ? "PresenterResize=1" : "PresenterResize=0", g.name, ini, "", "");
+    Log(!on ? "PresenterResize=0" : two ? "PresenterResize=2" : "PresenterResize=1", g.name, ini, "", "");
     return {};
 }
 

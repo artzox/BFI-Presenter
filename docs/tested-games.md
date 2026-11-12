@@ -30,7 +30,8 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Alan Wake 2 | Working | Works (2×, 3×); 3×: Refresh + automatic frame cap, or Half refresh + Apply the cap with Reflex's frame limit (v1.0.19) | v0.19 | Standard setup |
 | God of War Ragnarök | Working | Runs, but judders below 60 output fps | v0.24 | Standard setup; RTSS limiter off |
 | Riven (2023) | Working | Works (OptiScaler XeSS FG; Refresh + the presenter's frame limit since v1.0.25) | v0.13 | A steady 60 fps for smooth motion; with DLSS 5 at 4K, XeSS frame generation through OptiScaler (see the notes below) |
-| Onimusha | Working | Works (2×, 3×); with DLSS 5 (ShortFuse's injector or OptiScaler NR) and 2×: Refresh + automatic frame cap, 60 of 60 (v1.0.19) | v0.27 | Standard setup; see the notes below for DLSS 5 |
+| Onimusha | Working | Works (2×, 3×); with DLSS 5 (ShortFuse's injector or OptiScaler NR) and 2×: Refresh + automatic frame cap, 60 of 60 (v1.0.19) | v0.27 | Resize the game's swap chain to start BFI (`PresenterResize=2`, set by the Manager); without frame generation it holds 60 real fps and responds best (see the notes) |
+| 007 First Light | Working | Works (2×, 3×) | v1.0.37 | Standard setup |
 | Resonance: A Plague Tale | Working without FG | Game won't start with FG + presenter | v0.19 | Force VSync on, Reflex off, Queue ahead on |
 | Ratchet & Clank: Rift Apart | Working without FG | Must be off | v1.0.16 | Exclusive fullscreen; FG off; change resolution once to start BFI; Half refresh + Lowest latency (Refresh + automatic frame cap also works) |
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
@@ -209,7 +210,13 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - The game turns frame generation off in its menus, so the menu runs at about half the game's frame-generated fps (also without the presenter). With ShortFuse's injector at Half refresh, frame generation sometimes stayed at 30 presented / 15 rendered after leaving the menu, until the menu was opened and closed again; Refresh with the automatic frame cap held 60. With OptiScaler NR frame generation stays on in the menus.
 - OptiScaler NR keeps frame generation on in the menus, so the menus don't drop to half the frame rate (v1.0.21: 60 presented / 30 rendered in game and menus).
 - **Recommended (v1.0.28): DLSS frame generation 2× forced through OptiScaler, not the game's own.** With the game's own frame generation, the switches between menus (off) and gameplay (on) still played badly in testing.
-- BFI may only start after switching the game to windowed and back to borderless.
+- **v1.0.38: BFI starts by itself with `PresenterResize=2`** (the Manager sets it for this game). The game creates its swap chain at 1080p, then once more at 4K, and never resizes that one, so BFI used to wait until the game was switched to windowed and back.
+- **v1.0.38, most responsive: no frame generation, no OptiScaler.** On an RTX 5080 at 4K the game holds 60 real fps (GPU 13–15 ms a frame). With 2× frame generation the 60 shown frames are 30 real plus 30 generated (GPU frame time 33 ms in the logs), which feels slow.
+  - Without OptiScaler the game calls its Reflex sleep once per frame, so the presenter paces it there (`ReflexLimitAtSleep=1`, the default): frames waited about 0.3 ms in the GPU queue, against 18–23 ms with the driver's limit, which OptiScaler's second sleep call forces. Without frame generation the menus don't drop to half the frame rate either, so OptiScaler isn't needed.
+  - `AutoFramesAhead=0` with `MaxFramesAhead=1`: the automatic setting moved to 2 after a menu, which felt noticeably slower.
+  - `ReflexAlign=1` cut about 4 ms (34.7 against 38.8 ms from release to flash) at the cost of a few more repeated frames; `ReflexAlign=0` (the coarse alignment) is the smoother of the two.
+  - Delete `OptiScaler.ini` from the game folder too when OptiScaler is removed: the presenter takes it as OptiScaler being there.
+- **With OptiScaler and REFramework, switching DLSS frame generation in the game's menu can freeze the game** after a few switches, also without BFI Presenter (a lock between REFramework, OptiScaler and Streamline). Set frame generation before starting the game. Since v1.0.38 the presenter no longer makes the first switch freeze.
 
 ### Resonance: A Plague Tale
 

@@ -2229,7 +2229,7 @@ static void DrawDetail(HWND)
     if (g.route == Route::Addon64 || g.route == Route::Addon32)
     {
         ImGui::TextColored(kGrey, "Start BFI"); ImGui::SameLine(lab);
-        bool on = g.selfResize == 1;
+        bool on = g.selfResize >= 1;
         if (ImGui::Checkbox("Resize the game's swap chain##selfresize", &on))
         {
             std::string e = SetPresenterResize(g, on);
@@ -2239,11 +2239,13 @@ static void DrawDetail(HWND)
         Tooltip("PresenterResize in this game's BFIPresenter.ini. BFI starts inside the game's first resize of its swap chain;\n"
                 "a few games never do one on their own (Hades II, Wreckfest 2, Pragmata), and BFI waits until you change\n"
                 "resolution or display mode. With this on, the presenter does that resize itself once the game runs steadily.\n"
-                "Only on the game's first swap chain. Off by default; set by itself for games the tested list names.");
+                "Only on the game's first swap chain (also on one the game recreates where the tested list says so:\n"
+                "PresenterResize=2). Off by default; set by itself for games the tested list names.");
         if (g.selfResizeRecommended)
         {
             ImGui::SameLine();
-            ImGui::TextColored(g.selfResize == 1 ? kGrey : kYellow, g.selfResize == 1 ? "(recommended for this game)" : "(recommended for this game: BFI won't start without it)");
+            const bool ok = g.selfResize == g.selfResizeValue || (g.selfResize >= 1 && g.selfResizeValue == 1);
+            ImGui::TextColored(ok ? kGrey : kYellow, ok ? "(recommended for this game)" : "(recommended for this game: BFI won't start without it)");
         }
     }
     if (g.shaderRecommended && g.route != Route::Shader)
