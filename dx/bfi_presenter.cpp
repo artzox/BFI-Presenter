@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t10"
+#define BFI_ADDON_VERSION "1.0.38-t11"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3004,6 +3004,27 @@ static DWORD WINAPI WatchdogThread(void *)
                     {
                         snprintf(who, sizeof(who), "game present thread %lu", (unsigned long)g_presentThreads[0]);
                         LogThreadStack(g_presentThreads[0], who);
+                    }
+                    // The presenter's side of it: its step, its thread and the two fences (a GPU queue waiting on the
+                    // other's fence shows as completed below reserved / signalled).
+                    LOGW("BFI Presenter: WATCHDOG -- presenter step: %s (%.1f s), %s, %s queue", kStageNames[g_presStage.load()],
+                         t - g_presStageT.load(), g_running.load() ? "running" : "stopped", g_ownPresentQueue ? "own" : "game's");
+                    if (g_thread) LogThreadStack(GetThreadId(g_thread), "presenter thread");
+                    if (g_presFence && g_gameFence)
+                    {
+                        // a try only: a stuck thread may hold g_lock, and the watchdog must not stop with it
+                        const bool locked = TryEnterCriticalSection(&g_lock) != 0;
+                        const unsigned long long pres = g_presFenceVal, game = g_gameFenceVal;
+                        char slots[256]; int sl = 0;
+                        for (UINT i = 0; i < kStage && sl < (int)sizeof(slots) - 48; i++)
+                            sl += snprintf(slots + sl, sizeof(slots) - sl, " %u:r%llu/g%llu", i,
+                                           (unsigned long long)g_readFence[i], (unsigned long long)g_stageFence[i]);
+                        if (locked) LeaveCriticalSection(&g_lock);
+                        LOGW("BFI Presenter: WATCHDOG -- fences: presenter %llu done of %llu reserved, game copies %llu done of %llu; "
+                             "slots (read / copy):%s; showing %d / %d%s",
+                             (unsigned long long)g_presFence->GetCompletedValue(), pres,
+                             (unsigned long long)g_gameFence->GetCompletedValue(), game, slots, g_presCurSlot, g_presCurSlot2,
+                             locked ? "" : " (presenter lock held by another thread)");
                     }
                 }
                 if (st != lastGame && g_waitSem)
