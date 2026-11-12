@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.38-t4"
+#define BFI_VERSION "1.0.38-t5"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -796,6 +796,7 @@ struct Swapchain
     uint64_t       stagePresentId[kStage] = {};
     uint64_t       slotReadSub[kStage] = {};    // presenter submission that last read the slot
     int            presCurSlot = -1;
+    int            presCurSlot2 = -1;           // split comparison: the newer frame its side without BFI shows
     std::map<uint32_t, CopyCmds> copyCmds;      // per queue family the game presents from
     std::mutex     lock;                        // stage arrays
     std::mutex     submitLock;                  // game-side presents
@@ -1089,6 +1090,9 @@ struct PresenterRes
     VkImageView           realView[kMaxImg] = {};
     VkFramebuffer         fb[kMaxImg] = {};
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dslN = VK_NULL_HANDLE;   // set 1: split comparison's newest game frame (graphics and compute)
+    VkDescriptorPool      dpN = VK_NULL_HANDLE;
+    VkDescriptorSet       dsN[kStage] = {};
     VkPipelineLayout      pl = VK_NULL_HANDLE;
     VkShaderModule        vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE, fsMeas = VK_NULL_HANDLE;
     VkPipeline            pso = VK_NULL_HANDLE, psoMeas = VK_NULL_HANDLE;
@@ -1326,10 +1330,11 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
         dli.bindingCount = 3;
         dli.pBindings = b;
         p = d->CreateDescriptorSetLayout(dev, &dli, nullptr, &R.dslC) == VK_SUCCESS;
+        VkDescriptorSetLayout sl2[2] = { R.dslC, R.dslN };
         VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Constants) };
         VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        pli.setLayoutCount = 1;
-        pli.pSetLayouts = &R.dslC;
+        pli.setLayoutCount = 2;
+        pli.pSetLayouts = sl2;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pr;
         p = p && d->CreatePipelineLayout(dev, &pli, nullptr, &R.plC) == VK_SUCCESS;
@@ -1489,13 +1494,24 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     }
     if (p)
     {
+        // Set 1: the split comparison's newest game frame, one set per staging slot.
+        VkDescriptorSetLayoutBinding bn = {};
+        bn.binding = 0;
+        bn.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bn.descriptorCount = 1;
+        bn.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo dln = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        dln.bindingCount = 1;
+        dln.pBindings = &bn;
+        p = d->CreateDescriptorSetLayout(dev, &dln, nullptr, &R.dslN) == VK_SUCCESS;
+        VkDescriptorSetLayout sl2[2] = { R.dsl, R.dslN };
         VkPushConstantRange pr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Constants) };
         VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        pli.setLayoutCount = 1;
-        pli.pSetLayouts = &R.dsl;
+        pli.setLayoutCount = 2;
+        pli.pSetLayouts = sl2;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pr;
-        p = d->CreatePipelineLayout(dev, &pli, nullptr, &R.pl) == VK_SUCCESS;
+        p = p && d->CreatePipelineLayout(dev, &pli, nullptr, &R.pl) == VK_SUCCESS;
     }
     if (p)
     {
@@ -1622,6 +1638,33 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
             d->UpdateDescriptorSets(dev, 2, w, 0, nullptr);
         }
     }
+    if (p)
+    {
+        VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kStage };
+        VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        dpi.maxSets = kStage;
+        dpi.poolSizeCount = 1;
+        dpi.pPoolSizes = &ps;
+        p = d->CreateDescriptorPool(dev, &dpi, nullptr, &R.dpN) == VK_SUCCESS;
+        VkDescriptorSetLayout l[kStage];
+        for (uint32_t i = 0; i < kStage; i++) l[i] = R.dslN;
+        VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dai.descriptorPool = R.dpN;
+        dai.descriptorSetCount = kStage;
+        dai.pSetLayouts = l;
+        p = p && d->AllocateDescriptorSets(dev, &dai, R.dsN) == VK_SUCCESS;
+        for (uint32_t i = 0; p && i < kStage; i++)
+        {
+            VkDescriptorImageInfo ii = { R.sampler, sc->stageView[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            w.dstSet = R.dsN[i];
+            w.dstBinding = 0;
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w.pImageInfo = &ii;
+            d->UpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+        }
+    }
     if (!p)
     {
         if (R.pso) { d->DestroyPipeline(dev, R.pso, nullptr); R.pso = VK_NULL_HANDLE; }
@@ -1734,6 +1777,8 @@ static void DestroyPresenterRes(DeviceData *d, PresenterRes &R)
     if (R.fsMeas) d->DestroyShaderModule(dev, R.fsMeas, nullptr);
     if (R.pl) d->DestroyPipelineLayout(dev, R.pl, nullptr);
     if (R.dsl) d->DestroyDescriptorSetLayout(dev, R.dsl, nullptr);
+    if (R.dslN) d->DestroyDescriptorSetLayout(dev, R.dslN, nullptr);
+    if (R.dpN) d->DestroyDescriptorPool(dev, R.dpN, nullptr);
     if (R.dp) d->DestroyDescriptorPool(dev, R.dp, nullptr);
     if (R.sampler) d->DestroySampler(dev, R.sampler, nullptr);
     if (R.rp) d->DestroyRenderPass(dev, R.rp, nullptr);
@@ -2026,7 +2071,7 @@ static void PresenterThread(Swapchain *sc)
     float    soften = 0.0f;          // current fade (0 = full strobe, 1 = steady average)
     double   gradPhase = 0.0;        // LCD gradual saver: lit window start within the first sub-frame, 0..1
     double   gradHold = -1.0;        // LCD gradual saver at 2 frames: refreshes left to hold sharp (-1 = start a hold)
-    uint64_t bufSub[kMaxImg] = {}, bufFrame[kMaxImg] = {};
+    uint64_t bufSub[kMaxImg] = {}, bufFrame[kMaxImg] = {}, bufFrame2[kMaxImg] = {};
     Constants bufConst[kMaxImg] = {};
     bool bufValid[kMaxImg] = {};
     uint32_t acqIdx = 0;
@@ -2250,7 +2295,7 @@ static void PresenterThread(Swapchain *sc)
         // presenter (a new frame only at the start of each strobe cycle;
         // Smooth = oldest unseen, one in reserve; Lowest latency = newest).
         const uint32_t slotNow = (uint32_t)((presents - phaseShift) % (uint64_t)s.frames);
-        int pick = -1;
+        int pick = -1, pickNew2 = -1;       // pickNew2: split comparison's side without BFI (the newest frame)
         uint64_t pickId = 0;
         double pickTime = 0.0;
         bool pickNewG = false;
@@ -2310,6 +2355,10 @@ static void PresenterThread(Swapchain *sc)
                 pickReadyMs = pickNewG ? (sc->gDoneId[pickId % kLr] == pickId ? (Now() - sc->gDoneT[pickId % kLr]) * 1000.0 : 0.0) : -1.0;
                 pickPresentId = sc->stagePresentId[pick];
                 sc->presCurSlot = pick;
+                // Split comparison: its side without BFI shows the newest finished game frame at every refresh, like a
+                // display without BFI (120 fps at 120 Hz: every frame), while the BFI side keeps one frame per strobe cycle.
+                pickNew2 = (s.split && newest >= 0 && newestId > pickId) ? newest : pick;
+                sc->presCurSlot2 = pickNew2 != pick ? pickNew2 : -1;
                 if (cycleStart)
                 {
                     if (pickId == lastShownId) secFrameRepeats++;
@@ -2475,8 +2524,10 @@ static void PresenterThread(Swapchain *sc)
         }
 
         bool dumpNow = false;
+        if (pickNew2 < 0) pickNew2 = pick;
+        const uint64_t pickId2 = sc->stageId[pickNew2];
         const bool reuse = !(R.dumpPtr && dumpLeft > 0) &&
-                           bufValid[idx] && bufFrame[idx] == pickId && memcmp(&bufConst[idx], &c, sizeof(c)) == 0;
+                           bufValid[idx] && bufFrame[idx] == pickId && bufFrame2[idx] == pickId2 && memcmp(&bufConst[idx], &c, sizeof(c)) == 0;
         VkSemaphore presentWait = acqSem;
         double tFence = Now();
         if (reuse) secReused++;
@@ -2538,6 +2589,7 @@ static void PresenterThread(Swapchain *sc)
                 d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &mb);
                 d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.psoC);
                 d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plC, 0, 1, &R.dsC[pick], 0, nullptr);
+                d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plC, 1, 1, &R.dsN[pickNew2], 0, nullptr);
                 d->CmdPushConstants(cb, R.plC, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cc), &cc);
                 d->CmdDispatch(cb, (sc->extent.width + 7) / 8, (sc->extent.height + 7) / 8, 1);
                 VkImageMemoryBarrier b2[2] = {
@@ -2602,6 +2654,7 @@ static void PresenterThread(Swapchain *sc)
                 d->CmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
                 d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.pso);
                 d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.pl, 0, 1, &R.ds[pick], 0, nullptr);
+                d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.pl, 1, 1, &R.dsN[pickNew2], 0, nullptr);
                 d->CmdPushConstants(cb, R.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(c), &c);
                 VkViewport vp = { 0.0f, 0.0f, (float)sc->extent.width, (float)sc->extent.height, 0.0f, 1.0f };
                 VkRect2D scis = { { 0, 0 }, sc->extent };
@@ -2658,6 +2711,7 @@ static void PresenterThread(Swapchain *sc)
             {
                 std::lock_guard<std::mutex> l(sc->lock);
                 sc->slotReadSub[pick] = presSub;
+                if (pickNew2 >= 0) sc->slotReadSub[pickNew2] = presSub;
             }
             bufSub[idx] = presSub;
             VkPipelineStageFlags waitStage = (copyMode || R.rt) ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -2687,6 +2741,7 @@ static void PresenterThread(Swapchain *sc)
                 break;
             }
             bufFrame[idx] = pickId;
+            bufFrame2[idx] = pickId2;
             bufConst[idx] = c;
             bufValid[idx] = true;
             presentWait = R.done[idx];
@@ -4138,7 +4193,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
             uint64_t bestId = ~0ull;
             for (uint32_t i = 0; i < kStage; i++)
             {
-                if ((int)i == sc->presCurSlot || sc->slotReadSub[i] > pdone) continue;
+                if ((int)i == sc->presCurSlot || (int)i == sc->presCurSlot2 || sc->slotReadSub[i] > pdone) continue;
                 if (sc->stageId[i] < bestId) { slot = (int)i; bestId = sc->stageId[i]; }
             }
             if (slot >= 0) { sc->stageId[slot] = 0; sc->copyDone[slot] = false; }   // being rewritten: not selectable
@@ -4152,6 +4207,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
         sc->slotWaits.fetch_add(1);
         std::lock_guard<std::mutex> l(sc->lock);
         slot = (sc->presCurSlot + 1) % (int)kStage;
+        if (slot == sc->presCurSlot2) slot = (slot + 1) % (int)kStage;
         sc->stageId[slot] = 0;
         sc->copyDone[slot] = false;
     }
