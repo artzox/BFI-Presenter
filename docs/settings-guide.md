@@ -83,8 +83,8 @@ Shows one side of the screen without BFI and the other with it, at the same brig
 *When to change it:* for videos, streams and showing someone what BFI does. Hotkey: Ctrl+Shift+C. Turn it off for playing.
 
 **On-screen display** · `Osd`, `OsdCorner`, `OsdGraph`, `OsdLoads`, `OsdScale` · default: off, top right, on, on, 1.0\
-A small panel over the game, so you can watch it while changing the game's settings, without RTSS and without opening ReShade's menu: the game's frame rate and frame time (green at one game frame per strobe cycle or more, amber or red below), the refresh rate and strobe cycles per second, the presenter's **lost** frames (finished but never shown), **repeated** frames (strobe cycles that showed the previous frame again) and **missed** refreshes, each per second, a frame-time graph of the last 240 game frames, and CPU and GPU load (GPU load on NVIDIA cards, through the driver's NVML). It is drawn into the game's picture through ReShade, so it flashes with BFI like the rest of the image. Corner, graph, loads and size can be set. Works in every API, DirectX and Vulkan (v1.0.38).\
-*When to change it:* turn it on while tuning a game's settings. Hotkey: Ctrl+Shift+F.
+A small panel over the game, so you can watch it while changing the game's settings, without RTSS and without opening ReShade's menu: the game's frame rate and frame time (green at one game frame per strobe cycle or more, amber or red below), the refresh rate and strobe cycles per second, the presenter's **lost** frames (finished but never shown), **repeated** frames (strobe cycles that showed the previous frame again) and **missed** refreshes, each for the last second, with totals in brackets since you last reset them (Ctrl+Shift+Z, or **Reset totals** next to the checkbox; the time they cover is shown under them), a frame-time graph of the last 240 game frames, and CPU and GPU load (GPU load on NVIDIA cards, through the driver's NVML). It is drawn into the game's picture through ReShade, so it flashes with BFI like the rest of the image. Corner, graph, loads and size can be set. Works in every API, DirectX and Vulkan (v1.0.38).\
+*When to change it:* turn it on while tuning a game's settings. Hotkey: Ctrl+Shift+F. To compare two settings, reset the totals after each change and play the same stretch.
 
 ## Your display
 
@@ -393,6 +393,7 @@ The DX add-on compiles its shaders once per session, while the game starts up, a
 | Ctrl+Shift+S | Rolling scan on / off |
 | Ctrl+Shift+C | Split comparison on / off: one side of the screen without BFI |
 | Ctrl+Shift+F | On-screen display on / off: frame rate, lost frames, frame-time graph, CPU / GPU load |
+| Ctrl+Shift+Z | On-screen display: reset the lost / repeated / missed totals |
 | Ctrl+Shift+R | Reload `BFIPresenter.ini` after editing it |
 | Ctrl+Shift+O | Vulkan: rebuild the swap chain (if flashes started after an overlay or menu) |
 | Ctrl+Shift+K | Put a marker in the log with the last second's state (frame rate, frame generation, Reflex limit, video memory), to find a moment you noticed when sending a log |

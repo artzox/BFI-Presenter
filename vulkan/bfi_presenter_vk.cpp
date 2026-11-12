@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.38-t8"
+#define BFI_VERSION "1.0.38-t9"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -141,7 +141,7 @@ static void Log(const char *lvl, const char *fmt, ...)
 #include "../common/bfi_syscheck.h"
 #include "../common/bfi_vram.h"
 #include "../common/bfi_clockdrift.h"
-namespace Osd { inline void FramePush(double tNowSec); }   // common/bfi_osd.h (included with ImGui further down)
+namespace Osd { inline void FramePush(double tNowSec); inline void AddSecond(int, int, int, double); inline void ResetTotals(double); }   // common/bfi_osd.h (included with ImGui further down)
 static SysCheck g_sysCheck;      // power plan, GPUs, displays (checked on the window watch thread)
 #endif
 #define LOGE(...) Log("ERROR", __VA_ARGS__)
@@ -2153,7 +2153,7 @@ static void PresenterThread(Swapchain *sc)
     while (!sc->stopReq.load())
     {
         // hotkeys (edge-triggered) act on the shared settings
-        const bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C'), ko = KeyCombo('F');
+        const bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C'), ko = KeyCombo('F'), kz = KeyCombo('Z');
         if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp) || (ko && !kosd))
         {
             std::lock_guard<std::mutex> l(g_cfgLock);
@@ -2164,6 +2164,12 @@ static void PresenterThread(Swapchain *sc)
             if (sp && !ksp) g_shared.split = !g_shared.split;
         }
         krs = rs; ksp = sp; kosd = ko;
+        {
+            // Ctrl+Shift+Z: the OSD's totals start again
+            static bool kzPrev = false;
+            if (kz && !kzPrev) { Osd::ResetTotals(Now()); LOGI("BFI Presenter: OSD totals reset"); }
+            kzPrev = kz;
+        }
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
         // BFIPresenter.ini edited while the game runs (no ReShade overlay in the game): picked up within a second.
         {
@@ -3047,6 +3053,7 @@ static void PresenterThread(Swapchain *sc)
             }
             g_status.frameRepeats = secFrameRepeats;
             g_status.frameSkips   = secFrameSkips;
+            Osd::AddSecond(secFrameSkips, secFrameRepeats, secLate, Now());
             g_status.unevenRep    = secRepU;
             g_status.qaPrimes     = secQaPrimes;
             g_status.qaSkips      = secQaSkips;
@@ -5803,7 +5810,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
         std::lock_guard<std::mutex> l(g_cfgLock);
         on = g_shared.osd != 0; corner = g_shared.osdCorner; graph = g_shared.osdGraph; loads = g_shared.osdLoads; scale = g_shared.osdScale;
         d.gameFps = g_status.gameFps; d.refreshHz = g_status.refreshHz; d.frames = g_shared.frames;
-        d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late;
+        d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
         d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running;
     }
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
@@ -6030,6 +6037,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         }
         bool osd = s.osd != 0;
         if (ImGui::Checkbox("On-screen display (Ctrl+Shift+F)", &osd)) s.osd = osd ? 1 : 0;
+        if (s.osd) { ImGui::SameLine(); if (ImGui::SmallButton("Reset totals (Ctrl+Shift+Z)")) Osd::ResetTotals(Now()); }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("A small panel over the game: its frame rate and frame time, the presenter's lost and repeated\n"
                                                       "frames and missed refreshes, a frame-time graph and CPU / GPU load (GPU: NVIDIA).\n"
                                                       "For changing the game's settings without RTSS or opening this menu.");

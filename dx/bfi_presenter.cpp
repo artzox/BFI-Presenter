@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38-t8"
+#define BFI_ADDON_VERSION "1.0.38-t9"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3585,7 +3585,7 @@ static DWORD WINAPI PresenterThread(void *)
     while (ok && g_running.load())
     {
         // hotkeys (edge-triggered) act on the shared settings
-        bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C'), ko = KeyCombo('F');
+        bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C'), ko = KeyCombo('F'), kz = KeyCombo('Z');
         if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp) || (ko && !kosd))
         {
             EnterCriticalSection(&g_cfgLock);
@@ -3597,6 +3597,12 @@ static DWORD WINAPI PresenterThread(void *)
             LeaveCriticalSection(&g_cfgLock);
         }
         krs = rs; ksp = sp; kosd = ko;
+        {
+            // Ctrl+Shift+Z: the OSD's totals start again
+            static bool kzPrev = false;
+            if (kz && !kzPrev) { Osd::ResetTotals(Now()); LOGI("BFI Presenter: OSD totals reset"); }
+            kzPrev = kz;
+        }
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
         // Ctrl+Shift+K: a marker in the log with the last second's state, to find a moment the player noticed (a
         // stutter, a lost frame limit) in a long session.
@@ -4548,6 +4554,7 @@ static DWORD WINAPI PresenterThread(void *)
             }
             secReused = 0;
             g_status.frameSkips   = secFrameSkips;
+            Osd::AddSecond(g_status.frameSkips, g_status.frameRepeats, g_status.late, Now());
             // Automatic frames ahead: 1 (least latency) normally; 2 while the
             // game keeps missing strobe cycles (CPU and GPU then overlap again,
             // South of Midnight: 55 -> 60 fps); back to 1 when the game waits
@@ -10309,7 +10316,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
     const float scale = g_shared.osdScale;
     OsdData d;
     d.gameFps = g_status.gameFps; d.refreshHz = g_status.refreshHz; d.frames = g_shared.frames;
-    d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late;
+    d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
     d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
     LeaveCriticalSection(&g_cfgLock);
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
@@ -10567,6 +10574,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         }
         bool osd = s.osd != 0;
         if (ImGui::Checkbox("On-screen display (Ctrl+Shift+F)", &osd)) s.osd = osd ? 1 : 0;
+        if (s.osd) { ImGui::SameLine(); if (ImGui::SmallButton("Reset totals (Ctrl+Shift+Z)")) Osd::ResetTotals(Now()); }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("A small panel over the game: its frame rate and frame time, the presenter's lost and repeated\n"
                                                       "frames and missed refreshes, a frame-time graph and CPU / GPU load (GPU: NVIDIA).\n"
                                                       "For changing the game's settings without RTSS or opening this menu.");

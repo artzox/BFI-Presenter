@@ -18,6 +18,7 @@ struct OsdData
     bool   paused = false;     // hitch guard has BFI paused
     bool   bfiOn = true;
     double relFlashMs = -1.0;  // game released -> lit flash (average), -1 = not measured
+    double now = 0.0;          // Now() seconds, for the totals' time
 };
 
 namespace Osd
@@ -35,6 +36,25 @@ inline void FramePush(double tNowSec)
     const double d = (tNowSec - last) * 1000.0;
     if (d <= 0.0 || d > 1000.0) return;
     g_ms[g_head.fetch_add(1) % kHist] = (float)d;
+}
+
+// Totals since the last reset (Ctrl+Shift+Z or the overlay's button), next to the per-second counts: added once a
+// second where those are counted, so a setting can be changed, the totals reset and the two runs compared.
+static std::atomic<long long> g_totLost{0}, g_totRep{0}, g_totMiss{0};
+static std::atomic<double> g_totSince{0.0};   // when the totals started (Now() seconds), 0 = not yet
+
+inline void AddSecond(int lost, int repeated, int missed, double tNowSec)
+{
+    double z = 0.0;
+    g_totSince.compare_exchange_strong(z, tNowSec);
+    if (lost > 0) g_totLost.fetch_add(lost);
+    if (repeated > 0) g_totRep.fetch_add(repeated);
+    if (missed > 0) g_totMiss.fetch_add(missed);
+}
+inline void ResetTotals(double tNowSec)
+{
+    g_totLost.store(0); g_totRep.store(0); g_totMiss.store(0);
+    g_totSince.store(tNowSec);
 }
 
 // CPU load (all cores), from GetSystemTimes between calls about a second apart.
@@ -118,8 +138,15 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
         ImGui::TextDisabled("(%.0f strobe cycles/s)", cycles);
     }
     const bool trouble = d.lost > 0 || d.missed > 0 || d.repeated > 0;
-    ImGui::TextColored(trouble ? kWarn : kGood, "lost %d   repeated %d   missed %d", d.lost, d.repeated, d.missed);
+    // this second's counts, then the totals since the last reset in brackets
+    ImGui::TextColored(trouble ? kWarn : kGood, "lost %d (%lld)   repeated %d (%lld)   missed %d (%lld)", d.lost, g_totLost.load(),
+                       d.repeated, g_totRep.load(), d.missed, g_totMiss.load());
     if (d.paused) { ImGui::SameLine(); ImGui::TextColored(kBad, "  BFI paused"); }
+    {
+        const double since = g_totSince.load();
+        const int el = since > 0.0 && d.now > since ? (int)(d.now - since) : 0;
+        ImGui::TextDisabled("(totals for %d:%02d:%02d, Ctrl+Shift+Z resets)", el / 3600, el / 60 % 60, el % 60);
+    }
     if (d.relFlashMs > 0.0) ImGui::TextDisabled("release to flash %.1f ms", d.relFlashMs);
     if (graph)
     {
