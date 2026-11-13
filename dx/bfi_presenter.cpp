@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.39-t4"
+#define BFI_ADDON_VERSION "1.0.39-t5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3163,6 +3163,7 @@ struct ReflexSecond
 static void ReflexTick(int limitUs, ReflexSecond &out);
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
 static std::atomic<int> g_sleepGrid{1};       // SleepLimitGrid (copied from the settings)
+static std::atomic<bool> g_fgXess{false};     // the game presents through XeSS frame generation's swap chain (libxess_fg.dll)
 static std::atomic<int> g_sleepLimitUs{0};    // frame limit at the game's Reflex sleep, per rendered frame (0 = off)
 static std::atomic<bool> g_sleepActive{false};        // the sleep-point limit is in charge: the game's own limit is taken from the driver
 static std::atomic<int>  g_gameOwnUs{0};              // the game's own Reflex limit, applied at the sleep point instead
@@ -5062,7 +5063,8 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     static double nudgedT = -1.0;
                     if (t < phaseUntil && phaseUntil != nudgedT && g_sleepLimitUs.load() > 0 && !swSearching &&
-                        !(s.sleepFgSearch && s.sleepGrid && g_sleepFgFactor.load() > 1))
+                        !(s.sleepFgSearch && s.sleepGrid && g_sleepFgFactor.load() > 1) &&
+                        !(g_fgXess.load() && g_sleepFgFactor.load() > 1))   // XeSS frame generation: as 1.0.38
                     { nudgedT = phaseUntil; g_sleepShiftUs.fetch_sub(2000); }
                 }
                 // ReflexAlign: the limiter paces the game on its own clock, so a game frame is ready
@@ -5277,7 +5279,10 @@ static DWORD WINAPI PresenterThread(void *)
                         static int fgTight = 0;
                         const bool sleepFgNoSearch = !fgPace && !sleepFg && g_sleepLimitUs.load() > 0 && g_sleepFgFactor.load() > 1 && locked;
                         const bool missing = stNow.frameRepeats + stNow.frameSkips >= 2;
-                        fgTight = (sleepFgNoSearch && holds && !hitchPaused && p10 >= 0.0 && p10 < 0.001 && missing) ? fgTight + 1 : 0;
+                        // Presented frames against one per strobe cycle (capFps above counts rendered frames here).
+                        const double presCap = hzL > 0.0 ? hzL / s.frames : 0.0;
+                        const bool holdsPres = presCap > 0.0 && stNow.gameFps > 0.95 * presCap && stNow.gameFps < 1.05 * presCap;
+                        fgTight = (sleepFgNoSearch && !g_fgXess.load() && holdsPres && !hitchPaused && p10 >= 0.0 && p10 < 0.001 && missing) ? fgTight + 1 : 0;
                         if (fgTight >= 3)
                         {
                             fgTight = 0;
@@ -6678,7 +6683,10 @@ static int __cdecl hk_NvSleep(IUnknown *dev)
         // clock and the display on its own, and a whole number of cycles in microseconds is never exact, so the frames
         // drifted past the lit refresh's pick every so often (Silent Hill: Townfall, XeSS frame generation: 6-10
         // repeated and skipped a second each time). Only when the limit is a whole number of strobe cycles.
-        if (g_sleepGrid.load())
+        // Not with XeSS frame generation: it spaces its frames unevenly by itself, and a start time on the pick then
+        // stayed there (Silent Hill: Townfall: 1.9-2.3 frames a second not shown, against 0.5-1.0 with the PC's clock,
+        // whose drift moves it on). DLSS frame generation keeps the grid (Control: 0.05 against 1.7).
+        if (g_sleepGrid.load() && !(g_fgXess.load() && g_sleepFgFactor.load() > 1))
         {
             UINT64 c = 0; int sl = 0; double tick = 0.0;
             for (int i = 0; i < 4; i++)
@@ -7465,6 +7473,7 @@ static void OuterCheck(void *obj)
             LOGI("BFI Presenter: the game presents to a wrapper swap chain (%s) -- not FSR frame generation, so the game's "
                  "presents are counted on the real swap chain as before", mod);
             g_wrapperVtbl.store(vt);
+            if (strstr(l, "xess")) g_fgXess.store(true);
             EnterCriticalSection(&g_cfgLock);
             const bool self = g_shared.selfResize != 0;
             LeaveCriticalSection(&g_cfgLock);
