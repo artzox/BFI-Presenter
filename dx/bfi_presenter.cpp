@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.40-t2"
+#define BFI_ADDON_VERSION "1.0.40-t3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3161,6 +3161,7 @@ struct ReflexSecond
 };
 static void ReflexTick(int limitUs, ReflexSecond &out);
 // Stall probe (test, see StartProbe)
+static void StartProbe();
 static std::atomic<bool>   g_probeRun{false};
 static HANDLE              g_probeThread = nullptr;
 static std::atomic<int>    g_probeSameUs{-1}, g_probeDev2Us{-1};   // longest submission since the last log row (-1: no probe)
@@ -3748,6 +3749,7 @@ static DWORD WINAPI PresenterThread(void *)
                               "wait_vblank_ms,wait_gpu_ms,submit_ms,present_ms,hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,"
                               "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup,submit_cpu_ms,present_cpu_ms,probe_same_ms,probe_dev2_ms\n");
                 LOGI("BFI Presenter: timing log started: %s", path);
+                StartProbe();   // stall probe (test): runs while the timing log does
             }
             snprintf(path, sizeof(path), "%.*sBFIPresenter_reflex_%04u%02u%02u_%02u%02u%02u.csv",
                      (int)(strlen(g_logPath) - strlen("BFIPresenter_log.csv")), g_logPath,
@@ -5704,7 +5706,6 @@ static void StartPresenter()
     g_thread = CreateThread(nullptr, 0, PresenterThread, nullptr, 0, nullptr);
     if (g_thread) SetThreadPriority(g_thread, THREAD_PRIORITY_TIME_CRITICAL);
     else g_running.store(false);
-    if (g_thread) StartProbe();
     if (g_thread && !g_lrThread)
     {
         if (!g_lrEv) g_lrEv = CreateEventA(nullptr, FALSE, FALSE, nullptr);
@@ -5725,7 +5726,6 @@ static std::atomic<bool> g_presenterStuck{false};
 static bool StopPresenter()
 {
     if (g_presenterStuck.load()) return false;
-    StopProbe();
     if (g_lrThread)
     {
         g_lrRun.store(false);
@@ -5767,6 +5767,7 @@ static bool StopPresenter()
         CloseHandle(g_thread);
         g_thread = nullptr;
     }
+    StopProbe();   // started by the presenter thread with the timing log; stopped once that thread has ended
     // Drain the presenter queue. Signalling a value above every reservation
     // also releases game-queue waits on presenter reads that never happened.
     if (g_presQueue && g_presFence)
