@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.39"
+#define BFI_ADDON_VERSION "1.0.40-t1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -152,6 +152,7 @@ struct Settings
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap without Reflex holds the game before its next frame starts
     int   fgLimitNoReflex = 1; // FrameGenLimitWithoutReflex: frame generation without Reflex limited to one presented frame per strobe cycle
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
+    int   reflexReportSec = 1; // ReflexReportSeconds (test): read Reflex's latency reports every N seconds (0 = never)
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
     int   deferRecreated = 1; // recreated swap chains: no BFI until the game resizes (safe)
@@ -318,6 +319,7 @@ static void LoadSettings(Settings &s)
     s.reflexAlignCoarse = IniInt("ReflexAlignCoarse", 1) ? 1 : 0;
     s.sleepGrid = IniInt("SleepLimitGrid", 1) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
+    s.reflexReportSec = std::max(0, std::min(30, IniInt("ReflexReportSeconds", 1)));
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = IniInt("LearnPerGame", 1) ? 1 : 0;
@@ -3158,6 +3160,7 @@ struct ReflexSecond
     int    limitUs = 0;          // Reflex frame limit in effect
 };
 static void ReflexTick(int limitUs, ReflexSecond &out);
+static std::atomic<int> g_rfxReadMark{0};      // the timing log marks the refresh when Reflex's reports were read
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
 static std::atomic<int> g_sleepGrid{1};       // SleepLimitGrid (copied from the settings)
 static std::atomic<bool> g_alignHunted{false}; // ReflexAlign gave up this session (kept moving earlier: the game's own stutters)
@@ -3739,7 +3742,7 @@ static DWORD WINAPI PresenterThread(void *)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,present_count,sync_refresh_count,"
                               "bfi,method,frames,gain,floor,rolloff,pacing,cap,ahead,vblank,queue_ahead,queued,"
                               "wait_vblank_ms,wait_gpu_ms,submit_ms,present_ms,hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,"
-                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup\n");
+                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup,rfx_read\n");
                 LOGI("BFI Presenter: timing log started: %s", path);
             }
             snprintf(path, sizeof(path), "%.*sBFIPresenter_reflex_%04u%02u%02u_%02u%02u%02u.csv",
@@ -5453,14 +5456,15 @@ static DWORD WINAPI PresenterThread(void *)
             EnterCriticalSection(&g_cfgLock);
             lrLog.lrState = g_status.lrState; lrLog.lrEst = g_status.lrEst; lrLog.lrMargin = g_status.lrMargin;
             LeaveCriticalSection(&g_cfgLock);
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d\n", t * 1000.0,
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d\n", t * 1000.0,
                     (unsigned long long)presents, c.slot,
                     (unsigned long long)pickId, (t - pickTime) * 1000.0, (t - lastT) * 1000.0,
                     sok ? (int)st.PresentCount : -1, sok ? (int)st.SyncRefreshCount : -1,
                     s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     g_maxAhead.load(), s.pacing, s.queueAhead, queuedNow,
                     (tVb - tLoop0) * 1000.0, (tFence - tVb) * 1000.0, (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f, hotArea, rawAvg,
-                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp);
+                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp,
+                    g_rfxReadMark.exchange(0));
         }
         lastT = t;
         if (pickId != lastShownId) lastNewFrameT = Now();
@@ -6957,7 +6961,24 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
     memset(&res, 0, sizeof(res));
     res.version = BFI_NVVER(NvLatencyResult);
     bool markers = false;
-    if (g_nvGetLatency(dev, &res) == 0)
+    // ReflexReportSeconds (test): the latency reports are read every N seconds (0 = never). The presenter's next Present
+    // waited 5-9 ms now and then right after this read, once a second (Onimusha, Alan Wake 2, Dead Space). In between,
+    // the last second read is used again.
+    int every;
+    EnterCriticalSection(&g_cfgLock);
+    every = g_shared.reflexReportSec;
+    LeaveCriticalSection(&g_cfgLock);
+    static ReflexSecond s_lastRead;
+    static int s_tickN = 0, s_everyLogged = -1;
+    if (every != s_everyLogged)
+    {
+        s_everyLogged = every;
+        if (every != 1) LOGI("BFI Presenter: Reflex latency reports read %s (ReflexReportSeconds=%d, test)",
+                             every == 0 ? "never" : "every few seconds", every);
+    }
+    const bool readNow = every > 0 && (s_tickN++ % every) == 0;
+    if (readNow) g_rfxReadMark.store(1);
+    if (readNow && g_nvGetLatency(dev, &res) == 0)
     {
         double a = 0, b = 0, c = 0, g = 0, q = 0, ga = 0, sim = 0, sub = 0;
         int n = 0, ni = 0;
@@ -6989,7 +7010,8 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
         static UINT64 prevNewest = 0;
         static double prevT = 0.0;
         const double tn = Now();
-        if (prevNewest && newest > prevNewest && newest - prevNewest < 2000 && tn - prevT > 0.5 && tn - prevT < 3.0)
+        if (prevNewest && newest > prevNewest && newest - prevNewest < 2000 * std::max(1, every) && tn - prevT > 0.5 &&
+            tn - prevT < 2.0 + std::max(1, every))
         {
             out.renderedFps = (double)(newest - prevNewest) / (tn - prevT);
             g_rfxRenderedFps.store(out.renderedFps);
@@ -6997,6 +7019,13 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
         }
         prevNewest = newest; prevT = tn;
         g_rfxLastReport = newest;
+    }
+    if (readNow) s_lastRead = out;
+    else if (every > 0)
+    {
+        out = s_lastRead;                                     // the last read, kept for the seconds in between
+        markers = out.frames > 0;
+        if (g_rfxRenderedFps.load() > 1.0) g_rfxRenderedT.store(Now());
     }
 
     // The frame limit: on top of the game's own mode (as seen, or as the driver reports it).
