@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.40-t9"
+#define BFI_ADDON_VERSION "1.0.40-t10"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -874,6 +874,12 @@ static ID3D12Resource        *g_stagePrivI[16] = {};    // the imported copies a
 static ID3D12Fence           *g_ptFence = nullptr;      // pass-through copies (the game's own device)
 static UINT64                 g_ptFenceVal = 0;
 static ID3D12Device *ImpDev() { return g_impDev ? g_impDev : g_device; }
+// Two-step import (importer on its own device): the game's shared frame is first copied into a texture only the importer
+// has (g_impTmp), and that, in a separate submission, into the copy shared with the presenter. A submission held up by
+// the game's device then never holds the texture the presenter shares (t8: it did, and the presenter waited with it).
+static ID3D12Resource        *g_impTmp[16] = {};
+static ID3D12CommandAllocator *g_impAlloc2[16] = {};
+static ID3D12GraphicsCommandList *g_impList2 = nullptr;
 // What the presenter thread sees: a slot is ready when its frame was imported (importer) or copied (otherwise).
 static ID3D12Fence *PresFence();
 static UINT64 PresFenceOf(UINT i);
@@ -1392,6 +1398,9 @@ static bool CreateFrameResources()
             if (g_impOn.load() && !(g_stagePriv[s] = CreateTex(g_desc, gf, D3D12_RESOURCE_FLAG_NONE, L"BFI imported frame", s, g_device,
                                                                g_impDev ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE)))
                 return false;
+            if (g_impOn.load() && g_impDev && g_impList2 &&
+                !(g_impTmp[s] = CreateTex(g_desc, gf, D3D12_RESOURCE_FLAG_NONE, L"BFI import step", s, g_impDev)))
+                return false;
             if (g_impOn.load() && g_impDev)
             {
                 HANDLE h2 = nullptr;
@@ -1432,7 +1441,7 @@ static bool RefreshRealDesc()
 static void ReleaseFrameResources()
 {
     for (UINT i = 0; i < kMaxBuf; i++) SafeRelease(g_virt[i]);
-    for (UINT s = 0; s < kStage; s++) { SafeRelease(g_stage[s]); SafeRelease(g_stageG[s]); SafeRelease(g_stagePriv[s]); SafeRelease(g_stagePrivI[s]); }
+    for (UINT s = 0; s < kStage; s++) { SafeRelease(g_stage[s]); SafeRelease(g_stageG[s]); SafeRelease(g_stagePriv[s]); SafeRelease(g_stagePrivI[s]); SafeRelease(g_impTmp[s]); }
     g_bufCount = 0;
 }
 
@@ -5892,7 +5901,8 @@ static DWORD WINAPI ImportThread(void *)
             g_presFence->SetEventOnCompletion(rd, ev);
             WaitForSingleObject(ev, 100);
         }
-        ID3D12Resource *const dst = g_stagePrivI[slot] ? g_stagePrivI[slot] : g_stagePriv[slot];
+        ID3D12Resource *const out = g_stagePrivI[slot] ? g_stagePrivI[slot] : g_stagePriv[slot];
+        ID3D12Resource *const dst = g_impTmp[slot] ? g_impTmp[slot] : out;   // two-step: first into the importer's own
         g_impAlloc[slot]->Reset();
         g_impList->Reset(g_impAlloc[slot], nullptr);
         D3D12_RESOURCE_BARRIER br[2] = {
@@ -5907,6 +5917,23 @@ static DWORD WINAPI ImportThread(void *)
         ID3D12CommandList *l[] = { g_impList };
         const double t0 = Now();
         g_impQueue->ExecuteCommandLists(1, l);
+        if (g_impTmp[slot])
+        {
+            // Second step, its own submission: the importer's texture into the copy shared with the presenter.
+            g_impAlloc2[slot]->Reset();
+            g_impList2->Reset(g_impAlloc2[slot], nullptr);
+            D3D12_RESOURCE_BARRIER b2[2] = {
+                Transition(g_impTmp[slot], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                Transition(out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
+            g_impList2->ResourceBarrier(2, b2);
+            g_impList2->CopyResource(out, g_impTmp[slot]);
+            b2[0] = Transition(g_impTmp[slot], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            b2[1] = Transition(out, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            g_impList2->ResourceBarrier(2, b2);
+            g_impList2->Close();
+            ID3D12CommandList *l2[] = { g_impList2 };
+            g_impQueue->ExecuteCommandLists(1, l2);
+        }
         g_impQueue->Signal(g_impFence, issued);
         const double ms = (Now() - t0) * 1000.0;
         if (ms > 4.0 && g_impSlowLogged.fetch_add(1) < 5)
@@ -8316,7 +8343,8 @@ static void ReleaseAll()
     SafeRelease(g_presFenceS);
     g_impOn.store(false);
     SafeRelease(g_impList);
-    for (UINT i = 0; i < kStage; i++) SafeRelease(g_impAlloc[i]);
+    SafeRelease(g_impList2);
+    for (UINT i = 0; i < kStage; i++) { SafeRelease(g_impAlloc[i]); SafeRelease(g_impAlloc2[i]); }
     SafeRelease(g_impFenceG);
     SafeRelease(g_impFence);
     SafeRelease(g_impQueue);
@@ -10946,9 +10974,18 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
                 io = SUCCEEDED(idv->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_impAlloc[i])));
             io = io && SUCCEEDED(idv->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_impAlloc[0], nullptr,
                                                         IID_PPV_ARGS(&g_impList)));
+            if (io && g_impDev)
+            {
+                for (UINT i = 0; i < kStage && io; i++)
+                    io = SUCCEEDED(idv->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_impAlloc2[i])));
+                io = io && SUCCEEDED(idv->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_impAlloc2[0], nullptr,
+                                                            IID_PPV_ARGS(&g_impList2)));
+                if (io) g_impList2->Close();
+            }
             if (io) { g_impList->Close(); g_impQueue->SetName(L"BFI importer queue"); g_impFenceVal = 0; g_impOn.store(true); }
             LOGI("BFI Presenter: PresenterDevice: importer %s%s (the presenter draws only from its own copies of the frames)",
-                 io ? "ready" : "FAILED -- the presenter reads the shared frames", g_impDev ? ", on a device of its own" : "");
+                 io ? "ready" : "FAILED -- the presenter reads the shared frames",
+                 g_impList2 ? ", on a device of its own, in two steps" : g_impDev ? ", on a device of its own" : "");
         }
     }
     for (UINT s = 0; s < kStage && ok; s++)

@@ -87,3 +87,15 @@ sharing with the game's device isn't the whole story. Note: earlier normal-mode 
 its own (`probe_mem_ms`) and a copy from a texture shared with a third device (`probe_shared_ms`). If the memory copy
 stalls with the game, any submission that references memory waits (an adapter-wide residency/paging lock) and no
 device split can avoid it; if only the shared copy stalls, shared allocations are the link.
+
+## t9 result → t10
+
+Baseline, PresenterDevice=0, same build (2.1 min): 4.3 missed refreshes a minute; 16 presenter submit stalls over 2 ms,
+all with the game-device probe. The independent device's new probes never stalled: a copy between its own textures
+(max 1.1 ms) and a copy from a texture shared with an idle third device (max 0.7 ms), even during a 40 ms game stall
+in which the presenter waited 34 ms. So memory references in general don't wait. What every PresenterDevice build had
+in common: the presenter shared textures with a device that was itself stuck (t4-t7 the game's or the importer on the
+same device; t8 the importer's device, stuck on the game's shared frame while its submission also referenced the copy
+shared with the presenter). t10: the import in two submissions on the importer's device, game frame -> importer-only
+texture, then -> the copy shared with the presenter, so the submission that can be held up never references a texture
+the presenter shares.
