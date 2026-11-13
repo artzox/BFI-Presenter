@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.39-t6"
+#define BFI_ADDON_VERSION "1.0.39-t7"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -5292,6 +5292,21 @@ static DWORD WINAPI PresenterThread(void *)
                                  "lit refresh's pick, %d repeated -- 3 ms earlier", p10 * 1000.0, stNow.frameRepeats);
                         }
                     }
+                    // The alignment going round the strobe cycle: its total moved by 1.5 cycles or more within 90 s, either
+                    // way. Then where the game's frames finish doesn't follow the frame start (Returnal: frames ready 10 ms
+                    // before the pick however far it moved them later, +188 ms in 3 minutes; on another run 72 ms earlier
+                    // in 3.5 minutes). Both alignments stop for this session; the limit keeps its place in the strobe cycle.
+                    {
+                        static double histT[96] = {}, histS[96] = {};
+                        static int histN = 0;
+                        histT[histN % 96] = t; histS[histN % 96] = alignShiftTot; histN++;
+                        double span = 0.0;
+                        for (int k = 0; k < 96 && k < histN; k++)
+                            if (t - histT[k] <= 90.0) span = std::max(span, fabs(alignShiftTot - histS[k]));
+                        if (cyc > 0.0 && span >= 1.5 * cyc && !g_alignHunted.exchange(true))
+                            LOGI("BFI Presenter: Reflex frame limit alignment went round the strobe cycle (%.0f ms within 90 s): "
+                                 "the game's frames don't follow its frame start -- alignment off for this session", span * 1000.0);
+                    }
                     if (s.reflexAlign && !g_alignHunted.load() && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
                     {
                         if (alignLastStep > 0.0 && p10 >= 0.0 && alignPrevP10 >= 0.0 && p10 - alignPrevP10 > 0.5 * cyc)
@@ -5314,17 +5329,6 @@ static DWORD WINAPI PresenterThread(void *)
                             shiftUs.fetch_sub(2000); alignShiftTot -= 0.002;
                             alignTarget = std::min(0.005, alignTarget + 0.001);
                             alignCleanSecs = 0; alignCoolT = t + 2.0;
-                            // Moving earlier again and again, a whole strobe cycle within a minute, only goes round the cycle:
-                            // the repeats come from the game's own frame times, not from where its frames start (Returnal: 72 ms
-                            // in 3.5 minutes, flashes no better than without it). ReflexAlign stops for this session and the
-                            // coarse alignment takes over.
-                            static double earlyT[16] = {}; static int earlyN = 0;
-                            earlyT[earlyN++ % 16] = t;
-                            int recent = 0;
-                            for (int k = 0; k < 16 && k < earlyN; k++) if (t - earlyT[k] < 60.0) recent++;
-                            if (cyc > 0.0 && recent * 0.002 >= cyc && !g_alignHunted.exchange(true))
-                                LOGI("BFI Presenter: Reflex frame limit alignment kept moving earlier (%d steps in a minute: the game's own "
-                                     "frame times) -- off for this session, coarse alignment instead", recent);
                         }
                         else if (p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
                         {
@@ -5366,7 +5370,7 @@ static DWORD WINAPI PresenterThread(void *)
                         // both in the same second: 40 of 60 frames shown for 3 s, until the next nudge).
                         const bool nudging = t < phaseUntil;
                         if (nudging) coarseHoldT = t + 20.0;
-                        if (!nudging && (!s.reflexAlign || g_alignHunted.load()) && s.reflexAlignCoarse && atSleepNoFg && holds && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
+                        if (!nudging && !s.reflexAlign && !g_alignHunted.load() && s.reflexAlignCoarse && atSleepNoFg && holds && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
                         {
                             if (t - coarseT < 10.0 && stNow.frameRepeats >= 2 && p10 < 0.002)
                             {
