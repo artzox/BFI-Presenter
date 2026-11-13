@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.39"
+#define BFI_ADDON_VERSION "1.0.40-t2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -176,6 +176,7 @@ struct Settings
     int   queuePriority = 2;  // presenter GPU queue: 0 normal, 1 high, 2 realtime if allowed else high
     int   pacing   = 1;       // 1 = wait for vblank before each present, 0 = present queue only
     int   log      = 0;
+    int   stallProbe = 1; // StallProbe (test): time submissions on extra queues while the timing log runs
     int   dx11     = 1;       // manage DX11 games (through the add-on's own D3D12 presenter)
     // SDR to HDR (DX11, DX9, OpenGL: the presenter's own swap chain): an SDR game on an HDR display is presented as
     // HDR10, so the lit refresh has headroom above SDR white (as the Vulkan layer). Applies when the swap chain is next created.
@@ -368,6 +369,7 @@ static void LoadSettings(Settings &s)
     g_maxAhead.store(s.autoAhead && s.maxAhead ? 1 : s.maxAhead);
     s.pacing   = IniInt("WaitForVBlank", 1);
     s.log      = IniInt("Log", 0);
+    s.stallProbe = IniInt("StallProbe", 1) ? 1 : 0;
     s.dx11     = IniInt("DX11Support", 1) ? 1 : 0;
     s.sdrToHdr = IniInt("SdrToHdr", 1) ? 1 : 0;
     s.sdrWhite = IniFloat("SdrWhiteNits", 200.0f);
@@ -3158,6 +3160,11 @@ struct ReflexSecond
     int    limitUs = 0;          // Reflex frame limit in effect
 };
 static void ReflexTick(int limitUs, ReflexSecond &out);
+// Stall probe (test, see StartProbe)
+static std::atomic<bool>   g_probeRun{false};
+static HANDLE              g_probeThread = nullptr;
+static std::atomic<int>    g_probeSameUs{-1}, g_probeDev2Us{-1};   // longest submission since the last log row (-1: no probe)
+static std::atomic<double> g_cyclesPerMs{0.0};                     // CPU cycles per ms (calibrated by the probe thread)
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
 static std::atomic<int> g_sleepGrid{1};       // SleepLimitGrid (copied from the settings)
 static std::atomic<bool> g_alignHunted{false}; // ReflexAlign gave up this session (kept moving earlier: the game's own stutters)
@@ -3739,7 +3746,7 @@ static DWORD WINAPI PresenterThread(void *)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,present_count,sync_refresh_count,"
                               "bfi,method,frames,gain,floor,rolloff,pacing,cap,ahead,vblank,queue_ahead,queued,"
                               "wait_vblank_ms,wait_gpu_ms,submit_ms,present_ms,hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,"
-                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup\n");
+                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup,submit_cpu_ms,present_cpu_ms,probe_same_ms,probe_dev2_ms\n");
                 LOGI("BFI Presenter: timing log started: %s", path);
             }
             snprintf(path, sizeof(path), "%.*sBFIPresenter_reflex_%04u%02u%02u_%02u%02u%02u.csv",
@@ -3791,6 +3798,7 @@ static DWORD WINAPI PresenterThread(void *)
         if (bi >= n) { LOGE("BFI Presenter: unexpected back buffer index %u", bi); break; }
 
         double tFence = Now();
+        ULONG64 cycFence = 0, cycSub = 0, cycPres = 0;   // this thread's CPU cycles (timing log: submit / present CPU time)
         PresStage(ST_SUBMIT);
 
         // Which game frame this refresh shows. A new frame is taken only at
@@ -4092,6 +4100,7 @@ static DWORD WINAPI PresenterThread(void *)
             PresStage(ST_SUBMIT);
         }
         tFence = Now();
+        QueryThreadCycleTime(GetCurrentThread(), &cycFence);
         if (reuse) secReused++;
         else
         {
@@ -4231,10 +4240,12 @@ static DWORD WINAPI PresenterThread(void *)
             while (g_holdPresents.load() > 0 && g_running.load() && Now() - th < 2.0) Sleep(1);
         }
         const double tSub = Now();
+        QueryThreadCycleTime(GetCurrentThread(), &cycSub);
         PresStage(ST_PRESENT);
         HRESULT hr;
         hr = OwnPresent();
         const double tPres = Now();
+        QueryThreadCycleTime(GetCurrentThread(), &cycPres);
         if (tPres - tSub > 0.75 / (modeHz > 0.0 ? modeHz : 120.0)) secSlowPres++;
         PresStage(ST_IDLE);
         g_lastPresentHr.store(hr);
@@ -5453,14 +5464,19 @@ static DWORD WINAPI PresenterThread(void *)
             EnterCriticalSection(&g_cfgLock);
             lrLog.lrState = g_status.lrState; lrLog.lrEst = g_status.lrEst; lrLog.lrMargin = g_status.lrMargin;
             LeaveCriticalSection(&g_cfgLock);
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d\n", t * 1000.0,
+            const double cpm = g_cyclesPerMs.load();
+            const int pSame = g_probeSameUs.exchange(g_probeThread ? 0 : -1), pDev2 = g_probeDev2Us.exchange(g_probeThread ? 0 : -1);
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%.3f\n", t * 1000.0,
                     (unsigned long long)presents, c.slot,
                     (unsigned long long)pickId, (t - pickTime) * 1000.0, (t - lastT) * 1000.0,
                     sok ? (int)st.PresentCount : -1, sok ? (int)st.SyncRefreshCount : -1,
                     s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     g_maxAhead.load(), s.pacing, s.queueAhead, queuedNow,
                     (tVb - tLoop0) * 1000.0, (tFence - tVb) * 1000.0, (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f, hotArea, rawAvg,
-                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp);
+                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp,
+                    cpm > 0.0 && cycFence && cycSub >= cycFence ? (cycSub - cycFence) / cpm : -1.0,
+                    cpm > 0.0 && cycSub && cycPres >= cycSub ? (cycPres - cycSub) / cpm : -1.0,
+                    pSame >= 0 ? pSame / 1000.0 : -1.0, pDev2 >= 0 ? pDev2 / 1000.0 : -1.0);
         }
         lastT = t;
         if (pickId != lastShownId) lastNewFrameT = Now();
@@ -5521,6 +5537,165 @@ static DWORD WINAPI PresenterThread(void *)
     return 0;
 }
 
+// ------------------------------------------------------------------ stall probe (test)
+// StallProbe=1 with the timing log: while the presenter runs, a helper thread submits an empty command list and a
+// fence signal about every millisecond on two extra queues -- one on the game's device, one on a second, independent
+// device on the same GPU -- and the timing log records the longest submission of each per refresh. When the
+// presenter's own submission stalls together with the game (Control, Alan Wake 2), this shows whether another queue
+// of the game's device stalls too, and whether a separate device escapes it.
+
+static void ProbeMax(std::atomic<int> &a, int v)
+{
+    int cur = a.load();
+    while ((cur < 0 || v > cur) && !a.compare_exchange_weak(cur, v)) {}
+}
+
+struct ProbeQ
+{
+    ID3D12CommandQueue *q = nullptr; ID3D12CommandAllocator *al = nullptr; ID3D12GraphicsCommandList *l = nullptr;
+    ID3D12Fence *f = nullptr; UINT64 v = 0;
+    bool Make(ID3D12Device *d)
+    {
+        D3D12_COMMAND_QUEUE_DESC qd = {};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+        if (FAILED(d->CreateCommandQueue(&qd, IID_PPV_ARGS(&q)))) return false;
+        if (FAILED(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al)))) return false;
+        if (FAILED(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, IID_PPV_ARGS(&l)))) return false;
+        l->Close();
+        if (FAILED(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f)))) return false;
+        q->SetName(L"BFI stall probe");
+        return true;
+    }
+    // One submission, timed on the CPU; skipped while the last one hasn't finished on the GPU.
+    int Shot()
+    {
+        if (f->GetCompletedValue() < v) return -1;
+        const double t0 = Now();
+        ID3D12CommandList *ls[] = { l };
+        q->ExecuteCommandLists(1, ls);
+        q->Signal(f, ++v);
+        return (int)((Now() - t0) * 1e6);
+    }
+    void Free()
+    {
+        if (f && q && f->GetCompletedValue() < v)
+        {
+            HANDLE e = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+            if (e) { f->SetEventOnCompletion(v, e); WaitForSingleObject(e, 500); CloseHandle(e); }
+        }
+        SafeRelease(l); SafeRelease(al); SafeRelease(f); SafeRelease(q);
+    }
+};
+
+// ID3D12DeviceFactory (D3D12GetInterface): the device factory of the D3D12 runtime, declared here.
+struct DeviceFactoryI : public IUnknown
+{
+    virtual HRESULT STDMETHODCALLTYPE InitializeFromGlobalState() = 0;
+    virtual HRESULT STDMETHODCALLTYPE ApplyToGlobalState() = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetFlags(UINT flags) = 0;
+    virtual UINT    STDMETHODCALLTYPE GetFlags() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetConfigurationInterface(REFCLSID, REFIID, void **) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnableExperimentalFeatures(UINT, const IID *, void *, UINT *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void **dev) = 0;
+};
+
+// A second D3D12 device on the game's GPU that isn't the game's own (D3D12CreateDevice would hand back the game's).
+static ID3D12Device *CreateIndependentDevice(ID3D12Device *game, char *why, size_t whyLen)
+{
+    static const GUID kClsidFactory = { 0x114863bf, 0xc386, 0x4aee, { 0xb3, 0x9d, 0x8f, 0x0b, 0xbb, 0x06, 0x29, 0x55 } };
+    static const GUID kIidFactory   = { 0x61f307d3, 0xd34e, 0x4e7c, { 0x83, 0x74, 0x3b, 0xa4, 0xde, 0x23, 0xcc, 0xcb } };
+    typedef HRESULT (WINAPI *PFN_GetIf)(REFCLSID, REFIID, void **);
+    HMODULE h = GetModuleHandleA("d3d12.dll");
+    PFN_GetIf getIf = h ? (PFN_GetIf)(void *)GetProcAddress(h, "D3D12GetInterface") : nullptr;
+    if (!getIf) { snprintf(why, whyLen, "D3D12GetInterface not available"); return nullptr; }
+    DeviceFactoryI *fac = nullptr;
+    HRESULT hr = getIf(kClsidFactory, kIidFactory, (void **)&fac);
+    if (FAILED(hr) || !fac) { snprintf(why, whyLen, "no device factory (0x%08lX)", (unsigned long)hr); return nullptr; }
+    fac->SetFlags(4u);   // D3D12_DEVICE_FACTORY_FLAG_DISALLOW_STORING_NEW_DEVICE_AS_SINGLETON
+    IDXGIFactory4 *df = nullptr;
+    IDXGIAdapter1 *ad = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void **)&df)) && df)
+        df->EnumAdapterByLuid(game->GetAdapterLuid(), __uuidof(IDXGIAdapter1), (void **)&ad);
+    ID3D12Device *d = nullptr;
+    hr = fac->CreateDevice(ad, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void **)&d);
+    SafeRelease(ad);
+    SafeRelease(df);
+    fac->Release();
+    if (FAILED(hr) || !d) { snprintf(why, whyLen, "CreateDevice failed (0x%08lX)", (unsigned long)hr); return nullptr; }
+    if (d == game) { d->Release(); snprintf(why, whyLen, "the factory returned the game's own device"); return nullptr; }
+    return d;
+}
+
+static DWORD WINAPI ProbeThread(LPVOID dev)
+{
+    ID3D12Device *game = (ID3D12Device *)dev;
+    // CPU cycles per ms, for the presenter's own submit / present CPU time in the timing log.
+    {
+        ULONG64 c0 = 0, c1 = 0;
+        const double t0 = Now();
+        QueryThreadCycleTime(GetCurrentThread(), &c0);
+        while (Now() - t0 < 0.02) {}
+        QueryThreadCycleTime(GetCurrentThread(), &c1);
+        const double ms = (Now() - t0) * 1000.0;
+        if (ms > 0.0 && c1 > c0) g_cyclesPerMs.store((double)(c1 - c0) / ms);
+    }
+    ProbeQ same, other;
+    const bool sameOk = same.Make(game);
+    char why[96] = "";
+    ID3D12Device *d2 = CreateIndependentDevice(game, why, sizeof(why));
+    const bool otherOk = d2 && other.Make(d2);
+    LOGI("BFI Presenter: stall probe: queue on the game's device %s; second device %s%s%s", sameOk ? "ok" : "failed",
+         otherOk ? "ok (independent)" : "unavailable", why[0] ? " -- " : "", why);
+    HANDLE tm = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /*CREATE_WAITABLE_TIMER_HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
+    if (!tm) tm = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    while (g_probeRun.load())
+    {
+        if (sameOk)  { const int us = same.Shot();  if (us >= 0) ProbeMax(g_probeSameUs, us); }
+        if (otherOk) { const int us = other.Shot(); if (us >= 0) ProbeMax(g_probeDev2Us, us); }
+        if (tm)
+        {
+            LARGE_INTEGER due;
+            due.QuadPart = -10000;   // 1 ms
+            SetWaitableTimer(tm, &due, 0, nullptr, nullptr, FALSE);
+            WaitForSingleObject(tm, 5);
+        }
+        else Sleep(1);
+    }
+    if (tm) CloseHandle(tm);
+    same.Free();
+    other.Free();
+    SafeRelease(d2);
+    game->Release();
+    return 0;
+}
+
+static void StartProbe()
+{
+    if (g_probeThread || !g_device) return;
+    bool want;
+    EnterCriticalSection(&g_cfgLock);
+    want = g_shared.stallProbe != 0 && g_shared.log != 0;
+    LeaveCriticalSection(&g_cfgLock);
+    if (!want) return;
+    g_device->AddRef();
+    g_probeRun.store(true);
+    g_probeThread = CreateThread(nullptr, 0, ProbeThread, g_device, 0, nullptr);
+    if (g_probeThread) SetThreadPriority(g_probeThread, THREAD_PRIORITY_HIGHEST);
+    else { g_probeRun.store(false); g_device->Release(); }
+}
+
+static void StopProbe()
+{
+    if (!g_probeThread) return;
+    g_probeRun.store(false);
+    WaitForSingleObject(g_probeThread, 2000);
+    CloseHandle(g_probeThread);
+    g_probeThread = nullptr;
+    g_probeSameUs.store(-1);
+    g_probeDev2Us.store(-1);
+}
+
 static void StartPresenter()
 {
     if (g_running.load() || (!g_gameQueue && !g_dx11.load()) || g_bufCount == 0) return;
@@ -5529,6 +5704,7 @@ static void StartPresenter()
     g_thread = CreateThread(nullptr, 0, PresenterThread, nullptr, 0, nullptr);
     if (g_thread) SetThreadPriority(g_thread, THREAD_PRIORITY_TIME_CRITICAL);
     else g_running.store(false);
+    if (g_thread) StartProbe();
     if (g_thread && !g_lrThread)
     {
         if (!g_lrEv) g_lrEv = CreateEventA(nullptr, FALSE, FALSE, nullptr);
@@ -5549,6 +5725,7 @@ static std::atomic<bool> g_presenterStuck{false};
 static bool StopPresenter()
 {
     if (g_presenterStuck.load()) return false;
+    StopProbe();
     if (g_lrThread)
     {
         g_lrRun.store(false);
