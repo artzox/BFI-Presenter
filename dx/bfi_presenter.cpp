@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.39-t5"
+#define BFI_ADDON_VERSION "1.0.39-t6"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3163,6 +3163,7 @@ struct ReflexSecond
 static void ReflexTick(int limitUs, ReflexSecond &out);
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
 static std::atomic<int> g_sleepGrid{1};       // SleepLimitGrid (copied from the settings)
+static std::atomic<bool> g_alignHunted{false}; // ReflexAlign gave up this session (kept moving earlier: the game's own stutters)
 static std::atomic<bool> g_fgXess{false};     // the game presents through XeSS frame generation's swap chain (libxess_fg.dll)
 static std::atomic<int> g_sleepLimitUs{0};    // frame limit at the game's Reflex sleep, per rendered frame (0 = off)
 static std::atomic<bool> g_sleepActive{false};        // the sleep-point limit is in charge: the game's own limit is taken from the driver
@@ -5049,7 +5050,7 @@ static DWORD WINAPI PresenterThread(void *)
                 // ReflexAlign steers only without frame generation (and with Lowest latency): with frame generation the nudge is
                 // still needed, or frames that land on the pick stay there now that the limit keeps its place (Control, 3x:
                 // 42-57 of 60 shown for a minute, frames ready 0.3 ms before the pick).
-                const bool alignSteers = s.reflexAlign && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
+                const bool alignSteers = s.reflexAlign && !g_alignHunted.load() && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
                 if (!alignSteers && limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
                 {
                     phaseUntil = t + 1.0; phaseNextT = t + 4.0;
@@ -5291,7 +5292,7 @@ static DWORD WINAPI PresenterThread(void *)
                                  "lit refresh's pick, %d repeated -- 3 ms earlier", p10 * 1000.0, stNow.frameRepeats);
                         }
                     }
-                    if (s.reflexAlign && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
+                    if (s.reflexAlign && !g_alignHunted.load() && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
                     {
                         if (alignLastStep > 0.0 && p10 >= 0.0 && alignPrevP10 >= 0.0 && p10 - alignPrevP10 > 0.5 * cyc)
                         {
@@ -5313,6 +5314,17 @@ static DWORD WINAPI PresenterThread(void *)
                             shiftUs.fetch_sub(2000); alignShiftTot -= 0.002;
                             alignTarget = std::min(0.005, alignTarget + 0.001);
                             alignCleanSecs = 0; alignCoolT = t + 2.0;
+                            // Moving earlier again and again, a whole strobe cycle within a minute, only goes round the cycle:
+                            // the repeats come from the game's own frame times, not from where its frames start (Returnal: 72 ms
+                            // in 3.5 minutes, flashes no better than without it). ReflexAlign stops for this session and the
+                            // coarse alignment takes over.
+                            static double earlyT[16] = {}; static int earlyN = 0;
+                            earlyT[earlyN++ % 16] = t;
+                            int recent = 0;
+                            for (int k = 0; k < 16 && k < earlyN; k++) if (t - earlyT[k] < 60.0) recent++;
+                            if (cyc > 0.0 && recent * 0.002 >= cyc && !g_alignHunted.exchange(true))
+                                LOGI("BFI Presenter: Reflex frame limit alignment kept moving earlier (%d steps in a minute: the game's own "
+                                     "frame times) -- off for this session, coarse alignment instead", recent);
                         }
                         else if (p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
                         {
@@ -5354,7 +5366,7 @@ static DWORD WINAPI PresenterThread(void *)
                         // both in the same second: 40 of 60 frames shown for 3 s, until the next nudge).
                         const bool nudging = t < phaseUntil;
                         if (nudging) coarseHoldT = t + 20.0;
-                        if (!nudging && !s.reflexAlign && s.reflexAlignCoarse && atSleepNoFg && holds && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
+                        if (!nudging && (!s.reflexAlign || g_alignHunted.load()) && s.reflexAlignCoarse && atSleepNoFg && holds && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
                         {
                             if (t - coarseT < 10.0 && stNow.frameRepeats >= 2 && p10 < 0.002)
                             {
