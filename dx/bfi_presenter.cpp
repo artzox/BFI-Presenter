@@ -144,7 +144,7 @@ struct Settings
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   reflexAlign = 0;    // Reflex frame limit at the sleep point lined up with the lit refresh's pick (test)
     int   sleepGrid = 1;         // SleepLimitGrid: the limit at the game's Reflex sleep keeps its place in the strobe cycle (test)
-    int   sleepFgSearch = 1;     // SleepFgStartSearch: with frame generation, start times across the strobe cycle are tried (test)
+    int   sleepFgSearch = 0;     // SleepFgStartSearch: with frame generation, start times across the strobe cycle are tried (test)
     int   reflexAlignCoarse = 1; // ReflexAlignCoarse: frames ready far ahead of the pick are moved closer once (ReflexAlign off)
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
@@ -318,7 +318,7 @@ static void LoadSettings(Settings &s)
     s.reflexAlign = IniInt("ReflexAlign", 0) ? 1 : 0;
     s.reflexAlignCoarse = IniInt("ReflexAlignCoarse", 1) ? 1 : 0;
     s.sleepGrid = IniInt("SleepLimitGrid", 1) ? 1 : 0;
-    s.sleepFgSearch = IniInt("SleepFgStartSearch", 1) ? 1 : 0;
+    s.sleepFgSearch = IniInt("SleepFgStartSearch", 0) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
