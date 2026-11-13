@@ -75,3 +75,15 @@ and the game/import fences belong to it (shared with the game's device); the imp
 device and are shared only with the importer's. The presenter's fence is no longer shared at all: the game never waits
 on the presenter (it reads only its own copies; the importer waits for the presenter's read of a copy on the CPU).
 Pass-through copies (presenter not running) use a fence of the game's own device.
+
+## t8 result → t9
+
+Control, 3.8 min: missed refreshes 3.2 a minute (t7 2.5, within noise); 14 presenter submit stalls over 2 ms, every one
+together with the game-device probe, although the presenter's device now shares nothing with the game's (only the
+imported copies, with the importer's device). The independent-device probe (empty lists) still never stalled. So
+sharing with the game's device isn't the whole story. Note: earlier normal-mode Control logs (old builds) averaged
+~3.7 missed refreshes a minute, so the separate device hasn't beaten the baseline yet; a same-build baseline
+(PresenterDevice=0) is needed. t9 adds two probe queues on the independent device: a copy between two small textures of
+its own (`probe_mem_ms`) and a copy from a texture shared with a third device (`probe_shared_ms`). If the memory copy
+stalls with the game, any submission that references memory waits (an adapter-wide residency/paging lock) and no
+device split can avoid it; if only the shared copy stalls, shared allocations are the link.

@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.40-t8"
+#define BFI_ADDON_VERSION "1.0.40-t9"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3251,6 +3251,7 @@ static void StartProbe();
 static std::atomic<bool>   g_probeRun{false};
 static HANDLE              g_probeThread = nullptr;
 static std::atomic<int>    g_probeSameUs{-1}, g_probeDev2Us{-1};   // longest submission since the last log row (-1: no probe)
+static std::atomic<int>    g_probeMemUs{-1}, g_probeShUs{-1};      // the second device: a copy between its own textures / from a shared one
 static std::atomic<double> g_cyclesPerMs{0.0};                     // CPU cycles per ms (calibrated by the probe thread)
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
 static std::atomic<int> g_sleepGrid{1};       // SleepLimitGrid (copied from the settings)
@@ -3833,7 +3834,7 @@ static DWORD WINAPI PresenterThread(void *)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,present_count,sync_refresh_count,"
                               "bfi,method,frames,gain,floor,rolloff,pacing,cap,ahead,vblank,queue_ahead,queued,"
                               "wait_vblank_ms,wait_gpu_ms,submit_ms,present_ms,hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,"
-                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup,submit_cpu_ms,present_cpu_ms,probe_same_ms,probe_dev2_ms,exec_ms,signal_ms\n");
+                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup,submit_cpu_ms,present_cpu_ms,probe_same_ms,probe_dev2_ms,exec_ms,signal_ms,probe_mem_ms,probe_shared_ms\n");
                 LOGI("BFI Presenter: timing log started: %s", path);
                 StartProbe();   // stall probe (test): runs while the timing log does
             }
@@ -5558,7 +5559,8 @@ static DWORD WINAPI PresenterThread(void *)
             LeaveCriticalSection(&g_cfgLock);
             const double cpm = g_cyclesPerMs.load();
             const int pSame = g_probeSameUs.exchange(g_probeThread ? 0 : -1), pDev2 = g_probeDev2Us.exchange(g_probeThread ? 0 : -1);
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", t * 1000.0,
+            const int pMem = g_probeMemUs.exchange(g_probeThread ? 0 : -1), pSh = g_probeShUs.exchange(g_probeThread ? 0 : -1);
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", t * 1000.0,
                     (unsigned long long)presents, c.slot,
                     (unsigned long long)pickId, (t - pickTime) * 1000.0, (t - lastT) * 1000.0,
                     sok ? (int)st.PresentCount : -1, sok ? (int)st.SyncRefreshCount : -1,
@@ -5569,7 +5571,8 @@ static DWORD WINAPI PresenterThread(void *)
                     cpm > 0.0 && cycFence && cycSub >= cycFence ? (cycSub - cycFence) / cpm : -1.0,
                     cpm > 0.0 && cycSub && cycPres >= cycSub ? (cycPres - cycSub) / cpm : -1.0,
                     pSame >= 0 ? pSame / 1000.0 : -1.0, pDev2 >= 0 ? pDev2 / 1000.0 : -1.0,
-                    g_lastExecMs.exchange(-1.0), g_lastSignalMs.exchange(-1.0));
+                    g_lastExecMs.exchange(-1.0), g_lastSignalMs.exchange(-1.0),
+                    pMem >= 0 ? pMem / 1000.0 : -1.0, pSh >= 0 ? pSh / 1000.0 : -1.0);
         }
         lastT = t;
         if (pickId != lastShownId) lastNewFrameT = Now();
@@ -5660,6 +5663,22 @@ struct ProbeQ
         q->SetName(L"BFI stall probe");
         return true;
     }
+    // The list copies src to dst (small textures) instead of being empty.
+    bool MakeCopy(ID3D12Device *d, ID3D12Resource *src, ID3D12Resource *dst)
+    {
+        if (!Make(d)) return false;
+        al->Reset();
+        l->Reset(al, nullptr);
+        D3D12_RESOURCE_BARRIER br[2] = {
+            Transition(src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Transition(dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
+        l->ResourceBarrier(2, br);
+        l->CopyResource(dst, src);
+        br[0] = Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        br[1] = Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        l->ResourceBarrier(2, br);
+        return SUCCEEDED(l->Close());
+    }
     // One submission, timed on the CPU; skipped while the last one hasn't finished on the GPU.
     int Shot()
     {
@@ -5733,11 +5752,38 @@ static DWORD WINAPI ProbeThread(LPVOID dev)
         const double ms = (Now() - t0) * 1000.0;
         if (ms > 0.0 && c1 > c0) g_cyclesPerMs.store((double)(c1 - c0) / ms);
     }
-    ProbeQ same, other;
+    ProbeQ same, other, mem, sh;
     const bool sameOk = same.Make(game);
     char why[96] = "";
     ID3D12Device *d2 = CreateIndependentDevice(game, why, sizeof(why));
     const bool otherOk = d2 && other.Make(d2);
+    // Two more queues on the second device: one copies between two small textures of its own, one copies from a texture
+    // shared with a third device (nothing of the game's in either).
+    ID3D12Device *d3 = d2 ? CreateIndependentDevice(game, why, sizeof(why)) : nullptr;
+    ID3D12Resource *mA = nullptr, *mB = nullptr, *sOwn = nullptr, *sOpen = nullptr, *sDst = nullptr;
+    bool memOk = false, shOk = false;
+    {
+        DXGI_SWAP_CHAIN_DESC1 td = {};
+        td.Width = 256; td.Height = 256;
+        if (d2)
+        {
+            mA = CreateTex(td, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, L"BFI probe A", 0, d2);
+            mB = CreateTex(td, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, L"BFI probe B", 0, d2);
+            memOk = mA && mB && mem.MakeCopy(d2, mA, mB);
+            sDst = CreateTex(td, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, L"BFI probe C", 0, d2);
+        }
+        if (d3 && sDst)
+        {
+            sOwn = CreateTex(td, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, L"BFI probe shared", 0, d3, D3D12_HEAP_FLAG_SHARED);
+            HANDLE h = nullptr;
+            if (sOwn && SUCCEEDED(d3->CreateSharedHandle(sOwn, nullptr, GENERIC_ALL, nullptr, &h)) &&
+                SUCCEEDED(d2->OpenSharedHandle(h, IID_PPV_ARGS(&sOpen))))
+                shOk = sh.MakeCopy(d2, sOpen, sDst);
+            if (h) CloseHandle(h);
+        }
+    }
+    LOGI("BFI Presenter: stall probe: second device copying between its own textures %s, from a shared one %s",
+         memOk ? "ok" : "unavailable", shOk ? "ok" : "unavailable");
     LOGI("BFI Presenter: stall probe: queue on the game's device %s; second device %s%s%s", sameOk ? "ok" : "failed",
          otherOk ? "ok (independent)" : "unavailable", why[0] ? " -- " : "", why);
     HANDLE tm = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /*CREATE_WAITABLE_TIMER_HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
@@ -5746,6 +5792,8 @@ static DWORD WINAPI ProbeThread(LPVOID dev)
     {
         if (sameOk)  { const int us = same.Shot();  if (us >= 0) ProbeMax(g_probeSameUs, us); }
         if (otherOk) { const int us = other.Shot(); if (us >= 0) ProbeMax(g_probeDev2Us, us); }
+        if (memOk)   { const int us = mem.Shot();   if (us >= 0) ProbeMax(g_probeMemUs, us); }
+        if (shOk)    { const int us = sh.Shot();    if (us >= 0) ProbeMax(g_probeShUs, us); }
         if (tm)
         {
             LARGE_INTEGER due;
@@ -5758,6 +5806,10 @@ static DWORD WINAPI ProbeThread(LPVOID dev)
     if (tm) CloseHandle(tm);
     same.Free();
     other.Free();
+    mem.Free();
+    sh.Free();
+    SafeRelease(mA); SafeRelease(mB); SafeRelease(sDst); SafeRelease(sOpen); SafeRelease(sOwn);
+    SafeRelease(d3);
     SafeRelease(d2);
     game->Release();
     return 0;
@@ -5788,6 +5840,8 @@ static void StopProbe()
     g_probeThread = nullptr;
     g_probeSameUs.store(-1);
     g_probeDev2Us.store(-1);
+    g_probeMemUs.store(-1);
+    g_probeShUs.store(-1);
 }
 
 static ID3D12Fence *PresFence() { return g_impOn.load() ? g_impFence : g_gameFence; }
