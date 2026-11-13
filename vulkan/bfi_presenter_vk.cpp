@@ -58,7 +58,7 @@
 
 #include "shaders_spv.h"
 
-#define BFI_VERSION "1.0.37"
+#define BFI_VERSION "1.0.38"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -141,6 +141,7 @@ static void Log(const char *lvl, const char *fmt, ...)
 #include "../common/bfi_syscheck.h"
 #include "../common/bfi_vram.h"
 #include "../common/bfi_clockdrift.h"
+namespace Osd { inline void FramePush(double tNowSec); inline void AddSecond(int, int, int, double); inline void ResetTotals(double); }   // common/bfi_osd.h (included with ImGui further down)
 static SysCheck g_sysCheck;      // power plan, GPUs, displays (checked on the window watch thread)
 #endif
 #define LOGE(...) Log("ERROR", __VA_ARGS__)
@@ -262,6 +263,11 @@ struct Settings
     int   splitSide = 0;      // 0 = the left side without BFI, 1 = the right side
     int   splitPos = 50;      // the seam, percent of the width from the left
     int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
+    int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
+    int   osdCorner = 1;      // OsdCorner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
+    int   osdGraph = 1;       // OsdGraph: frame-time graph
+    int   osdLoads = 1;       // OsdLoads: CPU / GPU load
+    float osdScale = 1.0f;    // OsdScale: text size
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
@@ -365,6 +371,11 @@ static void LoadSettings(Settings &s)
     s.splitSide = KvInt(kv, "SplitCompareSide", 0) ? 1 : 0;
     s.splitPos = std::max(5, std::min(95, KvInt(kv, "SplitComparePosition", 50)));
     s.splitSeam = std::max(0, std::min(400, KvInt(kv, "SplitCompareSeamPx", 0)));
+    s.osd = KvInt(kv, "Osd", 0) ? 1 : 0;
+    s.osdCorner = std::max(0, std::min(3, KvInt(kv, "OsdCorner", 1)));
+    s.osdGraph = KvInt(kv, "OsdGraph", 1) ? 1 : 0;
+    s.osdLoads = KvInt(kv, "OsdLoads", 1) ? 1 : 0;
+    s.osdScale = std::max(0.75f, std::min(2.5f, KvFloat(kv, "OsdScale", 1.0f)));
     s.lcdSwap  = KvInt(kv, "LcdPhaseSwap", 0) ? 1 : 0;
     s.lcdSwapSec = Clamp(KvInt(kv, "LcdPhaseSwapSeconds", 5), 1, 300);
     s.lcdGradual = KvInt(kv, "LcdSaverGradual", 0) ? 1 : 0;
@@ -374,7 +385,7 @@ static void LoadSettings(Settings &s)
     s.rollSeam = Clamp(KvFloat(kv, "RollingSeam", 0.0f), 0.0f, 0.5f);
     s.rollDecay = Clamp(KvFloat(kv, "RollingPhosphorDecay", 0.2f), 0.0f, 1.0f);
     s.knee     = KvFloat(kv, "RolloffKnee", 0.75f);
-    s.peakNits = Clamp(KvFloat(kv, "DisplayPeakNits", 1400.0f), 80.0f, 10000.0f);
+    s.peakNits = Clamp(KvFloat(kv, "DisplayPeakNits", 1400.0f), 50.0f, 10000.0f);
     s.gameCap  = KvInt(kv, "CapGameToRefresh", 1);
     if (s.gameCap < 0 || s.gameCap > 5) s.gameCap = 1;
     s.capDivisor = Clamp(KvInt(kv, "CapDivisor", 3), 1, 8);
@@ -394,7 +405,7 @@ static void LoadSettings(Settings &s)
     s.vkExclusive = KvInt(kv, "VulkanExclusiveFullscreen", 1) ? 1 : 0;
     s.vkAutoRecover = KvInt(kv, "VulkanAutoRecover", 1) ? 1 : 0;
     s.ablGuard = KvInt(kv, "AblGuard", 1) ? 1 : 0;
-    s.ablBudget = Clamp(KvInt(kv, "AblGuardBudgetNits", 250), 100, 1500);
+    s.ablBudget = Clamp(KvInt(kv, "AblGuardBudgetNits", 250), 50, 1500);
     {
         auto it = kv.find("ablcurve");
         snprintf(s.ablCurve, sizeof(s.ablCurve), "%s", it == kv.end() ? "" : it->second.c_str());
@@ -434,7 +445,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -785,6 +796,7 @@ struct Swapchain
     uint64_t       stagePresentId[kStage] = {};
     uint64_t       slotReadSub[kStage] = {};    // presenter submission that last read the slot
     int            presCurSlot = -1;
+    int            presCurSlot2 = -1;           // split comparison: the newer frame its side without BFI shows
     std::map<uint32_t, CopyCmds> copyCmds;      // per queue family the game presents from
     std::mutex     lock;                        // stage arrays
     std::mutex     submitLock;                  // game-side presents
@@ -1078,6 +1090,9 @@ struct PresenterRes
     VkImageView           realView[kMaxImg] = {};
     VkFramebuffer         fb[kMaxImg] = {};
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dslN = VK_NULL_HANDLE;   // set 1: split comparison's newest game frame (graphics and compute)
+    VkDescriptorPool      dpN = VK_NULL_HANDLE;
+    VkDescriptorSet       dsN[kStage] = {};
     VkPipelineLayout      pl = VK_NULL_HANDLE;
     VkShaderModule        vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE, fsMeas = VK_NULL_HANDLE;
     VkPipeline            pso = VK_NULL_HANDLE, psoMeas = VK_NULL_HANDLE;
@@ -1315,10 +1330,11 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
         dli.bindingCount = 3;
         dli.pBindings = b;
         p = d->CreateDescriptorSetLayout(dev, &dli, nullptr, &R.dslC) == VK_SUCCESS;
+        VkDescriptorSetLayout sl2[2] = { R.dslC, R.dslN };
         VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Constants) };
         VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        pli.setLayoutCount = 1;
-        pli.pSetLayouts = &R.dslC;
+        pli.setLayoutCount = 2;
+        pli.pSetLayouts = sl2;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pr;
         p = p && d->CreatePipelineLayout(dev, &pli, nullptr, &R.plC) == VK_SUCCESS;
@@ -1478,13 +1494,24 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     }
     if (p)
     {
+        // Set 1: the split comparison's newest game frame, one set per staging slot.
+        VkDescriptorSetLayoutBinding bn = {};
+        bn.binding = 0;
+        bn.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bn.descriptorCount = 1;
+        bn.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo dln = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        dln.bindingCount = 1;
+        dln.pBindings = &bn;
+        p = d->CreateDescriptorSetLayout(dev, &dln, nullptr, &R.dslN) == VK_SUCCESS;
+        VkDescriptorSetLayout sl2[2] = { R.dsl, R.dslN };
         VkPushConstantRange pr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Constants) };
         VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        pli.setLayoutCount = 1;
-        pli.pSetLayouts = &R.dsl;
+        pli.setLayoutCount = 2;
+        pli.pSetLayouts = sl2;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pr;
-        p = d->CreatePipelineLayout(dev, &pli, nullptr, &R.pl) == VK_SUCCESS;
+        p = p && d->CreatePipelineLayout(dev, &pli, nullptr, &R.pl) == VK_SUCCESS;
     }
     if (p)
     {
@@ -1611,6 +1638,33 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
             d->UpdateDescriptorSets(dev, 2, w, 0, nullptr);
         }
     }
+    if (p)
+    {
+        VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kStage };
+        VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        dpi.maxSets = kStage;
+        dpi.poolSizeCount = 1;
+        dpi.pPoolSizes = &ps;
+        p = d->CreateDescriptorPool(dev, &dpi, nullptr, &R.dpN) == VK_SUCCESS;
+        VkDescriptorSetLayout l[kStage];
+        for (uint32_t i = 0; i < kStage; i++) l[i] = R.dslN;
+        VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dai.descriptorPool = R.dpN;
+        dai.descriptorSetCount = kStage;
+        dai.pSetLayouts = l;
+        p = p && d->AllocateDescriptorSets(dev, &dai, R.dsN) == VK_SUCCESS;
+        for (uint32_t i = 0; p && i < kStage; i++)
+        {
+            VkDescriptorImageInfo ii = { R.sampler, sc->stageView[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            w.dstSet = R.dsN[i];
+            w.dstBinding = 0;
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w.pImageInfo = &ii;
+            d->UpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+        }
+    }
     if (!p)
     {
         if (R.pso) { d->DestroyPipeline(dev, R.pso, nullptr); R.pso = VK_NULL_HANDLE; }
@@ -1723,6 +1777,8 @@ static void DestroyPresenterRes(DeviceData *d, PresenterRes &R)
     if (R.fsMeas) d->DestroyShaderModule(dev, R.fsMeas, nullptr);
     if (R.pl) d->DestroyPipelineLayout(dev, R.pl, nullptr);
     if (R.dsl) d->DestroyDescriptorSetLayout(dev, R.dsl, nullptr);
+    if (R.dslN) d->DestroyDescriptorSetLayout(dev, R.dslN, nullptr);
+    if (R.dpN) d->DestroyDescriptorPool(dev, R.dpN, nullptr);
     if (R.dp) d->DestroyDescriptorPool(dev, R.dp, nullptr);
     if (R.sampler) d->DestroySampler(dev, R.sampler, nullptr);
     if (R.rp) d->DestroyRenderPass(dev, R.rp, nullptr);
@@ -2015,7 +2071,7 @@ static void PresenterThread(Swapchain *sc)
     float    soften = 0.0f;          // current fade (0 = full strobe, 1 = steady average)
     double   gradPhase = 0.0;        // LCD gradual saver: lit window start within the first sub-frame, 0..1
     double   gradHold = -1.0;        // LCD gradual saver at 2 frames: refreshes left to hold sharp (-1 = start a hold)
-    uint64_t bufSub[kMaxImg] = {}, bufFrame[kMaxImg] = {};
+    uint64_t bufSub[kMaxImg] = {}, bufFrame[kMaxImg] = {}, bufFrame2[kMaxImg] = {};
     Constants bufConst[kMaxImg] = {};
     bool bufValid[kMaxImg] = {};
     uint32_t acqIdx = 0;
@@ -2089,7 +2145,7 @@ static void PresenterThread(Swapchain *sc)
     int capDownSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
     double capSwitchT = -100.0, probeWait = 30.0, capUpT = -100.0;
     bool capProbe = false, fgWas = false, rfxFgKnown = false;   // rfxFgKnown: the Reflex frame counts have agreed for 3 s
-    bool kb = false, km = false, kr = false, krs = false, ksp = false;
+    bool kb = false, km = false, kr = false, krs = false, ksp = false, kosd = false;
     FILE *logf = nullptr;
     double monitorCheckT = Now();
     int dumpLeft = g_dumpFrames;
@@ -2097,16 +2153,23 @@ static void PresenterThread(Swapchain *sc)
     while (!sc->stopReq.load())
     {
         // hotkeys (edge-triggered) act on the shared settings
-        const bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C');
-        if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp))
+        const bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C'), ko = KeyCombo('F'), kz = KeyCombo('Z');
+        if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp) || (ko && !kosd))
         {
             std::lock_guard<std::mutex> l(g_cfgLock);
+            if (ko && !kosd) g_shared.osd = !g_shared.osd;
             if (b && !kb) g_shared.enabled = !g_shared.enabled;
             if (m && !km) g_shared.method = !g_shared.method;
             if (rs && !krs) g_shared.rolling = !g_shared.rolling;
             if (sp && !ksp) g_shared.split = !g_shared.split;
         }
-        krs = rs; ksp = sp;
+        krs = rs; ksp = sp; kosd = ko;
+        {
+            // Ctrl+Shift+Z: the OSD's totals start again
+            static bool kzPrev = false;
+            if (kz && !kzPrev) { Osd::ResetTotals(Now()); LOGI("BFI Presenter: OSD totals reset"); }
+            kzPrev = kz;
+        }
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
         // BFIPresenter.ini edited while the game runs (no ReShade overlay in the game): picked up within a second.
         {
@@ -2238,7 +2301,7 @@ static void PresenterThread(Swapchain *sc)
         // presenter (a new frame only at the start of each strobe cycle;
         // Smooth = oldest unseen, one in reserve; Lowest latency = newest).
         const uint32_t slotNow = (uint32_t)((presents - phaseShift) % (uint64_t)s.frames);
-        int pick = -1;
+        int pick = -1, pickNew2 = -1;       // pickNew2: split comparison's side without BFI (the newest frame)
         uint64_t pickId = 0;
         double pickTime = 0.0;
         bool pickNewG = false;
@@ -2298,6 +2361,10 @@ static void PresenterThread(Swapchain *sc)
                 pickReadyMs = pickNewG ? (sc->gDoneId[pickId % kLr] == pickId ? (Now() - sc->gDoneT[pickId % kLr]) * 1000.0 : 0.0) : -1.0;
                 pickPresentId = sc->stagePresentId[pick];
                 sc->presCurSlot = pick;
+                // Split comparison: its side without BFI shows the newest finished game frame at every refresh, like a
+                // display without BFI (120 fps at 120 Hz: every frame), while the BFI side keeps one frame per strobe cycle.
+                pickNew2 = (s.split && newest >= 0 && newestId > pickId) ? newest : pick;
+                sc->presCurSlot2 = pickNew2 != pick ? pickNew2 : -1;
                 if (cycleStart)
                 {
                     if (pickId == lastShownId) secFrameRepeats++;
@@ -2362,7 +2429,7 @@ static void PresenterThread(Swapchain *sc)
             if (loadAt(peak) <= 1.0) ablSolve = peak;
             else
             {
-                double lo = 100.0, hi = peak;
+                double lo = 50.0, hi = peak;
                 for (int it = 0; it < 24; it++)
                 {
                     const double mid = 0.5 * (lo + hi);
@@ -2463,8 +2530,10 @@ static void PresenterThread(Swapchain *sc)
         }
 
         bool dumpNow = false;
+        if (pickNew2 < 0) pickNew2 = pick;
+        const uint64_t pickId2 = sc->stageId[pickNew2];
         const bool reuse = !(R.dumpPtr && dumpLeft > 0) &&
-                           bufValid[idx] && bufFrame[idx] == pickId && memcmp(&bufConst[idx], &c, sizeof(c)) == 0;
+                           bufValid[idx] && bufFrame[idx] == pickId && bufFrame2[idx] == pickId2 && memcmp(&bufConst[idx], &c, sizeof(c)) == 0;
         VkSemaphore presentWait = acqSem;
         double tFence = Now();
         if (reuse) secReused++;
@@ -2526,6 +2595,7 @@ static void PresenterThread(Swapchain *sc)
                 d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &mb);
                 d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.psoC);
                 d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plC, 0, 1, &R.dsC[pick], 0, nullptr);
+                d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plC, 1, 1, &R.dsN[pickNew2], 0, nullptr);
                 d->CmdPushConstants(cb, R.plC, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cc), &cc);
                 d->CmdDispatch(cb, (sc->extent.width + 7) / 8, (sc->extent.height + 7) / 8, 1);
                 VkImageMemoryBarrier b2[2] = {
@@ -2590,6 +2660,7 @@ static void PresenterThread(Swapchain *sc)
                 d->CmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
                 d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.pso);
                 d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.pl, 0, 1, &R.ds[pick], 0, nullptr);
+                d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.pl, 1, 1, &R.dsN[pickNew2], 0, nullptr);
                 d->CmdPushConstants(cb, R.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(c), &c);
                 VkViewport vp = { 0.0f, 0.0f, (float)sc->extent.width, (float)sc->extent.height, 0.0f, 1.0f };
                 VkRect2D scis = { { 0, 0 }, sc->extent };
@@ -2646,6 +2717,7 @@ static void PresenterThread(Swapchain *sc)
             {
                 std::lock_guard<std::mutex> l(sc->lock);
                 sc->slotReadSub[pick] = presSub;
+                if (pickNew2 >= 0) sc->slotReadSub[pickNew2] = presSub;
             }
             bufSub[idx] = presSub;
             VkPipelineStageFlags waitStage = (copyMode || R.rt) ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -2675,6 +2747,7 @@ static void PresenterThread(Swapchain *sc)
                 break;
             }
             bufFrame[idx] = pickId;
+            bufFrame2[idx] = pickId2;
             bufConst[idx] = c;
             bufValid[idx] = true;
             presentWait = R.done[idx];
@@ -2980,6 +3053,7 @@ static void PresenterThread(Swapchain *sc)
             }
             g_status.frameRepeats = secFrameRepeats;
             g_status.frameSkips   = secFrameSkips;
+            Osd::AddSecond(secFrameSkips, secFrameRepeats, secLate, Now());
             g_status.unevenRep    = secRepU;
             g_status.qaPrimes     = secQaPrimes;
             g_status.qaSkips      = secQaSkips;
@@ -4126,7 +4200,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
             uint64_t bestId = ~0ull;
             for (uint32_t i = 0; i < kStage; i++)
             {
-                if ((int)i == sc->presCurSlot || sc->slotReadSub[i] > pdone) continue;
+                if ((int)i == sc->presCurSlot || (int)i == sc->presCurSlot2 || sc->slotReadSub[i] > pdone) continue;
                 if (sc->stageId[i] < bestId) { slot = (int)i; bestId = sc->stageId[i]; }
             }
             if (slot >= 0) { sc->stageId[slot] = 0; sc->copyDone[slot] = false; }   // being rewritten: not selectable
@@ -4140,6 +4214,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
         sc->slotWaits.fetch_add(1);
         std::lock_guard<std::mutex> l(sc->lock);
         slot = (sc->presCurSlot + 1) % (int)kStage;
+        if (slot == sc->presCurSlot2) slot = (slot + 1) % (int)kStage;
         sc->stageId[slot] = 0;
         sc->copyDone[slot] = false;
     }
@@ -4219,6 +4294,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
     sc->lrStaged.store(id);
     sc->lrCv.notify_one();
     sc->staged.fetch_add(1);
+    Osd::FramePush(Now());
     if (!sc->firstFrameLogged) { sc->firstFrameLogged = true; LOGI("BFI Presenter: first game frame received"); }
 
     // Latency limit: before the game starts its next frame, the frame from
@@ -5633,6 +5709,7 @@ BFI_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BFI_vkGetDeviceProcAddr(VkDe
 #ifdef _WIN32
 #include <imgui.h>
 #include <reshade.hpp>
+#include "../common/bfi_osd.h"
 
 extern "C" __declspec(dllexport) const char *NAME;
 const char *NAME = "BFI Presenter (Vulkan)";
@@ -5713,6 +5790,30 @@ static bool RelimiterLoaded()
         return true;
     }
     return false;
+}
+
+// The in-game OSD (common/bfi_osd.h), every frame through ReShade's overlay event.
+static void on_osd(reshade::api::effect_runtime *rt)
+{
+    // One runtime only (ImGui's context is shared between ReShade's runtimes; see the DX add-on): the first that draws,
+    // another after it has been quiet for a second.
+    {
+        static std::atomic<void *> s_rt{nullptr};
+        static std::atomic<double> s_rtT{0.0};
+        const double now = Now();
+        if (s_rt.load() && s_rt.load() != (void *)rt && now - s_rtT.load() < 1.0) return;
+        s_rt.store((void *)rt); s_rtT.store(now);
+    }
+    OsdData d;
+    bool on; int corner, graph, loads; float scale;
+    {
+        std::lock_guard<std::mutex> l(g_cfgLock);
+        on = g_shared.osd != 0; corner = g_shared.osdCorner; graph = g_shared.osdGraph; loads = g_shared.osdLoads; scale = g_shared.osdScale;
+        d.gameFps = g_status.gameFps; d.refreshHz = g_status.refreshHz; d.frames = g_shared.frames;
+        d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
+        d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running;
+    }
+    if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
 }
 
 static void draw_overlay(reshade::api::effect_runtime *)
@@ -5934,6 +6035,23 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::SliderInt("Seam softness (pixels, 0 = hard)", &s.splitSeam, 0, 400);
             ImGui::Unindent(16.0f);
         }
+        bool osd = s.osd != 0;
+        if (ImGui::Checkbox("On-screen display (Ctrl+Shift+F)", &osd)) s.osd = osd ? 1 : 0;
+        if (s.osd) { ImGui::SameLine(); if (ImGui::SmallButton("Reset totals (Ctrl+Shift+Z)")) Osd::ResetTotals(Now()); }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A small panel over the game: its frame rate and frame time, the presenter's lost and repeated\n"
+                                                      "frames and missed refreshes, a frame-time graph and CPU / GPU load (GPU: NVIDIA).\n"
+                                                      "For changing the game's settings without RTSS or opening this menu.");
+        if (s.osd)
+        {
+            ImGui::Indent(16.0f);
+            ImGui::Combo("Corner", &s.osdCorner, "Top left\0Top right\0Bottom left\0Bottom right\0");
+            bool og = s.osdGraph != 0, ol = s.osdLoads != 0;
+            if (ImGui::Checkbox("Frame-time graph", &og)) s.osdGraph = og ? 1 : 0;
+            ImGui::SameLine();
+            if (ImGui::Checkbox("CPU / GPU load", &ol)) s.osdLoads = ol ? 1 : 0;
+            ImGui::SliderFloat("Size", &s.osdScale, 0.75f, 2.5f, "%.2f");
+            ImGui::Unindent(16.0f);
+        }
     }
 
     // ================================================================ 2. brightness and output
@@ -5941,15 +6059,31 @@ static void draw_overlay(reshade::api::effect_runtime *)
     {
         int out = s.output + 1;
         if (ImGui::Combo("Output", &out, kOutputNames)) s.output = out - 1;
-        ImGui::SliderFloat("Display peak (nits)", &s.peakNits, 100.0f, 4000.0f, "%.0f");
+        ImGui::SliderFloat("Display peak (nits)", &s.peakNits, 50.0f, 4000.0f, "%.0f");
+        if (s.peakNits < 100.0f)
+        {
+            // below 100 only on purpose: say what it does, in red
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.3f, 1.0f));
+            ImGui::TextWrapped("Below 100 nits: the lit refresh can't reach SDR white (80 nits or more), so the picture is darker "
+                               "than with BFI off and highlights are flattened to this ceiling. Only for a dim display or a "
+                               "deliberately dim picture.");
+            ImGui::PopStyleColor();
+        }
         bool ag = s.ablGuard != 0;
         if (ImGui::Checkbox("ABL guard (keep bright scenes within the panel's budget)", &ag)) s.ablGuard = ag ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("OLED panels dim the picture when a refresh puts out too much light overall (area x brightness).\nWith BFI the lit refresh carries the boost, so bright skies and white screens can trigger it.\nThe lit-refresh ceiling is lowered just enough to stay within the budget. HDR only.");
         if (s.ablGuard)
         {
             ImGui::Indent(16.0f);
-            ImGui::SliderInt("Panel budget (average nits of a lit refresh)", &s.ablBudget, 100, 1500);
+            ImGui::SliderInt("Panel budget (average nits of a lit refresh)", &s.ablBudget, 50, 1500);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Your panel's full-screen (100%% window) white brightness. Bright areas are held to what the\npanel sustains at their size: from Peak brightness at 10%% of the screen down to this budget at\n100%% (AblCurve in the ini takes your panel's measured curve). The ceiling is lowered just enough;\nsmall highlights keep the full one. Lower it if bright scenes still darken.");
+            if (s.ablBudget < 100)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.3f, 1.0f));
+                ImGui::TextWrapped("Below 100 nits: bright scenes are cut hard, so the brightness swings between dark and "
+                                   "bright scenes get larger. Only if your panel really holds this little on a full white screen.");
+                ImGui::PopStyleColor();
+            }
             if (st.litAvg >= 0.0)
                 ImGui::Text("Scene asks for: %.0f nits average   After ceiling: %.0f   Ceiling in use: %.0f nits", st.rawAvg, st.litAvg, st.ceilInUse);
             ImGui::Unindent(16.0f);
@@ -6326,6 +6460,9 @@ static void TryRegisterReShade()
     }
     imgui_function_table_instance() = table;
     ov("BFI Presenter (Vulkan)", draw_overlay);
+    // the in-game OSD: ReShade's overlay event, every frame
+    if (auto ev = (void (*)(reshade::addon_event, void *))(void *)GetProcAddress(rs, "ReShadeRegisterEvent"))
+        ev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
     static bool pinned = false;
     if (!pinned)
     {
@@ -6346,6 +6483,8 @@ static void UnregisterReShade()
     auto uov = (void (*)(const char *, void (*)(reshade::api::effect_runtime *)))(void *)GetProcAddress(g_rsModule, "ReShadeUnregisterOverlay");
     auto ureg = (void (*)(HMODULE))(void *)GetProcAddress(g_rsModule, "ReShadeUnregisterAddon");
     if (uov) uov("BFI Presenter (Vulkan)", draw_overlay);
+    if (auto uev = (void (*)(reshade::addon_event, void *))(void *)GetProcAddress(g_rsModule, "ReShadeUnregisterEvent"))
+        uev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
     if (ureg) ureg(g_module);
     g_rsModule = nullptr;
 }

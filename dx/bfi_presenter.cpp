@@ -54,6 +54,7 @@
 #include <reshade.hpp>
 #include "../common/bfi_syscheck.h"
 #include "../common/bfi_vram.h"
+#include "../common/bfi_osd.h"
 #include "../common/bfi_clockdrift.h"
 
 #ifdef _MSC_VER
@@ -93,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.37"
+#define BFI_ADDON_VERSION "1.0.38"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -111,6 +112,11 @@ struct Settings
     int   splitSide = 0;      // 0 = the left side without BFI, 1 = the right side
     int   splitPos = 50;      // the seam, percent of the width from the left
     int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
+    int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
+    int   osdCorner = 1;      // OsdCorner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
+    int   osdGraph = 1;       // OsdGraph: frame-time graph
+    int   osdLoads = 1;       // OsdLoads: CPU / GPU load
+    float osdScale = 1.0f;    // OsdScale: text size
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
@@ -266,6 +272,11 @@ static void LoadSettings(Settings &s)
     s.splitSide = IniInt("SplitCompareSide", 0) ? 1 : 0;
     s.splitPos = std::max(5, std::min(95, IniInt("SplitComparePosition", 50)));
     s.splitSeam = std::max(0, std::min(400, IniInt("SplitCompareSeamPx", 0)));
+    s.osd = IniInt("Osd", 0) ? 1 : 0;
+    s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
+    s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
+    s.osdLoads = IniInt("OsdLoads", 1) ? 1 : 0;
+    s.osdScale = std::max(0.75f, std::min(2.5f, IniFloat("OsdScale", 1.0f)));
     s.lcdSwap  = IniInt("LcdPhaseSwap", 0) ? 1 : 0;
     s.lcdSwapSec = IniInt("LcdPhaseSwapSeconds", 5);
     s.lcdGradual = IniInt("LcdSaverGradual", 0) ? 1 : 0;
@@ -284,6 +295,8 @@ static void LoadSettings(Settings &s)
     if (s.rollDecay > 1.0f) s.rollDecay = 1.0f;
     s.knee     = IniFloat("RolloffKnee", 0.75f);
     s.peakNits = IniFloat("DisplayPeakNits", 1400.0f);
+    if (s.peakNits < 50.0f) s.peakNits = 50.0f;
+    if (s.peakNits > 10000.0f) s.peakNits = 10000.0f;
     s.gameCap  = IniInt("CapGameToRefresh", 1);
     if (s.gameCap < 0 || s.gameCap > 5) s.gameCap = 1;
     s.capDivisor = IniInt("CapDivisor", 3);
@@ -317,7 +330,8 @@ static void LoadSettings(Settings &s)
     s.fitWindow = IniInt("ScaleToWindow", 1) ? 1 : 0;
     s.flashHints = IniInt("FlashHints", 1) ? 1 : 0;
     s.waitResizeAll = IniInt("StartBFIAfterGameResize", 1) ? 1 : 0;
-    s.selfResize = IniInt("PresenterResize", 0) ? 1 : 0;
+    s.selfResize = IniInt("PresenterResize", 0);
+    if (s.selfResize < 0 || s.selfResize > 2) s.selfResize = 1;
     s.bypassResizeHooks = IniInt("BypassOverlayResizeHooks", 1) ? 1 : 0;
     s.showOverlays = IniInt("ShowOverlays", 0) ? 1 : 0;
     s.reportTyped = IniInt("TypedBackBufferDesc", 1) ? 1 : 0;
@@ -327,7 +341,7 @@ static void LoadSettings(Settings &s)
     if (s.ablNits < 200) s.ablNits = 200;
     if (s.ablNits > 2000) s.ablNits = 2000;
     s.ablBudget = IniInt("AblGuardBudgetNits", 250);
-    if (s.ablBudget < 100) s.ablBudget = 100;
+    if (s.ablBudget < 50) s.ablBudget = 50;
     if (s.ablBudget > 1500) s.ablBudget = 1500;
     GetPrivateProfileStringA("BFI", "AblCurve", "", s.ablCurve, sizeof(s.ablCurve), g_iniPath);
     s.ablTrigNits = IniInt("AblGuardTriggerNits", 400);
@@ -457,6 +471,11 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("SplitCompareSide", s.splitSide);
     IniWriteInt("SplitComparePosition", s.splitPos);
     IniWriteInt("SplitCompareSeamPx", s.splitSeam);
+    IniWriteInt("Osd", s.osd);
+    IniWriteInt("OsdCorner", s.osdCorner);
+    IniWriteInt("OsdGraph", s.osdGraph);
+    IniWriteInt("OsdLoads", s.osdLoads);
+    IniWriteFloat("OsdScale", s.osdScale);
     IniWriteInt("LcdPhaseSwap", s.lcdSwap);
     IniWriteInt("LcdPhaseSwapSeconds", s.lcdSwapSec);
     IniWriteInt("LcdSaverGradual", s.lcdGradual);
@@ -798,6 +817,7 @@ static UINT64                 g_stageId[kStage] = {};      // game frame number 
 static double                 g_stageTime[kStage] = {};
 static UINT64                 g_readFence[kStage] = {};    // presenter fence value of the last read
 static int                    g_presCurSlot = -1;          // staging slot the presenter is showing (g_lock)
+static int                    g_presCurSlot2 = -1;         // split comparison: the newer frame its side without BFI shows (g_lock)
 static std::atomic<int>       g_slotWaits{0};
 // Swap chains the game recreates (God of War Ragnarok on loading) hung when
 // the presenter presented on the game's own queue, and also when moved to
@@ -861,6 +881,8 @@ BFI_TLS(int, t_ownCall);
 BFI_TLS(int, t_selfResize);         // inside the presenter's own resize of the game's swap chain (PresenterResize)
 BFI_TLS(int, t_inOuter);            // inside the game-facing (outer) swap chain's Present
 BFI_TLS(int, t_scCreateDepth);      // nested CreateSwapChain* calls through the factory hook (outermost = 1)
+BFI_TLS(void *, t_scLoopF);          // the factory and result pointer of the outermost call (hook ping-pong check)
+BFI_TLS(void *, t_scLoopOut);
 struct OwnCall { OwnCall() { t_ownCall++; } ~OwnCall() { t_ownCall--; } };
 static HRESULT OwnPresent();
 static std::atomic<bool>      g_needRebind{false};        // move presentation to g_presQueue on the first frame
@@ -1271,7 +1293,7 @@ static bool CreateFrameResources()
     {
         if (!(g_stage[s] = CreateTex(g_desc, gf, D3D12_RESOURCE_FLAG_NONE, L"BFI staging frame", s))) return false;
         g_stageFence[s] = g_stageId[s] = g_readFence[s] = 0;
-        g_presCurSlot = -1;
+        g_presCurSlot = -1; g_presCurSlot2 = -1;
         g_stageTime[s] = 0.0;
     }
     g_cur = 0;
@@ -1529,7 +1551,8 @@ cbuffer C : register(b0)
     float rfxApl;     // its APL Limiter: 1 = on (the scene average is in aplTex, measured from this frame)
 };
 Texture2D<float4> src : register(t0);
-Texture2D<float> aplTex : register(t1);   // APL Limiter: the scene average (1x1); for its reduction pass, the 32x18 cells
+Texture2D<float> aplTex : register(t1);
+Texture2D<float4> srcNew : register(t2);  // split comparison: the newest game frame, for the side without BFI   // APL Limiter: the scene average (1x1); for its reduction pass, the 32x18 cells
 SamplerState linClamp : register(s0);
 
 // The game's frame at output pixel pos. Same size: the pixel itself. Larger (a 5K frame in a 4K window): four bilinear
@@ -1546,6 +1569,21 @@ float3 Fetch(float2 pos)
                    src.SampleLevel(linClamp, (cp + float2( o.x, -o.y)) * inv, 0).rgb +
                    src.SampleLevel(linClamp, (cp + float2(-o.x,  o.y)) * inv, 0).rgb +
                    src.SampleLevel(linClamp, (cp + float2( o.x,  o.y)) * inv, 0).rgb);
+}
+
+// The same for the newest game frame (split comparison, side without BFI).
+float3 FetchNew(float2 pos)
+{
+    if (srcPerOut.x <= 1.0001 && srcPerOut.y <= 1.0001) return srcNew.Load(int3(pos, 0)).rgb;
+    uint w, h;
+    srcNew.GetDimensions(w, h);
+    float2 inv = 1.0 / float2(w, h);
+    float2 cp = pos * srcPerOut;
+    float2 o = 0.25 * srcPerOut;
+    return 0.25 * (srcNew.SampleLevel(linClamp, (cp + float2(-o.x, -o.y)) * inv, 0).rgb +
+                   srcNew.SampleLevel(linClamp, (cp + float2( o.x, -o.y)) * inv, 0).rgb +
+                   srcNew.SampleLevel(linClamp, (cp + float2(-o.x,  o.y)) * inv, 0).rgb +
+                   srcNew.SampleLevel(linClamp, (cp + float2( o.x,  o.y)) * inv, 0).rgb);
 }
 
 float4 VSMain(uint id : SV_VertexID) : SV_Position
@@ -2003,13 +2041,16 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
     {
         // Split comparison (idea: unrefined803, #111): one side shows every refresh at the light the strobe gives over
         // its cycle -- the mean of what each refresh emits, after roll-off and the ceiling -- so both sides match in
-        // brightness and differ only in motion clarity and flicker.
+        // brightness and differ only in motion clarity and flicker. It shows the newest game frame at every refresh, as a
+        // display without BFI would (120 fps at 120 Hz: a new frame each refresh), while the BFI side keeps one frame per
+        // strobe cycle.
         float t = splitSeam > 0.0 ? smoothstep(splitX - 0.5 * splitSeam, splitX + 0.5 * splitSeam, pos.x) : step(splitX, pos.x);
         float w = splitMode == 1 ? 1.0 - t : t;
         if (w > 0.0)
         {
             float3 a = float3(0, 0, 0);
-            [unroll] for (uint j = 0; j < 8; j++) if (j < frames) a += Strobe(lin, j, litGain);
+            float3 linNew = Decode(FetchNew(pos.xy));
+            [unroll] for (uint j = 0; j < 8; j++) if (j < frames) a += Strobe(linNew, j, litGain);
             o = lerp(o, a / float(frames), w);
         }
     }
@@ -2174,6 +2215,30 @@ static bool Compile(PFN_D3DCompile compile, const char *entry, const char *targe
     }
     SafeRelease(err);
     return true;
+}
+
+// ---- Trace file (BFIPresenter_trace.txt next to the ini): each line written and closed at once, for games that end
+// without a crash record (Avatar: Frontiers of Pandora closed itself while creating its swap chain; ReShade's log
+// may not be flushed by then). Only for the outer swap chain hook's steps.
+static void Trace(const char *fmt, ...)
+{
+    if (!g_iniPath[0]) return;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s", g_iniPath);
+    if (char *s = strrchr(path, '\\')) s[1] = '\0';
+    strncat(path, "BFIPresenter_trace.txt", MAX_PATH - strlen(path) - 1);
+    char line[512];
+    int n = snprintf(line, sizeof(line), "%10.3f [%5lu] ", Now(), GetCurrentThreadId());
+    va_list ap; va_start(ap, fmt);
+    n += vsnprintf(line + n, sizeof(line) - n - 3, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(line) - 3) n = (int)sizeof(line) - 3;
+    line[n++] = '\r'; line[n++] = '\n';
+    HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wr = 0;
+    WriteFile(f, line, (DWORD)n, &wr, nullptr);
+    CloseHandle(f);
 }
 
 // ---- Shader cache. The presenter's HLSL is compiled at the highest optimisation level, and the source has grown with
@@ -2378,6 +2443,7 @@ enum { ST_IDLE, ST_VBLANK, ST_BUFFENCE, ST_SUBMIT, ST_PRESENT, ST_G_SLOT, ST_G_C
        ST_G_OWN_INDEX, ST_G_OWN_GETBUF, ST_G_OWN_COPY, ST_G_OWN_PRESENT,
        ST_R_STOP, ST_R_RELEASE, ST_R_REBIND, ST_R_ORIG, ST_R_CREATE };
 static std::atomic<int>    g_presStage{ST_IDLE}, g_gameStage{ST_IDLE};
+static std::atomic<int>    g_holdPresents{0};          // > 0: the game is creating a swap chain for the window (see PresentHold)
 static std::atomic<int>    g_dbgStaged{0};                 // presenter idle: staged frames seen
 static std::atomic<UINT64> g_dbgDone{0}, g_dbgNeed{0};     // game fence completed vs needed
 static std::atomic<double> g_presStageT{0.0}, g_gameStageT{0.0};
@@ -2757,13 +2823,16 @@ static void SelfResizeTick(double t)
     if (stage == 0 && t - g_deferSinceT.load() < 0.6) steadySince = 0.0;       // a new swap chain
     if (!g_active.load() || g_dx11.load() || !g_deferPresenter.load() || g_ownPresentQueue) { g_selfResizeWanted.store(false); return; }
     EnterCriticalSection(&g_cfgLock);
-    const bool on = g_shared.selfResize != 0;
+    const int mode = g_shared.selfResize;
     LeaveCriticalSection(&g_cfgLock);
+    const bool on = mode != 0;
     if (!on || stage >= 2) return;
     // Only the game's first swap chain. A swap chain the game recreated (God of War Ragnarok when frame generation is
     // turned on: 6 buffers, Streamline's frame generation presenting from its own thread) went black after the
     // presenter's resize; there BFI waits for the game's resize as before (change resolution or display mode once).
-    if (g_swapChainsManaged > 1)
+    // PresenterResize=2 (test): also a recreated swap chain -- Onimusha recreates its swap chain at 4K once after
+    // starting and never resizes it (no frame generation there).
+    if (g_swapChainsManaged > 1 && mode < 2)
     {
         if (stage == 0)
         {
@@ -2940,6 +3009,27 @@ static DWORD WINAPI WatchdogThread(void *)
                     {
                         snprintf(who, sizeof(who), "game present thread %lu", (unsigned long)g_presentThreads[0]);
                         LogThreadStack(g_presentThreads[0], who);
+                    }
+                    // The presenter's side of it: its step, its thread and the two fences (a GPU queue waiting on the
+                    // other's fence shows as completed below reserved / signalled).
+                    LOGW("BFI Presenter: WATCHDOG -- presenter step: %s (%.1f s), %s, %s queue", kStageNames[g_presStage.load()],
+                         t - g_presStageT.load(), g_running.load() ? "running" : "stopped", g_ownPresentQueue ? "own" : "game's");
+                    if (g_thread) LogThreadStack(GetThreadId(g_thread), "presenter thread");
+                    if (g_presFence && g_gameFence)
+                    {
+                        // a try only: a stuck thread may hold g_lock, and the watchdog must not stop with it
+                        const bool locked = TryEnterCriticalSection(&g_lock) != 0;
+                        const unsigned long long pres = g_presFenceVal, game = g_gameFenceVal;
+                        char slots[256]; int sl = 0;
+                        for (UINT i = 0; i < kStage && sl < (int)sizeof(slots) - 48; i++)
+                            sl += snprintf(slots + sl, sizeof(slots) - sl, " %u:r%llu/g%llu", i,
+                                           (unsigned long long)g_readFence[i], (unsigned long long)g_stageFence[i]);
+                        if (locked) LeaveCriticalSection(&g_lock);
+                        LOGW("BFI Presenter: WATCHDOG -- fences: presenter %llu done of %llu reserved, game copies %llu done of %llu; "
+                             "slots (read / copy):%s; showing %d / %d%s",
+                             (unsigned long long)g_presFence->GetCompletedValue(), pres,
+                             (unsigned long long)g_gameFence->GetCompletedValue(), game, slots, g_presCurSlot, g_presCurSlot2,
+                             locked ? "" : " (presenter lock held by another thread)");
                     }
                 }
                 if (st != lastGame && g_waitSem)
@@ -3159,7 +3249,8 @@ static DWORD WINAPI PresenterThread(void *)
     // same game frame with the same settings into a buffer that already has
     // it just presents it again -- no GPU work, so a GPU busy with the game
     // (a hitch, shader compilation) can't hold the strobe up.
-    UINT64   bufFrame[kMaxBuf] = {};
+    UINT64   bufFrame[kMaxBuf] = {}, bufFrame2[kMaxBuf] = {};
+    int      pickNew2 = -1;                  // split comparison: the slot its side without BFI shows
     Constants bufConst[kMaxBuf] = {};
     bool     bufValid[kMaxBuf] = {};
     int      secReused = 0;
@@ -3228,7 +3319,9 @@ static DWORD WINAPI PresenterThread(void *)
         range.BaseShaderRegister = 0;
         D3D12_DESCRIPTOR_RANGE rangeApl = range;
         rangeApl.BaseShaderRegister = 1;                   // t1: the APL Limiter's value (or its cells)
-        D3D12_ROOT_PARAMETER params[3] = {};
+        D3D12_DESCRIPTOR_RANGE rangeNew = range;
+        rangeNew.BaseShaderRegister = 2;                   // t2: split comparison's newest game frame
+        D3D12_ROOT_PARAMETER params[4] = {};
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
         params[0].Constants.Num32BitValues = sizeof(Constants) / 4;
@@ -3239,6 +3332,8 @@ static DWORD WINAPI PresenterThread(void *)
         params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
         params[2] = params[1];
         params[2].DescriptorTable.pDescriptorRanges   = &rangeApl;
+        params[3] = params[1];
+        params[3].DescriptorTable.pDescriptorRanges   = &rangeNew;
         D3D12_STATIC_SAMPLER_DESC samp = {};
         samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -3246,7 +3341,7 @@ static DWORD WINAPI PresenterThread(void *)
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 3;
+        rsd.NumParameters = 4;
         rsd.pParameters   = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers   = &samp;
@@ -3511,22 +3606,29 @@ static DWORD WINAPI PresenterThread(void *)
     bool   flashOn = false;
     UINT lastSync = 0, lastPC = 0;
     bool haveStats = false;
-    bool kb = false, km = false, kr = false, krs = false, kk = false, ksp = false;
+    bool kb = false, km = false, kr = false, krs = false, kk = false, ksp = false, kosd = false;
 
     while (ok && g_running.load())
     {
         // hotkeys (edge-triggered) act on the shared settings
-        bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C');
-        if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp))
+        bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C'), ko = KeyCombo('F'), kz = KeyCombo('Z');
+        if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp) || (ko && !kosd))
         {
             EnterCriticalSection(&g_cfgLock);
+            if (ko && !kosd) g_shared.osd = !g_shared.osd;
             if (b && !kb) g_shared.enabled = !g_shared.enabled;
             if (m && !km) g_shared.method = !g_shared.method;
             if (rs && !krs) g_shared.rolling = !g_shared.rolling;
             if (sp && !ksp) g_shared.split = !g_shared.split;
             LeaveCriticalSection(&g_cfgLock);
         }
-        krs = rs; ksp = sp;
+        krs = rs; ksp = sp; kosd = ko;
+        {
+            // Ctrl+Shift+Z: the OSD's totals start again
+            static bool kzPrev = false;
+            if (kz && !kzPrev) { Osd::ResetTotals(Now()); LOGI("BFI Presenter: OSD totals reset"); }
+            kzPrev = kz;
+        }
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
         // Ctrl+Shift+K: a marker in the log with the last second's state, to find a moment the player noticed (a
         // stutter, a lost frame limit) in a long session.
@@ -3753,6 +3855,11 @@ static DWORD WINAPI PresenterThread(void *)
                 pick = oldestNew;
         }
         if (pick >= 0) { pickId = g_stageId[pick]; g_presCurSlot = pick; }
+        // Split comparison: its side without BFI shows the newest finished game frame at every refresh, like a display
+        // without BFI (120 fps at 120 Hz: every frame), while the BFI side keeps one frame per strobe cycle.
+        pickNew2 = pick;
+        if (s.split && pick >= 0 && newest >= 0 && newestId > pickId) pickNew2 = newest;
+        g_presCurSlot2 = pickNew2 != pick ? pickNew2 : -1;
         if (pick < 0)
         {
             int staged = 0;
@@ -3852,7 +3959,7 @@ static DWORD WINAPI PresenterThread(void *)
                 if (loadAt(peak) <= 1.0) ablSolve = peak;
                 else
                 {
-                    double lo = 100.0, hi = peak;
+                    double lo = 50.0, hi = peak;
                     for (int it = 0; it < 24; it++)
                     {
                         const double mid = 0.5 * (lo + hi);
@@ -3934,12 +4041,15 @@ static DWORD WINAPI PresenterThread(void *)
         c.seam    = s.rollSeam;
         c.decay   = s.rollDecay;
 
-        const bool reuse = s.reuseBuffers && bufValid[bi] && bufFrame[bi] == pickId &&
+        if (pickNew2 < 0) pickNew2 = pick;                       // picked later (the wait above): the same frame
+        const UINT64 pickId2 = pickNew2 >= 0 ? g_stageId[pickNew2] : 0;
+        const bool reuse = s.reuseBuffers && bufValid[bi] && bufFrame[bi] == pickId && bufFrame2[bi] == pickId2 &&
                            memcmp(&bufConst[bi], &c, sizeof(c)) == 0;
         if (!reuse)
         {
             reserve = ++g_presFenceVal;
             g_readFence[pick] = reserve;
+            if (pickNew2 != pick) g_readFence[pickNew2] = reserve;
         }
         // The game never copies into the slot being shown (g_presCurSlot), so
         // the lock can go before waiting on the GPU.
@@ -3960,6 +4070,11 @@ static DWORD WINAPI PresenterThread(void *)
             Transition(real[bi], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
             Transition(g_stage[pick], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) };
         list->ResourceBarrier(2, br);
+        if (pickNew2 != pick)
+        {
+            D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &b2);
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         rtv.ptr += (SIZE_T)bi * rtvStride;
         D3D12_GPU_DESCRIPTOR_HANDLE srv = srvHeap->GetGPUDescriptorHandleForHeapStart();
@@ -4011,6 +4126,11 @@ static DWORD WINAPI PresenterThread(void *)
             aplFrameId = pickId;
         }
         list->SetGraphicsRootDescriptorTable(2, aplSrv);
+        {
+            D3D12_GPU_DESCRIPTOR_HANDLE nsrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            nsrv.ptr += (UINT64)(pickNew2 >= 0 ? pickNew2 : pick) * srvStride;
+            list->SetGraphicsRootDescriptorTable(3, nsrv);
+        }
         D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)g_desc.Width, (float)g_desc.Height, 0.0f, 1.0f };
         D3D12_RECT sc = { 0, 0, (LONG)g_desc.Width, (LONG)g_desc.Height };
         list->RSSetViewports(1, &vp);
@@ -4056,6 +4176,11 @@ static DWORD WINAPI PresenterThread(void *)
         br[0] = Transition(real[bi], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         br[1] = Transition(g_stage[pick], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         list->ResourceBarrier(2, br);
+        if (pickNew2 != pick)
+        {
+            D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(1, &b2);
+        }
         if (FAILED(list->Close())) LOGE("BFI Presenter: presenter draw list failed to record (Close) -- see BFIPresenter_debug.txt with Diagnostics=2");
 
         ID3D12CommandList *lists[] = { list };
@@ -4063,10 +4188,17 @@ static DWORD WINAPI PresenterThread(void *)
         queue->Signal(g_presFence, reserve);
         bufFence[bi] = reserve;
         bufFrame[bi] = pickId;
+        bufFrame2[bi] = pickId2;
         bufConst[bi] = c;
         bufValid[bi] = true;
         }
 
+        if (g_holdPresents.load() > 0)
+        {
+            // the game is creating a new swap chain for this window: no Present on the old one meanwhile (at most 2 s)
+            const double th = Now();
+            while (g_holdPresents.load() > 0 && g_running.load() && Now() - th < 2.0) Sleep(1);
+        }
         const double tSub = Now();
         PresStage(ST_PRESENT);
         HRESULT hr;
@@ -4454,6 +4586,7 @@ static DWORD WINAPI PresenterThread(void *)
             }
             secReused = 0;
             g_status.frameSkips   = secFrameSkips;
+            Osd::AddSecond(g_status.frameSkips, g_status.frameRepeats, g_status.late, Now());
             // Automatic frames ahead: 1 (least latency) normally; 2 while the
             // game keeps missing strobe cycles (CPU and GPU then overlap again,
             // South of Midnight: 55 -> 60 fps); back to 1 when the game waits
@@ -5554,6 +5687,13 @@ static HRESULT SubmitGameFrameLocked()
         ID3D12Resource *rb = nullptr;
         GameStage(ST_G_OWN_INDEX);
         const UINT bi = o_GetCBBI(g_sc);
+        // Pass-through diagnostics (Avatar: the picture stayed black on a recreated swap chain): once a second for
+        // the first 30 s of a swap chain, what the pass-through did.
+        static int s_ptPres = 0, s_ptCopy = 0;
+        static double s_ptT = 0.0;
+        static HRESULT s_ptHr = S_OK;
+        const bool ptLog = Now() - g_deferSinceT.load() < 30.0;
+        s_ptPres++;
         GameStage(ST_G_OWN_GETBUF);
         // SDR to HDR: the real buffers are HDR10, the game's frames 8-bit -- a copy between them isn't allowed (it
         // removes the device). Only the presenter can draw them; until it runs, the screen keeps its last picture.
@@ -5592,11 +5732,23 @@ static HRESULT SubmitGameFrameLocked()
             g_fbFence[bi] = v;
             if (q != g_gameQueue) g_gameQueue->Wait(g_presFence, v);   // copy done before reuse
             rb->Release();
+            s_ptCopy++;
         }
+        const UINT stand = g_cur;
         g_cur = (g_cur + 1) % g_bufCount;
         ReleaseGameSlot();
         GameStage(ST_G_OWN_PRESENT);
-        return OwnPresent();
+        const HRESULT phr = OwnPresent();
+        if (FAILED(phr)) s_ptHr = phr;
+        const double tn = Now();
+        if (ptLog && tn - s_ptT >= 1.0)
+        {
+            LOGI("BFI Presenter: pass-through: %d presents, %d copied to the real buffer (real index %u, stand-in %u of %u, "
+                 "%s queue, formats %d -> %d, last failed present 0x%08lX)", s_ptPres, s_ptCopy, bi, stand, g_bufCount,
+                 q == g_gameQueue ? "game" : "presenter", (int)g_stageFmt, (int)g_desc.Format, (unsigned long)s_ptHr);
+            s_ptT = tn; s_ptPres = s_ptCopy = 0; s_ptHr = S_OK;
+        }
+        return phr;
     }
 
     // Staging slot for this frame: the oldest one the presenter is neither
@@ -5613,7 +5765,7 @@ static HRESULT SubmitGameFrameLocked()
         EnterCriticalSection(&g_lock);
         for (UINT i = 0; i < kStage; i++)
         {
-            if ((int)i == g_presCurSlot) continue;
+            if ((int)i == g_presCurSlot || (int)i == g_presCurSlot2) continue;
             if (g_readFence[i] > pdone || g_stageFence[i] > gdone) continue;
             if (g_stageId[i] < bestId) { best = (int)i; bestId = g_stageId[i]; }
         }
@@ -5681,6 +5833,7 @@ static HRESULT SubmitGameFrameLocked()
     g_stageNext = (s + 1) % kStage;
     g_cur = (g_cur + 1) % g_bufCount;
     g_stagedThisSecond.fetch_add(1);
+    Osd::FramePush(Now());
     if (!g_firstStaged.exchange(true)) LOGI("BFI Presenter: first game frame received");
     if ((g_frameId & 31) == 1) ReadRsColorSpace();     // for the presenter thread (see g_rsCs)
     if (g_gameFence->GetCompletedValue() == UINT64_MAX) DumpDeviceRemoved(g_device, "game Present");
@@ -7229,6 +7382,74 @@ static void OuterCheck(void *obj)
     LOGI("BFI Presenter: the game presents to FSR frame generation's swap chain (%s) -- its presents are counted there "
          "(FSR presents every frame from a thread of its own)", mod);
 }
+// A vtable slot's original function, read from the module file the vtable lives in (DXGI's own, in dxgi.dll): the value
+// in the file, relocated to where the module is loaded. Another add-on can sit on the same slot and re-hook it after us,
+// saving our hook as its "original" -- then its hook and ours call each other until the stack runs out (Elden Ring with
+// ERSS-FG, #119: 3993 nested calls; most likely Avatar too, which closed without a crash record). The real function
+// from the file breaks that loop. nullptr when the vtable isn't in a file on disk or the value doesn't check out.
+static std::atomic<bool> g_scLoopLogged{false};
+static void *PristineVtableSlot(void **vtbl, int idx)
+{
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)vtbl, &m) || !m)
+        return nullptr;
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(m, path, MAX_PATH)) return nullptr;
+    BYTE *base = (BYTE *)m;
+    auto *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    const ULONGLONG prefBase = nt->OptionalHeader.ImageBase;
+    const DWORD rva = (DWORD)((BYTE *)&vtbl[idx] - base);
+    // the file offset of that RVA
+    auto *sec = IMAGE_FIRST_SECTION(nt);
+    DWORD off = 0;
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+        if (rva >= sec->VirtualAddress && rva + sizeof(void *) <= sec->VirtualAddress + sec->SizeOfRawData)
+        { off = rva - sec->VirtualAddress + sec->PointerToRawData; break; }
+    if (!off) return nullptr;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return nullptr;
+    ULONGLONG raw = 0;
+    DWORD got = 0;
+    LARGE_INTEGER pos; pos.QuadPart = off;
+    const bool ok = SetFilePointerEx(f, pos, nullptr, FILE_BEGIN) && ReadFile(f, &raw, sizeof(void *), &got, nullptr) && got == sizeof(void *);
+    CloseHandle(f);
+    if (!ok || !raw) return nullptr;
+    BYTE *fn = (BYTE *)(uintptr_t)(raw - prefBase + (ULONGLONG)(uintptr_t)base);
+    // must point into that module's executable code
+    sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+        if ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) && fn >= base + sec->VirtualAddress && fn < base + sec->VirtualAddress + sec->Misc.VirtualSize)
+            return fn;
+    return nullptr;
+}
+static void *g_pristineSC = nullptr, *g_pristineSCHwnd = nullptr, *g_pristineSCCore = nullptr;
+static void **g_scFactoryVt = nullptr;   // the factory vtable the hooks sit on
+// Another add-on re-hooked the slot over ours with ours as its original, while ours still has its hook as the original:
+// each would call the other. Then ours goes straight to DXGI's own function (it is called by that add-on's hook, which
+// has done its part already).
+static bool ScPingPong(int idx, void *hook, void *orig)
+{
+    if (!g_scFactoryVt) return false;
+    void *cur = g_scFactoryVt[idx];
+    if (cur == hook || cur != orig) return false;
+    if (!g_scLoopLogged.exchange(true))
+        LOGW("BFI Presenter: another add-on hooked swap chain creation on top of BFI Presenter with BFI Presenter's hook as "
+             "its original -- going to DXGI's own function from there, so the two don't call each other in a loop");
+    return true;
+}
+
+// The hook was entered again for the same factory and result pointer inside its own call: another add-on's hook on the
+// same slot has ours as its "original". Go to DXGI's real function instead of round again.
+static bool ScLoop(void *f, void *out)
+{
+    if (t_scCreateDepth < 1 || f != t_scLoopF || out != t_scLoopOut) return false;
+    if (!g_scLoopLogged.exchange(true))
+        LOGW("BFI Presenter: another add-on's hook on swap chain creation calls ours back (each saved the other as the "
+             "original) -- calling DXGI's own function to break the loop");
+    Trace("hook loop at depth %d: calling DXGI's own function", (int)t_scCreateDepth);
+    return true;
+}
+
 typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSC)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSCHwnd)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *,
                                                         const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
@@ -7237,14 +7458,41 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_FCreateSCCore)(IDXGIFactory2 *, IUnknown
 static PFN_FCreateSC     o_FCreateSC = nullptr;
 static PFN_FCreateSCHwnd o_FCreateSCHwnd = nullptr;
 static PFN_FCreateSCCore o_FCreateSCCore = nullptr;
+// The game creates a new swap chain for the window the presenter is showing on (Onimusha switching DLSS frame
+// generation off: Streamline makes a new one while the old is still alive). With OptiScaler and Streamline that call
+// waits for the old swap chain to go quiet, while the presenter's next Present on it waits in the driver for DLSS-G's
+// present thread, which waits on the game's call: all three stopped. The presenter holds its presents while such a
+// call runs (from before it reaches the wrappers below), so the old swap chain is idle; the game presents again as soon
+// as it returns, and the old swap chain's release stops the presenter as usual.
+struct PresentHold
+{
+    bool on = false;
+    PresentHold(HWND w)
+    {
+        if (!w || !g_active.load() || !g_running.load() || w != g_watchHwnd.load()) return;
+        on = true;
+        g_holdPresents.fetch_add(1);
+        const double t0 = Now();
+        while (g_presStage.load() == ST_PRESENT && Now() - t0 < 0.1) Sleep(1);   // a Present under way finishes first
+        LOGI("BFI Presenter: the game creates a new swap chain for its window -- presents held until it returns");
+    }
+    ~PresentHold() { if (on) g_holdPresents.fetch_sub(1); }
+};
+
 static HRESULT STDMETHODCALLTYPE hk_FCreateSC(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out)
 {
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
+    if (g_pristineSC && (ScPingPong(10, (void *)&hk_FCreateSC, (void *)o_FCreateSC) || ScLoop((void *)f, (void *)out)))
+        return ((decltype(o_FCreateSC))g_pristineSC)(f, dev, d, out);
+    if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
+    Trace("FCreateSC: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSC);
+    PresentHold hold(t_scCreateDepth == 1 && !t_ownCall && d ? d->OutputWindow : nullptr);
     const HRESULT hr = o_FCreateSC(f, dev, d, out);
     const int depth = t_scCreateDepth--;
-    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    Trace("FCreateSC: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) { OuterCheck(*out); Trace("FCreateSC: outer check done"); }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hk_FCreateSCHwnd(IDXGIFactory2 *f, IUnknown *dev, HWND w, const DXGI_SWAP_CHAIN_DESC1 *d,
@@ -7252,10 +7500,16 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSCHwnd(IDXGIFactory2 *f, IUnknown *de
 {
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
+    if (g_pristineSCHwnd && (ScPingPong(15, (void *)&hk_FCreateSCHwnd, (void *)o_FCreateSCHwnd) || ScLoop((void *)f, (void *)out)))
+        return ((decltype(o_FCreateSCHwnd))g_pristineSCHwnd)(f, dev, w, d, fs, o, out);
+    if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
+    Trace("FCreateSCHwnd: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSCHwnd);
+    PresentHold hold(t_scCreateDepth == 1 && !t_ownCall ? w : nullptr);
     const HRESULT hr = o_FCreateSCHwnd(f, dev, w, d, fs, o, out);
     const int depth = t_scCreateDepth--;
-    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    Trace("FCreateSCHwnd: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) { OuterCheck(*out); Trace("FCreateSCHwnd: outer check done"); }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hk_FCreateSCCore(IDXGIFactory2 *f, IUnknown *dev, IUnknown *win, const DXGI_SWAP_CHAIN_DESC1 *d,
@@ -7263,10 +7517,15 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSCCore(IDXGIFactory2 *f, IUnknown *de
 {
     // Only the outermost call: wrappers create the real swap chain (and ReShade its own) inside it, through the
     // same factory methods, and the game gets the object the outermost call returns.
+    if (g_pristineSCCore && (ScPingPong(16, (void *)&hk_FCreateSCCore, (void *)o_FCreateSCCore) || ScLoop((void *)f, (void *)out)))
+        return ((decltype(o_FCreateSCCore))g_pristineSCCore)(f, dev, win, d, o, out);
+    if (t_scCreateDepth == 0) { t_scLoopF = (void *)f; t_scLoopOut = (void *)out; }
     t_scCreateDepth++;
+    Trace("FCreateSCCore: enter (depth %d, own call %d) -> %p", t_scCreateDepth, t_ownCall ? 1 : 0, (void *)o_FCreateSCCore);
     const HRESULT hr = o_FCreateSCCore(f, dev, win, d, o, out);
     const int depth = t_scCreateDepth--;
-    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) OuterCheck(*out);
+    Trace("FCreateSCCore: returned 0x%08lX (depth %d)", (unsigned long)hr, depth);
+    if (SUCCEEDED(hr) && out && !t_ownCall && depth == 1) { OuterCheck(*out); Trace("FCreateSCCore: outer check done"); }
     return hr;
 }
 // The function the game itself imports from dxgi.dll (its own import table): with OptiScaler that is
@@ -7293,12 +7552,78 @@ static void *GameDxgiImport(const char *fn)
     }
     return nullptr;
 }
+// OptiScaler in this game: its ini next to the game's exe, a module named OptiScaler, or a module whose version
+// information says OptiScaler (it usually loads as dxgi.dll, winmm.dll, version.dll ... next to the exe). Returns what
+// was found, or nullptr.
+static const char *OptiScalerFound(char *buf, size_t n)
+{
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return nullptr;
+    wchar_t dir[MAX_PATH];
+    wcscpy(dir, exe);
+    if (wchar_t *s = wcsrchr(dir, L'\\')) s[1] = 0;
+    wchar_t ini[MAX_PATH];
+    _snwprintf(ini, MAX_PATH, L"%sOptiScaler.ini", dir);
+    if (GetFileAttributesW(ini) != INVALID_FILE_ATTRIBUTES) { snprintf(buf, n, "OptiScaler.ini next to the game"); return buf; }
+    typedef DWORD (WINAPI *PFN_GFVIS)(LPCWSTR, LPDWORD);
+    typedef BOOL (WINAPI *PFN_GFVI)(LPCWSTR, DWORD, DWORD, LPVOID);
+    typedef BOOL (WINAPI *PFN_VQV)(LPCVOID, LPCWSTR, LPVOID *, PUINT);
+    HMODULE ver = LoadLibraryA("version.dll");
+    PFN_GFVIS gs = ver ? (PFN_GFVIS)(void *)GetProcAddress(ver, "GetFileVersionInfoSizeW") : nullptr;
+    PFN_GFVI  gi = ver ? (PFN_GFVI)(void *)GetProcAddress(ver, "GetFileVersionInfoW") : nullptr;
+    PFN_VQV   vq = ver ? (PFN_VQV)(void *)GetProcAddress(ver, "VerQueryValueW") : nullptr;
+    const char *found = nullptr;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap != INVALID_HANDLE_VALUE)
+    {
+        MODULEENTRY32W me = { sizeof(me) };
+        for (BOOL ok = Module32FirstW(snap, &me); ok && !found; ok = Module32NextW(snap, &me))
+        {
+            if (_wcsnicmp(me.szModule, L"optiscaler", 10) == 0) { snprintf(buf, n, "%ls loaded", me.szModule); found = buf; break; }
+            if (_wcsnicmp(me.szExePath, dir, wcslen(dir)) != 0 || !gs || !gi || !vq) continue;   // only modules next to the exe
+            DWORD h = 0, sz = gs(me.szExePath, &h);
+            if (!sz || sz > 1 << 20) continue;
+            std::vector<BYTE> vi(sz);
+            if (!gi(me.szExePath, 0, sz, vi.data())) continue;
+            struct LangCp { WORD lang, cp; } *tr = nullptr;
+            UINT tl = 0;
+            if (!vq(vi.data(), L"\\VarFileInfo\\Translation", (LPVOID *)&tr, &tl) || tl < sizeof(LangCp)) continue;
+            static const wchar_t *const keys[] = { L"ProductName", L"FileDescription", L"InternalName", L"OriginalFilename" };
+            for (const wchar_t *k : keys)
+            {
+                wchar_t q[96];
+                _snwprintf(q, 96, L"\\StringFileInfo\\%04x%04x\\%ls", tr->lang, tr->cp, k);
+                wchar_t *v = nullptr; UINT vl = 0;
+                if (vq(vi.data(), q, (LPVOID *)&v, &vl) && v && vl)
+                {
+                    std::wstring s(v);
+                    for (auto &c : s) c = (wchar_t)towlower(c);
+                    if (s.find(L"optiscaler") != std::wstring::npos) { snprintf(buf, n, "%ls (OptiScaler)", me.szModule); found = buf; break; }
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    return found;
+}
+
 static void InstallOuterFactoryHook()
 {
     static bool done = false;
     if (done) return;
     done = true;
-    if (!GetPrivateProfileIntA("BFI", "HookOuterSwapChain", 1, g_iniPath)) { LOGI("BFI Presenter: outer swap chain hook off (ini)"); return; }
+    // HookOuterSwapChain: 0 off; 1 (default) only with OptiScaler -- the hook is there for FSR frame generation through
+    // OptiScaler (1.0.26) and does nothing anywhere else, while hooking every DX game's swap chain creation could meet
+    // another add-on's hook on the same function (Elden Ring with ERSS-FG, #119; Avatar); 2 every game, as 1.0.26-1.0.37.
+    const int mode = (int)GetPrivateProfileIntA("BFI", "HookOuterSwapChain", 1, g_iniPath);
+    if (mode == 0) { LOGI("BFI Presenter: outer swap chain hook off (ini)"); return; }
+    if (mode == 1)
+    {
+        char why[160];
+        const char *opti = OptiScalerFound(why, sizeof(why));
+        if (!opti) { LOGI("BFI Presenter: outer swap chain hook not needed (no OptiScaler in this game; HookOuterSwapChain=2 forces it)"); return; }
+        LOGI("BFI Presenter: OptiScaler found (%s) -- outer swap chain hook for FSR frame generation", opti);
+    }
     typedef HRESULT (WINAPI *PFN_CF2)(UINT, REFIID, void **);
     typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void **);
     const char *from = "the game's import";
@@ -7320,7 +7645,15 @@ static void InstallOuterFactoryHook()
     void **vt = *(void ***)f;
     char mod[64];
     ModuleOf(vt[15], mod, sizeof(mod));
+    // DXGI's own functions for these slots, from dxgi.dll's file (see PristineVtableSlot), before anything is patched.
+    g_pristineSC = PristineVtableSlot(vt, 10);
+    g_pristineSCHwnd = PristineVtableSlot(vt, 15);
+    g_pristineSCCore = PristineVtableSlot(vt, 16);
+    Trace("outer hook: DXGI's own functions %p %p %p (slots now %p %p %p)", g_pristineSC, g_pristineSCHwnd, g_pristineSCCore,
+          vt[10], vt[15], vt[16]);
+    g_scFactoryVt = vt;
     PatchSlot(vt, 10, (void *)&hk_FCreateSC,     (void **)&o_FCreateSC);
+    Trace("outer hook: factory %p vtable %p, CreateSwapChainForHwnd %p", (void *)f, (void *)vt, vt[15]);
     PatchSlot(vt, 15, (void *)&hk_FCreateSCHwnd, (void **)&o_FCreateSCHwnd);
     PatchSlot(vt, 16, (void *)&hk_FCreateSCCore, (void **)&o_FCreateSCCore);
     f->Release();
@@ -7371,6 +7704,13 @@ static void ReleaseAll()
         return;
     }
     g_active.store(false);
+    // The frame limits are set by the presenter thread once a second; with it stopped they must not stay on, or a
+    // recreated swap chain's pass-through (no BFI until the game resizes it) ran at the old cap (Onimusha: 30 fps,
+    // the 2x frame generation limit, after the game recreated its swap chain).
+    if (g_sleepLimitUs.exchange(0) > 0) LOGI("BFI Presenter: frame limit at the game's Reflex sleep off (presenter stopped)");
+#ifdef _WIN64
+    g_rfxWantLimitUs.store(0);
+#endif
     ReleaseFrameResources();
     for (UINT s = 0; s < kStage; s++) SafeRelease(g_copyAlloc[s]);
     SafeRelease(g_copyList);
@@ -7758,7 +8098,7 @@ static bool CreateStage11()
         g_stageFence[s] = g_stageId[s] = g_readFence[s] = 0;
         g_stageTime[s] = 0.0;
     }
-    g_presCurSlot = -1;
+    g_presCurSlot = -1; g_presCurSlot2 = -1;
     g_stageNext = 0;
     LOGI("BFI Presenter: DX11: presenting %ux%u, format %u, %u buffers (game: %ux%u, format %u, %u buffers)%s",
          g_desc.Width, g_desc.Height, (unsigned)g_desc.Format, g_bufCount, g_srcW ? g_srcW : g_desc.Width,
@@ -8377,7 +8717,7 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
         EnterCriticalSection(&g_lock);
         for (UINT i = 0; i < kStage; i++)
         {
-            if ((int)i == g_presCurSlot) continue;
+            if ((int)i == g_presCurSlot || (int)i == g_presCurSlot2) continue;
             if (g_readFence[i] > pdone || g_stageFence[i] > gdone) continue;
             if (g_stageId[i] < bestId) { best = (int)i; bestId = g_stageId[i]; }
         }
@@ -8409,6 +8749,7 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
     bb->Release();
     g_stageNext = (s + 1) % kStage;
     g_stagedThisSecond.fetch_add(1);
+    Osd::FramePush(Now());
     if (!g_firstStaged.exchange(true)) LOGI("BFI Presenter: DX11: first game frame received");
     if ((g_frameId & 31) == 1) ReadRsColorSpace();     // for the presenter thread (see g_rsCs)
 
@@ -10013,6 +10354,40 @@ static void KofiButton()
         ImGui::SetTooltip("BFI Presenter is free. If it helps you, you can support its development on Ko-fi\n(ko-fi.com/artzox). Opens in your browser.");
 }
 
+// The in-game OSD (common/bfi_osd.h), every frame through ReShade's overlay event.
+static void on_osd(reshade::api::effect_runtime *rt)
+{
+    // One runtime only. ReShade draws its overlay for every swap chain it wraps, and with FSR frame generation (Callisto
+    // Protocol through OptiScaler) that is two -- the game's, presented on the game's thread, and the real one, presented
+    // on FSR's thread -- at the same time, while ImGui's context is shared: drawing on both crashed the game. The swap
+    // chain the presenter manages when there is one, otherwise the first runtime that draws (another takes over after
+    // it has been quiet for a second).
+    {
+        static std::atomic<void *> s_rt{nullptr};
+        static std::atomic<double> s_rtT{0.0};
+        void *nat = reinterpret_cast<void *>(rt->get_native());
+        // The game's own swap chain the presenter manages: DX12's (g_sc), or DX11's (g_sc11). In DX9 and OpenGL games
+        // g_sc is the presenter's own DX11 swap chain, which has no ReShade runtime -- there ReShade's runtime is the
+        // game's DX9 / OpenGL one, so the first runtime draws.
+        void *gameSc = g_dx11.load() ? (void *)g_sc11 : (void *)g_sc;
+        const bool managed = gameSc && nat == gameSc;
+        const bool anyManaged = gameSc != nullptr;
+        const double now = Now();
+        if (anyManaged ? !managed : (s_rt.load() && s_rt.load() != (void *)rt && now - s_rtT.load() < 1.0)) return;
+        s_rt.store((void *)rt); s_rtT.store(now);
+    }
+    EnterCriticalSection(&g_cfgLock);
+    const bool on = g_shared.osd != 0;
+    const int corner = g_shared.osdCorner, graph = g_shared.osdGraph, loads = g_shared.osdLoads;
+    const float scale = g_shared.osdScale;
+    OsdData d;
+    d.gameFps = g_status.gameFps; d.refreshHz = g_status.refreshHz; d.frames = g_shared.frames;
+    d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
+    d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
+    LeaveCriticalSection(&g_cfgLock);
+    if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
+}
+
 static void draw_overlay(reshade::api::effect_runtime *)
 {
     Status st;
@@ -10263,6 +10638,23 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::SliderInt("Seam softness (pixels, 0 = hard)", &s.splitSeam, 0, 400);
             ImGui::Unindent(16.0f);
         }
+        bool osd = s.osd != 0;
+        if (ImGui::Checkbox("On-screen display (Ctrl+Shift+F)", &osd)) s.osd = osd ? 1 : 0;
+        if (s.osd) { ImGui::SameLine(); if (ImGui::SmallButton("Reset totals (Ctrl+Shift+Z)")) Osd::ResetTotals(Now()); }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A small panel over the game: its frame rate and frame time, the presenter's lost and repeated\n"
+                                                      "frames and missed refreshes, a frame-time graph and CPU / GPU load (GPU: NVIDIA).\n"
+                                                      "For changing the game's settings without RTSS or opening this menu.");
+        if (s.osd)
+        {
+            ImGui::Indent(16.0f);
+            ImGui::Combo("Corner", &s.osdCorner, "Top left\0Top right\0Bottom left\0Bottom right\0");
+            bool og = s.osdGraph != 0, ol = s.osdLoads != 0;
+            if (ImGui::Checkbox("Frame-time graph", &og)) s.osdGraph = og ? 1 : 0;
+            ImGui::SameLine();
+            if (ImGui::Checkbox("CPU / GPU load", &ol)) s.osdLoads = ol ? 1 : 0;
+            ImGui::SliderFloat("Size", &s.osdScale, 0.75f, 2.5f, "%.2f");
+            ImGui::Unindent(16.0f);
+        }
     }
 
     // ================================================================ 2. brightness and output
@@ -10270,15 +10662,31 @@ static void draw_overlay(reshade::api::effect_runtime *)
     {
         int out = s.output + 1;
         if (ImGui::Combo("Output", &out, kOutputNames)) s.output = out - 1;
-        ImGui::SliderFloat("Display peak (nits)", &s.peakNits, 100.0f, 4000.0f, "%.0f");
+        ImGui::SliderFloat("Display peak (nits)", &s.peakNits, 50.0f, 4000.0f, "%.0f");
+        if (s.peakNits < 100.0f)
+        {
+            // below 100 only on purpose: say what it does, in red
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.3f, 1.0f));
+            ImGui::TextWrapped("Below 100 nits: the lit refresh can't reach SDR white (80 nits or more), so the picture is darker "
+                               "than with BFI off and highlights are flattened to this ceiling. Only for a dim display or a "
+                               "deliberately dim picture.");
+            ImGui::PopStyleColor();
+        }
         bool ag = s.ablGuard != 0;
         if (ImGui::Checkbox("ABL guard (keep bright scenes within the panel's budget)", &ag)) s.ablGuard = ag ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("OLED panels dim the picture when a refresh puts out too much light overall (area x brightness).\nWith BFI the lit refresh carries the boost, so bright skies and white screens can trigger it.\nThe lit-refresh ceiling is lowered just enough to stay within the budget (the rest spills into\nthe dark refresh), and returns to full when the scene allows. HDR only.");
         if (s.ablGuard)
         {
             ImGui::Indent(16.0f);
-            ImGui::SliderInt("Panel budget (average nits of a lit refresh)", &s.ablBudget, 100, 1500);
+            ImGui::SliderInt("Panel budget (average nits of a lit refresh)", &s.ablBudget, 50, 1500);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Your panel's full-screen (100%% window) white brightness. Bright areas are held to what the\npanel sustains at their size: from Peak brightness at 10%% of the screen down to this budget at\n100%% (AblCurve in the ini takes your panel's measured curve). The ceiling is lowered just enough;\nsmall highlights keep the full one. Lower it if bright scenes still darken.");
+            if (s.ablBudget < 100)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.3f, 1.0f));
+                ImGui::TextWrapped("Below 100 nits: bright scenes are cut hard, so the brightness swings between dark and "
+                                   "bright scenes get larger. Only if your panel really holds this little on a full white screen.");
+                ImGui::PopStyleColor();
+            }
             if (st.hotArea >= 0.0)
                 ImGui::Text("Scene asks for: %.0f nits average   After ceiling: %.0f   Ceiling in use: %.0f nits", st.rawAvg, st.hotArea, st.ceilInUse);
             ImGui::Unindent(16.0f);
@@ -10784,6 +11192,7 @@ static void UnregisterAll(HMODULE hModule)
     reshade::unregister_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
     RegisterDx9Events(false);
     reshade::unregister_overlay("BFI Presenter", draw_overlay);
+    reshade::unregister_event<reshade::addon_event::reshade_overlay>(on_osd);
     RemoveHooks();
     reshade::unregister_addon(hModule);
 }
@@ -10808,6 +11217,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
     RegisterDx9Events(true);
     reshade::register_overlay("BFI Presenter", draw_overlay);
+    reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
     if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
     return true;
 }
@@ -10864,6 +11274,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
         RegisterDx9Events(true);
         reshade::register_overlay("BFI Presenter", draw_overlay);
+        reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
         ShaderPrepare();                                // compiled (or loaded) while the game starts up
         // DRED must be switched on before the game creates its device; a
         // thread avoids calling into D3D12 under the loader lock.

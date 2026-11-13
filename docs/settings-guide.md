@@ -79,8 +79,12 @@ Makes each line fade out after the "beam" passes, like the glow of a real CRT, i
 *When to change it:* 0.2–0.4 works well; 0 switches it off and gives hard bands with the seam above.
 
 **Split comparison** · `SplitCompare` · default: off\
-Shows one side of the screen without BFI and the other with it, at the same brightness, so the difference in motion is visible in one picture: pan the camera and compare the two halves. The side without BFI shows every refresh at the light the strobe gives over its cycle, after highlight roll-off and the panel ceiling, so the halves differ only in motion clarity and flicker. **Without BFI** picks the side, **Seam position** where the halves meet (percent of the width) and **Seam softness** a soft edge in pixels. Works in every API, DirectX and Vulkan. The idea comes from [unrefined803](https://github.com/unrefined803)'s demo ([#111](https://github.com/artzox/BFI-Presenter/pull/111)).\
+Shows one side of the screen without BFI and the other with it, at the same brightness, so the difference in motion is visible in one picture: pan the camera and compare the two halves. The side without BFI shows every refresh at the light the strobe gives over its cycle, after highlight roll-off and the panel ceiling, so the halves differ only in motion clarity and flicker. It also shows the game's frames as a display without BFI would: the newest one at every refresh. When the game runs faster than the strobe cycle (e.g. 120 fps at 120 Hz with 2 frames per cycle), the side without BFI shows all 120 frames a second, while the BFI side shows one per strobe cycle (60) and drops the rest, so the comparison is BFI against the game at its full frame rate (v1.0.38; before, both sides showed the same 60). At Half refresh both sides show the same 60 frames. **Without BFI** picks the side, **Seam position** where the halves meet (percent of the width) and **Seam softness** a soft edge in pixels. Works in every API, DirectX and Vulkan. The idea comes from [unrefined803](https://github.com/unrefined803)'s demo ([#111](https://github.com/artzox/BFI-Presenter/pull/111)).\
 *When to change it:* for videos, streams and showing someone what BFI does. Hotkey: Ctrl+Shift+C. Turn it off for playing.
+
+**On-screen display** · `Osd`, `OsdCorner`, `OsdGraph`, `OsdLoads`, `OsdScale` · default: off, top right, on, on, 1.0\
+A small panel over the game, so you can watch it while changing the game's settings, without RTSS and without opening ReShade's menu: the game's frame rate and frame time (green at one game frame per strobe cycle or more, amber or red below), the refresh rate and strobe cycles per second, the presenter's **lost** frames (finished but never shown), **repeated** frames (strobe cycles that showed the previous frame again) and **missed** refreshes, each for the last second, with totals in brackets since you last reset them (Ctrl+Shift+Z, or **Reset totals** next to the checkbox; the time they cover is shown under them), a frame-time graph of the last 240 game frames, and CPU and GPU load (GPU load on NVIDIA cards, through the driver's NVML). It is drawn into the game's picture through ReShade, so it flashes with BFI like the rest of the image. Corner, graph, loads and size can be set. Works in every API, DirectX and Vulkan (v1.0.38).\
+*When to change it:* turn it on while tuning a game's settings. Hotkey: Ctrl+Shift+F. To compare two settings, reset the totals after each change and play the same stretch.
 
 ## Your display
 
@@ -137,11 +141,13 @@ Whether the game's picture is SDR or HDR (and which HDR format). Auto reads it f
 
 **Display peak** · `DisplayPeakNits` · default: 1400\
 The brightest your screen can get, in nits. In HDR, the boosted lit frame never asks for more than this.\
-*When to change it:* set it to your display's real peak brightness (check a review such as RTINGS). Too high and highlights clip; too low and you waste brightness.
+*When to change it:* set it to your display's real peak brightness (check a review such as RTINGS). Too high and highlights clip; too low and you waste brightness.\
+It goes down to 50 (v1.0.38). Below 100 a red warning shows under the slider: the lit refresh can't reach SDR white any more, so the picture is darker than with BFI off and highlights are flattened. Only for a dim display or a deliberately dim picture.
 
 **ABL guard** and **budget** · `AblGuard`, `AblGuardBudgetNits` · default: on, 250\
 OLED screens have a power limit: when a lot of the screen is bright at once, the TV dims everything (that's "ABL"). With BFI the lit frame is extra bright, so that limit can kick in and make bright scenes pump or flash. The guard watches how much bright area is on screen and gently lowers the boost in very bright scenes, so the TV never hits its limit. It knows that a panel holds more brightness on a small area than on the whole screen: by default it assumes your **Peak brightness** on 10% of the screen, falling to the budget on all of it (v1.0.20).\
-*When to change it:* set the budget to your screen's full-white brightness: about 250 for the Sony A95L and similar QD-OLEDs, 150–200 for many LG-panel OLEDs. If a review lists your panel's sustained brightness by window size, enter it as `AblCurve` in the ini (e.g. `AblCurve=10:1400,25:600,50:400,100:250`).
+*When to change it:* set the budget to your screen's full-white brightness: about 250 for the Sony A95L and similar QD-OLEDs, 150–200 for many LG-panel OLEDs. If a review lists your panel's sustained brightness by window size, enter it as `AblCurve` in the ini (e.g. `AblCurve=10:1400,25:600,50:400,100:250`).\
+The budget goes down to 50 (v1.0.38), with a red warning below 100: bright scenes are cut hard, so the brightness swings between dark and bright scenes get larger. Use it only if your panel really holds that little on a full white screen.
 
 ## Smoothness and latency
 
@@ -304,7 +310,7 @@ BFI starts once the game has finished setting up its window (almost every game d
 *When to change it:* if BFI doesn't start, change resolution or display mode once in the game.
 
 **Resize the game's swap chain to start BFI** · `PresenterResize` · default: off\
-A few games never resize their swap chain on their own (Hades II, Wreckfest 2, Pragmata), so BFI (and SDR to HDR in DirectX 12) would wait until you change resolution or display mode. Once such a game has run steadily for 3 seconds, BFI Presenter does that resize itself, at the size and format the game already uses, as the RenoDX mods do when they upgrade a game's picture to HDR. You may see one blink, then BFI starts. Only on the game's first swap chain: one the game recreates later (God of War Ragnarok when frame generation is turned on) still waits for the game's own resize, because the presenter's resize left that one black. Under **Advanced** in the overlay (DirectX 12 games). The Manager turns it on for the games the tested-games list names, and has a checkbox for it in each DX game's details.\
+A few games never resize their swap chain on their own (Hades II, Wreckfest 2, Pragmata), so BFI (and SDR to HDR in DirectX 12) would wait until you change resolution or display mode. Once such a game has run steadily for 3 seconds, BFI Presenter does that resize itself, at the size and format the game already uses, as the RenoDX mods do when they upgrade a game's picture to HDR. You may see one blink, then BFI starts. Only on the game's first swap chain: one the game recreates later (God of War Ragnarok when frame generation is turned on) still waits for the game's own resize, because the presenter's resize left that one black. `PresenterResize=2` also resizes a swap chain the game recreated (v1.0.38): for a game that recreates its swap chain once after starting without resizing it (Onimusha without frame generation, Pragmata with HDR on); not for a game with frame generation on. Under **Advanced** in the overlay (DirectX 12 games). The Manager turns it on for the games the tested-games list names, and has a checkbox for it in each DX game's details.\
 *When to change it:* turn it on for a game where the overlay keeps saying "BFI starts when the game resizes its swap chain". If a game freezes or goes black a few seconds after start, turn it off again and change display mode by hand instead.
 
 **Report the game's own frames** · `GameFrameStatistics` · default: on\
@@ -386,6 +392,8 @@ The DX add-on compiles its shaders once per session, while the game starts up, a
 | Ctrl+Shift+M | Switch BFI ↔ Variable MPRT |
 | Ctrl+Shift+S | Rolling scan on / off |
 | Ctrl+Shift+C | Split comparison on / off: one side of the screen without BFI |
+| Ctrl+Shift+F | On-screen display on / off: frame rate, lost frames, frame-time graph, CPU / GPU load |
+| Ctrl+Shift+Z | On-screen display: reset the lost / repeated / missed totals |
 | Ctrl+Shift+R | Reload `BFIPresenter.ini` after editing it |
 | Ctrl+Shift+O | Vulkan: rebuild the swap chain (if flashes started after an overlay or menu) |
 | Ctrl+Shift+K | Put a marker in the log with the last second's state (frame rate, frame generation, Reflex limit, video memory), to find a moment you noticed when sending a log |
