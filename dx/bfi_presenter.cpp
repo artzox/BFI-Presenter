@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.39-t1"
+#define BFI_ADDON_VERSION "1.0.39-t2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -5182,7 +5182,7 @@ static DWORD WINAPI PresenterThread(void *)
                                 if (p10 >= 0.0) swSlack = std::min(swSlack, p10);
                                 // The automatic frame cap at the frame start: a start time that loses frames in its first
                                 // measured second is left at once (it showed for 3 s each before).
-                                const bool dropEarly = g_fgPaceKind.load() == 2 && swSecs == settle && relN < (int)(0.9 * capFps);
+                                const bool dropEarly = (g_fgPaceKind.load() == 2 || sleepFg) && swSecs == settle && relN < (int)(0.9 * capFps);
                                 if (swSecs >= settle + 1 || dropEarly)
                                 {
                                     const double relMs = swRelN ? swRel / swRelN : 1e3;
@@ -5226,8 +5226,13 @@ static DWORD WINAPI PresenterThread(void *)
                         {
                             swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + 6.0))) ? swBad + 1 : 0;
                             // Held, frames repeating close to their flash (the GPU work grew): 2 ms earlier, once per 3 s.
-                            swTight = (!fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.0015) ? swTight + 1 : 0;
-                            if (swTight >= 3)
+                            // Reflex frame generation at the sleep point: the game's render time swings with the scene
+                            // (Silent Hill: Townfall, 13-21 ms from frame start to GPU done), and the 7 ms to spare found by
+                            // the search went down to 0-2 ms with frames lost: under 2 ms for 2 s in a row is enough there.
+                            const bool tightNow = sleepFg ? (ok && p10 >= 0.0 && p10 < 0.002)
+                                                          : (!fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.0015);
+                            swTight = tightNow ? swTight + 1 : 0;
+                            if (swTight >= (sleepFg ? 2 : 3))
                             {
                                 swTight = 0;
                                 moveTo(swPhase - 0.002);
