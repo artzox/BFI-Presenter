@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.40-t4"
+#define BFI_ADDON_VERSION "1.0.40-t5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -371,7 +371,7 @@ static void LoadSettings(Settings &s)
     s.pacing   = IniInt("WaitForVBlank", 1);
     s.log      = IniInt("Log", 0);
     s.stallProbe = IniInt("StallProbe", 1) ? 1 : 0;
-    s.presenterDevice = IniInt("PresenterDevice", 0) ? 1 : 0;
+    s.presenterDevice = std::max(0, std::min(2, IniInt("PresenterDevice", 0)));
     s.dx11     = IniInt("DX11Support", 1) ? 1 : 0;
     s.sdrToHdr = IniInt("SdrToHdr", 1) ? 1 : 0;
     s.sdrWhite = IniFloat("SdrWhiteNits", 200.0f);
@@ -841,6 +841,12 @@ static ID3D12Device          *g_presDevOwn = nullptr;   // kept across swap chai
 static IDXGISwapChain3       *g_scOut = nullptr;        // the presenter's own swap chain (sep mode)
 static ID3D12Resource        *g_stageG[16] = {};        // the staging frames as the game's device sees them (sep mode)
 static ID3D12Fence           *g_gameFenceG = nullptr, *g_presFenceG = nullptr;   // the shared fences on the game's device
+// PresenterDevice=2: the presenter signals a fence of its own (g_presFence, not shared); a forwarder thread copies its
+// progress to the shared one the game waits on (g_presFenceS), so a shared-fence signal can't hold up a refresh.
+static ID3D12Fence           *g_presFenceS = nullptr;
+static HANDLE                 g_fwdThread = nullptr;
+static std::atomic<bool>      g_fwdRun{false};
+static std::atomic<double>    g_lastExecMs{-1.0}, g_lastSignalMs{-1.0};   // timing log: the presenter's submit, split
 static ID3D12Device *GameDev() { return g_sep.load() && g_gameDev ? g_gameDev : g_device; }
 static void ApplyColorSpaceOut();
 static void ResizeOut(UINT w, UINT h, DXGI_FORMAT f);
@@ -3784,7 +3790,7 @@ static DWORD WINAPI PresenterThread(void *)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,present_count,sync_refresh_count,"
                               "bfi,method,frames,gain,floor,rolloff,pacing,cap,ahead,vblank,queue_ahead,queued,"
                               "wait_vblank_ms,wait_gpu_ms,submit_ms,present_ms,hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,"
-                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup,submit_cpu_ms,present_cpu_ms,probe_same_ms,probe_dev2_ms\n");
+                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup,submit_cpu_ms,present_cpu_ms,probe_same_ms,probe_dev2_ms,exec_ms,signal_ms\n");
                 LOGI("BFI Presenter: timing log started: %s", path);
                 StartProbe();   // stall probe (test): runs while the timing log does
             }
@@ -4263,8 +4269,12 @@ static DWORD WINAPI PresenterThread(void *)
         if (FAILED(list->Close())) LOGE("BFI Presenter: presenter draw list failed to record (Close) -- see BFIPresenter_debug.txt with Diagnostics=2");
 
         ID3D12CommandList *lists[] = { list };
+        const double tX0 = Now();
         queue->ExecuteCommandLists(1, lists);
+        const double tX1 = Now();
         queue->Signal(g_presFence, reserve);
+        g_lastExecMs.store((tX1 - tX0) * 1000.0);
+        g_lastSignalMs.store((Now() - tX1) * 1000.0);
         bufFence[bi] = reserve;
         bufFrame[bi] = pickId;
         bufFrame2[bi] = pickId2;
@@ -5505,7 +5515,7 @@ static DWORD WINAPI PresenterThread(void *)
             LeaveCriticalSection(&g_cfgLock);
             const double cpm = g_cyclesPerMs.load();
             const int pSame = g_probeSameUs.exchange(g_probeThread ? 0 : -1), pDev2 = g_probeDev2Us.exchange(g_probeThread ? 0 : -1);
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%.3f\n", t * 1000.0,
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", t * 1000.0,
                     (unsigned long long)presents, c.slot,
                     (unsigned long long)pickId, (t - pickTime) * 1000.0, (t - lastT) * 1000.0,
                     sok ? (int)st.PresentCount : -1, sok ? (int)st.SyncRefreshCount : -1,
@@ -5515,7 +5525,8 @@ static DWORD WINAPI PresenterThread(void *)
                     lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp,
                     cpm > 0.0 && cycFence && cycSub >= cycFence ? (cycSub - cycFence) / cpm : -1.0,
                     cpm > 0.0 && cycSub && cycPres >= cycSub ? (cycPres - cycSub) / cpm : -1.0,
-                    pSame >= 0 ? pSame / 1000.0 : -1.0, pDev2 >= 0 ? pDev2 / 1000.0 : -1.0);
+                    pSame >= 0 ? pSame / 1000.0 : -1.0, pDev2 >= 0 ? pDev2 / 1000.0 : -1.0,
+                    g_lastExecMs.exchange(-1.0), g_lastSignalMs.exchange(-1.0));
         }
         lastT = t;
         if (pickId != lastShownId) lastNewFrameT = Now();
@@ -5736,6 +5747,21 @@ static void StopProbe()
     g_probeDev2Us.store(-1);
 }
 
+// PresenterDevice=2: the presenter's progress (its own fence) copied to the fence shared with the game's device.
+static DWORD WINAPI FwdThread(void *)
+{
+    HANDLE ev = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    while (g_fwdRun.load())
+    {
+        const UINT64 lv = g_presFence->GetCompletedValue(), sv = g_presFenceS->GetCompletedValue();
+        if (lv != UINT64_MAX && lv > sv) g_presFenceS->Signal(lv);
+        if (ev && g_presFence->SetEventOnCompletion(lv + 1, ev) == S_OK) WaitForSingleObject(ev, 4);
+        else Sleep(1);
+    }
+    if (ev) CloseHandle(ev);
+    return 0;
+}
+
 static void StartPresenter()
 {
     if (g_running.load() || (!g_gameQueue && !g_dx11.load()) || g_bufCount == 0) return;
@@ -5744,6 +5770,12 @@ static void StartPresenter()
     g_thread = CreateThread(nullptr, 0, PresenterThread, nullptr, 0, nullptr);
     if (g_thread) SetThreadPriority(g_thread, THREAD_PRIORITY_TIME_CRITICAL);
     else g_running.store(false);
+    if (g_thread && g_presFenceS && !g_fwdThread)
+    {
+        g_fwdRun.store(true);
+        g_fwdThread = CreateThread(nullptr, 0, FwdThread, nullptr, 0, nullptr);
+        if (g_fwdThread) SetThreadPriority(g_fwdThread, THREAD_PRIORITY_HIGHEST);
+    }
     if (g_thread && !g_lrThread)
     {
         if (!g_lrEv) g_lrEv = CreateEventA(nullptr, FALSE, FALSE, nullptr);
@@ -5816,6 +5848,15 @@ static bool StopPresenter()
         g_presQueue->Signal(g_presFence, v);
         WaitFence(g_presFence, v, g_gameFenceEvent);
     }
+    if (g_fwdThread)
+    {
+        g_fwdRun.store(false);
+        WaitForSingleObject(g_fwdThread, 2000);
+        CloseHandle(g_fwdThread);
+        g_fwdThread = nullptr;
+    }
+    if (g_presFenceS && g_presFence && g_presFence->GetCompletedValue() > g_presFenceS->GetCompletedValue())
+        g_presFenceS->Signal(g_presFence->GetCompletedValue());   // everything the presenter read is released
     // Let the game queue finish our copies before resources go away.
     if (g_dx11.load() && g_gameFence)
         WaitFence(g_gameFence, g_gameFenceVal, g_gameFenceEvent);     // the DX11 copies (flushed at each frame)
@@ -6007,7 +6048,7 @@ static HRESULT SubmitGameFrameLocked()
             GameStage(ST_G_OWN_COPY);
             g_gameQueue->Signal(g_sep.load() ? g_gameFenceG : g_gameFence, ++g_gameFenceVal);   // game frame finished
             if (q != g_gameQueue) q->Wait(g_gameFence, g_gameFenceVal);
-            WaitFence(g_presFence, g_fbFence[bi], g_gameFenceEvent);
+            WaitFence(g_presFenceS ? g_presFenceS : g_presFence, g_fbFence[bi], g_gameFenceEvent);
             g_fbAlloc[bi]->Reset();
             g_fbList->Reset(g_fbAlloc[bi], nullptr);
             D3D12_RESOURCE_BARRIER br[2] = {
@@ -8060,6 +8101,7 @@ static void ReleaseAll()
     SafeRelease(g_presFence);
     SafeRelease(g_gameFenceG);
     SafeRelease(g_presFenceG);
+    SafeRelease(g_presFenceS);
     if (g_sep.load())
     {
         SafeRelease(g_scOut);
@@ -10635,9 +10677,22 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             if (h) CloseHandle(h);
             return r;
         };
+        Settings c1;
+        EnterCriticalSection(&g_cfgLock);
+        c1 = g_shared;
+        LeaveCriticalSection(&g_cfgLock);
         ok = SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_gameFence))) &&
-             SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_presFence))) &&
-             openOnGame(g_gameFence, &g_gameFenceG) && openOnGame(g_presFence, &g_presFenceG);
+             openOnGame(g_gameFence, &g_gameFenceG);
+        if (c1.presenterDevice == 2)
+        {
+            ok = ok && SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_presFence))) &&
+                 SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_presFenceS))) &&
+                 openOnGame(g_presFenceS, &g_presFenceG);
+            if (ok) LOGI("BFI Presenter: PresenterDevice=2 -- the presenter's own fence, forwarded to the shared one");
+        }
+        else
+            ok = ok && SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_presFence))) &&
+                 openOnGame(g_presFence, &g_presFenceG);
         if (!ok) LOGE("BFI Presenter: PresenterDevice: shared fences failed");
     }
     for (UINT s = 0; s < kStage && ok; s++)

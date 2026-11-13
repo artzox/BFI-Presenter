@@ -37,3 +37,13 @@ Modelled on the DX11 front end, which already runs the presenter on a D3D12 devi
 - SDR to HDR (the presenter's swap chain could be HDR10 while the game's stays 8-bit: simpler than today's path).
 - Exclusive fullscreen (the child window is hidden by it); borderless/windowed only.
 - HDR metadata pass-through.
+
+## t4 result (Control, no frame generation, 3.8 min)
+
+The presenter on its own device still had its submission held up together with the game's device (22 of 27 missed
+refreshes; submit 6-22 ms with ~0.1 ms CPU), while the probe's independent device never was (max 0.5 ms). The
+difference between them: the presenter's submission signals a fence shared with the game's device and draws from
+staging textures shared with it. t5 times ExecuteCommandLists and Signal separately (`exec_ms`, `signal_ms`) and adds
+`PresenterDevice=2`: the presenter signals a fence of its own, and a forwarder thread copies its progress to the shared
+fence the game waits on. If `exec_ms` carries the stalls instead, the next step is an importer: the shared staging
+frame copied into a private texture on another queue/thread before the presenter samples it.
