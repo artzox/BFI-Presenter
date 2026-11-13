@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.38"
+#define BFI_ADDON_VERSION "1.0.39"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -142,7 +142,8 @@ struct Settings
     int   laterRelease = 0;   // Lowest latency + Refresh cap: release the game just in time for the pick
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
-    int   reflexAlign = 0;    // Reflex frame limit at the sleep point lined up with the lit refresh's pick (test)
+    int   reflexAlign = 1;    // Reflex frame limit at the sleep point lined up with the lit refresh's pick (default on since 1.0.39)
+    int   sleepGrid = 1;         // SleepLimitGrid: the limit at the game's Reflex sleep keeps its place in the strobe cycle (test)
     int   reflexAlignCoarse = 1; // ReflexAlignCoarse: frames ready far ahead of the pick are moved closer once (ReflexAlign off)
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
@@ -313,8 +314,9 @@ static void LoadSettings(Settings &s)
     s.capJit = IniInt("CapJustInTime", 1) ? 1 : 0;
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
-    s.reflexAlign = IniInt("ReflexAlign", 0) ? 1 : 0;
+    s.reflexAlign = IniInt("ReflexAlign", 1) ? 1 : 0;
     s.reflexAlignCoarse = IniInt("ReflexAlignCoarse", 1) ? 1 : 0;
+    s.sleepGrid = IniInt("SleepLimitGrid", 1) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
@@ -434,6 +436,7 @@ static void UpgradeIni(const Settings &s)
     SaveSettings(s);
     if (!IniHasKey("Diagnostics")) IniWrite("Diagnostics", "1");
     if (!IniHasKey("AllowRTSS"))   IniWrite("AllowRTSS", "1");
+    if (!IniHasKey("DefaultsVersion")) IniWrite("DefaultsVersion", "39");
     g_iniOnlyMissing = false;
     if (fresh)
         LOGI("BFI Presenter: created BFIPresenter.ini with default settings (see BFIPresenter.example.ini for what each does)");
@@ -441,9 +444,32 @@ static void UpgradeIni(const Settings &s)
         LOGI("BFI Presenter: added new settings to your BFIPresenter.ini with their defaults: %s", g_iniAdded);
 }
 
+// Defaults changed in a release, applied once to an existing BFIPresenter.ini (the file holds every setting, so a
+// new default never reaches it otherwise). DefaultsVersion records what was applied; set a value back afterwards
+// and it stays. 1.0.39: ReflexAlign on (it was off and written as 0 into every ini).
+static void MigrateDefaults()
+{
+    char keys[64];
+    if (!GetPrivateProfileStringA("BFI", nullptr, "", keys, sizeof(keys), g_iniPath) || !keys[0]) return;   // new file
+    const int v = (int)GetPrivateProfileIntA("BFI", "DefaultsVersion", 0, g_iniPath);
+    if (v < 39)
+    {
+        if (GetPrivateProfileIntA("BFI", "ReflexAlign", 0, g_iniPath) == 0)
+        {
+            WritePrivateProfileStringA("BFI", "ReflexAlign", "1", g_iniPath);
+            LOGI("BFI Presenter: ReflexAlign turned on (the default since 1.0.39; set ReflexAlign=0 to turn it off again)");
+        }
+        WritePrivateProfileStringA("BFI", "DefaultsVersion", "39", g_iniPath);
+    }
+}
+
 static void LoadShared()
 {
     Settings s;
+    {
+        static std::atomic<bool> migrated{false};
+        if (!migrated.exchange(true)) MigrateDefaults();
+    }
     LoadSettings(s);
     static std::atomic<bool> upgraded{false};
     if (!upgraded.exchange(true)) UpgradeIni(s);
@@ -514,6 +540,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("CapWithReflex", s.capReflex);
     IniWriteInt("ReflexAlign", s.reflexAlign);
     IniWriteInt("ReflexAlignCoarse", s.reflexAlignCoarse);
+    IniWriteInt("SleepLimitGrid", s.sleepGrid);
     IniWriteInt("FrameGenLimitWithoutReflex", s.fgLimitNoReflex);
     IniWriteInt("AutoCapAtFrameStart", s.autoCapFrameStart);
     IniWriteInt("LearnPerGame", s.learnPerGame);
@@ -3132,6 +3159,9 @@ struct ReflexSecond
 };
 static void ReflexTick(int limitUs, ReflexSecond &out);
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
+static std::atomic<int> g_sleepGrid{1};       // SleepLimitGrid (copied from the settings)
+static std::atomic<bool> g_alignHunted{false}; // ReflexAlign gave up this session (kept moving earlier: the game's own stutters)
+static std::atomic<bool> g_fgXess{false};     // the game presents through XeSS frame generation's swap chain (libxess_fg.dll)
 static std::atomic<int> g_sleepLimitUs{0};    // frame limit at the game's Reflex sleep, per rendered frame (0 = off)
 static std::atomic<bool> g_sleepActive{false};        // the sleep-point limit is in charge: the game's own limit is taken from the driver
 static std::atomic<int>  g_gameOwnUs{0};              // the game's own Reflex limit, applied at the sleep point instead
@@ -3748,6 +3778,7 @@ static DWORD WINAPI PresenterThread(void *)
         {
             output->WaitForVBlank();
             g_strobeFrames.store(s.frames);
+            g_sleepGrid.store(s.sleepGrid);
             g_tickSlot.store((int)((presents - phaseShift) % (uint64_t)s.frames));
             g_tickT.store(Now());
             g_tickCount.fetch_add(1);
@@ -5013,7 +5044,11 @@ static DWORD WINAPI PresenterThread(void *)
                 // pairs a second for a whole minute, against none in another run). Then the limit is
                 // shortened by 0.15 ms for one second, which moves the frames ~9 ms earlier against
                 // the strobe, and checked again 3 s later.
-                if (!s.reflexAlign && limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
+                // ReflexAlign steers only without frame generation (and with Lowest latency): with frame generation the nudge is
+                // still needed, or frames that land on the pick stay there now that the limit keeps its place (Control, 3x:
+                // 42-57 of 60 shown for a minute, frames ready 0.3 ms before the pick).
+                const bool alignSteers = s.reflexAlign && !g_alignHunted.load() && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
+                if (!alignSteers && limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
                 {
                     phaseUntil = t + 1.0; phaseNextT = t + 4.0;
                     if (++phaseNudges <= 5)
@@ -5021,7 +5056,15 @@ static DWORD WINAPI PresenterThread(void *)
                              "last second) -- moving them earlier", stNow.frameRepeats, stNow.frameSkips);
                 }
                 if (limitUs > 0 && t < phaseUntil) limitUs -= 150;
-                // ReflexAlign (test): the limiter paces the game on its own clock, so a game frame is ready
+                // At the game's Reflex sleep the driver gets no limit, so the 0.15 ms above did nothing there: move the
+                // sleep-point limit's start 2 ms earlier instead, once per nudge (not while its start times are searched).
+                {
+                    static double nudgedT = -1.0;
+                    if (t < phaseUntil && phaseUntil != nudgedT && g_sleepLimitUs.load() > 0 && !swSearching &&
+                        !(g_fgXess.load() && g_sleepFgFactor.load() > 1))   // XeSS frame generation: as 1.0.38
+                    { nudgedT = phaseUntil; g_sleepShiftUs.fetch_sub(2000); }
+                }
+                // ReflexAlign: the limiter paces the game on its own clock, so a game frame is ready
                 // anywhere up to a whole cap interval before the presenter picks it for the lit refresh -- time
                 // it only waits. Line the wake-up up so frames are ready just before the pick: each second the
                 // 10th percentile of that wait is brought down to a small target (half the excess at a time,
@@ -5039,9 +5082,12 @@ static DWORD WINAPI PresenterThread(void *)
                     // The limit has to be a whole number of strobe cycles, or its frames drift past the pick by design.
                     // Also for the frame limit with frame generation without Reflex: one presented frame
                     // per strobe cycle, moved through g_fgShiftUs.
-                    const bool fgOn = g_fgPaceUs.load() > 0;
-                    std::atomic<int> &shiftUs = fgOn ? g_fgShiftUs : g_sleepShiftUs;
-                    const int sleepUs = fgOn ? g_fgPaceUs.load() : g_sleepLimitUs.load();
+                    const bool fgPace = g_fgPaceUs.load() > 0;
+                    // (1.0.39 tests also searched the start time of frame generation with Reflex at the game's sleep; it
+                    // hunted and never beat the fixed place in the strobe cycle -- Silent Hill: Townfall, Dead Space.)
+                    const bool fgOn = fgPace;
+                    std::atomic<int> &shiftUs = fgPace ? g_fgShiftUs : g_sleepShiftUs;
+                    const int sleepUs = fgPace ? g_fgPaceUs.load() : g_sleepLimitUs.load();
                     const double capFps = fgOn ? (hzL > 0.0 ? hzL / s.frames : 0.0) : sleepUs > 0 ? 1e6 / sleepUs : 0.0;
                     const double cyc = hzL > 0.0 ? s.frames / hzL : 0.0;
                     const double cycles = cyc > 0.0 && sleepUs > 0 ? sleepUs * 1e-6 / cyc : 0.0;
@@ -5107,6 +5153,7 @@ static DWORD WINAPI PresenterThread(void *)
                     }
                     swWasOn = fgOn;
                     swSearching = fgOn && swIdx >= 0 && g_fgPaceKind.load() == 2;
+                    const char *swName = g_fgPaceKind.load() == 2 ? "automatic frame cap at the frame start" : "frame limit for frame generation";
                     if (fgOn && locked && s.pacingMode == 1 && cyc > 0.0)
                     {
                         // FSR frame generation paces its own output and follows a moved frame start with a lag, and the
@@ -5148,7 +5195,7 @@ static DWORD WINAPI PresenterThread(void *)
                             swStart = base;
                             moveTo(swStart);
                             LOGI("BFI Presenter: %s: trying %d start times across the strobe cycle (%.0f s)",
-                                 g_fgPaceKind.load() == 2 ? "automatic frame cap at the frame start" : "frame limit for frame generation",
+                                 swName,
                                  swN, swN * (settle + 1.0));
                         }
                         else if (swIdx >= 0)
@@ -5192,7 +5239,7 @@ static DWORD WINAPI PresenterThread(void *)
                                                             swShownK[k], swRelMs[k], swSlackK[k] < 1.0 ? swSlackK[k] * 1000.0 : -1.0);
                                         LOGI("BFI Presenter: %s%s lined up with the flash: start %+.1f ms "
                                              "in the cycle, %.1f ms from release to flash, %d of %.0f frames shown (start ms:shown/ms/ready ms before the flash --%s)",
-                                             g_fgPaceKind.load() == 2 ? "automatic frame cap at the frame start" : "frame limit for frame generation",
+                                             swName,
                                              fsr ? " (FSR)" : "", best * cyc / swN * 1000.0, swRelMs[best], swShownK[best], 2.0 * capFps, list);
                                     }
                                 }
@@ -5211,11 +5258,45 @@ static DWORD WINAPI PresenterThread(void *)
                                 moveTo(swPhase - 0.002);
                                 learnSw();
                                 LOGI("BFI Presenter: %s: frames repeated close to their flash -- 2 ms earlier",
-                                     g_fgPaceKind.load() == 2 ? "automatic frame cap at the frame start" : "frame limit for frame generation");
+                                     swName);
                             }
                         }
                     }
-                    if (s.reflexAlign && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
+                    // Frame generation at the game's Reflex sleep (no ReflexAlign there, no start-time search): frames ready
+                    // under 1 ms before the pick for 3 s in a row while frames go missing -> 3 ms earlier. The limit keeps its
+                    // place in the strobe cycle, so a start time on the pick no longer drifts away by itself.
+                    {
+                        static int fgTight = 0;
+                        const bool sleepFgNoSearch = !fgPace && g_sleepLimitUs.load() > 0 && g_sleepFgFactor.load() > 1 && locked;
+                        const bool missing = stNow.frameRepeats + stNow.frameSkips >= 2;
+                        // Presented frames against one per strobe cycle (capFps above counts rendered frames here).
+                        const double presCap = hzL > 0.0 ? hzL / s.frames : 0.0;
+                        const bool holdsPres = presCap > 0.0 && stNow.gameFps > 0.95 * presCap && stNow.gameFps < 1.05 * presCap;
+                        fgTight = (sleepFgNoSearch && !g_fgXess.load() && holdsPres && !hitchPaused && p10 >= 0.0 && p10 < 0.001 && missing) ? fgTight + 1 : 0;
+                        if (fgTight >= 3)
+                        {
+                            fgTight = 0;
+                            g_sleepShiftUs.fetch_sub(3000); alignShiftTot -= 0.003;
+                            LOGI("BFI Presenter: frame limit at the game's Reflex sleep (frame generation): frames ready %.1f ms before the "
+                                 "lit refresh's pick, %d repeated -- 3 ms earlier", p10 * 1000.0, stNow.frameRepeats);
+                        }
+                    }
+                    // The alignment going round the strobe cycle: its total moved by 1.5 cycles or more within 90 s, either
+                    // way. Then where the game's frames finish doesn't follow the frame start (Returnal: frames ready 10 ms
+                    // before the pick however far it moved them later, +188 ms in 3 minutes; on another run 72 ms earlier
+                    // in 3.5 minutes). Both alignments stop for this session; the limit keeps its place in the strobe cycle.
+                    {
+                        static double histT[96] = {}, histS[96] = {};
+                        static int histN = 0;
+                        histT[histN % 96] = t; histS[histN % 96] = alignShiftTot; histN++;
+                        double span = 0.0;
+                        for (int k = 0; k < 96 && k < histN; k++)
+                            if (t - histT[k] <= 90.0) span = std::max(span, fabs(alignShiftTot - histS[k]));
+                        if (cyc > 0.0 && span >= 1.5 * cyc && !g_alignHunted.exchange(true))
+                            LOGI("BFI Presenter: Reflex frame limit alignment went round the strobe cycle (%.0f ms within 90 s): "
+                                 "the game's frames don't follow its frame start -- alignment off for this session", span * 1000.0);
+                    }
+                    if (s.reflexAlign && !g_alignHunted.load() && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
                     {
                         if (alignLastStep > 0.0 && p10 >= 0.0 && alignPrevP10 >= 0.0 && p10 - alignPrevP10 > 0.5 * cyc)
                         {
@@ -5278,7 +5359,7 @@ static DWORD WINAPI PresenterThread(void *)
                         // both in the same second: 40 of 60 frames shown for 3 s, until the next nudge).
                         const bool nudging = t < phaseUntil;
                         if (nudging) coarseHoldT = t + 20.0;
-                        if (!nudging && !s.reflexAlign && s.reflexAlignCoarse && atSleepNoFg && holds && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
+                        if (!nudging && !s.reflexAlign && !g_alignHunted.load() && s.reflexAlignCoarse && atSleepNoFg && holds && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
                         {
                             if (t - coarseT < 10.0 && stNow.frameRepeats >= 2 && p10 < 0.002)
                             {
@@ -6600,8 +6681,36 @@ static int __cdecl hk_NvSleep(IUnknown *dev)
         const double iv = us * 1e-6;
         double now = Now();
         if (nextT <= 0.0 || now > nextT + iv || nextT - now > 2.0 * iv) nextT = now;   // start, a hitch, or a changed limit
+        static double phase = 0.0;   // where in the strobe cycle frames start (moved by the alignment and the search)
         const int sh = g_sleepShiftUs.exchange(0);
-        if (sh != 0) nextT += sh * 1e-6;
+        if (sh != 0) { nextT += sh * 1e-6; phase += sh * 1e-6; }
+        // On the strobe-cycle grid, as the frame limit for frame generation without Reflex: the limit runs on the PC's
+        // clock and the display on its own, and a whole number of cycles in microseconds is never exact, so the frames
+        // drifted past the lit refresh's pick every so often (Silent Hill: Townfall, XeSS frame generation: 6-10
+        // repeated and skipped a second each time). Only when the limit is a whole number of strobe cycles.
+        // Not with XeSS frame generation: it spaces its frames unevenly by itself, and a start time on the pick then
+        // stayed there (Silent Hill: Townfall: 1.9-2.3 frames a second not shown, against 0.5-1.0 with the PC's clock,
+        // whose drift moves it on). DLSS frame generation keeps the grid (Control: 0.05 against 1.7).
+        if (g_sleepGrid.load() && !(g_fgXess.load() && g_sleepFgFactor.load() > 1))
+        {
+            UINT64 c = 0; int sl = 0; double tick = 0.0;
+            for (int i = 0; i < 4; i++)
+            {
+                c = g_tickCount.load(); sl = g_tickSlot.load(); tick = g_tickT.load();
+                if (g_tickCount.load() == c) break;
+            }
+            const double per = g_lrPeriod.load();
+            const double cyc = per * std::max(1, g_strobeFrames.load());
+            const double k = cyc > 0.0 ? iv / cyc : 0.0;
+            const bool whole = k >= 0.9 && fabs(k - std::floor(k + 0.5)) * cyc < 0.0003;
+            if (whole && tick > 0.0 && per > 0.0 && now - tick < 0.1)
+            {
+                const double cycStart = tick - sl * per;
+                double ph = std::fmod(phase, cyc);
+                if (ph < 0.0) ph += cyc;
+                nextT = cycStart + ph + std::floor((nextT - cycStart - ph) / cyc + 0.5) * cyc;
+            }
+        }
         while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
         SleepUntil(nextT, timer);
         nextT += iv;
@@ -7369,6 +7478,7 @@ static void OuterCheck(void *obj)
             LOGI("BFI Presenter: the game presents to a wrapper swap chain (%s) -- not FSR frame generation, so the game's "
                  "presents are counted on the real swap chain as before", mod);
             g_wrapperVtbl.store(vt);
+            if (strstr(l, "xess")) g_fgXess.store(true);
             EnterCriticalSection(&g_cfgLock);
             const bool self = g_shared.selfResize != 0;
             LeaveCriticalSection(&g_cfgLock);
@@ -11015,14 +11125,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("How long before its refresh a game frame is due when the game is released just in time\n(just-in-time release below the refresh rate, later release at it). Widened by itself when frames miss.");
         bool ra = s.reflexAlign != 0;
         ImGui::BeginDisabled(!st.rfxGameUses);
-        if (ImGui::Checkbox("Line Reflex's frame limit up with the flash (test)", &ra)) s.reflexAlign = ra ? 1 : 0;
+        if (ImGui::Checkbox("Line Reflex's frame limit up with the flash", &ra)) s.reflexAlign = ra ? 1 : 0;
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Games with Reflex, capped with Reflex's frame limit (e.g. the automatic frame cap) and without frame\n"
                                                       "generation: the presenter moves the moment the game starts each frame so the frame is ready just\n"
                                                       "before the lit refresh picks it, instead of waiting there for up to a whole strobe cycle.\n"
-                                                      "Needs Lowest latency pacing. Best in games with steady frame times (God of War Ragnarok: about\n"
-                                                      "7 ms less from release to flash); in games whose frame times vary it gains little and can\n"
-                                                      "repeat a frame now and then (Spider-Man 2). Off by default. With it off, frames ready more than\n"
+                                                      "Needs Lowest latency pacing. On by default since 1.0.39 (God of War Ragnarok, Dead Space,\n"
+                                                      "Spider-Man 2, The Midnight Walk: as smooth or smoother, 2-7 ms less from release to flash in\n"
+                                                      "games whose frames waited). With it off, frames ready more than\n"
                                                       "8 ms before the pick are still moved to 5 ms before it once (ReflexAlignCoarse=1 in the ini).");
         if (!st.rfxGameUses) { ImGui::SameLine(); ImGui::TextDisabled("(not used: no Reflex in this game)"); }
         else if (s.reflexAlign)

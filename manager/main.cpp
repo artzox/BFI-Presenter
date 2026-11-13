@@ -1771,7 +1771,13 @@ static void DrawBatch()
     std::vector<Game *> sel;
     for (auto &g : g_app.games) if (g_app.picked.count(g.root)) sel.push_back(&g);
     int nInst = 0, nRem = 0;
-    for (auto *g : sel) { if (BatchSkip(*g).empty()) nInst++; if (!g->addonPath.empty() || g->ini || !g->shaderPath.empty()) nRem++; }
+    std::vector<Game *> reinst;   // up to date: Reinstall overwrites them with the picked release (Vulkan: the layer is shared)
+    for (auto *g : sel)
+    {
+        if (BatchSkip(*g).empty()) nInst++;
+        if (!g->addonPath.empty() || g->ini || !g->shaderPath.empty()) nRem++;
+        if (StatusOf(*g) == St::Installed && g->route != Route::Vulkan && CanInstall(*g)) reinst.push_back(g);
+    }
 
     ImGui::Text("%d games ticked", (int)sel.size());
     ImGui::SameLine();
@@ -1787,6 +1793,38 @@ static void DrawBatch()
         RequestInstall(todo);
     }
     ImGui::EndDisabled();
+    snprintf(lbl, 64, "Reinstall (%d)", (int)reinst.size());
+    SameLineIfFits(ButtonW(lbl));
+    ImGui::BeginDisabled(reinst.empty() || g_app.busy);
+    if (ImGui::Button(lbl)) ImGui::OpenPopup("Reinstall ticked");
+    ImGui::EndDisabled();
+    Tooltip("Copies the picked release over BFI Presenter in the ticked games that already have this version "
+            "(e.g. after testing builds with the same number). Asks first.");
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Reinstall ticked", nullptr, ImGuiWindowFlags_NoSavedSettings))
+    {
+        ImGui::TextWrapped("Overwrite BFI Presenter in %d game%s with the files from the picked release (DX add-on v%s)?",
+                           (int)reinst.size(), reinst.size() == 1 ? "" : "s", g_app.src.dxVersion.c_str());
+        int shown = 0;
+        for (auto *g : reinst)
+        {
+            if (++shown > 12) { ImGui::TextColored(kGrey, "  ... and %d more", (int)reinst.size() - 12); break; }
+            ImGui::Text("  %s", g->name.c_str());
+            ImGui::SameLine();
+            ImGui::TextColored(kGrey, "(%s)", g->route == Route::Shader ? ("shader " + g->shaderVersion).c_str() : g->addonVersion.c_str());
+        }
+        ImGui::Spacing();
+        ImGui::TextColored(kGrey, "Each game's BFIPresenter.ini is kept. Replaced files are backed up; Undo last change in a game puts them back.");
+        ImGui::Separator();
+        if (ImGui::Button("Reinstall"))
+        {
+            ImGui::CloseCurrentPopup();
+            RequestInstall(reinst);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
     snprintf(lbl, 64, "Remove (%d)", nRem);
     SameLineIfFits(ButtonW(lbl));
     ImGui::BeginDisabled(nRem == 0 || g_app.busy);
@@ -1908,7 +1946,8 @@ static void DrawBatch()
             ImGui::TableNextColumn();
             std::string skip = BatchSkip(*g);
             if (skip.empty()) ImGui::TextColored(kGreen, StatusOf(*g) == St::NotInstalled ? "install" : "update");
-            else ImGui::TextColored(skip == "up to date" ? kGrey : kOrange, "skip: %s", skip.c_str());
+            else if (skip == "up to date") ImGui::TextColored(kGrey, "up to date%s", g->route != Route::Vulkan && CanInstall(*g) ? " (Reinstall)" : "");
+            else ImGui::TextColored(kOrange, "skip: %s", skip.c_str());
         }
         ImGui::EndTable();
     }

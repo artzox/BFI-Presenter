@@ -464,7 +464,19 @@ int CompareVersions(const std::string &a, const std::string &b)
         int x = i < pa.size() ? pa[i] : 0, y = i < pb.size() ? pb[i] : 0;
         if (x != y) return x < y ? -1 : 1;
     }
-    return 0;
+    // Same numbers: a test build ("1.0.39-t9") comes before its release ("1.0.39"); t9 before t16.
+    auto test = [](const std::string &s) -> int {
+        size_t d = s.find("-t");
+        if (d == std::string::npos) return -1;
+        int n = 0;
+        for (size_t i = d + 2; i < s.size() && s[i] >= '0' && s[i] <= '9'; i++) n = n * 10 + (s[i] - '0');
+        return n;
+    };
+    int ta = test(a), tb = test(b);
+    if (ta == tb) return 0;
+    if (ta < 0) return 1;
+    if (tb < 0) return -1;
+    return ta < tb ? -1 : 1;
 }
 
 // The DX add-on carries "BFI Presenter v1.0.2"; the Vulkan layer "BFI Presenter (Vulkan layer) v1.0.2".
@@ -507,8 +519,15 @@ std::string ShaderVersionOf(const std::wstring &file)
     auto it = std::search(v.begin(), v.end(), key, key + kl);
     if (it == v.end()) return "older";
     std::string out;
-    for (auto p = it + kl; p != v.end() && ((*p >= '0' && *p <= '9') || *p == '.'); ++p) out += *p;
+    auto p = it + kl;
+    for (; p != v.end() && ((*p >= '0' && *p <= '9') || *p == '.'); ++p) out += *p;
     while (!out.empty() && out.back() == '.') out.pop_back();
+    // test builds carry "-t9" after the number
+    if (p != v.end() && *p == '-' && p + 1 != v.end() && p[1] == 't' && p + 2 != v.end() && p[2] >= '0' && p[2] <= '9')
+    {
+        out += "-t";
+        for (p += 2; p != v.end() && *p >= '0' && *p <= '9'; ++p) out += *p;
+    }
     return out;
 }
 
@@ -521,8 +540,15 @@ std::string BfiVersionOf(const std::wstring &file, bool vulkan)
     auto it = std::search(v.begin(), v.end(), key, key + kl);
     if (it == v.end()) return vulkan ? "older" : "older than 0.72";
     std::string out;
-    for (auto p = it + kl; p != v.end() && ((*p >= '0' && *p <= '9') || *p == '.'); ++p) out += *p;
+    auto p = it + kl;
+    for (; p != v.end() && ((*p >= '0' && *p <= '9') || *p == '.'); ++p) out += *p;
     while (!out.empty() && out.back() == '.') out.pop_back();
+    // test builds carry "-t9" after the number
+    if (p != v.end() && *p == '-' && p + 1 != v.end() && p[1] == 't' && p + 2 != v.end() && p[2] >= '0' && p[2] <= '9')
+    {
+        out += "-t";
+        for (p += 2; p != v.end() && *p >= '0' && *p <= '9'; ++p) out += *p;
+    }
     return out;
 }
 
