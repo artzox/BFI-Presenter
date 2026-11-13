@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.39-t3"
+#define BFI_ADDON_VERSION "1.0.39-t4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -5045,7 +5045,11 @@ static DWORD WINAPI PresenterThread(void *)
                 // pairs a second for a whole minute, against none in another run). Then the limit is
                 // shortened by 0.15 ms for one second, which moves the frames ~9 ms earlier against
                 // the strobe, and checked again 3 s later.
-                if (!s.reflexAlign && limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
+                // ReflexAlign steers only without frame generation (and with Lowest latency): with frame generation the nudge is
+                // still needed, or frames that land on the pick stay there now that the limit keeps its place (Control, 3x:
+                // 42-57 of 60 shown for a minute, frames ready 0.3 ms before the pick).
+                const bool alignSteers = s.reflexAlign && g_sleepFgFactor.load() == 1 && !stNow.fgActive && s.pacingMode == 1;
+                if (!alignSteers && limitUs > 0 && rsLast.limitUs > 0 && !hitchPaused && stNow.frameRepeats >= 5 && stNow.frameSkips >= 5 && t >= phaseNextT)
                 {
                     phaseUntil = t + 1.0; phaseNextT = t + 4.0;
                     if (++phaseNudges <= 5)
@@ -5264,6 +5268,22 @@ static DWORD WINAPI PresenterThread(void *)
                                 LOGI("BFI Presenter: %s: frames repeated close to their flash -- 2 ms earlier",
                                      swName);
                             }
+                        }
+                    }
+                    // Frame generation at the game's Reflex sleep (no ReflexAlign there, no start-time search): frames ready
+                    // under 1 ms before the pick for 3 s in a row while frames go missing -> 3 ms earlier. The limit keeps its
+                    // place in the strobe cycle, so a start time on the pick no longer drifts away by itself.
+                    {
+                        static int fgTight = 0;
+                        const bool sleepFgNoSearch = !fgPace && !sleepFg && g_sleepLimitUs.load() > 0 && g_sleepFgFactor.load() > 1 && locked;
+                        const bool missing = stNow.frameRepeats + stNow.frameSkips >= 2;
+                        fgTight = (sleepFgNoSearch && holds && !hitchPaused && p10 >= 0.0 && p10 < 0.001 && missing) ? fgTight + 1 : 0;
+                        if (fgTight >= 3)
+                        {
+                            fgTight = 0;
+                            g_sleepShiftUs.fetch_sub(3000); alignShiftTot -= 0.003;
+                            LOGI("BFI Presenter: frame limit at the game's Reflex sleep (frame generation): frames ready %.1f ms before the "
+                                 "lit refresh's pick, %d repeated -- 3 ms earlier", p10 * 1000.0, stNow.frameRepeats);
                         }
                     }
                     if (s.reflexAlign && atSleepNoFg && holds && !hitchPaused && t >= alignCoolT)
