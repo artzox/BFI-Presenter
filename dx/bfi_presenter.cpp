@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.40-t5"
+#define BFI_ADDON_VERSION "1.0.40-t6"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -847,6 +847,10 @@ static ID3D12Fence           *g_presFenceS = nullptr;
 static HANDLE                 g_fwdThread = nullptr;
 static std::atomic<bool>      g_fwdRun{false};
 static std::atomic<double>    g_lastExecMs{-1.0}, g_lastSignalMs{-1.0};   // timing log: the presenter's submit, split
+// PresenterGamePresent=1 (with PresenterDevice): the game's own swap chain presents each frame too, hidden under the
+// presenter's window, so the driver sees the game's frames (Reflex's latency reports, frame generation's detection).
+static std::atomic<bool>      g_gamePresentSep{true};
+static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT flags);
 static ID3D12Device *GameDev() { return g_sep.load() && g_gameDev ? g_gameDev : g_device; }
 static void ApplyColorSpaceOut();
 static void ResizeOut(UINT w, UINT h, DXGI_FORMAT f);
@@ -6186,6 +6190,20 @@ static HRESULT SubmitGameFrameLocked()
     if (!g_firstStaged.exchange(true)) LOGI("BFI Presenter: first game frame received");
     if ((g_frameId & 31) == 1) ReadRsColorSpace();     // for the presenter thread (see g_rsCs)
     if (g_gameFence->GetCompletedValue() == UINT64_MAX) DumpDeviceRemoved(GameDev(), "game Present");
+    if (g_sep.load() && g_running.load() && g_gamePresentSep.load())
+    {
+        // DXGI's own Present on the game's swap chain, past the overlay hooks: never seen (the presenter's window covers
+        // it), but the driver counts the game's frame as presented.
+        OwnCall own;
+        static PFN_Present direct = nullptr;
+        static void **forVt = nullptr;
+        void **vt = *(void ***)g_sc;
+        if (forVt != vt) { forVt = vt; direct = (PFN_Present)DirectSlot(vt, VT_Present); }
+        const HRESULT ph = (direct && direct != (PFN_Present)&hk_Present) ? direct(g_sc, 0, DXGI_PRESENT_DO_NOT_WAIT)
+                                                                            : o_Present(g_sc, 0, DXGI_PRESENT_DO_NOT_WAIT);
+        static bool logged = false;
+        if (!logged) { logged = true; LOGI("BFI Presenter: PresenterDevice: the game's own swap chain presents too (PresenterGamePresent=1): 0x%08lX", (unsigned long)ph); }
+    }
 
     // VSync-like cap: at most one game frame per display refresh.
     const int cap = g_gameCap.load();
@@ -10656,6 +10674,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             if (!g_presDevOwn) g_presDevOwn = CreateIndependentDevice(g_device, why, sizeof(why));
             if (g_presDevOwn)
             {
+                g_gamePresentSep.store(GetPrivateProfileIntA("BFI", "PresenterGamePresent", 1, g_iniPath) != 0);
                 g_device = g_presDevOwn;
                 g_sep.store(true);
                 LOGI("BFI Presenter: PresenterDevice=1 -- the presenter runs on a device and swap chain of its own (test)");

@@ -47,3 +47,10 @@ staging textures shared with it. t5 times ExecuteCommandLists and Signal separat
 `PresenterDevice=2`: the presenter signals a fence of its own, and a forwarder thread copies its progress to the shared
 fence the game waits on. If `exec_ms` carries the stalls instead, the next step is an importer: the shared staging
 frame copied into a private texture on another queue/thread before the presenter samples it.
+
+## t6
+
+In t4 the game's own swap chain never presented, so NVIDIA's driver returned no Reflex latency reports: frame
+generation wasn't detected and the frame limit at the game's Reflex sleep never switched on. `PresenterGamePresent=1`
+(default with PresenterDevice) lets the game's swap chain present each frame too (DXGI's own Present, past the overlay
+hooks, sync interval 0, do-not-wait), hidden under the presenter's window, as `DX11GamePresent=1` does in DX11 mode.
