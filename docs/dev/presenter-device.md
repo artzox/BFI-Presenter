@@ -64,3 +64,14 @@ importer (`PresenterImport=1`, default with PresenterDevice): a thread with its 
 copies each finished shared staging frame into a private texture of the same slot and signals a shared import fence;
 the presenter sees a slot as ready only once imported, and draws only from the private copies. The game's copy into a
 slot also waits (on the GPU) for that slot's import, and its slot choice skips slots still being imported.
+
+## t7 result → t8
+
+Control, 2.4 min: missed refreshes 2.5 a minute (t6: 5.7-6.1); presenter submit stalls over 2 ms 4 (t6: 27 in 3.7 min).
+The importer logged imports held up 7.5, 19.4 and 21.0 ms; the two longer ones line up with the remaining presenter
+stalls (a 17.9 ms submit and a 21.9 ms present): the importer and the presenter share the presenter's device, and a
+stalled import holds it. t8 (`PresenterImport=2`, default): the importer gets a third device. The shared staging frames
+and the game/import fences belong to it (shared with the game's device); the imported copies belong to the presenter's
+device and are shared only with the importer's. The presenter's fence is no longer shared at all: the game never waits
+on the presenter (it reads only its own copies; the importer waits for the presenter's read of a copy on the CPU).
+Pass-through copies (presenter not running) use a fence of the game's own device.
