@@ -7,7 +7,9 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [Unreleased]
+## [1.0.38] — 2026-11-13 (Manager 1.3.18)
+
+**On-screen display, PresenterResize=2 for games that recreate their swap chain, and REFramework from the Manager.**
 
 - **[DX] [Vulkan] On-screen display** (`Osd`, off by default, Ctrl+Shift+F). A small panel over the game with its frame rate and frame time, the presenter's lost and repeated frames and missed refreshes per second with their totals since the last reset (Ctrl+Shift+Z, or **Reset totals** in the overlay), a frame-time graph and CPU / GPU load (GPU: NVIDIA, through NVML), so a game's settings can be tuned without RTSS or opening ReShade's menu. Corner, graph, loads and size are settings (`OsdCorner`, `OsdGraph`, `OsdLoads`, `OsdScale`).
 - **[DX] [Vulkan] Split comparison: the side without BFI shows every game frame.** It took one game frame per strobe cycle, like the BFI side, so at 120 fps on a 120 Hz display with 2 frames per cycle both sides showed the same 60 frames a second and the side without BFI was frame doubling, not what the game looks like without BFI. It now shows the newest frame at every refresh, as a display without BFI would: all 120 frames, against BFI's 60. At Half refresh nothing changes (both sides show the same 60).
