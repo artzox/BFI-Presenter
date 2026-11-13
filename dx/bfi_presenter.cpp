@@ -7640,24 +7640,66 @@ static HRESULT STDMETHODCALLTYPE hk_FCreateSCCore(IDXGIFactory2 *f, IUnknown *de
 }
 // The function the game itself imports from dxgi.dll (its own import table): with OptiScaler that is
 // OptiScaler's dxgi.dll, so the factory made here is the kind the game gets.
+// Every offset is checked against the image's size and the memory it points at: some games' executables have their
+// import table rewritten or partly removed once loaded (RE4: a crash here in 1.0.37), and then nothing is found and the
+// caller falls back to dxgi.dll.
+static bool ImageSpanOk(const BYTE *base, size_t size, ULONGLONG rva, size_t len)
+{
+    if (rva >= size || len > size - rva) return false;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    const BYTE *a = base + rva, *e = a + len;
+    while (a < e)
+    {
+        if (VirtualQuery(a, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !mbi.Protect)
+            return false;
+        a = (const BYTE *)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return true;
+}
+// The string at rva, if it lies in the image and ends there within max characters.
+static const char *ImageStr(const BYTE *base, size_t size, ULONGLONG rva, size_t max)
+{
+    if (rva >= size) return nullptr;
+    const size_t n = size - rva < max ? (size_t)(size - rva) : max;
+    if (!ImageSpanOk(base, size, rva, n)) return nullptr;
+    const char *s = (const char *)(base + rva);
+    return memchr(s, 0, n) ? s : nullptr;
+}
 static void *GameDxgiImport(const char *fn)
 {
     BYTE *base = (BYTE *)GetModuleHandleW(nullptr);
     if (!base) return nullptr;
     auto *dos = (IMAGE_DOS_HEADER *)base;
+    if (!ImageSpanOk(base, sizeof(IMAGE_DOS_HEADER), 0, sizeof(IMAGE_DOS_HEADER)) || dos->e_magic != IMAGE_DOS_SIGNATURE ||
+        dos->e_lfanew <= 0 || dos->e_lfanew > 0x10000 || !ImageSpanOk(base, 0x20000, (ULONGLONG)dos->e_lfanew, sizeof(IMAGE_NT_HEADERS)))
+        return nullptr;
     auto *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) return nullptr;
+    const size_t size = nt->OptionalHeader.SizeOfImage;
     const IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (!dir.VirtualAddress) return nullptr;
-    for (auto *imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); imp->Name; imp++)
+    for (ULONGLONG d = dir.VirtualAddress; ImageSpanOk(base, size, d, sizeof(IMAGE_IMPORT_DESCRIPTOR));
+         d += sizeof(IMAGE_IMPORT_DESCRIPTOR))
     {
-        if (_stricmp((const char *)(base + imp->Name), "dxgi.dll") != 0) continue;
-        auto *names = (IMAGE_THUNK_DATA *)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
-        auto *addrs = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
-        for (; names->u1.AddressOfData; names++, addrs++)
+        auto *imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + d);
+        if (!imp->Name) break;
+        const char *dll = ImageStr(base, size, imp->Name, 260);
+        if (!dll || _stricmp(dll, "dxgi.dll") != 0) continue;
+        // Without the name table (OriginalFirstThunk) the FirstThunk entries are already the resolved addresses, not
+        // names: nothing to match.
+        if (!imp->OriginalFirstThunk || !imp->FirstThunk) continue;
+        for (ULONGLONG i = 0; i < 4096; i++)
         {
-            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
-            auto *ibn = (IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData);
-            if (strcmp((const char *)ibn->Name, fn) == 0) return (void *)addrs->u1.Function;
+            const ULONGLONG nr = imp->OriginalFirstThunk + i * sizeof(IMAGE_THUNK_DATA);
+            const ULONGLONG ar = imp->FirstThunk + i * sizeof(IMAGE_THUNK_DATA);
+            if (!ImageSpanOk(base, size, nr, sizeof(IMAGE_THUNK_DATA)) || !ImageSpanOk(base, size, ar, sizeof(IMAGE_THUNK_DATA)))
+                break;
+            const IMAGE_THUNK_DATA *nm = (const IMAGE_THUNK_DATA *)(base + nr);
+            if (!nm->u1.AddressOfData) break;
+            if (IMAGE_SNAP_BY_ORDINAL(nm->u1.Ordinal)) continue;
+            const char *name = ImageStr(base, size, nm->u1.AddressOfData + offsetof(IMAGE_IMPORT_BY_NAME, Name), 256);
+            if (name && strcmp(name, fn) == 0) return (void *)((const IMAGE_THUNK_DATA *)(base + ar))->u1.Function;
         }
     }
     return nullptr;

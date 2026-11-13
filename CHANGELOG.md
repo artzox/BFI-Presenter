@@ -7,6 +7,10 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Unreleased]
+
+- **[DX] No crash at start in games whose import table changes once loaded.** To find the DXGI factory the game itself uses, the add-on reads the game's import table; Resident Evil 4 (reported in discussion #68, 1.0.37) crashed there on start, inside ReShade's device creation. Every entry is now checked against the image and the memory it points at, and a table without import names is skipped; the add-on then takes the factory from dxgi.dll, as it already did for games that don't import it.
+
 ## [1.0.39] — 2026-11-13 (Manager 1.3.19)
 
 **Reflex games: the frame limit stays in step with the strobe, and ReflexAlign is on by default.**
