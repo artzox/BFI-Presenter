@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.40-t3"
+#define BFI_ADDON_VERSION "1.0.40-t4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -177,6 +177,7 @@ struct Settings
     int   pacing   = 1;       // 1 = wait for vblank before each present, 0 = present queue only
     int   log      = 0;
     int   stallProbe = 1; // StallProbe (test): time submissions on extra queues while the timing log runs
+    int   presenterDevice = 0; // PresenterDevice (test, DX12): the presenter on a device and swap chain of its own
     int   dx11     = 1;       // manage DX11 games (through the add-on's own D3D12 presenter)
     // SDR to HDR (DX11, DX9, OpenGL: the presenter's own swap chain): an SDR game on an HDR display is presented as
     // HDR10, so the lit refresh has headroom above SDR white (as the Vulkan layer). Applies when the swap chain is next created.
@@ -370,6 +371,7 @@ static void LoadSettings(Settings &s)
     s.pacing   = IniInt("WaitForVBlank", 1);
     s.log      = IniInt("Log", 0);
     s.stallProbe = IniInt("StallProbe", 1) ? 1 : 0;
+    s.presenterDevice = IniInt("PresenterDevice", 0) ? 1 : 0;
     s.dx11     = IniInt("DX11Support", 1) ? 1 : 0;
     s.sdrToHdr = IniInt("SdrToHdr", 1) ? 1 : 0;
     s.sdrWhite = IniFloat("SdrWhiteNits", 200.0f);
@@ -828,6 +830,21 @@ static std::atomic<int> g_rsCs{-1};
 static void ReadRsColorSpace() { if (g_rsSwapchain) g_rsCs.store((int)g_rsSwapchain->get_color_space()); }
 static std::atomic<bool>      g_active{false};   // hooks redirect for g_sc
 static ID3D12Device          *g_device = nullptr;
+// PresenterDevice=1 (test, DX12 games): the presenter runs on an independent D3D12 device of its own and shows its
+// frames through a swap chain of its own on a child window (as the DX11 front end does), so the driver's stalls on the
+// game's device (Control: submissions held 2-20 ms while the game's own work goes in) don't hold it up. g_device is
+// then the presenter's device and g_gameDev the game's. See docs/dev/presenter-device.md.
+static std::atomic<bool>      g_sep{false};
+static std::atomic<HWND>      g_childHwnd{nullptr};     // the presenter's own window (DX11 front end, PresenterDevice)
+static ID3D12Device          *g_gameDev = nullptr;
+static ID3D12Device          *g_presDevOwn = nullptr;   // kept across swap chains, like the presenter queue
+static IDXGISwapChain3       *g_scOut = nullptr;        // the presenter's own swap chain (sep mode)
+static ID3D12Resource        *g_stageG[16] = {};        // the staging frames as the game's device sees them (sep mode)
+static ID3D12Fence           *g_gameFenceG = nullptr, *g_presFenceG = nullptr;   // the shared fences on the game's device
+static ID3D12Device *GameDev() { return g_sep.load() && g_gameDev ? g_gameDev : g_device; }
+static void ApplyColorSpaceOut();
+static void ResizeOut(UINT w, UINT h, DXGI_FORMAT f);
+static void DestroyChildWindow();
 static ID3D12CommandQueue    *g_gameQueue = nullptr;
 
 static DXGI_SWAP_CHAIN_DESC1  g_desc = {};
@@ -1225,7 +1242,8 @@ static DXGI_FORMAT VirtualFormat(DXGI_FORMAT f)
 }
 
 static ID3D12Resource *CreateTex(const DXGI_SWAP_CHAIN_DESC1 &d, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
-                                 const wchar_t *name, UINT index)
+                                 const wchar_t *name, UINT index, ID3D12Device *dev = nullptr,
+                                 D3D12_HEAP_FLAGS heap = D3D12_HEAP_FLAG_NONE)
 {
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1239,8 +1257,8 @@ static ID3D12Resource *CreateTex(const DXGI_SWAP_CHAIN_DESC1 &d, DXGI_FORMAT for
     rd.SampleDesc.Count = 1;
     rd.Flags            = flags;
     ID3D12Resource *r = nullptr;
-    HRESULT hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
-                                                   nullptr, IID_PPV_ARGS(&r));
+    HRESULT hr = (dev ? dev : g_device)->CreateCommittedResource(&hp, heap, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                                 nullptr, IID_PPV_ARGS(&r));
     if (FAILED(hr)) LOGE("BFI Presenter: CreateCommittedResource failed (0x%08lX)", (unsigned long)hr);
     else
     {
@@ -1316,11 +1334,25 @@ static bool CreateFrameResources()
     D3D12_RESOURCE_FLAGS vf = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (g_desc.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS) vf |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     for (UINT i = 0; i < g_bufCount; i++)
-        if (!(g_virt[i] = CreateTex(g_desc, VirtualFormat(gf), vf, L"BFI virtual back buffer", i))) return false;
+        if (!(g_virt[i] = CreateTex(g_desc, VirtualFormat(gf), vf, L"BFI virtual back buffer", i, GameDev()))) return false;
     if (g_reportTyped.load() && VirtualFormat(gf) != gf) HookResourceGetDesc(g_virt[0]);
     for (UINT s = 0; s < kStage; s++)
     {
-        if (!(g_stage[s] = CreateTex(g_desc, gf, D3D12_RESOURCE_FLAG_NONE, L"BFI staging frame", s))) return false;
+        if (!g_sep.load())
+        {
+            if (!(g_stage[s] = CreateTex(g_desc, gf, D3D12_RESOURCE_FLAG_NONE, L"BFI staging frame", s))) return false;
+        }
+        else
+        {
+            // On the presenter's device, shared, and opened on the game's for its copies.
+            if (!(g_stage[s] = CreateTex(g_desc, gf, D3D12_RESOURCE_FLAG_NONE, L"BFI staging frame (shared)", s, g_device,
+                                         D3D12_HEAP_FLAG_SHARED))) return false;
+            HANDLE h = nullptr;
+            HRESULT hr = g_device->CreateSharedHandle(g_stage[s], nullptr, GENERIC_ALL, nullptr, &h);
+            if (SUCCEEDED(hr)) hr = g_gameDev->OpenSharedHandle(h, IID_PPV_ARGS(&g_stageG[s]));
+            if (h) CloseHandle(h);
+            if (FAILED(hr)) { LOGE("BFI Presenter: PresenterDevice: shared staging frame %u failed (0x%08lX)", s, (unsigned long)hr); return false; }
+        }
         g_stageFence[s] = g_stageId[s] = g_readFence[s] = 0;
         g_presCurSlot = -1; g_presCurSlot2 = -1;
         g_stageTime[s] = 0.0;
@@ -1351,7 +1383,7 @@ static bool RefreshRealDesc()
 static void ReleaseFrameResources()
 {
     for (UINT i = 0; i < kMaxBuf; i++) SafeRelease(g_virt[i]);
-    for (UINT s = 0; s < kStage; s++) SafeRelease(g_stage[s]);
+    for (UINT s = 0; s < kStage; s++) { SafeRelease(g_stage[s]); SafeRelease(g_stageG[s]); }
     g_bufCount = 0;
 }
 
@@ -2912,6 +2944,7 @@ static void HookSelfPresent()
 }
 static void SelfResize(IDXGISwapChain *outer)
 {
+    if (g_sep.load()) return;                        // PresenterDevice: the game's swap chain keeps its own queue
     DXGI_SWAP_CHAIN_DESC d = {};
     if (FAILED(outer->GetDesc(&d))) { LOGW("BFI Presenter: PresenterResize: no swap chain description"); return; }
     if (d.OutputWindow != g_watchHwnd.load())       // another swap chain behind the same wrapper type: not this one
@@ -3104,36 +3137,40 @@ static void *DirectSlot(void **vt, int idx)
     LeaveCriticalSection(&cs);
     return u;
 }
-#define SC_DIRECT(T, idx) ((T)DirectSlot(*(void ***)g_sc, idx))
+// The swap chain the presenter shows its refreshes on: the game's (DX12), or one of the presenter's own (DX11 front end,
+// PresenterDevice=1). Calls on an own swap chain go straight to DXGI, past any hooks.
+static IDXGISwapChain3 *OutSc() { return g_sep.load() ? g_scOut : g_sc; }
+static bool OwnOut() { return g_dx11.load() || g_sep.load(); }
+#define SC_DIRECT(T, idx) ((T)DirectSlot(*(void ***)OutSc(), idx))
 static void ScDesc1(DXGI_SWAP_CHAIN_DESC1 *d)
 {
-    if (g_dx11.load()) { OwnCall own; SC_DIRECT(HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain1 *, DXGI_SWAP_CHAIN_DESC1 *), 18)(g_sc, d); }
+    if (OwnOut()) { OwnCall own; SC_DIRECT(HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain1 *, DXGI_SWAP_CHAIN_DESC1 *), 18)(OutSc(), d); }
     else if (o_GetDesc1) o_GetDesc1(g_sc, d);
     else *d = g_desc;
 }
 static HRESULT ScBuffer(UINT i, ID3D12Resource **r)
 {
-    if (g_dx11.load()) { OwnCall own; return SC_DIRECT(PFN_GetBuffer, 9)(g_sc, i, __uuidof(ID3D12Resource), (void **)r); }
+    if (OwnOut()) { OwnCall own; return SC_DIRECT(PFN_GetBuffer, 9)(OutSc(), i, __uuidof(ID3D12Resource), (void **)r); }
     return o_GetBuffer(g_sc, i, __uuidof(ID3D12Resource), (void **)r);
 }
 static UINT ScCBBI()
 {
-    if (g_dx11.load()) { OwnCall own; return SC_DIRECT(PFN_GetCBBI, 36)(g_sc); }
+    if (OwnOut()) { OwnCall own; return SC_DIRECT(PFN_GetCBBI, 36)(OutSc()); }
     return o_GetCBBI(g_sc);
 }
 static HRESULT ScStats(DXGI_FRAME_STATISTICS *st)
 {
-    if (g_dx11.load()) { OwnCall own; return SC_DIRECT(HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain *, DXGI_FRAME_STATISTICS *), 16)(g_sc, st); }
+    if (OwnOut()) { OwnCall own; return SC_DIRECT(HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain *, DXGI_FRAME_STATISTICS *), 16)(OutSc(), st); }
     return g_sc->GetFrameStatistics(st);
 }
 static HRESULT ScLPC(UINT *n)
 {
-    if (g_dx11.load()) { OwnCall own; return SC_DIRECT(HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT *), 17)(g_sc, n); }
+    if (OwnOut()) { OwnCall own; return SC_DIRECT(HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT *), 17)(OutSc(), n); }
     return g_sc->GetLastPresentCount(n);
 }
 static HRESULT ScOutput(IDXGIOutput **o)
 {
-    if (g_dx11.load()) { OwnCall own; return SC_DIRECT(HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain *, IDXGIOutput **), 15)(g_sc, o); }
+    if (OwnOut()) { OwnCall own; return SC_DIRECT(HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain *, IDXGIOutput **), 15)(OutSc(), o); }
     return g_sc->GetContainingOutput(o);
 }
 static void Sync11Window();
@@ -5456,7 +5493,7 @@ static DWORD WINAPI PresenterThread(void *)
             }
             secStart = t; secPresents = 0; secLate = 0; ageSum = 0.0; secSlowPres = 0;
             if (g_device->GetDeviceRemovedReason() != S_OK) { DumpDeviceRemoved(g_device, "presenter check"); break; }
-            if (g_dx11.load()) Sync11Window();
+            if (OwnOut()) Sync11Window();
         }
         if (logf)
         {
@@ -5674,17 +5711,18 @@ static DWORD WINAPI ProbeThread(LPVOID dev)
 
 static void StartProbe()
 {
-    if (g_probeThread || !g_device) return;
+    if (g_probeThread || !GameDev()) return;
     bool want;
     EnterCriticalSection(&g_cfgLock);
     want = g_shared.stallProbe != 0 && g_shared.log != 0;
     LeaveCriticalSection(&g_cfgLock);
     if (!want) return;
-    g_device->AddRef();
+    ID3D12Device *gd = GameDev();
+    gd->AddRef();
     g_probeRun.store(true);
-    g_probeThread = CreateThread(nullptr, 0, ProbeThread, g_device, 0, nullptr);
+    g_probeThread = CreateThread(nullptr, 0, ProbeThread, gd, 0, nullptr);
     if (g_probeThread) SetThreadPriority(g_probeThread, THREAD_PRIORITY_HIGHEST);
-    else { g_probeRun.store(false); g_device->Release(); }
+    else { g_probeRun.store(false); gd->Release(); }
 }
 
 static void StopProbe()
@@ -5783,7 +5821,7 @@ static bool StopPresenter()
         WaitFence(g_gameFence, g_gameFenceVal, g_gameFenceEvent);     // the DX11 copies (flushed at each frame)
     else if (g_gameQueue && g_gameFence)
     {
-        g_gameQueue->Signal(g_gameFence, ++g_gameFenceVal);
+        g_gameQueue->Signal(g_sep.load() ? g_gameFenceG : g_gameFence, ++g_gameFenceVal);
         WaitFence(g_gameFence, g_gameFenceVal, g_gameFenceEvent);
     }
     TopUpGameSlots();
@@ -5942,7 +5980,7 @@ static HRESULT SubmitGameFrameLocked()
     {
         // Presenter not running: copy the frame to the real back buffer and
         // present it directly, on whichever queue the swap chain presents on.
-        ID3D12CommandQueue *q = g_ownPresentQueue ? g_presQueue : g_gameQueue;
+        ID3D12CommandQueue *q = g_ownPresentQueue && !g_sep.load() ? g_presQueue : g_gameQueue;
         ID3D12Resource *rb = nullptr;
         GameStage(ST_G_OWN_INDEX);
         const UINT bi = o_GetCBBI(g_sc);
@@ -5967,7 +6005,7 @@ static HRESULT SubmitGameFrameLocked()
         if (!fmtDiffers && bi < kMaxBuf && SUCCEEDED(o_GetBuffer(g_sc, bi, __uuidof(ID3D12Resource), (void **)&rb)))
         {
             GameStage(ST_G_OWN_COPY);
-            g_gameQueue->Signal(g_gameFence, ++g_gameFenceVal);          // game frame finished
+            g_gameQueue->Signal(g_sep.load() ? g_gameFenceG : g_gameFence, ++g_gameFenceVal);   // game frame finished
             if (q != g_gameQueue) q->Wait(g_gameFence, g_gameFenceVal);
             WaitFence(g_presFence, g_fbFence[bi], g_gameFenceEvent);
             g_fbAlloc[bi]->Reset();
@@ -5987,7 +6025,7 @@ static HRESULT SubmitGameFrameLocked()
             EnterCriticalSection(&g_lock);
             v = ++g_presFenceVal;
             LeaveCriticalSection(&g_lock);
-            q->Signal(g_presFence, v);
+            q->Signal(q == g_gameQueue && g_sep.load() ? g_presFenceG : g_presFence, v);
             g_fbFence[bi] = v;
             if (q != g_gameQueue) g_gameQueue->Wait(g_presFence, v);   // copy done before reuse
             rb->Release();
@@ -5997,7 +6035,15 @@ static HRESULT SubmitGameFrameLocked()
         g_cur = (g_cur + 1) % g_bufCount;
         ReleaseGameSlot();
         GameStage(ST_G_OWN_PRESENT);
-        const HRESULT phr = OwnPresent();
+        HRESULT phr;
+        if (g_sep.load())
+        {
+            // PresenterDevice: the game's own swap chain shows its frames until the presenter runs (its window hidden).
+            if (HWND hw = g_childHwnd.load()) if (IsWindowVisible(hw)) ShowWindowAsync(hw, SW_HIDE);
+            OwnCall own;
+            phr = o_Present(g_sc, 1, 0);
+        }
+        else phr = OwnPresent();
         if (FAILED(phr)) s_ptHr = phr;
         const double tn = Now();
         if (ptLog && tn - s_ptT >= 1.0)
@@ -6055,13 +6101,14 @@ static HRESULT SubmitGameFrameLocked()
 
     g_copyAlloc[s]->Reset();
     g_copyList->Reset(g_copyAlloc[s], nullptr);
+    ID3D12Resource *const dst = g_sep.load() ? g_stageG[s] : g_stage[s];   // PresenterDevice: the game's view of it
     D3D12_RESOURCE_BARRIER br[2] = {
         Transition(g_virt[g_cur], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        Transition(g_stage[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
+        Transition(dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
     g_copyList->ResourceBarrier(2, br);
-    g_copyList->CopyResource(g_stage[s], g_virt[g_cur]);
+    g_copyList->CopyResource(dst, g_virt[g_cur]);
     br[0] = Transition(g_virt[g_cur], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
-    br[1] = Transition(g_stage[s], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    br[1] = Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     g_copyList->ResourceBarrier(2, br);
     {
         const HRESULT ch = g_copyList->Close();
@@ -6076,10 +6123,12 @@ static HRESULT SubmitGameFrameLocked()
         }
     }
 
-    if (waitRead) g_gameQueue->Wait(g_presFence, waitRead);   // presenter done reading this slot
+    if (waitRead) g_gameQueue->Wait(g_sep.load() ? g_presFenceG : g_presFence, waitRead);   // presenter done reading this slot
     ID3D12CommandList *l[] = { g_copyList };
     g_gameQueue->ExecuteCommandLists(1, l);
-    g_gameQueue->Signal(g_gameFence, ++g_gameFenceVal);
+    g_gameQueue->Signal(g_sep.load() ? g_gameFenceG : g_gameFence, ++g_gameFenceVal);
+    if (g_sep.load())
+        if (HWND hw = g_childHwnd.load()) if (!IsWindowVisible(hw) && g_running.load()) ShowWindowAsync(hw, SW_SHOWNA);
     EnterCriticalSection(&g_lock);            // publish: selectable from here on
     g_stageFence[s] = g_gameFenceVal;
     g_stageId[s]    = ++g_frameId;
@@ -6095,7 +6144,7 @@ static HRESULT SubmitGameFrameLocked()
     Osd::FramePush(Now());
     if (!g_firstStaged.exchange(true)) LOGI("BFI Presenter: first game frame received");
     if ((g_frameId & 31) == 1) ReadRsColorSpace();     // for the presenter thread (see g_rsCs)
-    if (g_gameFence->GetCompletedValue() == UINT64_MAX) DumpDeviceRemoved(g_device, "game Present");
+    if (g_gameFence->GetCompletedValue() == UINT64_MAX) DumpDeviceRemoved(GameDev(), "game Present");
 
     // VSync-like cap: at most one game frame per display refresh.
     const int cap = g_gameCap.load();
@@ -6293,7 +6342,7 @@ static HRESULT STDMETHODCALLTYPE hk_GetDesc1(IDXGISwapChain1 *sc, DXGI_SWAP_CHAI
 
 static HRESULT STDMETHODCALLTYPE hk_GetFS(IDXGISwapChain *sc, DXGI_FRAME_STATISTICS *st)
 {
-    if (!t_ownCall && !t_presenterThread && IsGame11(sc) && g_sc && st)
+    if (!t_ownCall && !t_presenterThread && (IsGame11(sc) || (g_sep.load() && g_running.load() && IsManaged(sc))) && g_sc && st)
     {
         // Its own swap chain never presents: report the presenter's, in terms
         // of the game's frames.
@@ -7295,16 +7344,16 @@ static HRESULT OwnPresent()
     {
         // Through the hooks: the swap chain's vtable (this add-on's hook passes own calls straight on) for
         // the DX11-mode swap chain, the original Present below this add-on's hook for a DX12 game's.
-        if (g_dx11.load()) return g_sc->Present(1, 0);
+        if (OwnOut()) return OutSc()->Present(1, 0);
         return o_Present(g_sc, 1, 0);
     }
-    if (g_dx11.load())
+    if (OwnOut())
     {
         // The add-on's own swap chain: DXGI's Present past any inline hooks
         // (Steam's overlay hooks dxgi.dll's Present, whatever the API).
         static PFN_Present direct11 = nullptr;
         static void **forVt = nullptr;
-        void **vt = *(void ***)g_sc;
+        void **vt = *(void ***)OutSc();
         if (forVt != vt)
         {
             forVt = vt;
@@ -7313,7 +7362,7 @@ static HRESULT OwnPresent()
             direct11 = pr ? (PFN_Present)MakeUnhookedEntry(pr, why, sizeof(why)) : nullptr;
             LOGI("BFI Presenter: DX11 mode, direct Present for the presenter's swap chain: %s", direct11 ? why : "not possible");
         }
-        return direct11 ? direct11(g_sc, 1, 0) : g_sc->Present(1, 0);
+        return direct11 ? direct11(OutSc(), 1, 0) : OutSc()->Present(1, 0);
     }
     // Also before BFI starts, when the game's own frames are passed on: Steam's
     // Present hook recursed until the stack overflowed on Resident Evil 4's
@@ -7383,6 +7432,7 @@ template <class F> static HRESULT StuckResize(void *sc, F orig)
 static bool HdrDisplayFor(IDXGIFactory4 *fac, HWND hwnd);
 static DXGI_FORMAT Hdr12ResizeFormat(IDXGISwapChain *sc, DXGI_FORMAT f)
 {
+    if (g_sep.load()) { g_hdrUp.store(false); g_stageFmt = DXGI_FORMAT_UNKNOWN; return f; }   // PresenterDevice: not yet
     DXGI_FORMAT game = f;
     if (game == DXGI_FORMAT_UNKNOWN)                              // "keep the format": the game's current one
     {
@@ -7479,10 +7529,10 @@ static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *sc, UINT cnt, 
     const DXGI_FORMAT rf = Hdr12ResizeFormat(sc, f);
     // A pending move to the presenter's queue happens here: nothing holds the
     // real buffers and ReShade's lock is not held.
-    const bool wantOwn = g_ownPresentQueue || g_needRebind.exchange(false);
+    const bool wantOwn = !g_sep.load() && (g_ownPresentQueue || g_needRebind.exchange(false));
     HRESULT hr = wantOwn ? ResizeOnPresenterQueue((IDXGISwapChain3 *)sc, cnt, w, h, rf, fl) : E_FAIL;
     if (wantOwn && FAILED(hr) && !g_ownPresentQueue) g_needRebind.store(true);   // try again at the next resize
-    g_ownPresentQueue = SUCCEEDED(hr);
+    if (!g_sep.load()) g_ownPresentQueue = SUCCEEDED(hr);   // PresenterDevice: the presenter's own swap chain
     if (wantOwn) LOGI("BFI Presenter: presenting on %s queue after resize", g_ownPresentQueue ? "its own" : "the game's");
     GameStage(ST_R_ORIG);
     if (FAILED(hr)) { OwnCall own; hr = o_ResizeBuffers(sc, cnt, w, h, rf, fl); }
@@ -7494,6 +7544,7 @@ static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *sc, UINT cnt, 
     }
     if (SUCCEEDED(hr)) Hdr12ApplyColorSpace(sc, hdrWas);
     GameStage(ST_R_CREATE);
+    if (g_sep.load() && SUCCEEDED(hr)) ResizeOut(w, h, f);
     if (g_ownPresentQueue && g_deferPresenter.exchange(false))
         LOGI("BFI Presenter: %s -- BFI starts", t_selfResize ? "the presenter resized the game's swap chain (PresenterResize)"
                                                               : "the game resized its swap chain");
@@ -7522,10 +7573,10 @@ static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers1(IDXGISwapChain3 *sc, UINT cnt
     GameStage(ST_R_REBIND);
     const bool hdrWas = g_hdrUp.load();
     const DXGI_FORMAT rf = Hdr12ResizeFormat(sc, f);
-    const bool wantOwn = g_ownPresentQueue || g_needRebind.exchange(false);
+    const bool wantOwn = !g_sep.load() && (g_ownPresentQueue || g_needRebind.exchange(false));
     HRESULT hr = wantOwn ? ResizeOnPresenterQueue(sc, cnt, w, h, rf, fl) : E_FAIL;
     if (wantOwn && FAILED(hr) && !g_ownPresentQueue) g_needRebind.store(true);   // try again at the next resize
-    g_ownPresentQueue = SUCCEEDED(hr);
+    if (!g_sep.load()) g_ownPresentQueue = SUCCEEDED(hr);   // PresenterDevice: the presenter's own swap chain
     if (wantOwn) LOGI("BFI Presenter: presenting on %s queue after resize", g_ownPresentQueue ? "its own" : "the game's");
     GameStage(ST_R_ORIG);
     if (FAILED(hr)) { OwnCall own; hr = o_ResizeBuffers1(sc, cnt, w, h, rf, fl, mask, queues); }
@@ -7537,6 +7588,7 @@ static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers1(IDXGISwapChain3 *sc, UINT cnt
     }
     if (SUCCEEDED(hr)) Hdr12ApplyColorSpace(sc, hdrWas);
     GameStage(ST_R_CREATE);
+    if (g_sep.load() && SUCCEEDED(hr)) ResizeOut(w, h, f);
     if (g_ownPresentQueue && g_deferPresenter.exchange(false))
         LOGI("BFI Presenter: %s -- BFI starts", t_selfResize ? "the presenter resized the game's swap chain (PresenterResize)"
                                                               : "the game resized its swap chain");
@@ -8006,6 +8058,15 @@ static void ReleaseAll()
     SafeRelease(g_fbList);
     SafeRelease(g_gameFence);
     SafeRelease(g_presFence);
+    SafeRelease(g_gameFenceG);
+    SafeRelease(g_presFenceG);
+    if (g_sep.load())
+    {
+        SafeRelease(g_scOut);
+        DestroyChildWindow();
+        g_sep.store(false);
+        g_gameDev = nullptr;          // g_presDevOwn and g_presQueue stay for the next swap chain
+    }
     // The presenter queue is deliberately kept alive across swap chains.
     // Present hooks of overlays (Steam's gameoverlayrenderer64) remember the
     // queue a swap chain presents on and don't let go of it when the game
@@ -8174,7 +8235,7 @@ static ID3D11Device5        *g_dev11 = nullptr;
 static IUnknown *ReflexOwnDevice()
 {
     if (g_dx11.load()) return (IUnknown *)g_dev11;
-    return (IUnknown *)g_device;
+    return (IUnknown *)GameDev();
 }
 static ID3D11DeviceContext4 *g_ctx11 = nullptr;
 static ID3D11Fence          *g_gameFence11 = nullptr, *g_presFence11 = nullptr;
@@ -8182,7 +8243,6 @@ static ID3D11Texture2D      *g_stage11[kStage] = {};
 static ID3D12Device         *g_dev12own = nullptr;     // the add-on's D3D12 device (kept across swap chains)
 static LUID                  g_dev12Luid = {};
 static HWND                  g_gameHwnd = nullptr;
-static std::atomic<HWND>     g_childHwnd{nullptr};
 static HANDLE                g_uiThread = nullptr;
 static DXGI_SWAP_CHAIN_DESC1 g_desc11 = {};             // the game's swap chain
 static bool                  g_fsLogged = false;
@@ -8522,6 +8582,7 @@ static HRESULT STDMETHODCALLTYPE hk_SetCS1(IDXGISwapChain3 *sc, DXGI_COLOR_SPACE
         }
     }
     const HRESULT hr = o_SetCS1(sc, cs);
+    if (!t_ownCall && g_sep.load() && IsManaged(sc) && SUCCEEDED(hr)) ApplyColorSpaceOut();
     if (!t_ownCall && IsGame11(sc) && SUCCEEDED(hr) && g_cs11.exchange((int)cs) != (int)cs)
     {
         LOGI("BFI Presenter: DX11: the game set colour space %d", (int)cs);
@@ -8626,6 +8687,94 @@ static HRESULT RawCreateSwapChain(IDXGIFactory4 *fac, IUnknown *queue, HWND hwnd
     return f((IDXGIFactory2 *)fac, queue, hwnd, sd, nullptr, nullptr, out);
 }
 static std::atomic<bool> g_creatingOwn{false};
+
+// PresenterDevice: the colour space of the game's swap chain on the presenter's own.
+static void ApplyColorSpaceOut()
+{
+    IDXGISwapChain3 *o = g_scOut;
+    if (!o) return;
+    DXGI_COLOR_SPACE_TYPE cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    const int set = g_cs12.load();
+    if (set >= 0) cs = (DXGI_COLOR_SPACE_TYPE)set;
+    else if (g_rsSwapchain)
+    {
+        switch (g_rsSwapchain->get_color_space())
+        {
+        case reshade::api::color_space::hdr10_st2084:         cs = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020; break;
+        case reshade::api::color_space::extended_srgb_linear: cs = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709; break;
+        default: break;
+        }
+    }
+    static int last = -1;
+    OwnCall own;
+    const HRESULT hr = ((PFN_SetCS1)DirectSlot(*(void ***)o, VT_SetColorSpace1))(o, cs);
+    if ((int)cs != last) LOGI("BFI Presenter: PresenterDevice: colour space %d on the presenter's swap chain (0x%08lX)", (int)cs, (unsigned long)hr);
+    last = (int)cs;
+}
+
+// PresenterDevice: the presenter's swap chain follows the game's size and format (presenter stopped).
+static void ResizeOut(UINT, UINT, DXGI_FORMAT)
+{
+    if (!g_scOut) return;
+    DXGI_SWAP_CHAIN_DESC1 gd = {};
+    { OwnCall own; if (o_GetDesc1) o_GetDesc1(g_sc, &gd); else g_sc->GetDesc1(&gd); }
+    DXGI_FORMAT nf = FlipFormat(gd.Format);
+    if (nf == DXGI_FORMAT_UNKNOWN) nf = gd.Format;
+    HRESULT hr;
+    {
+        OwnCall own;
+        hr = SC_DIRECT(PFN_ResizeBuffers, 13)(g_scOut, 0, gd.Width, gd.Height, nf, 0);
+    }
+    LOGI("BFI Presenter: PresenterDevice: the presenter's swap chain resized to %ux%u, format %u (0x%08lX)",
+         gd.Width, gd.Height, (unsigned)nf, (unsigned long)hr);
+    ApplyColorSpaceOut();
+}
+
+// PresenterDevice: the presenter's window over the game's and its swap chain on the presenter's queue.
+static bool CreateOutSwapChain(IDXGISwapChain3 *sc3)
+{
+    HWND hwnd = nullptr;
+    if (FAILED(sc3->GetHwnd(&hwnd)) || !hwnd) { LOGE("BFI Presenter: PresenterDevice: the game's swap chain has no window"); return false; }
+    g_gameHwnd = hwnd;
+    g_watchHwnd.store(hwnd);
+    if (!CreateChildWindow()) return false;
+    Settings cur;
+    EnterCriticalSection(&g_cfgLock);
+    cur = g_shared;
+    LeaveCriticalSection(&g_cfgLock);
+    IDXGIFactory4 *fac = nullptr;
+    HRESULT hr = RawCreateFactory(&fac);
+    IDXGISwapChain1 *own1 = nullptr;
+    DXGI_SWAP_CHAIN_DESC1 sd = {};
+    if (SUCCEEDED(hr))
+    {
+        sd.Width       = g_desc.Width;
+        sd.Height      = g_desc.Height;
+        sd.Format      = FlipFormat(g_desc.Format);
+        if (sd.Format == DXGI_FORMAT_UNKNOWN) sd.Format = g_desc.Format;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount = (UINT)(std::max)(2, cur.presBuffers);
+        sd.Scaling     = DXGI_SCALING_STRETCH;
+        sd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        sd.AlphaMode   = DXGI_ALPHA_MODE_IGNORE;
+        OwnCall own;
+        g_creatingOwn.store(true);
+        hr = RawCreateSwapChain(fac, g_presQueue, g_childHwnd.load(), &sd, &own1);
+        g_creatingOwn.store(false);
+    }
+    const bool ok = SUCCEEDED(hr) && own1 && SUCCEEDED(own1->QueryInterface(IID_PPV_ARGS(&g_scOut)));
+    SafeRelease(own1);
+    if (ok) fac->MakeWindowAssociation(g_childHwnd.load(), DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
+    SafeRelease(fac);
+    LOGI("BFI Presenter: PresenterDevice: the presenter's swap chain on its own window, %ux%u format %u, %u buffers (0x%08lX)",
+         sd.Width, sd.Height, (unsigned)sd.Format, sd.BufferCount, (unsigned long)hr);
+    if (!ok) { SafeRelease(g_scOut); DestroyChildWindow(); return false; }
+    if (HWND ch = g_childHwnd.load()) ShowWindowAsync(ch, SW_HIDE);   // shown once the presenter runs
+    ApplyColorSpaceOut();
+    g_ownPresentQueue = true;          // the presenter draws and presents on its own queue
+    return true;
+}
 
 static bool InitPresenter11(reshade::api::swapchain *swapchain, IDXGISwapChain3 *sc3, const DXGI_SWAP_CHAIN_DESC1 &d,
                             HWND hwnd, DXGI_FORMAT ff, LUID luid, const char *what);
@@ -10446,13 +10595,56 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     for (DWORD &t : g_presentThreads) t = 0;
     LoadShared();
 
-    bool ok = SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_gameFence))) &&
-              SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_presFence)));
+    // PresenterDevice=1 (test): the presenter on an independent device of its own; the game keeps its device and queue.
+    g_gameDev = g_device;
+    g_sep.store(false);
+    {
+        Settings c0;
+        EnterCriticalSection(&g_cfgLock);
+        c0 = g_shared;
+        LeaveCriticalSection(&g_cfgLock);
+        if (c0.presenterDevice)
+        {
+            if (g_presDevOwn)
+            {
+                const LUID a = g_presDevOwn->GetAdapterLuid(), b = g_device->GetAdapterLuid();
+                if (memcmp(&a, &b, sizeof(LUID)) != 0) { SafeRelease(g_presQueue); SafeRelease(g_presDevOwn); }
+            }
+            char why[96] = "";
+            if (!g_presDevOwn) g_presDevOwn = CreateIndependentDevice(g_device, why, sizeof(why));
+            if (g_presDevOwn)
+            {
+                g_device = g_presDevOwn;
+                g_sep.store(true);
+                LOGI("BFI Presenter: PresenterDevice=1 -- the presenter runs on a device and swap chain of its own (test)");
+            }
+            else LOGW("BFI Presenter: PresenterDevice=1, but no device of its own could be created (%s) -- the game's is used", why);
+        }
+    }
+    bool ok;
+    if (!g_sep.load())
+        ok = SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_gameFence))) &&
+             SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_presFence)));
+    else
+    {
+        // Shared fences: the game's queue signals / waits on its view of them, the presenter's queue on the originals.
+        auto openOnGame = [](ID3D12Fence *f, ID3D12Fence **out) {
+            HANDLE h = nullptr;
+            const bool r = SUCCEEDED(g_device->CreateSharedHandle(f, nullptr, GENERIC_ALL, nullptr, &h)) &&
+                           SUCCEEDED(g_gameDev->OpenSharedHandle(h, IID_PPV_ARGS(out)));
+            if (h) CloseHandle(h);
+            return r;
+        };
+        ok = SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_gameFence))) &&
+             SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_presFence))) &&
+             openOnGame(g_gameFence, &g_gameFenceG) && openOnGame(g_presFence, &g_presFenceG);
+        if (!ok) LOGE("BFI Presenter: PresenterDevice: shared fences failed");
+    }
     for (UINT s = 0; s < kStage && ok; s++)
-        ok = SUCCEEDED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_copyAlloc[s])));
+        ok = SUCCEEDED(GameDev()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_copyAlloc[s])));
     if (ok)
-        ok = SUCCEEDED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_copyAlloc[0], nullptr,
-                                                   IID_PPV_ARGS(&g_copyList)));
+        ok = SUCCEEDED(GameDev()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_copyAlloc[0], nullptr,
+                                                    IID_PPV_ARGS(&g_copyList)));
     if (ok)
     {
         g_copyList->SetName(L"BFI frame copy list");
@@ -10506,12 +10698,12 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     }
     for (UINT i = 0; i < kMaxBuf && ok; i++)
     {
-        ok = SUCCEEDED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_fbAlloc[i])));
+        ok = SUCCEEDED(GameDev()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_fbAlloc[i])));
         g_fbFence[i] = 0;
     }
     if (ok)
-        ok = SUCCEEDED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_fbAlloc[0], nullptr,
-                                                   IID_PPV_ARGS(&g_fbList)));
+        ok = SUCCEEDED(GameDev()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_fbAlloc[0], nullptr,
+                                                    IID_PPV_ARGS(&g_fbList)));
     if (ok)
     {
         g_fbList->SetName(L"BFI fallback copy list");
@@ -10530,7 +10722,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     EnterCriticalSection(&g_cfgLock);
     cur = g_shared;
     LeaveCriticalSection(&g_cfgLock);
-    g_needRebind.store(ok && cur.ownQueue != 0);
+    g_needRebind.store(ok && cur.ownQueue != 0 && !g_sep.load());
     g_presenterFailed.store(false);
     g_swapChainsManaged++;
     // Presenting on the game's own queue before its first resize deadlocked
@@ -10539,7 +10731,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     // game's queue). By default the game presents its own frames until it
     // resizes the swap chain -- nearly every game does at start-up -- and BFI
     // starts inside that resize, on the presenter's own queue.
-    g_deferPresenter.store(ok && cur.ownQueue != 0 &&
+    g_deferPresenter.store(ok && cur.ownQueue != 0 && !g_sep.load() &&
                            (cur.waitResizeAll || (cur.deferRecreated && g_swapChainsManaged > 1)));
     g_deferSinceT.store(Now());
     g_nudgeStage.store(0);
@@ -10552,6 +10744,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
                                                         : "PresentOnOwnQueue=0, presenting on the game's queue");
     ok = ok && CreateFrameResources();
     LOGI("BFI Presenter: init 6/6 -- stand-in back buffers %s", ok ? "created" : "FAILED");
+    if (ok && g_sep.load()) ok = CreateOutSwapChain(sc3);
     if (!ok)
     {
         SetReason(0, "Not managed: setup failed (see ReShade.log).");
