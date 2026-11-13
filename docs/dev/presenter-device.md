@@ -54,3 +54,13 @@ In t4 the game's own swap chain never presented, so NVIDIA's driver returned no 
 generation wasn't detected and the frame limit at the game's Reflex sleep never switched on. `PresenterGamePresent=1`
 (default with PresenterDevice) lets the game's swap chain present each frame too (DXGI's own Present, past the overlay
 hooks, sync interval 0, do-not-wait), hidden under the presenter's window, as `DX11GamePresent=1` does in DX11 mode.
+
+## t6 result → t7
+
+With the game's swap chain presenting again, Reflex reports and frame generation came back. The split timing showed
+every remaining submission stall in ExecuteCommandLists (4-32 ms), never in Signal (max 0.08 ms), in both modes: the
+presenter's draws reading a texture shared with the game's device tie it to that device's stalls. t7 adds the
+importer (`PresenterImport=1`, default with PresenterDevice): a thread with its own queue on the presenter's device
+copies each finished shared staging frame into a private texture of the same slot and signals a shared import fence;
+the presenter sees a slot as ready only once imported, and draws only from the private copies. The game's copy into a
+slot also waits (on the GPU) for that slot's import, and its slot choice skips slots still being imported.

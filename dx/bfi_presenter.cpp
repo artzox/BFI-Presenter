@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.40-t6"
+#define BFI_ADDON_VERSION "1.0.40-t7"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -851,6 +851,25 @@ static std::atomic<double>    g_lastExecMs{-1.0}, g_lastSignalMs{-1.0};   // tim
 // presenter's window, so the driver sees the game's frames (Reflex's latency reports, frame generation's detection).
 static std::atomic<bool>      g_gamePresentSep{true};
 static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *sc, UINT sync, UINT flags);
+// Importer (PresenterDevice, PresenterImport=1): the shared staging frames are copied into textures of the presenter's own
+// (g_stagePriv) by a thread with its own queue. The presenter's draws then reference nothing shared with the game's
+// device: in t6 every stall of its submission was ExecuteCommandLists of a list that read a shared texture (Control,
+// 4-32 ms, together with the game's device). A stalled import only delays that frame.
+static std::atomic<bool>      g_impOn{false};
+static ID3D12Resource        *g_stagePriv[16] = {};
+static ID3D12CommandQueue    *g_impQueue = nullptr;
+static ID3D12CommandAllocator *g_impAlloc[16] = {};
+static ID3D12GraphicsCommandList *g_impList = nullptr;
+static ID3D12Fence           *g_impFence = nullptr, *g_impFenceG = nullptr;   // shared: the game waits for imports of a slot
+static UINT64                 g_impId[16] = {}, g_impVal[16] = {}, g_impIssued[16] = {};   // under g_lock
+static UINT64                 g_impFenceVal = 0;
+static HANDLE                 g_impThread = nullptr;
+static std::atomic<bool>      g_impRun{false};
+static std::atomic<int>       g_impSlowLogged{0};
+// What the presenter thread sees: a slot is ready when its frame was imported (importer) or copied (otherwise).
+static ID3D12Fence *PresFence();
+static UINT64 PresFenceOf(UINT i);
+static ID3D12Resource *PresTex(UINT i);
 static ID3D12Device *GameDev() { return g_sep.load() && g_gameDev ? g_gameDev : g_device; }
 static void ApplyColorSpaceOut();
 static void ResizeOut(UINT w, UINT h, DXGI_FORMAT f);
@@ -1362,6 +1381,9 @@ static bool CreateFrameResources()
             if (SUCCEEDED(hr)) hr = g_gameDev->OpenSharedHandle(h, IID_PPV_ARGS(&g_stageG[s]));
             if (h) CloseHandle(h);
             if (FAILED(hr)) { LOGE("BFI Presenter: PresenterDevice: shared staging frame %u failed (0x%08lX)", s, (unsigned long)hr); return false; }
+            if (g_impOn.load() && !(g_stagePriv[s] = CreateTex(g_desc, gf, D3D12_RESOURCE_FLAG_NONE, L"BFI imported frame", s, g_device)))
+                return false;
+            g_impId[s] = g_impVal[s] = g_impIssued[s] = 0;
         }
         g_stageFence[s] = g_stageId[s] = g_readFence[s] = 0;
         g_presCurSlot = -1; g_presCurSlot2 = -1;
@@ -1393,7 +1415,7 @@ static bool RefreshRealDesc()
 static void ReleaseFrameResources()
 {
     for (UINT i = 0; i < kMaxBuf; i++) SafeRelease(g_virt[i]);
-    for (UINT s = 0; s < kStage; s++) { SafeRelease(g_stage[s]); SafeRelease(g_stageG[s]); }
+    for (UINT s = 0; s < kStage; s++) { SafeRelease(g_stage[s]); SafeRelease(g_stageG[s]); SafeRelease(g_stagePriv[s]); }
     g_bufCount = 0;
 }
 
@@ -3379,7 +3401,7 @@ static DWORD WINAPI PresenterThread(void *)
         svd.Texture2D.MipLevels     = 1;
         for (UINT s = 0; s < kStage; s++)
         {
-            g_device->CreateShaderResourceView(g_stage[s], &svd, sh);
+            g_device->CreateShaderResourceView(PresTex(s), &svd, sh);
             sh.ptr += srvStride;
         }
     }
@@ -3880,22 +3902,22 @@ static DWORD WINAPI PresenterThread(void *)
                 UINT64 wantFence = 0;
                 EnterCriticalSection(&g_lock);
                 for (UINT i = 0; i < kStage; i++)
-                    if (g_stageId[i] == want) wantFence = g_stageFence[i];
+                    if (g_stageId[i] == want) wantFence = PresFenceOf(i);
                 LeaveCriticalSection(&g_lock);
-                if (wantFence && g_gameFence->GetCompletedValue() < wantFence)
+                if (wantFence && wantFence != ~0ull && PresFence()->GetCompletedValue() < wantFence)
                 {
-                    g_gameFence->SetEventOnCompletion(wantFence, llEv);
+                    PresFence()->SetEventOnCompletion(wantFence, llEv);
                     WaitForSingleObject(llEv, 3);
                 }
             }
         }
-        const UINT64 done = g_gameFence->GetCompletedValue();
+        const UINT64 done = PresFence()->GetCompletedValue();
         EnterCriticalSection(&g_lock);
         int newest = -1, oldestNew = -1, unseen = 0;
         UINT64 newestId = 0, oldestNewId = ~0ull;
         for (UINT i = 0; i < kStage; i++)
         {
-            if (g_stageId[i] == 0 || g_stageFence[i] > done) continue;   // empty, being rewritten or unfinished
+            if (g_stageId[i] == 0 || PresFenceOf(i) > done) continue;   // empty, being rewritten or unfinished
             if (g_stageId[i] > newestId) { newest = (int)i; newestId = g_stageId[i]; }
             if (g_stageId[i] > lastShownId)
             {
@@ -3904,7 +3926,7 @@ static DWORD WINAPI PresenterThread(void *)
             }
         }
         const bool cycleStart = (slotNow == 0) || lastShown < 0;
-        if (!cycleStart && lastShown >= 0 && g_stageId[lastShown] == lastShownId && g_stageFence[lastShown] <= done)
+        if (!cycleStart && lastShown >= 0 && g_stageId[lastShown] == lastShownId && PresFenceOf(lastShown) <= done)
             pick = lastShown;                                     // rest of the cycle: same frame
         else if (s.pacingMode == 0 && oldestNew >= 0)
         {
@@ -3926,7 +3948,7 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 UINT64 bestId = 0;
                 for (UINT i = 0; i < kStage; i++)
-                    if (g_stageId[i] > lastShownId && g_stageId[i] < newestId && g_stageFence[i] <= done && g_stageId[i] > bestId)
+                    if (g_stageId[i] > lastShownId && g_stageId[i] < newestId && PresFenceOf(i) <= done && g_stageId[i] > bestId)
                     { pick = (int)i; bestId = g_stageId[i]; }
                 extraCycles = 0;
             }
@@ -3953,7 +3975,7 @@ static DWORD WINAPI PresenterThread(void *)
             int staged = 0;
             UINT64 need = ~0ull;
             for (UINT i = 0; i < kStage; i++)
-                if (g_stageId[i] > 0) { staged++; if (g_stageFence[i] < need) need = g_stageFence[i]; }
+                if (g_stageId[i] > 0) { staged++; if (PresFenceOf(i) < need) need = PresFenceOf(i); }
             g_dbgStaged.store(staged);
             g_dbgDone.store(done);
             g_dbgNeed.store(staged ? need : 0);
@@ -4157,11 +4179,11 @@ static DWORD WINAPI PresenterThread(void *)
         list->Reset(alloc[bi], pso);
         D3D12_RESOURCE_BARRIER br[2] = {
             Transition(real[bi], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
-            Transition(g_stage[pick], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) };
+            Transition(PresTex(pick), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) };
         list->ResourceBarrier(2, br);
         if (pickNew2 != pick)
         {
-            D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            D3D12_RESOURCE_BARRIER b2 = Transition(PresTex(pickNew2), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &b2);
         }
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -4263,11 +4285,11 @@ static DWORD WINAPI PresenterThread(void *)
             measFence = reserve;
         }
         br[0] = Transition(real[bi], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-        br[1] = Transition(g_stage[pick], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        br[1] = Transition(PresTex(pick), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         list->ResourceBarrier(2, br);
         if (pickNew2 != pick)
         {
-            D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            D3D12_RESOURCE_BARRIER b2 = Transition(PresTex(pickNew2), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             list->ResourceBarrier(1, &b2);
         }
         if (FAILED(list->Close())) LOGE("BFI Presenter: presenter draw list failed to record (Close) -- see BFIPresenter_debug.txt with Diagnostics=2");
@@ -5751,6 +5773,87 @@ static void StopProbe()
     g_probeDev2Us.store(-1);
 }
 
+static ID3D12Fence *PresFence() { return g_impOn.load() ? g_impFence : g_gameFence; }
+static UINT64 PresFenceOf(UINT i)
+{
+    if (!g_impOn.load()) return g_stageFence[i];
+    return (g_impId[i] && g_impId[i] == g_stageId[i]) ? g_impVal[i] : ~0ull;   // not imported yet: not ready
+}
+static ID3D12Resource *PresTex(UINT i) { return g_impOn.load() && g_stagePriv[i] ? g_stagePriv[i] : g_stage[i]; }
+
+// The importer: each finished staging frame (shared) copied into the presenter's own texture of the same slot.
+static DWORD WINAPI ImportThread(void *)
+{
+    HANDLE ev = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    while (g_impRun.load())
+    {
+        const UINT64 gdone = g_gameFence->GetCompletedValue();
+        if (gdone == UINT64_MAX) break;                              // device removed
+        int slot = -1;
+        UINT64 id = 0;
+        EnterCriticalSection(&g_lock);
+        for (UINT i = 0; i < kStage; i++)
+            if (g_stageId[i] && g_stageId[i] != g_impId[i] && g_stageFence[i] <= gdone && (slot < 0 || g_stageId[i] < id))
+            { slot = (int)i; id = g_stageId[i]; }
+        UINT64 issued = 0;
+        if (slot >= 0) { issued = ++g_impFenceVal; g_impIssued[slot] = issued; }
+        LeaveCriticalSection(&g_lock);
+        if (slot < 0)
+        {
+            // Nothing new: wait for the game's next copy to finish (or 2 ms).
+            if (ev && g_gameFence->SetEventOnCompletion(gdone + 1, ev) == S_OK) WaitForSingleObject(ev, 2);
+            else Sleep(1);
+            continue;
+        }
+        // The allocator of this slot is free once its previous import finished.
+        if (g_impVal[slot] && g_impFence->GetCompletedValue() < g_impVal[slot] && ev)
+        {
+            g_impFence->SetEventOnCompletion(g_impVal[slot], ev);
+            WaitForSingleObject(ev, 100);
+        }
+        g_impAlloc[slot]->Reset();
+        g_impList->Reset(g_impAlloc[slot], nullptr);
+        D3D12_RESOURCE_BARRIER br[2] = {
+            Transition(g_stage[slot], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Transition(g_stagePriv[slot], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
+        g_impList->ResourceBarrier(2, br);
+        g_impList->CopyResource(g_stagePriv[slot], g_stage[slot]);
+        br[0] = Transition(g_stage[slot], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        br[1] = Transition(g_stagePriv[slot], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        g_impList->ResourceBarrier(2, br);
+        g_impList->Close();
+        ID3D12CommandList *l[] = { g_impList };
+        const double t0 = Now();
+        g_impQueue->ExecuteCommandLists(1, l);
+        g_impQueue->Signal(g_impFence, issued);
+        const double ms = (Now() - t0) * 1000.0;
+        if (ms > 4.0 && g_impSlowLogged.fetch_add(1) < 5)
+            LOGI("BFI Presenter: PresenterDevice: an import was held up %.1f ms (the presenter's refreshes weren't)", ms);
+        EnterCriticalSection(&g_lock);
+        if (g_stageId[slot] == id) { g_impId[slot] = id; g_impVal[slot] = issued; }   // ready for the presenter
+        LeaveCriticalSection(&g_lock);
+    }
+    if (ev) CloseHandle(ev);
+    return 0;
+}
+
+static void StartImporter()
+{
+    if (!g_impOn.load() || g_impThread) return;
+    g_impRun.store(true);
+    g_impThread = CreateThread(nullptr, 0, ImportThread, nullptr, 0, nullptr);
+    if (g_impThread) SetThreadPriority(g_impThread, THREAD_PRIORITY_HIGHEST);
+}
+static void StopImporter()
+{
+    if (!g_impThread) return;
+    g_impRun.store(false);
+    WaitForSingleObject(g_impThread, 2000);
+    CloseHandle(g_impThread);
+    g_impThread = nullptr;
+    if (g_impFence && g_impFence->GetCompletedValue() < g_impFenceVal) WaitFence(g_impFence, g_impFenceVal, g_gameFenceEvent);
+}
+
 // PresenterDevice=2: the presenter's progress (its own fence) copied to the fence shared with the game's device.
 static DWORD WINAPI FwdThread(void *)
 {
@@ -5771,6 +5874,7 @@ static void StartPresenter()
     if (g_running.load() || (!g_gameQueue && !g_dx11.load()) || g_bufCount == 0) return;
     g_presStageT.store(Now());   // the watchdog measures from here, not from 0
     g_running.store(true);
+    StartImporter();
     g_thread = CreateThread(nullptr, 0, PresenterThread, nullptr, 0, nullptr);
     if (g_thread) SetThreadPriority(g_thread, THREAD_PRIORITY_TIME_CRITICAL);
     else g_running.store(false);
@@ -5842,6 +5946,7 @@ static bool StopPresenter()
         g_thread = nullptr;
     }
     StopProbe();   // started by the presenter thread with the timing log; stopped once that thread has ended
+    StopImporter();
     // Drain the presenter queue. Signalling a value above every reservation
     // also releases game-queue waits on presenter reads that never happened.
     if (g_presQueue && g_presFence)
@@ -6110,6 +6215,7 @@ static HRESULT SubmitGameFrameLocked()
     {
         const UINT64 pdone = g_presFence->GetCompletedValue();
         const UINT64 gdone = g_gameFence->GetCompletedValue();
+        const UINT64 idone = g_impOn.load() && g_impFence ? g_impFence->GetCompletedValue() : 0;
         int best = -1;
         UINT64 bestId = ~0ull;
         EnterCriticalSection(&g_lock);
@@ -6117,6 +6223,7 @@ static HRESULT SubmitGameFrameLocked()
         {
             if ((int)i == g_presCurSlot || (int)i == g_presCurSlot2) continue;
             if (g_readFence[i] > pdone || g_stageFence[i] > gdone) continue;
+            if (g_impOn.load() && g_impIssued[i] > idone) continue;    // the importer is still reading it
             if (g_stageId[i] < bestId) { best = (int)i; bestId = g_stageId[i]; }
         }
         LeaveCriticalSection(&g_lock);
@@ -6136,10 +6243,11 @@ static HRESULT SubmitGameFrameLocked()
     // across recording and submitting the copy: when the driver blocked that
     // submission for 50-70 ms (Obduction, streaming), the presenter waited
     // on the lock, missed 6-8 refreshes and the panel held one -- a flash.
-    UINT64 waitRead;
+    UINT64 waitRead, waitImp = 0;
     EnterCriticalSection(&g_lock);
     g_gtLock = Now();
     waitRead = g_readFence[s];
+    if (g_impOn.load()) waitImp = g_impIssued[s];
     if (g_stageId[s] > g_shownGameFrames.load()) g_lostFrames.fetch_add(1);
     g_stageId[s] = 0;                         // being rewritten: not selectable
     LeaveCriticalSection(&g_lock);
@@ -6169,6 +6277,7 @@ static HRESULT SubmitGameFrameLocked()
     }
 
     if (waitRead) g_gameQueue->Wait(g_sep.load() ? g_presFenceG : g_presFence, waitRead);   // presenter done reading this slot
+    if (waitImp && g_impFenceG) g_gameQueue->Wait(g_impFenceG, waitImp);                     // importer done reading it
     ID3D12CommandList *l[] = { g_copyList };
     g_gameQueue->ExecuteCommandLists(1, l);
     g_gameQueue->Signal(g_sep.load() ? g_gameFenceG : g_gameFence, ++g_gameFenceVal);
@@ -8120,6 +8229,12 @@ static void ReleaseAll()
     SafeRelease(g_gameFenceG);
     SafeRelease(g_presFenceG);
     SafeRelease(g_presFenceS);
+    g_impOn.store(false);
+    SafeRelease(g_impList);
+    for (UINT i = 0; i < kStage; i++) SafeRelease(g_impAlloc[i]);
+    SafeRelease(g_impFenceG);
+    SafeRelease(g_impFence);
+    SafeRelease(g_impQueue);
     if (g_sep.load())
     {
         SafeRelease(g_scOut);
@@ -10713,6 +10828,24 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             ok = ok && SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_presFence))) &&
                  openOnGame(g_presFence, &g_presFenceG);
         if (!ok) LOGE("BFI Presenter: PresenterDevice: shared fences failed");
+        // The importer: its own queue, a shared fence (the game waits on it before rewriting a slot), a list.
+        g_impOn.store(false);
+        if (ok && GetPrivateProfileIntA("BFI", "PresenterImport", 1, g_iniPath))
+        {
+            D3D12_COMMAND_QUEUE_DESC iq = {};
+            iq.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            iq.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+            bool io = SUCCEEDED(g_device->CreateCommandQueue(&iq, IID_PPV_ARGS(&g_impQueue))) &&
+                      SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_impFence))) &&
+                      openOnGame(g_impFence, &g_impFenceG);
+            for (UINT i = 0; i < kStage && io; i++)
+                io = SUCCEEDED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_impAlloc[i])));
+            io = io && SUCCEEDED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_impAlloc[0], nullptr,
+                                                             IID_PPV_ARGS(&g_impList)));
+            if (io) { g_impList->Close(); g_impQueue->SetName(L"BFI importer queue"); g_impFenceVal = 0; g_impOn.store(true); }
+            LOGI("BFI Presenter: PresenterDevice: importer %s (the presenter draws only from its own copies of the frames)",
+                 io ? "ready" : "FAILED -- the presenter reads the shared frames");
+        }
     }
     for (UINT s = 0; s < kStage && ok; s++)
         ok = SUCCEEDED(GameDev()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_copyAlloc[s])));
