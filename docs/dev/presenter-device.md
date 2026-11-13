@@ -99,3 +99,13 @@ same device; t8 the importer's device, stuck on the game's shared frame while it
 shared with the presenter). t10: the import in two submissions on the importer's device, game frame -> importer-only
 texture, then -> the copy shared with the presenter, so the submission that can be held up never references a texture
 the presenter shares.
+
+## t10 result
+
+Control, 2.8 min: 9.6 late presents a minute (same-build baseline, PresenterDevice=0: 4.1; same count over the log after
+its first 1000 rows). 27 presenter submit stalls over 2 ms (up to 38 ms), all in ExecuteCommandLists, 26 of them with the
+game-device probe; the independent device's empty and shared-copy probes never stalled; its own-texture copy did twice
+(5.7, 10.7 ms), both without the game probe. The two-step import didn't free the presenter: its device shares nothing
+with the game's, and only the importer-only step references the game's frame, yet its submissions still wait with the
+game's device. Not shared memory with a stuck device, then (or not only). Left: the presenter queue's global realtime
+priority and its swap chain's back buffers, which no probe has. PresenterDevice stays a test option, off.
