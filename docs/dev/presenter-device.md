@@ -102,10 +102,12 @@ the presenter shares.
 
 ## t10 result
 
-Control, 2.8 min: 9.6 late presents a minute (same-build baseline, PresenterDevice=0: 4.1; same count over the log after
-its first 1000 rows). 27 presenter submit stalls over 2 ms (up to 38 ms), all in ExecuteCommandLists, 26 of them with the
-game-device probe; the independent device's empty and shared-copy probes never stalled; its own-texture copy did twice
-(5.7, 10.7 ms), both without the game probe. The two-step import didn't free the presenter: its device shares nothing
-with the game's, and only the importer-only step references the game's frame, yet its submissions still wait with the
-game's device. Not shared memory with a stuck device, then (or not only). Left: the presenter queue's global realtime
-priority and its swap chain's back buffers, which no probe has. PresenterDevice stays a test option, off.
+Control, 4.8 min: 3.3 late presents a minute (same-build baseline, PresenterDevice=0, 1.9 min: 4.1; t7 2.5, t8 3.2;
+counted over each log after its first 1000 rows). 18 presenter submit stalls over 2 ms (up to 40 ms), all in
+ExecuteCommandLists, 16 of them with the game-device probe. The importer was held up 5 times (7-22 ms) without the
+presenter missing a refresh, so the two-step import kept the importer's stalls away from the presenter; the
+independent device's empty and shared-copy probes never stalled (its own-texture copy once, 7.6 ms, without the game
+probe). The presenter still waits with the game's device although its device shares nothing with the game's. Run-to-run
+spread (a PresenterDevice=1 run of t9 gave 9.6 a minute) is larger than the differences between builds, so no build
+has clearly beaten the baseline. Left untested: the presenter queue's global realtime priority and its swap chain's
+back buffers, which no probe has. PresenterDevice stays a test option, off.
