@@ -33,7 +33,7 @@ When a Reflex game can't hold the refresh rate, the automatic frame cap (on by d
 | God of War Ragnarök | 54–64 | ~70 | Frame start → flash |
 | God of War Ragnarök, Reflex limit lost at launch (fixed in v1.0.21) | ~15 | 45–53 | Frame start → GPU |
 
-`ReflexAlign` (DX, off by default, needs Lowest latency, not with frame generation) moves the start of each frame so it is ready about 2 ms before its flash, instead of waiting up to a whole strobe cycle by an amount that changes from launch to launch. It helps games with even frame times (God of War Ragnarök, row above); in games with uneven frame times it gains little and can repeat a frame now and then (Spider-Man 2: 1.5 ms quicker, more repeats; Dead Space: no change).
+`ReflexAlign` (DX, on by default since v1.0.39, needs Lowest latency, not with frame generation) moves the start of each frame so it is ready about 2 ms before its flash, instead of waiting up to a whole strobe cycle by an amount that changes from launch to launch. It helps games with even frame times (God of War Ragnarök, row above); before v1.0.39, in games with uneven frame times it gained little and could repeat a frame now and then (Spider-Man 2). Since v1.0.39, with Reflex's limit no longer drifting against the display: The Midnight Walk 25.5 ms with 0.05 frames missing a second, Spider-Man 2 28.8 against 30.9 ms with fewer missing frames, Dead Space 0.09 against 0.22 missing a second for about 1 ms more.
 
 ## Frame generation
 

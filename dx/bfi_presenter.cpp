@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.39-t2"
+#define BFI_ADDON_VERSION "1.0.39-t3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -142,7 +142,7 @@ struct Settings
     int   laterRelease = 0;   // Lowest latency + Refresh cap: release the game just in time for the pick
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
-    int   reflexAlign = 0;    // Reflex frame limit at the sleep point lined up with the lit refresh's pick (test)
+    int   reflexAlign = 1;    // Reflex frame limit at the sleep point lined up with the lit refresh's pick (default on since 1.0.39)
     int   sleepGrid = 1;         // SleepLimitGrid: the limit at the game's Reflex sleep keeps its place in the strobe cycle (test)
     int   sleepFgSearch = 0;     // SleepFgStartSearch: with frame generation, start times across the strobe cycle are tried (test)
     int   reflexAlignCoarse = 1; // ReflexAlignCoarse: frames ready far ahead of the pick are moved closer once (ReflexAlign off)
@@ -315,7 +315,7 @@ static void LoadSettings(Settings &s)
     s.capJit = IniInt("CapJustInTime", 1) ? 1 : 0;
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
     s.capReflex = IniInt("CapWithReflex", 0) ? 1 : 0;
-    s.reflexAlign = IniInt("ReflexAlign", 0) ? 1 : 0;
+    s.reflexAlign = IniInt("ReflexAlign", 1) ? 1 : 0;
     s.reflexAlignCoarse = IniInt("ReflexAlignCoarse", 1) ? 1 : 0;
     s.sleepGrid = IniInt("SleepLimitGrid", 1) ? 1 : 0;
     s.sleepFgSearch = IniInt("SleepFgStartSearch", 0) ? 1 : 0;
@@ -438,6 +438,7 @@ static void UpgradeIni(const Settings &s)
     SaveSettings(s);
     if (!IniHasKey("Diagnostics")) IniWrite("Diagnostics", "1");
     if (!IniHasKey("AllowRTSS"))   IniWrite("AllowRTSS", "1");
+    if (!IniHasKey("DefaultsVersion")) IniWrite("DefaultsVersion", "39");
     g_iniOnlyMissing = false;
     if (fresh)
         LOGI("BFI Presenter: created BFIPresenter.ini with default settings (see BFIPresenter.example.ini for what each does)");
@@ -445,9 +446,32 @@ static void UpgradeIni(const Settings &s)
         LOGI("BFI Presenter: added new settings to your BFIPresenter.ini with their defaults: %s", g_iniAdded);
 }
 
+// Defaults changed in a release, applied once to an existing BFIPresenter.ini (the file holds every setting, so a
+// new default never reaches it otherwise). DefaultsVersion records what was applied; set a value back afterwards
+// and it stays. 1.0.39: ReflexAlign on (it was off and written as 0 into every ini).
+static void MigrateDefaults()
+{
+    char keys[64];
+    if (!GetPrivateProfileStringA("BFI", nullptr, "", keys, sizeof(keys), g_iniPath) || !keys[0]) return;   // new file
+    const int v = (int)GetPrivateProfileIntA("BFI", "DefaultsVersion", 0, g_iniPath);
+    if (v < 39)
+    {
+        if (GetPrivateProfileIntA("BFI", "ReflexAlign", 0, g_iniPath) == 0)
+        {
+            WritePrivateProfileStringA("BFI", "ReflexAlign", "1", g_iniPath);
+            LOGI("BFI Presenter: ReflexAlign turned on (the default since 1.0.39; set ReflexAlign=0 to turn it off again)");
+        }
+        WritePrivateProfileStringA("BFI", "DefaultsVersion", "39", g_iniPath);
+    }
+}
+
 static void LoadShared()
 {
     Settings s;
+    {
+        static std::atomic<bool> migrated{false};
+        if (!migrated.exchange(true)) MigrateDefaults();
+    }
     LoadSettings(s);
     static std::atomic<bool> upgraded{false};
     if (!upgraded.exchange(true)) UpgradeIni(s);
@@ -5037,7 +5061,7 @@ static DWORD WINAPI PresenterThread(void *)
                         !(s.sleepFgSearch && s.sleepGrid && g_sleepFgFactor.load() > 1))
                     { nudgedT = phaseUntil; g_sleepShiftUs.fetch_sub(2000); }
                 }
-                // ReflexAlign (test): the limiter paces the game on its own clock, so a game frame is ready
+                // ReflexAlign: the limiter paces the game on its own clock, so a game frame is ready
                 // anywhere up to a whole cap interval before the presenter picks it for the lit refresh -- time
                 // it only waits. Line the wake-up up so frames are ready just before the pick: each second the
                 // 10th percentile of that wait is brought down to a small target (half the excess at a time,
@@ -11067,14 +11091,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("How long before its refresh a game frame is due when the game is released just in time\n(just-in-time release below the refresh rate, later release at it). Widened by itself when frames miss.");
         bool ra = s.reflexAlign != 0;
         ImGui::BeginDisabled(!st.rfxGameUses);
-        if (ImGui::Checkbox("Line Reflex's frame limit up with the flash (test)", &ra)) s.reflexAlign = ra ? 1 : 0;
+        if (ImGui::Checkbox("Line Reflex's frame limit up with the flash", &ra)) s.reflexAlign = ra ? 1 : 0;
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Games with Reflex, capped with Reflex's frame limit (e.g. the automatic frame cap) and without frame\n"
                                                       "generation: the presenter moves the moment the game starts each frame so the frame is ready just\n"
                                                       "before the lit refresh picks it, instead of waiting there for up to a whole strobe cycle.\n"
-                                                      "Needs Lowest latency pacing. Best in games with steady frame times (God of War Ragnarok: about\n"
-                                                      "7 ms less from release to flash); in games whose frame times vary it gains little and can\n"
-                                                      "repeat a frame now and then (Spider-Man 2). Off by default. With it off, frames ready more than\n"
+                                                      "Needs Lowest latency pacing. On by default since 1.0.39 (God of War Ragnarok, Dead Space,\n"
+                                                      "Spider-Man 2, The Midnight Walk: as smooth or smoother, 2-7 ms less from release to flash in\n"
+                                                      "games whose frames waited). With it off, frames ready more than\n"
                                                       "8 ms before the pick are still moved to 5 ms before it once (ReflexAlignCoarse=1 in the ini).");
         if (!st.rfxGameUses) { ImGui::SameLine(); ImGui::TextDisabled("(not used: no Reflex in this game)"); }
         else if (s.reflexAlign)
