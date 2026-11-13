@@ -2997,7 +2997,8 @@ std::string InstallOrUpdate(Game &g, const Source &src)
         // Games the tested list says never resize their swap chain on their own: BFI starts only with PresenterResize.
         // Set once; a value the user chose (0, 1 or 2) is left alone. 2 where the list says so: the game recreates its
         // swap chain after starting and doesn't resize that one either (Onimusha).
-        if (err.empty() && g.selfResizeRecommended && g.selfResize < 0)
+        // 1 becomes 2 where the list now says 2 (Pragmata): 2 only adds the recreated swap chain to what 1 does.
+        if (err.empty() && g.selfResizeRecommended && (g.selfResize < 0 || (g.selfResize == 1 && g.selfResizeValue == 2)))
         {
             const std::wstring ini = Join(dir, L"BFIPresenter.ini");
             const wchar_t *v = g.selfResizeValue == 2 ? L"2" : L"1";
