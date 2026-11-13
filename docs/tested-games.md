@@ -38,7 +38,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Returnal | Working without FG | Highlights flicker, frame cap can't pace it | v0.27 | FG off. Automatic frame cap works from v1.0.14 |
 | Pragmata | Working | Refresh cap + automatic frame cap with FG 2× or 3× (60 of 60), or Half refresh + Apply the cap with Reflex's frame limit | v1.0.19 | Resize the game's swap chain to start BFI (`PresenterResize=2`, set by the Manager: the game recreates its swap chain after starting, with HDR on), or change the resolution once or switch the display mode to windowed and back to borderless; don't use ShortFuse's DLSS 5 add-on (even set to off it breaks frame generation's pacing) |
 | Resident Evil 4 (2023) | Working without OptiScaler | Not tested | v0.40 | No OptiScaler; Quarter refresh below 60 fps. Refresh + automatic frame cap with **Presenter's own cap without frame generation** (`AutoCapOwnWithoutFg=1`): held at the frame start, a steady 27 ms from frame start to flash, 60 of 60 (v1.0.27); its Reflex limit shows frames in pairs |
-| Control | Working | Works (2×, 3×, 4× with the [Control-FG](https://github.com/Frooglemcdoo/Control-FG) mod, also with DLSS 5); Refresh cap | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54 |
+| Control | Working | Works (2×, 3×, 4× with the [Control-FG](https://github.com/Frooglemcdoo/Control-FG) mod, also with DLSS 5); Refresh cap | v0.54 | G-SYNC off (with it on, VRR took over in heavy scenes and the strobe flickered); G-SYNC-off freeze gone as of v0.54. v1.0.39, 3× frame generation, Lowest latency: 0.05–0.19 frames missing a second (1.7 in v1.0.38), about 28 ms from release to flash |
 | Marvel's Spider-Man 2 | Working | Works in borderless (the game's "Fullscreen"), not in exclusive fullscreen; Refresh + automatic frame cap (v1.0.20) | v1.0.16 | Recommended without FG and ray tracing, in exclusive fullscreen (BFI starts with the game); with FG: borderless and change resolution once to start BFI |
 | Sifu | Working (DX11) | Not tested | — | Borderless window |
 | God of War (2018) | Working (DX11) | Not tested | v0.60 | Borderless window |
@@ -47,7 +47,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Grip | Working | Not tested | v0.65 | Standard setup (didn't load in v0.64) |
 | Prince of Persia: The Lost Crown | Working | Not tested | v0.64 | Standard setup (was held at 60 fps before v0.64) |
 | ABZU | Working | Not tested | v0.66 | Standard setup |
-| The Midnight Walk | Working | Not tested | v0.70 | Half refresh + Apply the cap with Reflex's frame limit (v1.0.15) + Lowest latency; DLSS needs `Engine.ini` lines (see notes) |
+| The Midnight Walk | Working | Not tested | v0.70 | v1.0.39: Refresh + automatic frame cap, Lowest latency, `MaxFramesAhead=1`, ReflexAlign (on by default): 0.05 frames missing a second, 25.5 ms from release to flash. Before: Half refresh + Apply the cap with Reflex's frame limit (v1.0.15). DLSS needs `Engine.ini` lines (see notes) |
 | Cuphead | Working | Not tested | v0.73 | Later release on: \~5 ms less latency at 120 fps |
 | Obduction | Working | Not tested | v0.77 | Half refresh + just-in-time release; Lowest latency + Refresh is smoothest at 120 |
 | Hades II | Working | Not tested | v0.78 | GPU headroom for 120 fps (4K yes, 5K DSR no); without RenoDX, BFI starts only with Resize the game's swap chain to start BFI (`PresenterResize`, set by the Manager) |
@@ -100,7 +100,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Cocoon | Standard setup |
 | Crash Bandicoot N. Sane Trilogy | Standard setup |
 | Days Gone | Standard setup |
-| Dead Space (2023) | Standard setup; Frame pacing Lowest latency (about 37 ms from release to flash against about 44 ms with Smooth, v1.0.22). Refresh + automatic frame cap with Reflex's limit is the quickest: about 24 ms from frame start to flash against about 37 ms with the presenter's cap (v1.0.27). With the Ishimura patch, enable Reflex in `IshimuraPatch.ini`: with it off there, the automatic frame cap can't use Reflex's limit and falls back to the presenter's own cap |
+| Dead Space (2023) | Standard setup; Frame pacing Lowest latency (about 37 ms from release to flash against about 44 ms with Smooth, v1.0.22). Refresh + automatic frame cap with Reflex's limit is the quickest: about 24 ms from frame start to flash against about 37 ms with the presenter's cap (v1.0.27). With the Ishimura patch, enable Reflex in `IshimuraPatch.ini`: with it off there, the automatic frame cap can't use Reflex's limit and falls back to the presenter's own cap. v1.0.39, ReflexAlign on by default: 0.09–0.19 frames missing a second at 34 ms from release to flash (0.22 without it); without frame generation -- OptiScaler's own frame generation, if switched on, halves the game to 30 real fps and feels sluggish |
 | Dishonored 2 | Standard setup |
 | FAR: Lone Sails | Standard setup |
 | GRIS | Standard setup |
@@ -215,7 +215,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - **v1.0.38, most responsive: no frame generation, no OptiScaler.** On an RTX 5080 at 4K the game holds 60 real fps (GPU 13–15 ms a frame). With 2× frame generation the 60 shown frames are 30 real plus 30 generated (GPU frame time 33 ms in the logs), which feels slow.
   - Without OptiScaler the game calls its Reflex sleep once per frame, so the presenter paces it there (`ReflexLimitAtSleep=1`, the default): frames waited about 0.3 ms in the GPU queue, against 18–23 ms with the driver's limit, which OptiScaler's second sleep call forces. Without frame generation the menus don't drop to half the frame rate either, so OptiScaler isn't needed.
   - `AutoFramesAhead=0` with `MaxFramesAhead=1`: the automatic setting moved to 2 after a menu, which felt noticeably slower.
-  - `ReflexAlign=1` cut about 4 ms (34.7 against 38.8 ms from release to flash) at the cost of a few more repeated frames; `ReflexAlign=0` (the coarse alignment) is the smoother of the two.
+  - `ReflexAlign=1` (on by default since v1.0.39) cut about 4 ms (34.7 against 38.8 ms from release to flash) at the cost of a few more repeated frames; `ReflexAlign=0` (the coarse alignment) is the smoother of the two. v1.0.39: 0.54 frames missing a second, 37.3 ms, 1.2 flashes a minute (the game's render time swings 9–41 ms, so ReflexAlign keeps a wider margin).
   - Delete `OptiScaler.ini` from the game folder too when OptiScaler is removed: the presenter takes it as OptiScaler being there.
 - **With OptiScaler and REFramework, switching DLSS frame generation in the game's menu can freeze the game** after a few switches, also without BFI Presenter (a lock between REFramework, OptiScaler and Streamline). Set frame generation before starting the game. Since v1.0.38 the presenter no longer makes the first switch freeze.
 
@@ -225,6 +225,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 - **Load ReShade itself, not through OptiScaler:** ReShade as `dxgi.dll`, OptiScaler as `d3d12.dll`, `LoadReShade = false` in `OptiScaler.ini`. With OptiScaler loading `ReShade64.dll`, XeFG created the real swap chain on a GPU queue ReShade hadn't wrapped (ReShade.log: "Skipping swap chain because it was created without a proxy Direct3D device"), so neither ReShade's effects nor BFI ran.
 - **OptiScaler only works here as `d3d12.dll`.** Under its other names (`winmm.dll`, `version.dll`, ...) OptiScaler loads, but ReShade as `dxgi.dll` doesn't. SCSKiller's recorder also puts a `d3d12.dll` in the game folder, so turn off **Record while I play** on Townfall's page in SCSKiller.
 - **Frame pacing: Smooth, not Lowest latency** (`FramePacing`), with XeSS frame generation and with DLSS 5 at 2×: the generated frames arrive unevenly, and Lowest latency drops the late ones, which shows as stutter. Smooth shows every frame once, in order, for about one refresh more delay.
+- v1.0.39 keeps 1.0.38's timing for XeSS frame generation (frames held to the strobe cycle made it worse here: 4.7 frames missing a second against about 1 with Lowest latency); Smooth stays the better choice (0.09 missing a second, about 43 ms from release to flash).
 
 ### Resonance: A Plague Tale
 
@@ -242,6 +243,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### Returnal
 
+- **v1.0.39, ReflexAlign:** where the game's frames finish doesn't always follow the frame start, so in some sessions ReflexAlign went round the strobe cycle (−72 ms, +188 ms); since 1.0.39 it then switches off for the session. With it settled: 1.03 frames missing a second, 32.9 ms from release to flash, 27 flashes a minute (1.0.38: 1.13, 33.2 ms, 39). With RenoDX's DLSS 5 neural rendering add-ons loaded the GPU load is high; try without them if flashes bother you.
 - FG off: frame generation caused menu freezes and flickering UI elements, and with v1.0.13 bright highlights flicker under BFI (the lit refresh mixes real and generated frames unevenly).
 - v1.0.19: the presenter applies Reflex frame limits in the game's Reflex sleep call, including the game's own 16,666 µs limit, so they no longer collapse it (the driver's limit counted the presenter's own presents). Before: any Reflex frame limit collapsed the game to 7–8 fps, including the game's own 16,666 µs limit, which it switches on and off by itself. From v1.0.14 the automatic frame cap notices the collapse, takes the limit out (the game's own too) for the rest of the session and caps with the presenter instead: a steady 60 fps without FG. Without a Reflex limit nothing paces DLSS-G here, which is another reason to keep FG off.
 - Remaining flashes (about 5 per minute) coincide with the game's own GPU hitches of 100–276 ms. Buffer reuse (v0.27) removed the presenter's own GPU stalls.
@@ -250,6 +252,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 ### Pragmata
 
+- **v1.0.39, no frame generation, ReflexAlign:** ReflexAlign moved the frame start 27 ms within a minute without the frames following it, so it switches itself off for the session ("alignment went round the strobe cycle" in `ReShade.log`). After that: 0.40 frames missing a second, 36.5 ms from release to flash (38.5–38.8 ms before).
 - Uses REFramework (loads as `dinput8.dll`); its harmless memory-probe exceptions appear at the top of `BFIPresenter_crash.txt`.
 - Steam's overlay hooks on Present and ResizeBuffers1 hung and crashed the game until v0.34, which calls DXGI directly past them.
 - **BFI starts only after the game rebuilds its swap chain**, also with frame generation on: turn on **Resize the game's swap chain to start BFI** (`PresenterResize=1`, v1.0.31; the Manager sets it for this game), or change the resolution once in the game's settings (and back), or switch the display mode to windowed and back to borderless.

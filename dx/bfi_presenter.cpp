@@ -94,7 +94,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.39-t7"
+#define BFI_ADDON_VERSION "1.0.39-t8"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -144,7 +144,6 @@ struct Settings
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
     int   reflexAlign = 1;    // Reflex frame limit at the sleep point lined up with the lit refresh's pick (default on since 1.0.39)
     int   sleepGrid = 1;         // SleepLimitGrid: the limit at the game's Reflex sleep keeps its place in the strobe cycle (test)
-    int   sleepFgSearch = 0;     // SleepFgStartSearch: with frame generation, start times across the strobe cycle are tried (test)
     int   reflexAlignCoarse = 1; // ReflexAlignCoarse: frames ready far ahead of the pick are moved closer once (ReflexAlign off)
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
@@ -318,7 +317,6 @@ static void LoadSettings(Settings &s)
     s.reflexAlign = IniInt("ReflexAlign", 1) ? 1 : 0;
     s.reflexAlignCoarse = IniInt("ReflexAlignCoarse", 1) ? 1 : 0;
     s.sleepGrid = IniInt("SleepLimitGrid", 1) ? 1 : 0;
-    s.sleepFgSearch = IniInt("SleepFgStartSearch", 0) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
@@ -543,7 +541,6 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("ReflexAlign", s.reflexAlign);
     IniWriteInt("ReflexAlignCoarse", s.reflexAlignCoarse);
     IniWriteInt("SleepLimitGrid", s.sleepGrid);
-    IniWriteInt("SleepFgStartSearch", s.sleepFgSearch);
     IniWriteInt("FrameGenLimitWithoutReflex", s.fgLimitNoReflex);
     IniWriteInt("AutoCapAtFrameStart", s.autoCapFrameStart);
     IniWriteInt("LearnPerGame", s.learnPerGame);
@@ -5064,7 +5061,6 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     static double nudgedT = -1.0;
                     if (t < phaseUntil && phaseUntil != nudgedT && g_sleepLimitUs.load() > 0 && !swSearching &&
-                        !(s.sleepFgSearch && s.sleepGrid && g_sleepFgFactor.load() > 1) &&
                         !(g_fgXess.load() && g_sleepFgFactor.load() > 1))   // XeSS frame generation: as 1.0.38
                     { nudgedT = phaseUntil; g_sleepShiftUs.fetch_sub(2000); }
                 }
@@ -5087,10 +5083,9 @@ static DWORD WINAPI PresenterThread(void *)
                     // Also for the frame limit with frame generation without Reflex: one presented frame
                     // per strobe cycle, moved through g_fgShiftUs.
                     const bool fgPace = g_fgPaceUs.load() > 0;
-                    // Frame generation with Reflex, limited at the game's sleep (SleepFgStartSearch, test): its start time
-                    // is searched as for frame generation without Reflex (one presented frame per strobe cycle).
-                    const bool sleepFg = !fgPace && s.sleepFgSearch && s.sleepGrid && g_sleepLimitUs.load() > 0 && g_sleepFgFactor.load() > 1;
-                    const bool fgOn = fgPace || sleepFg;
+                    // (1.0.39 tests also searched the start time of frame generation with Reflex at the game's sleep; it
+                    // hunted and never beat the fixed place in the strobe cycle -- Silent Hill: Townfall, Dead Space.)
+                    const bool fgOn = fgPace;
                     std::atomic<int> &shiftUs = fgPace ? g_fgShiftUs : g_sleepShiftUs;
                     const int sleepUs = fgPace ? g_fgPaceUs.load() : g_sleepLimitUs.load();
                     const double capFps = fgOn ? (hzL > 0.0 ? hzL / s.frames : 0.0) : sleepUs > 0 ? 1e6 / sleepUs : 0.0;
@@ -5157,9 +5152,8 @@ static DWORD WINAPI PresenterThread(void *)
                         if (fgOn) swKind = kindNow;
                     }
                     swWasOn = fgOn;
-                    swSearching = fgOn && swIdx >= 0 && (g_fgPaceKind.load() == 2 || sleepFg);
-                    const char *swName = g_fgPaceKind.load() == 2 && fgPace ? "automatic frame cap at the frame start" :
-                                         sleepFg ? "frame limit at the game's Reflex sleep (frame generation)" : "frame limit for frame generation";
+                    swSearching = fgOn && swIdx >= 0 && g_fgPaceKind.load() == 2;
+                    const char *swName = g_fgPaceKind.load() == 2 ? "automatic frame cap at the frame start" : "frame limit for frame generation";
                     if (fgOn && locked && s.pacingMode == 1 && cyc > 0.0)
                     {
                         // FSR frame generation paces its own output and follows a moved frame start with a lag, and the
@@ -5213,7 +5207,7 @@ static DWORD WINAPI PresenterThread(void *)
                                 if (p10 >= 0.0) swSlack = std::min(swSlack, p10);
                                 // The automatic frame cap at the frame start: a start time that loses frames in its first
                                 // measured second is left at once (it showed for 3 s each before).
-                                const bool dropEarly = (g_fgPaceKind.load() == 2 || sleepFg) && swSecs == settle && relN < (int)(0.9 * capFps);
+                                const bool dropEarly = g_fgPaceKind.load() == 2 && swSecs == settle && relN < (int)(0.9 * capFps);
                                 if (swSecs >= settle + 1 || dropEarly)
                                 {
                                     const double relMs = swRelN ? swRel / swRelN : 1e3;
@@ -5257,13 +5251,8 @@ static DWORD WINAPI PresenterThread(void *)
                         {
                             swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + 6.0))) ? swBad + 1 : 0;
                             // Held, frames repeating close to their flash (the GPU work grew): 2 ms earlier, once per 3 s.
-                            // Reflex frame generation at the sleep point: the game's render time swings with the scene
-                            // (Silent Hill: Townfall, 13-21 ms from frame start to GPU done), and the 7 ms to spare found by
-                            // the search went down to 0-2 ms with frames lost: under 2 ms for 2 s in a row is enough there.
-                            const bool tightNow = sleepFg ? (ok && p10 >= 0.0 && p10 < 0.002)
-                                                          : (!fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.0015);
-                            swTight = tightNow ? swTight + 1 : 0;
-                            if (swTight >= (sleepFg ? 2 : 3))
+                            swTight = (!fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.0015) ? swTight + 1 : 0;
+                            if (swTight >= 3)
                             {
                                 swTight = 0;
                                 moveTo(swPhase - 0.002);
@@ -5278,7 +5267,7 @@ static DWORD WINAPI PresenterThread(void *)
                     // place in the strobe cycle, so a start time on the pick no longer drifts away by itself.
                     {
                         static int fgTight = 0;
-                        const bool sleepFgNoSearch = !fgPace && !sleepFg && g_sleepLimitUs.load() > 0 && g_sleepFgFactor.load() > 1 && locked;
+                        const bool sleepFgNoSearch = !fgPace && g_sleepLimitUs.load() > 0 && g_sleepFgFactor.load() > 1 && locked;
                         const bool missing = stNow.frameRepeats + stNow.frameSkips >= 2;
                         // Presented frames against one per strobe cycle (capFps above counts rendered frames here).
                         const double presCap = hzL > 0.0 ? hzL / s.frames : 0.0;
