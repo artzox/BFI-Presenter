@@ -1927,6 +1927,23 @@ void Detect(Game &g)
         else if (InfoHas(d, "dgVoodoo")) g.dgvoodoo = true;
     }
     if (Exists(Join(dir, L"OptiScaler.ini")) || Exists(Join(dir, L"OptiScaler.dll"))) g.optiscaler = true;
+    // RE Engine and REFramework
+    g.reEngine = Exists(Join(dir, L"re_chunk_000.pak")) || Exists(Join(g.root, L"re_chunk_000.pak"));
+    g.reframework = false; g.reframeworkVersion.clear(); g.dinput8Other.clear();
+    {
+        const std::wstring di = Join(dir, L"dinput8.dll");
+        if (Exists(di))
+        {
+            const DllInfo d = ReadDllInfo(di);
+            const std::wstring rec = LoadSetting((L"REF_" + PathKey(g.root)).c_str());
+            if (InfoHas(d, "REFramework") || DirExists(Join(dir, L"reframework")) || !rec.empty())
+            {
+                g.reframework = true;
+                g.reframeworkVersion = U8(rec);
+            }
+            else g.dinput8Other = InfoHas(d, "OptiScaler") ? "OptiScaler" : !d.product.empty() ? d.product : "another program";
+        }
+    }
     if (Exists(Join(dir, L"dgVoodoo.conf"))) g.dgvoodoo = true;
     for (auto n : { L"d3d11.dll", L"dxgi.dll", L"d3d9.dll", L"d3d10core.dll" })
     {
@@ -2026,6 +2043,10 @@ void Detect(Game &g)
     if (g.route == Route::Unsupported) g.notes.push_back("Direct3D 10 games aren't supported (try DXVK and the Vulkan layer).");
     if ((g.route == Route::Addon64 || g.route == Route::Addon32) && !g.reshade)
         g.notes.push_back("ReShade isn't installed for this game. Install ReShade (with full add-on support) first: reshade.me");
+    if (g.reEngine && !g.reframework && UsesReShadeRoute(g.route))
+        g.notes.push_back("RE Engine game: ReShade usually needs REFramework here, or the game crashes at start or ReShade's overlay "
+                          "never shows (so BFI can't start either). Install the latest REFramework nightly in the REFramework row below; "
+                          "skip it if your setup already works.");
     if ((g.route == Route::Addon64 || g.route == Route::Addon32) && g.reshade && (g.apis & (ApiD3D8 | ApiD3D9)) &&
         !(g.apis & (ApiD3D11 | ApiD3D12)) && CompareVersions(g.reshadeDll.version, "6.8") < 0)
         g.notes.push_back("Direct3D 9 needs ReShade 6.8 or newer (installed: " + g.reshadeDll.version + ").");
@@ -3894,6 +3915,69 @@ std::string SetReShadeVulkan(Game &g, bool on, std::string *note)
         *note = "(ReShade's setup list ReShadeApps.ini wasn't updated -- it needs administrator rights or doesn't exist; "
                 "ReShade works anyway, only its setup won't list the game.)";
     Log(on ? "ReShade Vulkan on" : "ReShade Vulkan off", g.name, ini, "", "");
+    Detect(g);
+    return {};
+}
+
+// ------------------------------------------------------------------ REFramework
+
+std::string EnsureREFramework(std::string *tag, const std::function<void(const std::string &)> &progress)
+{
+    if (progress) progress("Looking up the latest REFramework nightly...");
+    std::string body, err;
+    if (!HttpGet(L"https://api.github.com/repos/praydog/REFramework-nightly/releases/latest", body, err))
+        return "Couldn't find the latest REFramework nightly: " + err;
+    std::string t = JsonString(body, "tag_name"), url;
+    {
+        Jv root; size_t i = 0;
+        if (JsonParse(body, i, root))
+            if (const Jv *as = root.get("assets"))
+                for (auto &a : as->a)
+                    if (LowerA(a.str("name")) == "reframework.zip") url = a.str("browser_download_url");
+    }
+    if (t.empty() || url.empty()) return "The latest REFramework nightly has no REFramework.zip.";
+    // "nightly-01394-ec6c81fd..." -> "nightly-01394"
+    std::string shortTag = t;
+    { size_t d = t.find('-', 8); if (t.rfind("nightly-", 0) == 0 && d != std::string::npos) shortTag = t.substr(0, d); }
+    if (tag) *tag = shortTag;
+    std::wstring dir = Join(DataDir(), L"reframework");
+    CreateDirectoryW(dir.c_str(), nullptr);
+    dir = Join(dir, W(shortTag));
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring dll = Join(dir, L"dinput8.dll");
+    if (Exists(dll)) return {};
+    body.clear();
+    if (progress) progress("Downloading REFramework " + shortTag);
+    if (!HttpGet(W(url), body, err, [&](size_t got, size_t total) {
+            if (progress && total) progress("Downloading REFramework " + shortTag + " (" + std::to_string(got * 100 / total) + " %)");
+        }))
+        return "Download of REFramework " + shortTag + " failed: " + err;
+    std::string data;
+    if (!ZipExtract(body, "dinput8.dll", data) || data.size() < 100000 || data[0] != 'M' || data[1] != 'Z')
+        return "REFramework.zip of " + shortTag + " has no dinput8.dll.";
+    std::ofstream(fs::path(dll), std::ios::binary).write(data.data(), (std::streamsize)data.size());
+    if (!Exists(dll)) return LastError("Couldn't write", dll);
+    return {};
+}
+
+std::string InstallREFramework(Game &g, const std::string &tag)
+{
+    if (g.exe.empty()) return "No game executable.";
+    if (!g.reEngine) return "Not an RE Engine game (no re_chunk_000.pak next to the exe).";
+    if (g.bits == 32) return "REFramework is 64-bit only.";
+    if (!g.dinput8Other.empty())
+        return "dinput8.dll in the game folder belongs to " + g.dinput8Other + ". Load that under another name first "
+               "(OptiScaler: e.g. d3d12.dll or winmm.dll), then install REFramework.";
+    const std::wstring src = Join(Join(Join(DataDir(), L"reframework"), W(tag)), L"dinput8.dll");
+    if (!Exists(src)) return "REFramework " + tag + " isn't downloaded yet.";
+    const std::wstring dest = Join(DirOf(g.exe), L"dinput8.dll");
+    const std::string oldV = g.reframework ? (g.reframeworkVersion.empty() ? "REFramework" : g.reframeworkVersion) : "";
+    Txn t(g);
+    std::string err = CopyIn(t, src, dest);
+    t.Finish();
+    if (!err.empty()) return err;
+    SaveSetting((L"REF_" + PathKey(g.root)).c_str(), W(tag));
+    Log(oldV.empty() ? "install REFramework" : "update REFramework", g.name, dest, oldV, tag);
     Detect(g);
     return {};
 }

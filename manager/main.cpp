@@ -178,6 +178,10 @@ struct App {
     bool rsDone = false;                   // guarded by lock: a download finished
     std::string rsErr, rsPendingVer;       // guarded by lock
     std::vector<std::wstring> rsPending;   // games to install ReShade in after the download
+    // REFramework (RE Engine games): the latest nightly, downloaded by the worker, then installed in refPending
+    bool refDone = false;                  // guarded by lock
+    std::string refErr, refTag;            // guarded by lock
+    std::vector<std::wstring> refPending;
     // install question (NVIDIA settings)
     std::vector<std::wstring> instPending;
     bool openInstall = false;
@@ -410,6 +414,23 @@ static void StartReShade(const std::string &ver, const std::vector<std::wstring>
     });
 }
 
+static void StartREFramework(const std::vector<std::wstring> &roots)
+{
+    if (g_app.busy) return;
+    JoinWorker();
+    g_app.busy = true;
+    g_app.refPending = roots;
+    SetBusy("Getting the latest REFramework nightly...");
+    g_app.worker = std::thread([] {
+        std::string tag, e = EnsureREFramework(&tag, SetBusy);
+        std::lock_guard<std::mutex> l(g_app.lock);
+        g_app.refErr = e;
+        g_app.refTag = tag;
+        g_app.refDone = true;
+        g_app.busy = false;
+    });
+}
+
 // getRelease false: only look (a folder picked by hand stays in use; a new Manager is still offered).
 static void StartFetch(bool getRelease = true)
 {
@@ -537,6 +558,19 @@ static void PollWorker()
                      });
         }
         g_app.rsPending.clear();
+    }
+    if (g_app.refDone)
+    {
+        g_app.refDone = false;
+        if (!g_app.refErr.empty()) g_app.SetMsg(g_app.refErr, true);
+        else
+        {
+            std::string tag = g_app.refTag;
+            StartJob("Installing REFramework " + tag + "...", g_app.refPending,
+                     [tag](Game &g, Job &) { return InstallREFramework(g, tag); },
+                     [tag](Job &j) { g_app.SetMsg("REFramework " + tag + ": " + JobSummary(j, "installed in"), j.fail != 0); });
+        }
+        g_app.refPending.clear();
     }
     if (g_app.tempMsgUntil && GetTickCount64() >= g_app.tempMsgUntil)
     {
@@ -2200,6 +2234,23 @@ static void DrawDetail(HWND)
         Tooltip(g.reshade ? "Replaces the ReShade DLL with the chosen version, keeping its name. The old one is backed up (Undo last change)."
                           : "Downloads ReShade with add-on support from reshade.me and puts it next to the game's exe "
                             "(dxgi.dll; d3d9.dll or opengl32.dll for those games; ReShade64.dll next to OptiScaler).");
+    }
+    // REFramework: RE Engine games only
+    if (g.reEngine && UsesReShadeRoute(g.route))
+    {
+        ImGui::TextColored(kGrey, "REFramework"); ImGui::SameLine(lab);
+        if (g.reframework) ImGui::Text("%s", g.reframeworkVersion.empty() ? "installed (dinput8.dll)" : (g.reframeworkVersion + "  (dinput8.dll)").c_str());
+        else if (!g.dinput8Other.empty()) ImGui::TextColored(kOrange, "dinput8.dll belongs to %s", g.dinput8Other.c_str());
+        else ImGui::TextColored(g.reshade ? kYellow : kGrey, "not installed");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(g_app.busy || !g.dinput8Other.empty() || g.bits == 32);
+        if (ImGui::Button(g.reframework ? "Update to the latest nightly##ref" : "Install the latest nightly##ref")) StartREFramework({ g.root });
+        ImGui::EndDisabled();
+        Tooltip("RE Engine games (Resident Evil, Monster Hunter, Dragon's Dogma 2, Onimusha, Pragmata, ...): ReShade there usually needs "
+                "REFramework, or the game crashes at start or ReShade's overlay never shows -- then BFI Presenter can't start either.\n"
+                "Downloads the latest nightly build (REFramework.zip from praydog/REFramework-nightly, for every supported RE Engine game) "
+                "and puts its dinput8.dll next to the game's exe; an older one is backed up first (Undo last change).\n"
+                "Optional: if ReShade already works in this game, there's no need for it.");
     }
     std::string extra;
     if (g.optiscaler) extra += "OptiScaler  ";

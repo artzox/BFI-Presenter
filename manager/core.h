@@ -66,6 +66,12 @@ struct Game {
     bool         reshade = false;
     DllInfo      reshadeDll;     // the ReShade DLL (any name: dxgi.dll, ReShade64.dll, ...)
     bool         optiscaler = false, dxvk = false, dgvoodoo = false, specialK = false;
+    // RE Engine (re_chunk_000.pak next to the exe): ReShade there usually needs REFramework (its dinput8.dll), or the game
+    // crashes at start or ReShade never shows -- which looks like BFI Presenter not working.
+    bool         reEngine = false;
+    bool         reframework = false;     // REFramework's dinput8.dll next to the exe
+    std::string  reframeworkVersion;      // the nightly the Manager installed (e.g. "nightly-01394"), if it did
+    std::string  dinput8Other;            // dinput8.dll next to the exe that isn't REFramework (e.g. "OptiScaler")
     std::wstring addonPath;      // installed BFIPresenter.addon64/32, if any
     std::string  addonVersion;
     bool         addonWrongBits = false;
@@ -221,6 +227,13 @@ std::string InstallReShade(Game &g, const std::string &version, std::string *not
 // Vulkan games: turns ReShade's own (system-wide) Vulkan layer on or off for the game, the way ReShade's setup
 // does: ReShade.ini next to the exe (what the layer looks for) and the exe in ReShadeApps.ini (the setup's list).
 std::string SetReShadeVulkan(Game &g, bool on, std::string *note = nullptr);
+
+// ----- REFramework (RE Engine games), the latest nightly build from praydog/REFramework-nightly (REFramework.zip, which
+// works in every supported RE Engine game; only its dinput8.dll is used, as its notes say for play without VR).
+// Blocking: finds the latest nightly and downloads it once into %LOCALAPPDATA%\BFIPresenter\reframework\<tag>. *tag gets it.
+std::string EnsureREFramework(std::string *tag, const std::function<void(const std::string &)> &progress);
+// Puts that nightly's dinput8.dll next to the game's exe (an older REFramework there is replaced, backed up first).
+std::string InstallREFramework(Game &g, const std::string &tag);
 
 // Open a folder or file in Explorer.
 void OpenInExplorer(const std::wstring &path, bool select);
