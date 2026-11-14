@@ -85,10 +85,10 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | DARQ | Working (DX11, 32-bit) | — | v1.0.18 | `BFIPresenter.addon32`; v1.0.18 or newer (the game makes a second swap chain at start); ReShade's overlay may react late to the mouse and keyboard in this game, with or without the presenter |
 | RPCS3 | Working (Vulkan) | — | — | Vulkan layer; `BFIPresenter.ini` next to the emulator's .exe. RPCS3 presents each frame twice (the overlay shows 120 for 60 fps). Killzone 2: automatic frame cap. inFamous (44–60 fps): Half refresh, which stops the automatic cap switching between 30 and 60. Realtime GPU priority isn't used: RPCS3 uses the compute queue family itself (v1.0.29) |
 | Myst Online: Uru Live | Working (DX9, 32-bit) | — | — | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+ |
-| Monkey Island 2 Special Edition: LeChuck's Revenge | Working (DX9) | — | — | The game caps its own frame rate: needs a patch that lifts the cap |
+| Monkey Island 2 Special Edition: LeChuck's Revenge | Working (DX9) | — | — | The game caps its own frame rate: in `Monkey2.exe` (back it up first), replace the bytes `76 05 0F 57 C0 EB 06` with `89 C0 0F 57 C0 EB 06` |
 | Neva | Working (DX11) | — | — | Standard setup |
 | Star Wars: Episode I Racer (GOG) | Working (DX11, 32-bit) | — | — | GOG version (Direct3D 11); `BFIPresenter.addon32` with the 32-bit ReShade |
-| Half-Life 2 RTX | Working (Vulkan) | Not tested | — | Vulkan layer (RTX Remix renders through Vulkan) |
+| Half-Life 2 RTX | Working (Vulkan) | Not tested | — | Vulkan layer. RTX Remix renders in its own Vulkan process: `BFIPresenter.ini` goes in `bin\.trex` (where `BFIPresenterVK.log` then appears), not next to `hl2.exe` |
 
 ### More games tested
 
