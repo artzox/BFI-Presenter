@@ -26,6 +26,21 @@ Software strobing usually runs on the game's frame clock, so any late frame leav
 - **APIs:** Direct3D 12, 11 and 9 and OpenGL through a ReShade add-on; Vulkan (and DXVK) through a Vulkan layer. Works with the game's own frame generation (DLSS FG, FSR FG, XeSS FG) at the Refresh cap. Lossless Scaling's frame generation doesn't work with BFI: it captures the strobed picture on its own clock, so depending on the phase it multiplies the lit or the black refreshes, and drifts between them.
 - **Settings** live in the ReShade overlay and in one `BFIPresenter.ini` per game.
 
+## Tested games
+
+**120 games and emulators run with BFI Presenter**: 113 tested on an RTX 5080 with a Sony A95L at 120 Hz, and 7 more reported working by users. Each entry says what it needs: a setting, frame generation on or off, the start-up quirk to work around.
+
+| | Some of the games |
+| --- | --- |
+| **Direct3D 12** | Alan Wake 2, Control, God of War Ragnarök, Marvel's Spider-Man 2, Silent Hill 2, The Witcher 3, Shadow of the Tomb Raider, Returnal, Pragmata, Resident Evil 4, Oblivion Remastered |
+| **Direct3D 11 / 9, OpenGL** | Mirror's Edge Catalyst, Hades II, Cuphead, Burnout Paradise Remastered, FlatOut: Ultimate Carnage, Celeste |
+| **Vulkan** | Indiana Jones and the Great Circle, DOOM Eternal, Red Dead Redemption 2, PCSX2, RPCS3, shadPS4 |
+| **Frame generation** | DLSS FG (2×, 3×), FSR FG and XeSS FG through OptiScaler: Alan Wake 2, Control, Onimusha, Silent Hill: Townfall, Riven |
+
+**[Full list with per-game settings →](docs/tested-games.md)** · [Tested by users](docs/tested-games.md#tested-by-users) · The [Manager](manager/README.md) shows each game's entry in its **Tested** column.
+
+Got a game running? Post it in [Post your successful game runs](https://github.com/artzox/BFI-Presenter/discussions/68) with your GPU, display and settings, and it goes on the list with your name.
+
 ## Which download do I need?
 
 Each [release](../../releases) has two packages with the same version number:

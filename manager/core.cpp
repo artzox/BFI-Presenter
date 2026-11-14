@@ -984,42 +984,131 @@ static const TestedEntry kTested[] = {
 
 static std::string NormName(const std::string &s)
 {
+    // Accented Latin letters (UTF-8, U+00C0-U+00FF) count as their base letter: the store's "ABZÛ" is the list's "ABZU".
+    static const char kFold[] = "aaaaaaaceeeeiiiidnooooo-ouuuuytsaaaaaaaceeeeiiiidnooooo-ouuuuyty";
     std::string out;
     bool paren = false;
-    for (unsigned char c : s)
+    for (size_t i = 0; i < s.size(); i++)
     {
+        const unsigned char c = (unsigned char)s[i];
         if (c == '(') { paren = true; continue; }
         if (c == ')') { paren = false; continue; }
         if (paren) continue;
-        if (isalnum(c)) out += (char)tolower(c);
+        if (c == 0xC3 && i + 1 < s.size() && ((unsigned char)s[i + 1] & 0xC0) == 0x80)
+        {
+            const char f = kFold[(unsigned char)s[++i] - 0x80];
+            if (f != '-') out += f;
+            continue;
+        }
+        if (c < 0x80 && isalnum(c)) out += (char)tolower(c);
     }
     return out;
+}
+
+// A store's name without its edition: "Control Ultimate Edition" -> "Control", "The Witcher 3: Wild Hunt Game of the
+// Year Edition" -> "The Witcher 3: Wild Hunt", "FlatOut: Ultimate Carnage Collector's Edition" -> "FlatOut: Ultimate
+// Carnage", "Jotun: Valhalla Edition" -> "Jotun". Unchanged if it doesn't end in "Edition" / "GOTY".
+static std::string StripEdition(const std::string &name)
+{
+    std::string s = name;
+    auto lowEnds = [&](const char *w) {
+        const size_t n = strlen(w);
+        if (s.size() < n) return false;
+        for (size_t i = 0; i < n; i++)
+            if (tolower((unsigned char)s[s.size() - n + i]) != w[i]) return false;
+        return true;
+    };
+    auto trim = [&] { while (!s.empty() && strchr(" :-\t", s.back())) s.pop_back(); };
+    trim();
+    if (lowEnds(" goty")) { s.resize(s.size() - 5); trim(); return s; }
+    if (!lowEnds(" edition")) return s;
+    s.resize(s.size() - 8);
+    trim();
+    if (lowEnds("game of the year")) s.resize(s.size() - 16);
+    else
+    {
+        const size_t sp = s.find_last_of(" :");
+        s.resize(sp == std::string::npos ? 0 : sp);
+    }
+    trim();
+    return s;
+}
+
+// What a longer name adds that makes it another game: a sequel's numeral ("Little Nightmares III" is not "Little
+// Nightmares") or a remaster / remake ("Alan Wake Remastered" is DX12, "Alan Wake" DX9).
+static bool OtherGame(const std::string &extra)
+{
+    if (!extra.empty() && extra.size() <= 4 && extra.find_first_not_of("ivx") == std::string::npos) return true;
+    for (const char *w : { "remaster", "remake", "reforged", "redux", "anniversary" })
+        if (extra.rfind(w, 0) == 0) return true;
+    return false;
 }
 
 static std::string TestedFor(const std::string &game)
 {
     std::string g = NormName(game);
     if (g.empty()) return {};
+    auto entry = [](const TestedEntry &t) {
+        std::string s = std::string(t.status);
+        if (t.note && *t.note) s += " -- " + std::string(t.note);
+        return s;
+    };
     // An exact name first: "Hades" must not get "Hades II"'s entry (it comes first in the list).
     for (auto &t : kTested)
-        if (NormName(t.name) == g)
+        if (NormName(t.name) == g) return entry(t);
+    // The store's name with an edition the list doesn't name ("Control Ultimate Edition", "Little Nightmares Enhanced
+    // Edition", "The Witcher 3: Wild Hunt Game of the Year Edition"; the list's own "(Enhanced Edition)" is left out by
+    // NormName), or without its subtitle ("Grip: Combat Racing", "Trine 5: A Clockwork Conspiracy"): exact matches only.
+    {
+        std::string e = NormName(StripEdition(game));
+        const size_t colon = game.find(':');
+        // Before the colon, with and without its edition: GOG's "Monkey Island 2 Special Edition: LeChuck's Revenge" is
+        // the list's (Steam's) "Monkey Island 2: Special Edition".
+        std::string sub = colon != std::string::npos ? NormName(StripEdition(game.substr(0, colon))) : std::string();
+        std::string pre = colon != std::string::npos ? NormName(game.substr(0, colon)) : std::string();
+        for (auto &t : kTested)
         {
-            std::string s = std::string(t.status);
-            if (t.note && *t.note) s += " -- " + std::string(t.note);
-            return s;
+            const std::string n = NormName(t.name);
+            if ((!e.empty() && e != g && n == e) || (sub.size() >= 4 && n == sub) || (pre.size() >= 8 && n == pre)) return entry(t);
         }
+        // The list's subtitle alone: "The Dark Pictures Anthology: Directive 8020" for "Directive 8020".
+        for (auto &t : kTested)
+        {
+            const char *c = strrchr(t.name, ':');
+            if (c && g.size() >= 8 && (NormName(c + 1) == g || NormName(c + 1) == e)) return entry(t);
+        }
+    }
     for (auto &t : kTested)
     {
         std::string n = NormName(t.name);
         if (n == g || (n.size() >= 6 && g.size() >= 6 && (g.rfind(n, 0) == 0 || n.rfind(g, 0) == 0) &&
                        std::max(n.size(), g.size()) - std::min(n.size(), g.size()) <= 12 &&
                        // "Wreckfest" must not match "Wreckfest 2"
-                       !isdigit((unsigned char)(g.size() > n.size() ? g[n.size()] : n[g.size()]))))
-        {
-            std::string s = std::string(t.status);
-            if (t.note && *t.note) s += " -- " + std::string(t.note);
-            return s;
-        }
+                       !isdigit((unsigned char)(g.size() > n.size() ? g[n.size()] : n[g.size()])) &&
+                       !OtherGame(g.size() > n.size() ? g.substr(n.size()) : n.substr(g.size()))))
+            return entry(t);
+    }
+    return {};
+}
+
+// The tested entry an executable's name points to: the list's name exactly, or followed by a build tag that isn't a
+// number ("pcsx2-qt", "rpcs3"); "Hades2.exe" doesn't take "Hades". Names under 4 letters are left out.
+static std::string TestedForExe(const std::string &exeName)
+{
+    std::string stem = exeName;
+    const size_t dot = stem.rfind('.');
+    if (dot != std::string::npos) stem.resize(dot);
+    const std::string g = NormName(stem);
+    if (g.size() < 4) return {};
+    for (auto &t : kTested)
+    {
+        const std::string n = NormName(t.name);
+        if (n.size() < 4 || g.rfind(n, 0) != 0) continue;
+        const std::string extra = g.substr(n.size());
+        if (extra.size() > 10 || (!extra.empty() && isdigit((unsigned char)extra[0])) || OtherGame(extra)) continue;
+        std::string s = std::string(t.status);
+        if (t.note && *t.note) s += " -- " + std::string(t.note);
+        return s;
     }
     return {};
 }
@@ -1935,6 +2024,9 @@ void Detect(Game &g)
     HdrModApply(g);
     g.apis = (g.pcgwKnown && g.pcgwApis) ? g.pcgwApis : g.exeApis;
     g.tested = TestedFor(g.name);
+    // Emulators and other folder games are often named after their release folder ("rpcs3-v0.0.38-18291_win64"): the
+    // executable's name then says what it is ("rpcs3.exe", "pcsx2-qt.exe", "shadPS4.exe").
+    if (g.tested.empty() && !g.exe.empty()) g.tested = TestedForExe(U8(NameOf(g.exe)));
     std::wstring dir = DirOf(g.exe);
     g.online = g.store == "Steam" && !g.appid.empty() && SteamOnline(g.appid);
     g.antiCheat = FindAntiCheat(g.root, dir);
@@ -2005,8 +2097,15 @@ void Detect(Game &g)
         bool is64 = Lower(std::wstring(n)) == L"bfipresenter.addon64";
         if ((is64 && g.bits == 32) || (!is64 && g.bits == 64)) g.addonWrongBits = true;
     }
-    for (auto d : { addonDir, dir })
+    // RTX Remix (Half-Life 2 RTX, Portal RTX): the game's own .exe is Direct3D 9, and the picture is drawn through Vulkan
+    // by NvRemixBridge.exe in .trex (bin\.trex next to hl2.exe). The Vulkan layer runs there, so its ini goes there.
+    g.remixDir.clear();
+    for (const std::wstring &d : { Join(dir, L".trex"), Join(Join(g.root, L"bin"), L".trex"), Join(g.root, L".trex") })
+        if (Exists(Join(d, L"NvRemixBridge.exe"))) { g.remixDir = d; break; }
+    if (!g.remixDir.empty()) g.notes.push_back("RTX Remix: drawn through Vulkan by NvRemixBridge.exe; BFIPresenter.ini goes next to it (" + U8(g.remixDir) + ")");
+    for (auto d : { g.remixDir, addonDir, dir })
     {
+        if (d.empty()) continue;
         std::wstring p = Join(d, L"BFIPresenter.ini");
         if (Exists(p)) { g.ini = true; g.iniPath = p; break; }
     }
@@ -2026,7 +2125,7 @@ void Detect(Game &g)
     else if (!g.shaderPath.empty() && g.addonPath.empty()) g.route = Route::Shader;       // installed that way
     else if (g.shaderRecommended && g.addonPath.empty() && (g.apis & (ApiD3D8 | ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL)))
         g.route = Route::Shader;                                                          // the tested list suggests it
-    else if (g.dxvk) g.route = Route::Vulkan;
+    else if (g.dxvk || !g.remixDir.empty()) g.route = Route::Vulkan;
     // The executable itself can only load Vulkan: that beats a store page or wiki listing Direct3D too (PT-PC).
     else if ((g.exeApis & ApiVulkan) && !(g.exeApis & (ApiD3D8 | ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL))) g.route = Route::Vulkan;
     else if ((g.apis & ApiVulkan) && g.tested.find("(Vulkan") != std::string::npos) g.route = Route::Vulkan;
@@ -3044,7 +3143,7 @@ std::string InstallOrUpdate(Game &g, const Source &src)
         if (!g.ini)
         {
             Txn t(g);
-            std::wstring dest = Join(DirOf(g.exe), L"BFIPresenter.ini");
+            std::wstring dest = Join(g.remixDir.empty() ? DirOf(g.exe) : g.remixDir, L"BFIPresenter.ini");
             err = CopyIn(t, Join(src.vkDir, L"BFIPresenter.ini"), dest);
             t.Finish();
             if (err.empty()) Log("install", g.name, dest, "", src.vkVersion);

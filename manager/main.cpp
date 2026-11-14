@@ -162,6 +162,10 @@ struct App {
     // UI
     char search[128] = {};
     bool onlyRelevant = false;
+    bool onlyTested = false;           // only games in the tested-games list (ours or users' reports)
+    int  colToggle = -1;               // Columns menu: a column to show or hide, applied inside the table
+    bool colReset = false;             // Columns menu: back to the default order, widths and columns
+    bool colShown[16] = {};            // which columns the table showed last frame (for the menu's ticks)
     std::string msg;
     bool msgErr = false;
     bool removeIni = false;
@@ -746,6 +750,21 @@ static bool Relevant(const Game &g)
     return g.reshade || !g.addonPath.empty() || g.ini || !g.tested.empty();
 }
 
+// The tested-games list in a word: "yes" (tested here), "no FG" / "no mod" (working with something off), "user"
+// (reported working by a user), "" (not in the list). Rank for sorting: tested first.
+static const char *TestedShort(const Game &g, int *rank = nullptr, ImVec4 *col = nullptr)
+{
+    const std::string &t = g.tested;
+    const char *w = ""; int r = 9; ImVec4 c = kGrey;
+    if (t.rfind("Reported working", 0) == 0) { w = "user"; r = 2; c = kAccent; }
+    else if (t.rfind("Working without", 0) == 0) { w = "partly"; r = 1; c = kText; }
+    else if (t.rfind("Working", 0) == 0) { w = "yes"; r = 0; c = kGreen; }
+    else if (!t.empty()) { w = "partly"; r = 1; c = kText; }
+    if (rank) *rank = r;
+    if (col) *col = c;
+    return w;
+}
+
 static bool Matches(const Game &g, const char *q)
 {
     if (!q[0]) return true;
@@ -1250,6 +1269,29 @@ static void DrawTop(HWND hwnd)
     }
     ImGui::SameLine();
     ImGui::Checkbox("Only games with ReShade, BFI or a tested entry", &g_app.onlyRelevant);
+    ImGui::SameLine();
+    ImGui::Checkbox("Only tested games", &g_app.onlyTested);
+    Tooltip("Only games in the tested-games list: tested here (\"yes\", or \"partly\": working with something off, "
+            "e.g. without frame generation) or reported working by a user (\"user\"). Hover a game's Tested cell for its notes.");
+    ImGui::SameLine();
+    if (ImGui::Button("Columns")) ImGui::OpenPopup("##columns");
+    Tooltip("Choose which columns are shown. Drag a column header to move it (e.g. less important ones to the right), "
+            "drag a header's edge to resize it; right-clicking a header opens this menu too. The layout is remembered.");
+    if (ImGui::BeginPopup("##columns"))
+    {
+        static const char *names[] = { "", "Game", "Tested", "Store", "Bits", "API", "HDR", "ReShade", "BFI Presenter",
+                                       "G-SYNC", "VSync", "Power", "Status" };
+        for (int c = 2; c < 12; c++)
+        {
+            bool on = g_app.colShown[c];
+            if (ImGui::MenuItem(names[c], nullptr, on)) g_app.colToggle = c;
+        }
+        ImGui::Separator();
+        ImGui::TextColored(kGrey, "Game and Status are always shown.");
+        if (ImGui::MenuItem("Reset columns")) g_app.colReset = true;
+        Tooltip("Back to the default order and widths, every column shown.");
+        ImGui::EndPopup();
+    }
 
     if (g_app.busy)
     {
@@ -1293,11 +1335,13 @@ static void DrawTable(float height)
                          ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
                          ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Sortable;
     const float em = ImGui::GetFontSize();
-    // "games2": the HDR column was added after API (1.3.16); the old saved layout would put widths on the wrong columns.
-    if (!ImGui::BeginTable("games2", 12, tf, ImVec2(0, height))) return;
+    // "games3": the Tested column was added after Game (1.3.20); "games2": HDR after API (1.3.16). A new id, or the old
+    // saved layout would put widths, order and hidden flags on the wrong columns.
+    if (!ImGui::BeginTable("games3", 13, tf, ImVec2(0, height))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("##pick", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize | ImGuiTableColumnFlags_NoSort, ImGui::GetFrameHeight());
     ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_NoHide, em * 15.0f);
+    ImGui::TableSetupColumn("Tested", ImGuiTableColumnFlags_WidthFixed, em * 4.0f);
     ImGui::TableSetupColumn("Store", ImGuiTableColumnFlags_WidthFixed, em * 4.0f);
     ImGui::TableSetupColumn("Bits", ImGuiTableColumnFlags_WidthFixed, em * 3.2f);
     ImGui::TableSetupColumn("API", ImGuiTableColumnFlags_WidthFixed, em * 8.0f);
@@ -1308,9 +1352,20 @@ static void DrawTable(float height)
     ImGui::TableSetupColumn("VSync", ImGuiTableColumnFlags_WidthFixed, em * 6.0f);
     ImGui::TableSetupColumn("Power", ImGuiTableColumnFlags_WidthFixed, em * 8.0f);
     ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoHide, em * 8.0f);
+    // The Columns menu (outside the table) asks; columns can only be shown or hidden from inside it.
+    if (g_app.colReset) { ImGui::TableResetSettings(ImGui::GetCurrentTable()); g_app.colReset = false; }
+    if (g_app.colToggle >= 0)
+    {
+        const int c = g_app.colToggle;
+        ImGui::TableSetColumnEnabled(c, !(ImGui::TableGetColumnFlags(c) & ImGuiTableColumnFlags_IsEnabled));
+        g_app.colToggle = -1;
+    }
+    for (int c = 0; c < 13; c++) g_app.colShown[c] = (ImGui::TableGetColumnFlags(c) & ImGuiTableColumnFlags_IsEnabled) != 0;
     std::vector<int> vis;
     for (int i = 0; i < (int)g_app.games.size(); i++)
-        if (Matches(g_app.games[i], g_app.search) && (!g_app.onlyRelevant || Relevant(g_app.games[i]))) vis.push_back(i);
+        if (Matches(g_app.games[i], g_app.search) && (!g_app.onlyRelevant || Relevant(g_app.games[i])) &&
+            (!g_app.onlyTested || !g_app.games[i].tested.empty()))
+            vis.push_back(i);
     // Sorting: click a header (again to reverse). The order is applied to the rows shown, the list itself stays.
     static int sortCol = 1;
     static bool sortAsc = true;
@@ -1326,20 +1381,21 @@ static void DrawTable(float height)
             char b[32];
             switch (sortCol)
             {
-            case 2: return low(g.store);
-            case 3: snprintf(b, 32, "%02d", g.bits); return b;
-            case 4: return ApiText(g.apis);
-            case 5: { static const char *ord[] = { "9", "0", "3", "1", "2", "4" }; const int h = ShownHdr(g); return h >= 0 && h <= 5 ? ord[h] : "9"; }
-            case 6: return g.reshade ? g.reshadeDll.version : std::string();
-            case 7: return g.route == Route::Vulkan ? (g.ini ? "vulkan" : "") : g.route == Route::Shader ? g.shaderVersion : g.addonVersion;
-            case 8: return g.nvKnown ? std::string(g.nvVrrOwn ? "0" : "1") + VrrText(g.nvVrr) : "2";
-            case 9: return g.nvKnown ? std::string(g.nvVsyncOwn ? "0" : "1") + VsyncText(g.nvVsync) : "2";
-            case 10: return g.nvKnown ? std::string(g.nvPowerOwn ? "0" : "1") + PowerText(g.nvPower) : "2";
-            case 11: snprintf(b, 32, "%02d", (int)StatusOf(g)); return b;
+            case 2: { int r = 9; TestedShort(g, &r); snprintf(b, 32, "%d", r); return b; }
+            case 3: return low(g.store);
+            case 4: snprintf(b, 32, "%02d", g.bits); return b;
+            case 5: return ApiText(g.apis);
+            case 6: { static const char *ord[] = { "9", "0", "3", "1", "2", "4" }; const int h = ShownHdr(g); return h >= 0 && h <= 5 ? ord[h] : "9"; }
+            case 7: return g.reshade ? g.reshadeDll.version : std::string();
+            case 8: return g.route == Route::Vulkan ? (g.ini ? "vulkan" : "") : g.route == Route::Shader ? g.shaderVersion : g.addonVersion;
+            case 9: return g.nvKnown ? std::string(g.nvVrrOwn ? "0" : "1") + VrrText(g.nvVrr) : "2";
+            case 10: return g.nvKnown ? std::string(g.nvVsyncOwn ? "0" : "1") + VsyncText(g.nvVsync) : "2";
+            case 11: return g.nvKnown ? std::string(g.nvPowerOwn ? "0" : "1") + PowerText(g.nvPower) : "2";
+            case 12: snprintf(b, 32, "%02d", (int)StatusOf(g)); return b;
             default: return low(g.name);
             }
         };
-        auto ver = sortCol == 6 || sortCol == 7;
+        auto ver = sortCol == 7 || sortCol == 8;
         std::stable_sort(vis.begin(), vis.end(), [&](int a, int b) {
             const Game &x = g_app.games[a], &y = g_app.games[b];
             std::string kx = key(x), ky = key(y);
@@ -1372,11 +1428,17 @@ static void DrawTable(float height)
         if (mixed) ImGui::PopItemFlag();     // pop what was pushed, whatever the click changed
         Tooltip("Tick or clear all games shown (Ctrl+A ticks all, Esc clears)");
     }
-    for (int c = 1; c < 12; c++)
+    for (int c = 1; c < 13; c++)
     {
-        ImGui::TableSetColumnIndex(c);
+        if (!ImGui::TableSetColumnIndex(c)) continue;
         ImGui::TableHeader(ImGui::TableGetColumnName(c));
-        if (c == 5)
+        if (c == 2)
+            Tooltip("The tested-games list (docs/tested-games.md):\n"
+                    "yes: tested here and working.\n"
+                    "partly: working with something off (e.g. without frame generation, or without a mod).\n"
+                    "user: reported working by a user (who and where in the notes).\n"
+                    "Hover a game's cell for its notes; \"Only tested games\" above shows just these.");
+        if (c == 6)
             Tooltip("Whether the game has its own HDR output, from PCGamingWiki.\n"
                     "native: the game outputs HDR itself; BFI Presenter strobes it as it is.\n"
                     "no: SDR only. With Windows HDR on, BFI Presenter's SDR to HDR (SdrToHdr) gives the lit refresh "
@@ -1432,6 +1494,20 @@ static void DrawTable(float height)
         }
         if (scrollToSel && g_app.sel == i) ImGui::SetScrollHereY(0.5f);
         ImGui::PopID();
+        ImGui::TableNextColumn();
+        {
+            ImVec4 c;
+            const char *w = TestedShort(g, nullptr, &c);
+            if (*w) ImGui::TextColored(c, "%s", w); else ImGui::TextColored(kGrey, "-");
+            if (*w && ImGui::IsItemHovered())
+            {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0f);
+                ImGui::TextUnformatted(g.tested.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+        }
         ImGui::TableNextColumn(); ImGui::TextColored(kGrey, "%s", g.store.c_str());
         ImGui::TableNextColumn(); if (g.bits) ImGui::Text("%d", g.bits); else ImGui::TextColored(kGrey, "?");
         ImGui::TableNextColumn(); ImGui::TextUnformatted(g.exe.empty() ? "" : ApiText(g.apis).c_str());
