@@ -284,6 +284,7 @@ struct Settings
     int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
     int   threadBoost = 1;       // PresenterThreadBoost: the presenter thread registered with MMCSS (applies at the next start)
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap times the game's frame start with a search across the strobe cycle
+    int   sleepGrid = 1;      // SleepLimitGrid: the frame limit at the game's Reflex sleep keeps its place in the strobe cycle
     int   fgDllCheck = 1;     // FrameGenDllCheck: a loaded frame generation DLL counts as frame generation (games without Reflex)
     int   gameCap  = 1;       // 0 off, 1 refresh rate, 2 half refresh, 3 quarter refresh,
                               // 4 one game frame per strobe cycle (refresh / Frames), 5 refresh / CapDivisor
@@ -393,6 +394,7 @@ static void LoadSettings(Settings &s)
     s.capJit = KvInt(kv, "CapJustInTime", 1) ? 1 : 0;
     s.autoCap = KvInt(kv, "AutoFrameCap", 1) ? 1 : 0;
     s.fgDllCheck = KvInt(kv, "FrameGenDllCheck", 1) ? 1 : 0;
+    s.sleepGrid = KvInt(kv, "SleepLimitGrid", 1) ? 1 : 0;
     s.autoCapFrameStart = KvInt(kv, "AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = KvInt(kv, "LearnPerGame", 1) ? 1 : 0;
     s.threadBoost = KvInt(kv, "PresenterThreadBoost", 1) ? 1 : 0;
@@ -446,7 +448,7 @@ static void LoadSettings(Settings &s)
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
     I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
-    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
+    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
@@ -611,6 +613,8 @@ static std::atomic<long> g_vkSleepSec{0};       // the game's Reflex sleep calls
 static std::atomic<double> g_vkSleepLastT{0.0};  // last Reflex sleep call
 static std::atomic<int>  g_vkSleepLimitUs{0};    // Reflex frame limit applied in the game's sleep call, per rendered frame (0 = off)
 static std::atomic<int>  g_vkFgFactor{1};        // presents per rendered frame, from Reflex sleep calls
+static std::atomic<int>  g_vkSleepGrid{1};       // SleepLimitGrid (copied from the settings)
+static std::atomic<int>  g_vkSleepShiftUs{0};    // move the sleep limit's next wake-up by this much (+ later), taken once
 static std::atomic<bool> g_vkRfxBad{false};      // the game collapsed under the limit: off for the session
 static bool g_active = false;      // BFIPresenter.ini found: the layer manages swap chains in this process
 static std::atomic<bool> g_surfCaps2Ext{false};    // VK_KHR_get_surface_capabilities2 enabled (needed by full_screen_exclusive)
@@ -2243,6 +2247,7 @@ static void PresenterThread(Swapchain *sc)
         if (vblank)
         {
             sc->strobeFrames.store(s.frames);
+            g_vkSleepGrid.store(s.sleepGrid);
             sc->tickSlot.store((int)((presents - phaseShift) % (uint64_t)s.frames));
             sc->tickT.store(Now());
             sc->ticks.fetch_add(1);
@@ -3241,6 +3246,45 @@ static void PresenterThread(Swapchain *sc)
                         }
                     }
                     else badSecs = 0;
+                    // Frames landing on the lit refresh's pick (DX 1.0.39): with the limit keeping its place in the strobe
+                    // cycle, a start time on the pick no longer drifts away by itself. 5 or more frames repeated and
+                    // skipped in a second -> 2 ms earlier (at most every 4 s); frames ready under 1 ms before the pick
+                    // for 3 s in a row while frames go missing -> 3 ms earlier.
+                    {
+                        static double nudgeNextT = 0.0;
+                        static int nudges = 0, tight = 0;
+                        const int rep = g_status.frameRepeats, skp = g_status.frameSkips;
+                        double p10 = -1.0;
+                        if (secReadyN >= 10)
+                        {
+                            double tmp[256];
+                            std::copy(secReady, secReady + secReadyN, tmp);
+                            std::nth_element(tmp, tmp + secReadyN / 10, tmp + secReadyN);
+                            p10 = tmp[secReadyN / 10];
+                        }
+                        const double presCap = hzA > 0.0 ? hzA / s.frames : 0.0;
+                        const bool holds = presCap > 0.0 && fpsA > 0.95 * presCap && fpsA < 1.05 * presCap;
+                        const bool on = want > 0 && was == want && !hitchPaused && g_vkSleepGrid.load();
+                        if (on && rep >= 5 && skp >= 5 && t >= nudgeNextT)
+                        {
+                            nudgeNextT = t + 4.0; tight = 0;
+                            g_vkSleepShiftUs.fetch_sub(2000);
+                            if (++nudges <= 5)
+                                LOGI("BFI Presenter: frame limit at the game's Reflex sleep: game frames arrive at the lit refresh's pick "
+                                     "(%d repeated, %d skipped last second) -- 2 ms earlier", rep, skp);
+                        }
+                        else
+                        {
+                            tight = (on && holds && p10 >= 0.0 && p10 < 1.0 && rep + skp >= 2) ? tight + 1 : 0;
+                            if (tight >= 3)
+                            {
+                                tight = 0;
+                                g_vkSleepShiftUs.fetch_sub(3000);
+                                LOGI("BFI Presenter: frame limit at the game's Reflex sleep (frame generation): frames ready %.1f ms before "
+                                     "the lit refresh's pick, %d repeated -- 3 ms earlier", p10, rep);
+                            }
+                        }
+                    }
                     g_status.rfxLimitUs = g_vkSleepLimitUs.load();
                     // Video memory over the game's budget: Windows moves part of it to system memory, and the GPU then
                     // stalls now and then (Indiana Jones at 4K with frame generation: presentation slowed, generated
@@ -5613,9 +5657,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_LatencySleepNV(VkDevice device, VkSwap
     const int us = g_vkSleepLimitUs.load();
     if (us > 0)
     {
-        static double nextT = 0.0;
+        static double nextT = 0.0, phase = 0.0;
         const double iv = us * 1e-6, now = Now();
         if (nextT <= 0.0 || now > nextT + iv || nextT - now > 2.0 * iv) nextT = now;
+        const int sh = g_vkSleepShiftUs.exchange(0);
+        if (sh != 0) { nextT += sh * 1e-6; phase += sh * 1e-6; }
+        // On the strobe-cycle grid (SleepLimitGrid, DX 1.0.39): the limit runs on the PC's clock and the display on its
+        // own, and a whole number of strobe cycles in microseconds is never exact, so the frame starts drifted slowly
+        // through the strobe cycle and every so often landed on the lit refresh's pick (bursts of repeated and skipped
+        // frames). Each wake-up is placed at a fixed point of the presenter's strobe cycle instead.
+        Swapchain *g = g_vkSleepGrid.load() ? GetSC(sc) : nullptr;
+        if (g)
+        {
+            uint64_t c = 0; int sl = 0; double tick = 0.0;
+            for (int i = 0; i < 4; i++)
+            {
+                c = g->ticks.load(); sl = g->tickSlot.load(); tick = g->tickT.load();
+                if (g->ticks.load() == c) break;
+            }
+            const double per = g->period.load();
+            const double cyc = per * std::max(1, g->strobeFrames.load());
+            const double k = cyc > 0.0 ? iv / cyc : 0.0;
+            const bool whole = k >= 0.9 && fabs(k - std::floor(k + 0.5)) * cyc < 0.0003;
+            if (whole && tick > 0.0 && per > 0.0 && now - tick < 0.1)
+            {
+                const double cycStart = tick - sl * per;
+                double ph = std::fmod(phase, cyc);
+                if (ph < 0.0) ph += cyc;
+                nextT = cycStart + ph + std::floor((nextT - cycStart - ph) / cyc + 0.5) * cyc;
+            }
+        }
         SleepUntil(nextT);
         nextT += iv;
     }

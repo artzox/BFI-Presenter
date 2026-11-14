@@ -9,6 +9,7 @@ Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply 
 
 ## [Unreleased]
 
+- **[Vulkan] Reflex's frame limit for frame generation keeps its place in the strobe cycle** (`SleepLimitGrid`, on by default), as in DX since 1.0.39. The limit held the game on the PC's clock and the display runs on its own, so the frame starts drifted slowly through the strobe cycle and every so often landed on the lit refresh's pick: bursts of repeated and skipped frames. Each frame start is now placed at a fixed point of the presenter's strobe cycle. With frames arriving at the pick (5 or more repeated and skipped in a second) it moves 2 ms earlier; with frames ready under 1 ms before the pick for 3 s while frames go missing, 3 ms earlier.
 - **[DX] No crash at start in games whose import table changes once loaded.** To find the DXGI factory the game itself uses, the add-on reads the game's import table; Resident Evil 4 (reported in discussion #68, 1.0.37) crashed there on start, inside ReShade's device creation. Every entry is now checked against the image and the memory it points at, and a table without import names is skipped; the add-on then takes the factory from dxgi.dll, as it already did for games that don't import it.
 
 ## [1.0.39] — 2026-11-13 (Manager 1.3.19)
