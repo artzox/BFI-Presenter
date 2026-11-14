@@ -284,6 +284,7 @@ struct Settings
     int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
     int   threadBoost = 1;       // PresenterThreadBoost: the presenter thread registered with MMCSS (applies at the next start)
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap times the game's frame start with a search across the strobe cycle
+    int   alignCoarse = 1;    // ReflexAlignCoarse: frames ready far ahead of the pick under the Reflex frame limit are moved closer once
     int   sleepGrid = 1;      // SleepLimitGrid: the frame limit at the game's Reflex sleep keeps its place in the strobe cycle
     int   fgDllCheck = 1;     // FrameGenDllCheck: a loaded frame generation DLL counts as frame generation (games without Reflex)
     int   gameCap  = 1;       // 0 off, 1 refresh rate, 2 half refresh, 3 quarter refresh,
@@ -395,6 +396,7 @@ static void LoadSettings(Settings &s)
     s.autoCap = KvInt(kv, "AutoFrameCap", 1) ? 1 : 0;
     s.fgDllCheck = KvInt(kv, "FrameGenDllCheck", 1) ? 1 : 0;
     s.sleepGrid = KvInt(kv, "SleepLimitGrid", 1) ? 1 : 0;
+    s.alignCoarse = KvInt(kv, "ReflexAlignCoarse", 1) ? 1 : 0;
     s.autoCapFrameStart = KvInt(kv, "AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = KvInt(kv, "LearnPerGame", 1) ? 1 : 0;
     s.threadBoost = KvInt(kv, "PresenterThreadBoost", 1) ? 1 : 0;
@@ -448,7 +450,7 @@ static void LoadSettings(Settings &s)
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
     I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
-    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
+    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
@@ -3265,6 +3267,27 @@ static void PresenterThread(Swapchain *sc)
                         const double presCap = hzA > 0.0 ? hzA / s.frames : 0.0;
                         const bool holds = presCap > 0.0 && fpsA > 0.95 * presCap && fpsA < 1.05 * presCap;
                         const bool on = want > 0 && was == want && !hitchPaused && g_vkSleepGrid.load();
+                        // Frames ready far ahead of the pick (ReflexAlignCoarse, as DX without frame generation): the grid keeps the
+                        // frame start wherever it began, and that can be a whole cycle's wait from the flash (Indiana Jones, 2x:
+                        // ready 12-13 ms before the pick, 33 ms from release to flash; 2-4 ms and 21-23 ms where the PC's clock
+                        // had drifted it). After 3 s of frames ready more than 8 ms early while the game holds the cap, the frame
+                        // start moves later once, to 5 ms before the pick; again each time the limit comes on, at most every 20 s.
+                        {
+                            static int coarseRun = 0;
+                            static double coarseT = -1e9, coarseOnT = -1.0;
+                            static bool coarseDone = false;
+                            if (onT != coarseOnT) { coarseOnT = onT; coarseDone = false; coarseRun = 0; }
+                            const bool enough = secReadyN >= (int)(0.8 * presCap);
+                            coarseRun = (on && s.alignCoarse && holds && !hitchPaused && enough && p10 > 8.0 && rep + skp < 5) ? coarseRun + 1 : 0;
+                            if (coarseRun >= 3 && !coarseDone && t - coarseT >= 20.0)
+                            {
+                                const int us = (int)((p10 - 5.0) * 1000.0);
+                                g_vkSleepShiftUs.fetch_add(us);
+                                coarseDone = true; coarseT = t; coarseRun = 0;
+                                LOGI("BFI Presenter: frame limit at the game's Reflex sleep: frames ready %.1f ms before the lit refresh's "
+                                     "pick -- the frame start moves %.1f ms later, to 5 ms before it (ReflexAlignCoarse)", p10, us / 1000.0);
+                            }
+                        }
                         if (on && rep >= 5 && skp >= 5 && t >= nudgeNextT)
                         {
                             nudgeNextT = t + 4.0; tight = 0;
