@@ -88,7 +88,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Monkey Island 2 Special Edition: LeChuck's Revenge | Working (DX9) | — | — | The game caps its own frame rate: in `Monkey2.exe` (back it up first), replace the bytes `76 05 0F 57 C0 EB 06` with `89 C0 0F 57 C0 EB 06` |
 | Neva | Working (DX11) | — | — | Standard setup |
 | Star Wars: Episode I Racer (GOG) | Working (DX11, 32-bit) | — | — | GOG version (Direct3D 11); `BFIPresenter.addon32` with the 32-bit ReShade |
-| Half-Life 2 RTX | Working (Vulkan) | Not tested | — | Vulkan layer. RTX Remix renders in its own Vulkan process: `BFIPresenter.ini` goes in `bin\.trex` (where `BFIPresenterVK.log` then appears), not next to `hl2.exe` |
+| Half-Life 2 RTX | Working (Vulkan) | Not tested | — | Vulkan layer. RTX Remix renders in its own Vulkan process: `BFIPresenter.ini` goes next to `NvRemixBridge.exe` in `bin\.trex` (where `BFIPresenterVK.log` then appears), not next to `hl2.exe`; the Manager puts it there |
 
 ### More games tested
 

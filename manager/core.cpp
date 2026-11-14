@@ -2069,8 +2069,15 @@ void Detect(Game &g)
         bool is64 = Lower(std::wstring(n)) == L"bfipresenter.addon64";
         if ((is64 && g.bits == 32) || (!is64 && g.bits == 64)) g.addonWrongBits = true;
     }
-    for (auto d : { addonDir, dir })
+    // RTX Remix (Half-Life 2 RTX, Portal RTX): the game's own .exe is Direct3D 9, and the picture is drawn through Vulkan
+    // by NvRemixBridge.exe in .trex (bin\.trex next to hl2.exe). The Vulkan layer runs there, so its ini goes there.
+    g.remixDir.clear();
+    for (const std::wstring &d : { Join(dir, L".trex"), Join(Join(g.root, L"bin"), L".trex"), Join(g.root, L".trex") })
+        if (Exists(Join(d, L"NvRemixBridge.exe"))) { g.remixDir = d; break; }
+    if (!g.remixDir.empty()) g.notes.push_back("RTX Remix: drawn through Vulkan by NvRemixBridge.exe; BFIPresenter.ini goes next to it (" + U8(g.remixDir) + ")");
+    for (auto d : { g.remixDir, addonDir, dir })
     {
+        if (d.empty()) continue;
         std::wstring p = Join(d, L"BFIPresenter.ini");
         if (Exists(p)) { g.ini = true; g.iniPath = p; break; }
     }
@@ -2090,7 +2097,7 @@ void Detect(Game &g)
     else if (!g.shaderPath.empty() && g.addonPath.empty()) g.route = Route::Shader;       // installed that way
     else if (g.shaderRecommended && g.addonPath.empty() && (g.apis & (ApiD3D8 | ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL)))
         g.route = Route::Shader;                                                          // the tested list suggests it
-    else if (g.dxvk) g.route = Route::Vulkan;
+    else if (g.dxvk || !g.remixDir.empty()) g.route = Route::Vulkan;
     // The executable itself can only load Vulkan: that beats a store page or wiki listing Direct3D too (PT-PC).
     else if ((g.exeApis & ApiVulkan) && !(g.exeApis & (ApiD3D8 | ApiD3D9 | ApiD3D11 | ApiD3D12 | ApiGL))) g.route = Route::Vulkan;
     else if ((g.apis & ApiVulkan) && g.tested.find("(Vulkan") != std::string::npos) g.route = Route::Vulkan;
@@ -3108,7 +3115,7 @@ std::string InstallOrUpdate(Game &g, const Source &src)
         if (!g.ini)
         {
             Txn t(g);
-            std::wstring dest = Join(DirOf(g.exe), L"BFIPresenter.ini");
+            std::wstring dest = Join(g.remixDir.empty() ? DirOf(g.exe) : g.remixDir, L"BFIPresenter.ini");
             err = CopyIn(t, Join(src.vkDir, L"BFIPresenter.ini"), dest);
             t.Finish();
             if (err.empty()) Log("install", g.name, dest, "", src.vkVersion);

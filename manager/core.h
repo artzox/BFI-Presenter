@@ -85,6 +85,7 @@ struct Game {
     int          selfResize = -1;           // PresenterResize in the game's BFIPresenter.ini (-1: not set, the add-on's default 0)
     bool         reshadeVkIni = false;      // ReShade.ini next to the exe: ReShade's Vulkan layer is on for this game
     bool         ini = false;    // BFIPresenter.ini next to the add-on or the exe
+    std::wstring remixDir;       // RTX Remix: the folder of NvRemixBridge.exe, the program that renders through Vulkan
     std::wstring iniPath;
     Route        route = Route::Unknown;
     std::vector<std::string> notes;   // shown in the detail pane
