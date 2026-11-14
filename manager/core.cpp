@@ -996,30 +996,85 @@ static std::string NormName(const std::string &s)
     return out;
 }
 
+// A store's name without its edition: "Control Ultimate Edition" -> "Control", "The Witcher 3: Wild Hunt Game of the
+// Year Edition" -> "The Witcher 3: Wild Hunt", "FlatOut: Ultimate Carnage Collector's Edition" -> "FlatOut: Ultimate
+// Carnage", "Jotun: Valhalla Edition" -> "Jotun". Unchanged if it doesn't end in "Edition" / "GOTY".
+static std::string StripEdition(const std::string &name)
+{
+    std::string s = name;
+    auto lowEnds = [&](const char *w) {
+        const size_t n = strlen(w);
+        if (s.size() < n) return false;
+        for (size_t i = 0; i < n; i++)
+            if (tolower((unsigned char)s[s.size() - n + i]) != w[i]) return false;
+        return true;
+    };
+    auto trim = [&] { while (!s.empty() && strchr(" :-\t", s.back())) s.pop_back(); };
+    trim();
+    if (lowEnds(" goty")) { s.resize(s.size() - 5); trim(); return s; }
+    if (!lowEnds(" edition")) return s;
+    s.resize(s.size() - 8);
+    trim();
+    if (lowEnds("game of the year")) s.resize(s.size() - 16);
+    else
+    {
+        const size_t sp = s.find_last_of(" :");
+        s.resize(sp == std::string::npos ? 0 : sp);
+    }
+    trim();
+    return s;
+}
+
+// What a longer name adds that makes it another game: a sequel's numeral ("Little Nightmares III" is not "Little
+// Nightmares") or a remaster / remake ("Alan Wake Remastered" is DX12, "Alan Wake" DX9).
+static bool OtherGame(const std::string &extra)
+{
+    if (!extra.empty() && extra.size() <= 4 && extra.find_first_not_of("ivx") == std::string::npos) return true;
+    for (const char *w : { "remaster", "remake", "reforged", "redux", "anniversary" })
+        if (extra.rfind(w, 0) == 0) return true;
+    return false;
+}
+
 static std::string TestedFor(const std::string &game)
 {
     std::string g = NormName(game);
     if (g.empty()) return {};
+    auto entry = [](const TestedEntry &t) {
+        std::string s = std::string(t.status);
+        if (t.note && *t.note) s += " -- " + std::string(t.note);
+        return s;
+    };
     // An exact name first: "Hades" must not get "Hades II"'s entry (it comes first in the list).
     for (auto &t : kTested)
-        if (NormName(t.name) == g)
+        if (NormName(t.name) == g) return entry(t);
+    // The store's name with an edition the list doesn't name ("Control Ultimate Edition", "Little Nightmares Enhanced
+    // Edition", "The Witcher 3: Wild Hunt Game of the Year Edition"; the list's own "(Enhanced Edition)" is left out by
+    // NormName), or without its subtitle ("Grip: Combat Racing", "Trine 5: A Clockwork Conspiracy"): exact matches only.
+    {
+        std::string e = NormName(StripEdition(game));
+        const size_t colon = game.find(':');
+        std::string sub = colon != std::string::npos ? NormName(StripEdition(game.substr(0, colon))) : std::string();
+        for (auto &t : kTested)
         {
-            std::string s = std::string(t.status);
-            if (t.note && *t.note) s += " -- " + std::string(t.note);
-            return s;
+            const std::string n = NormName(t.name);
+            if ((!e.empty() && e != g && n == e) || (sub.size() >= 4 && n == sub)) return entry(t);
         }
+        // The list's subtitle alone: "The Dark Pictures Anthology: Directive 8020" for "Directive 8020".
+        for (auto &t : kTested)
+        {
+            const char *c = strrchr(t.name, ':');
+            if (c && g.size() >= 8 && (NormName(c + 1) == g || NormName(c + 1) == e)) return entry(t);
+        }
+    }
     for (auto &t : kTested)
     {
         std::string n = NormName(t.name);
         if (n == g || (n.size() >= 6 && g.size() >= 6 && (g.rfind(n, 0) == 0 || n.rfind(g, 0) == 0) &&
                        std::max(n.size(), g.size()) - std::min(n.size(), g.size()) <= 12 &&
                        // "Wreckfest" must not match "Wreckfest 2"
-                       !isdigit((unsigned char)(g.size() > n.size() ? g[n.size()] : n[g.size()]))))
-        {
-            std::string s = std::string(t.status);
-            if (t.note && *t.note) s += " -- " + std::string(t.note);
-            return s;
-        }
+                       !isdigit((unsigned char)(g.size() > n.size() ? g[n.size()] : n[g.size()])) &&
+                       !OtherGame(g.size() > n.size() ? g.substr(n.size()) : n.substr(g.size()))))
+            return entry(t);
     }
     return {};
 }
