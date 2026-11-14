@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-103 of 104 tested games and emulators run with BFI: the 53 working in the table below (some only with a setting, without frame generation or without a conflicting mod; thirteen of them 32-bit; one with the engine's own stutter) and 50 more listed after it. One is partial.
+109 tested games and emulators run with BFI: the 59 in the table below (some only with a setting, without frame generation or without a conflicting mod; thirteen of them 32-bit; one with the engine's own stutter) and 50 more listed after it. Users have reported 7 more working ([Tested by users](#tested-by-users)).
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -142,6 +142,28 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Until Dawn (2024) | Works with DLSS 5 and FG: Refresh cap, or Half refresh at \~30 rendered fps (60 of 60 flashes, \~30 ms more latency) |
 | Untitled Goose Game | Standard setup |
 | Wreckfest 2 | BFI starts only with Resize the game's swap chain to start BFI (`PresenterResize`, set by the Manager), or after changing the resolution once |
+
+### Tested by users
+
+Reported working by users on their own hardware, in [Post your successful game runs](https://github.com/artzox/BFI-Presenter/discussions/68) and in issues. Thanks to everyone who tested! Not retested here; the notes are theirs. To add a game, post it in that discussion with your GPU, display and anything you set.
+
+| Game | Tested by | Notes |
+| --- | --- | --- |
+| Call of Duty: Advanced Warfare | [@JOnceTV](https://github.com/JOnceTV) ([#68](https://github.com/artzox/BFI-Presenter/discussions/68#discussioncomment-19580826)) | Runs very well, HDR |
+| Control: Resonant | [@miguelbogea](https://github.com/miguelbogea) ([#26](https://github.com/artzox/BFI-Presenter/issues/26)) | DLSS frame generation works with G-SYNC off in the game's own NVIDIA profile (NVIDIA Profile Inspector; the NVIDIA app couldn't set it for this .exe) and ReLimiter removed: it read the display as G-SYNC and kept switching DLSS-G's mode. RTX 5070 Ti, LG G6 at 120 and 360 Hz |
+| Death Stranding | [@Fischmann3000](https://github.com/Fischmann3000) ([#32](https://github.com/artzox/BFI-Presenter/issues/32)) | DLSS 5; Half refresh at 144 Hz (72 fps) |
+| DOOM: The Dark Ages (Vulkan) | [@katexpero2-gif](https://github.com/katexpero2-gif) ([#45](https://github.com/artzox/BFI-Presenter/issues/45)) | Vulkan layer. If the game or Steam runs as administrator (or User Account Control is off), register the layer for all users: the Manager's **All users** button (v1.0.12) |
+| Elden Ring | [@mondhersmida87](https://github.com/mondhersmida87) ([#119](https://github.com/artzox/BFI-Presenter/issues/119)) | v1.0.38. With OptiScaler in the game, `HookOuterSwapChain=0` (another swap-chain add-on crashed it at start). At 360 Hz: multi frame generation 60 × 6 with Display Commander's limiter was steadier for them than the presenter's limiter |
+| Horizon Forbidden West | [@JOnceTV](https://github.com/JOnceTV) ([#68](https://github.com/artzox/BFI-Presenter/discussions/68#discussioncomment-19600793)) | Smooth on an RTX 4060 Ti |
+| Megabonk | [@HighPriest](https://github.com/HighPriest) ([#59](https://github.com/artzox/BFI-Presenter/issues/59)) | Standard setup |
+
+Also confirmed by users: Pragmata with 3× frame generation at 240 Hz ([@NereusHixon](https://github.com/NereusHixon), [#72](https://github.com/artzox/BFI-Presenter/issues/72)).
+
+**Open reports** (not working yet; logs welcome in the linked thread):
+
+- Avatar: Frontiers of Pandora: starts with `HookOuterSwapChain=0`, but the game picture stays black ([@Josh6499](https://github.com/Josh6499), [#115](https://github.com/artzox/BFI-Presenter/issues/115)).
+- Resident Evil 4 (2023) with REFramework: crash at start in v1.0.37 ([@JOnceTV](https://github.com/JOnceTV), [#68](https://github.com/artzox/BFI-Presenter/discussions/68#discussioncomment-19601252)); fixed for the next release, being tested.
+- Watch Dogs: doesn't start with BFI on ([@JOnceTV](https://github.com/JOnceTV), [#68](https://github.com/artzox/BFI-Presenter/discussions/68#discussioncomment-19580826)); no logs yet.
 
 ## Per-game notes
 
