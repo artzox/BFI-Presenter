@@ -984,14 +984,23 @@ static const TestedEntry kTested[] = {
 
 static std::string NormName(const std::string &s)
 {
+    // Accented Latin letters (UTF-8, U+00C0-U+00FF) count as their base letter: the store's "ABZÛ" is the list's "ABZU".
+    static const char kFold[] = "aaaaaaaceeeeiiiidnooooo-ouuuuytsaaaaaaaceeeeiiiidnooooo-ouuuuyty";
     std::string out;
     bool paren = false;
-    for (unsigned char c : s)
+    for (size_t i = 0; i < s.size(); i++)
     {
+        const unsigned char c = (unsigned char)s[i];
         if (c == '(') { paren = true; continue; }
         if (c == ')') { paren = false; continue; }
         if (paren) continue;
-        if (isalnum(c)) out += (char)tolower(c);
+        if (c == 0xC3 && i + 1 < s.size() && ((unsigned char)s[i + 1] & 0xC0) == 0x80)
+        {
+            const char f = kFold[(unsigned char)s[++i] - 0x80];
+            if (f != '-') out += f;
+            continue;
+        }
+        if (c < 0x80 && isalnum(c)) out += (char)tolower(c);
     }
     return out;
 }

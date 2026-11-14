@@ -28,7 +28,7 @@ Software strobing usually runs on the game's frame clock, so any late frame leav
 
 ## Tested games
 
-**116 games and emulators run with BFI Presenter**: 109 tested on an RTX 5080 with a Sony A95L at 120 Hz, and 7 more reported working by users. Each entry says what it needs: a setting, frame generation on or off, the start-up quirk to work around.
+**120 games and emulators run with BFI Presenter**: 113 tested on an RTX 5080 with a Sony A95L at 120 Hz, and 7 more reported working by users. Each entry says what it needs: a setting, frame generation on or off, the start-up quirk to work around.
 
 | | Some of the games |
 | --- | --- |
