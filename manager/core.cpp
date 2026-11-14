@@ -1091,6 +1091,28 @@ static std::string TestedFor(const std::string &game)
     return {};
 }
 
+// The tested entry an executable's name points to: the list's name exactly, or followed by a build tag that isn't a
+// number ("pcsx2-qt", "rpcs3"); "Hades2.exe" doesn't take "Hades". Names under 4 letters are left out.
+static std::string TestedForExe(const std::string &exeName)
+{
+    std::string stem = exeName;
+    const size_t dot = stem.rfind('.');
+    if (dot != std::string::npos) stem.resize(dot);
+    const std::string g = NormName(stem);
+    if (g.size() < 4) return {};
+    for (auto &t : kTested)
+    {
+        const std::string n = NormName(t.name);
+        if (n.size() < 4 || g.rfind(n, 0) != 0) continue;
+        const std::string extra = g.substr(n.size());
+        if (extra.size() > 10 || (!extra.empty() && isdigit((unsigned char)extra[0])) || OtherGame(extra)) continue;
+        std::string s = std::string(t.status);
+        if (t.note && *t.note) s += " -- " + std::string(t.note);
+        return s;
+    }
+    return {};
+}
+
 // ------------------------------------------------------------------ PCGamingWiki
 
 static bool HttpGet(const std::wstring &url, std::string &body, std::string &err,
@@ -2002,6 +2024,9 @@ void Detect(Game &g)
     HdrModApply(g);
     g.apis = (g.pcgwKnown && g.pcgwApis) ? g.pcgwApis : g.exeApis;
     g.tested = TestedFor(g.name);
+    // Emulators and other folder games are often named after their release folder ("rpcs3-v0.0.38-18291_win64"): the
+    // executable's name then says what it is ("rpcs3.exe", "pcsx2-qt.exe", "shadPS4.exe").
+    if (g.tested.empty() && !g.exe.empty()) g.tested = TestedForExe(U8(NameOf(g.exe)));
     std::wstring dir = DirOf(g.exe);
     g.online = g.store == "Steam" && !g.appid.empty() && SteamOnline(g.appid);
     g.antiCheat = FindAntiCheat(g.root, dir);
