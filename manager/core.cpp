@@ -1062,11 +1062,14 @@ static std::string TestedFor(const std::string &game)
     {
         std::string e = NormName(StripEdition(game));
         const size_t colon = game.find(':');
+        // Before the colon, with and without its edition: GOG's "Monkey Island 2 Special Edition: LeChuck's Revenge" is
+        // the list's (Steam's) "Monkey Island 2: Special Edition".
         std::string sub = colon != std::string::npos ? NormName(StripEdition(game.substr(0, colon))) : std::string();
+        std::string pre = colon != std::string::npos ? NormName(game.substr(0, colon)) : std::string();
         for (auto &t : kTested)
         {
             const std::string n = NormName(t.name);
-            if ((!e.empty() && e != g && n == e) || (sub.size() >= 4 && n == sub)) return entry(t);
+            if ((!e.empty() && e != g && n == e) || (sub.size() >= 4 && n == sub) || (pre.size() >= 8 && n == pre)) return entry(t);
         }
         // The list's subtitle alone: "The Dark Pictures Anthology: Directive 8020" for "Directive 8020".
         for (auto &t : kTested)
