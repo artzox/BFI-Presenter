@@ -440,6 +440,7 @@ Also confirmed by users: Pragmata with 3× frame generation at 240 Hz ([@NereusH
 
 - **Recommended with frame generation (v1.0.13+): DLSS FG 2×, Game frame cap Refresh rate, Automatic frame cap on, Frame pacing Lowest latency.** The automatic frame cap steps down to one presented frame per strobe cycle with Reflex's frame limit, and the presenter shows 60 even frames a second from 30 rendered, about 20–30 ms from release to flash.
 - Without frame generation: Unreal's frame pipeline hands finished frames over with a varying delay (10–33 ms), so a fixed 120 Hz strobe shows some judder at any setting; this is the engine, not the presenter. Queue one refresh ahead removes the flashes.
+- **v1.0.40, switching frame generation on and off in one session:** the game turns Reflex's low latency mode on only with frame generation. With 2× frame generation: 22–23 ms from release to flash, 0.6 frames missing a second once settled (the frame limit at the game's Reflex sleep, moved closer to the flash once). Without it (Reflex low latency off, so the driver's limit): 35 ms, 0.45–0.9 missing a second. Frame generation is both smoother and about 12 ms quicker here.
 - With RenoDX, use the UE Extended RenoDX mod. The older RenoDX Unreal Engine mod (0.2025.622) removed the GPU device a few minutes in (DXGI_ERROR_INVALID_CALL, each time right after it hooked a new render target) and hung the GPU at start-up on ReShade 6.8.0; with UE Extended the game no longer crashes.
 
 ### Kena: Bridge of Spirits
