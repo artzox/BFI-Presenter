@@ -22,7 +22,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 
 ## Compatibility
 
-103 of 104 tested games and emulators run with BFI: the 53 working in the table below (some only with a setting, without frame generation or without a conflicting mod; thirteen of them 32-bit; one with the engine's own stutter) and 50 more listed after it. One is partial.
+113 tested games and emulators run with BFI: the 63 in the table below (some only with a setting, without frame generation or without a conflicting mod; fifteen of them 32-bit; one with the engine's own stutter) and 50 more listed after it. Users have reported 7 more working ([Tested by users](#tested-by-users)).
 
 | Game | Status | Frame generation with the presenter | Min. version | Key requirement |
 | --- | --- | --- | --- | --- |
@@ -46,7 +46,7 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | Mirror's Edge Catalyst | Working (DX11) | Not tested | v0.65 | Borderless window, not exclusive fullscreen; with Windows Auto HDR lower Gain or Auto HDR's intensity (bright scenes trigger the TV's ABL; the ABL guard can't see Auto HDR's output) |
 | Grip | Working | Not tested | v0.65 | Standard setup (didn't load in v0.64) |
 | Prince of Persia: The Lost Crown | Working | Not tested | v0.64 | Standard setup (was held at 60 fps before v0.64) |
-| ABZU | Working | Not tested | v0.66 | Standard setup |
+| ABZÛ | Working | Not tested | v0.66 | Standard setup |
 | The Midnight Walk | Working | Not tested | v0.70 | v1.0.39: Refresh + automatic frame cap, Lowest latency, `MaxFramesAhead=1`, ReflexAlign (on by default): 0.05 frames missing a second, 25.5 ms from release to flash. Before: Half refresh + Apply the cap with Reflex's frame limit (v1.0.15). DLSS needs `Engine.ini` lines (see notes) |
 | Cuphead | Working | Not tested | v0.73 | Later release on: \~5 ms less latency at 120 fps |
 | Obduction | Working | Not tested | v0.77 | Half refresh + just-in-time release; Lowest latency + Refresh is smoothest at 120 |
@@ -83,8 +83,12 @@ Every game below was tested on an RTX 5080 with a Sony A95L at a fixed 120 Hz, w
 | DOOM 3: BFG Edition | Working (OpenGL, 32-bit) | — | v1.0.4 | `BFIPresenter.addon32`; NVIDIA profile: Vulkan/OpenGL present method = Prefer layered on DXGI swapchain (else about 30 fps) |
 | Clive Barker's Undying | Working (DX11 via dgVoodoo, 32-bit) | — | v1.0.3 | `BFIPresenter.addon32`; G-SYNC off for the game (Fixed refresh + VSync Force on), or Queue one refresh ahead |
 | DARQ | Working (DX11, 32-bit) | — | v1.0.18 | `BFIPresenter.addon32`; v1.0.18 or newer (the game makes a second swap chain at start); ReShade's overlay may react late to the mouse and keyboard in this game, with or without the presenter |
-| PCSX2 | Working (Vulkan) | — | — | Vulkan layer; Vulkan renderer, `BFIPresenter.ini` next to the emulator's .exe |
 | RPCS3 | Working (Vulkan) | — | — | Vulkan layer; `BFIPresenter.ini` next to the emulator's .exe. RPCS3 presents each frame twice (the overlay shows 120 for 60 fps). Killzone 2: automatic frame cap. inFamous (44–60 fps): Half refresh, which stops the automatic cap switching between 30 and 60. Realtime GPU priority isn't used: RPCS3 uses the compute queue family itself (v1.0.29) |
+| Myst Online: Uru Live | Working (DX9, 32-bit) | — | — | `BFIPresenter.addon32` with the 32-bit ReShade 6.8+ |
+| Monkey Island 2 Special Edition: LeChuck's Revenge | Working (DX9) | — | — | The game caps its own frame rate: needs a patch that lifts the cap |
+| Neva | Working (DX11) | — | — | Standard setup |
+| Star Wars: Episode I Racer (GOG) | Working (DX11, 32-bit) | — | — | GOG version (Direct3D 11); `BFIPresenter.addon32` with the 32-bit ReShade |
+| Half-Life 2 RTX | Working (Vulkan) | Not tested | — | Vulkan layer (RTX Remix renders through Vulkan) |
 
 ### More games tested
 
@@ -142,6 +146,28 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | Until Dawn (2024) | Works with DLSS 5 and FG: Refresh cap, or Half refresh at \~30 rendered fps (60 of 60 flashes, \~30 ms more latency) |
 | Untitled Goose Game | Standard setup |
 | Wreckfest 2 | BFI starts only with Resize the game's swap chain to start BFI (`PresenterResize`, set by the Manager), or after changing the resolution once |
+
+### Tested by users
+
+Reported working by users on their own hardware, in [Post your successful game runs](https://github.com/artzox/BFI-Presenter/discussions/68) and in issues. Thanks to everyone who tested! Not retested here; the notes are theirs. To add a game, post it in that discussion with your GPU, display and anything you set.
+
+| Game | Tested by | Notes |
+| --- | --- | --- |
+| Call of Duty: Advanced Warfare | [@JOnceTV](https://github.com/JOnceTV) ([#68](https://github.com/artzox/BFI-Presenter/discussions/68#discussioncomment-19580826)) | Runs very well, HDR |
+| Control: Resonant | [@miguelbogea](https://github.com/miguelbogea) ([#26](https://github.com/artzox/BFI-Presenter/issues/26)) | DLSS frame generation works with G-SYNC off in the game's own NVIDIA profile (NVIDIA Profile Inspector; the NVIDIA app couldn't set it for this .exe) and ReLimiter removed: it read the display as G-SYNC and kept switching DLSS-G's mode. RTX 5070 Ti, LG G6 at 120 and 360 Hz |
+| Death Stranding | [@Fischmann3000](https://github.com/Fischmann3000) ([#32](https://github.com/artzox/BFI-Presenter/issues/32)) | DLSS 5; Half refresh at 144 Hz (72 fps) |
+| DOOM: The Dark Ages (Vulkan) | [@katexpero2-gif](https://github.com/katexpero2-gif) ([#45](https://github.com/artzox/BFI-Presenter/issues/45)) | Vulkan layer. If the game or Steam runs as administrator (or User Account Control is off), register the layer for all users: the Manager's **All users** button (v1.0.12) |
+| Elden Ring | [@mondhersmida87](https://github.com/mondhersmida87) ([#119](https://github.com/artzox/BFI-Presenter/issues/119)) | v1.0.38. With OptiScaler in the game, `HookOuterSwapChain=0` (another swap-chain add-on crashed it at start). At 360 Hz: multi frame generation 60 × 6 with Display Commander's limiter was steadier for them than the presenter's limiter |
+| Horizon Forbidden West | [@JOnceTV](https://github.com/JOnceTV) ([#68](https://github.com/artzox/BFI-Presenter/discussions/68#discussioncomment-19600793)) | Smooth on an RTX 4060 Ti |
+| Megabonk | [@HighPriest](https://github.com/HighPriest) ([#59](https://github.com/artzox/BFI-Presenter/issues/59)) | Standard setup |
+
+Also confirmed by users: Pragmata with 3× frame generation at 240 Hz ([@NereusHixon](https://github.com/NereusHixon), [#72](https://github.com/artzox/BFI-Presenter/issues/72)).
+
+**Open reports** (not working yet; logs welcome in the linked thread):
+
+- Avatar: Frontiers of Pandora: starts with `HookOuterSwapChain=0`, but the game picture stays black ([@Josh6499](https://github.com/Josh6499), [#115](https://github.com/artzox/BFI-Presenter/issues/115)).
+- Resident Evil 4 (2023) with REFramework: crash at start in v1.0.37 ([@JOnceTV](https://github.com/JOnceTV), [#68](https://github.com/artzox/BFI-Presenter/discussions/68#discussioncomment-19601252)); fixed for the next release, being tested.
+- Watch Dogs: doesn't start with BFI on ([@JOnceTV](https://github.com/JOnceTV), [#68](https://github.com/artzox/BFI-Presenter/discussions/68#discussioncomment-19580826)); no logs yet.
 
 ## Per-game notes
 
@@ -311,7 +337,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 
 - Unity game held at 60 fps in every mode before v0.64, because frame slots came back only at the 60 lit picks. Runs at 120 since.
 
-### ABZU
+### ABZÛ
 
 - Lit refreshes sometimes repeated a frame and then skipped one, when the expected frame finished a moment after the pick. v0.66 waits up to 3 ms for it.
 
