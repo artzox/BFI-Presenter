@@ -5359,7 +5359,18 @@ static DWORD WINAPI PresenterThread(void *)
                         // both in the same second: 40 of 60 frames shown for 3 s, until the next nudge).
                         const bool nudging = t < phaseUntil;
                         if (nudging) coarseHoldT = t + 20.0;
-                        if (!nudging && !s.reflexAlign && !g_alignHunted.load() && s.reflexAlignCoarse && atSleepNoFg && holds && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * capFps))
+                        // Frame generation at the game's Reflex sleep too (1.0.40), whether ReflexAlign is on or not (it doesn't
+                        // steer there): the limit keeps its place in the strobe cycle, wherever it began (Indiana Jones, Vulkan,
+                        // 2x: frames ready 12-13 ms before the pick, 33 ms from release to flash; 26 ms after this move). Not with
+                        // XeSS frame generation (no fixed place there). Presented frames against one per strobe cycle.
+                        const double presCapC = hzL > 0.0 ? hzL / s.frames : 0.0;
+                        const bool atSleepFgC = !fgPace && g_sleepLimitUs.load() > 0 && g_sleepFgFactor.load() > 1 && locked &&
+                                                g_sleepGrid.load() && !g_fgXess.load();
+                        const bool holdsC = atSleepFgC ? (presCapC > 0.0 && stNow.gameFps > 0.95 * presCapC && stNow.gameFps < 1.05 * presCapC) : holds;
+                        const bool quietC = atSleepFgC ? stNow.frameRepeats + stNow.frameSkips < 5 : stNow.frameRepeats == 0;
+                        const double nC = atSleepFgC ? presCapC : capFps;
+                        if (!nudging && !g_alignHunted.load() && s.reflexAlignCoarse && ((atSleepNoFg && !s.reflexAlign) || atSleepFgC) &&
+                            holdsC && !hitchPaused && p10 >= 0.0 && alignN >= (int)(0.8 * nC))
                         {
                             if (t - coarseT < 10.0 && stNow.frameRepeats >= 2 && p10 < 0.002)
                             {
@@ -5371,7 +5382,7 @@ static DWORD WINAPI PresenterThread(void *)
                             }
                             else
                             {
-                                coarseSecs = (p10 > coarseTarget + 0.003 && stNow.frameRepeats == 0) ? coarseSecs + 1 : 0;
+                                coarseSecs = (p10 > coarseTarget + 0.003 && quietC) ? coarseSecs + 1 : 0;
                                 if (coarseSecs >= 3 && t - coarseT >= 20.0 && t >= coarseHoldT)
                                 {
                                     const double step = std::min(p10 - coarseTarget, 0.9 * cyc);
