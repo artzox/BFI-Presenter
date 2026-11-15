@@ -233,6 +233,29 @@ It costs latency: about 10–20 ms more than just-in-time release (Silent Hill 2
 
 ### Every cap
 
+**Frame warp** · `FrameWarp`, `FrameWarpMaxAhead`, `FrameWarpMinRate`, `FrameWarpDetail` · default: off, 1.0, 75, Normal · DX add-on, test (v1.0.41)\
+For games that can't hold the strobe rate, e.g. 54 fps against a 60 Hz strobe. Six times a second a strobe cycle then has no new game frame, the presenter lights the last one again, and the picture stands still for one flash and jumps at the next: stutter. With frame warp, that cycle shows the last frame **moved ahead along its own motion**. The motion is measured on the GPU between the last two frames shown, from the finished picture, so it works in every game: no motion vectors, depth or Reflex needed.
+
+It is not frame generation. Frame generation holds each frame back until the next one exists and shows a picture between the two, which costs a frame of latency. Frame warp never waits: it only carries the newest frame forward, so the latency is the same as without it. What it can't do is bring your input in sooner, as Reflex 2's Frame Warp does with the game's camera: it continues the motion the last two frames showed.
+
+- **Fill missing frames**: frames are shown as rendered. Only a cycle without a new frame is filled, half way to where the next frame is expected (steps of 1, 1, ½, ½, 1 instead of 1, 1, 0, 1, 1). 9 of 10 flashes at 54 fps are untouched.
+- **Even pacing**: every cycle shows the picture where the motion is at that moment. A 54 fps game's frames are 18.5 ms apart but lit 16.7 ms apart, so each is moved ahead by what is missing (0.9, 0.8 … 0.1, 0 of a frame), and every step on screen is the same. Smoothest, but most frames are moved a little, and it uses more GPU time. A game that holds the strobe rate is left alone (only an odd missing frame is filled).
+
+What stands still on the screen is never moved: a pixel that is the same in both frames is shown as rendered when most of the pixels around it are unchanged too, or when the scene's motion doesn't explain why it is unchanged. So a HUD, subtitles and a crosshair stay sharp and still, down to one-pixel lines, and the scene next to them is not smeared over them.
+
+**Furthest ahead** limits how far a frame is carried (game frames). **Only from** is the lowest frame rate it works at, in percent of the strobe rate: below it frames repeat as before, because the further a frame has to be carried, the more errors show. **Motion detail** measures the motion in 8×8 pixel blocks (Normal) or 4×4 (Fine).
+
+Its limits, so you know what you are looking at:
+- Where two things move differently (a character crossing in front of a panning background), the edge between them can tear or smear for that one flash. What comes out from behind something isn't in the frame, so it is filled from the surroundings.
+- Regular patterns (stripes, a fence, tiles, a grate) match themselves at many offsets, so their motion can be measured wrong in places: they can wobble on a moved flash.
+- A HUD that changes every frame (film grain or a ReShade effect drawn over it, an animated minimap) can't be told from the scene and moves with it.
+- With a CRT shader (CRT-Standalone), the scanlines and mask are part of the picture and move with it on warped flashes: expect shimmer in the mask. Better with plain BFI.
+- Changes of direction: the frame is carried on in the direction it was moving, so a sudden stop or turn overshoots for one flash.
+- It needs the game's frames to arrive steadily. Heavy hitches aren't filled (the picture waits at the limit).
+
+It costs one small pass per game frame, plus the motion measurement and a heavier draw on the flashes that are moved, and one more staging image of video memory.\
+*When to change it:* turn it on (start with Fill missing frames) for a game that stays a few fps under the strobe rate and stutters. Hotkey: Ctrl+Shift+W switches it off and back on, to compare. If its errors bother you more than the stutter, lower Furthest ahead or leave it off. The overlay shows whether it is at work, the game's share of the strobe rate, and how many cycles a second are moved.
+
 **Frame pacing** · `FramePacing` · default: Lowest latency (new ini files)
 - **Lowest latency** always shows the newest image: quickest response.
 - **Smooth** holds one finished image in reserve so every image is shown once, in order, even if one arrives a little late: about one refresh more delay.
@@ -398,6 +421,7 @@ The DX add-on compiles its shaders once per session, while the game starts up, a
 | Ctrl+Shift+M | Switch BFI ↔ Variable MPRT |
 | Ctrl+Shift+S | Rolling scan on / off |
 | Ctrl+Shift+C | Split comparison on / off: one side of the screen without BFI |
+| Ctrl+Shift+W | Frame warp off / back on (DX add-on) |
 | Ctrl+Shift+F | On-screen display on / off: frame rate, lost frames, frame-time graph, CPU / GPU load |
 | Ctrl+Shift+Z | On-screen display: reset the lost / repeated / missed totals |
 | Ctrl+Shift+R | Reload `BFIPresenter.ini` after editing it |

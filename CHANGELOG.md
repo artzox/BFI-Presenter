@@ -7,6 +7,21 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.41] — unreleased (test build 1.0.41-t1)
+
+**Frame warp: strobe cycles without a new game frame are filled, without holding frames back.**
+
+- **[DX] Frame warp** (`FrameWarp`, off by default, Ctrl+Shift+W; under Frame pacing in the overlay). A game that can't hold the strobe rate (54 fps against a 60 Hz strobe) leaves strobe cycles without a new frame; the presenter lit the last frame again, so the picture stood still for a flash and then jumped. With frame warp that cycle shows the last frame moved ahead along its own motion, measured on the GPU between the last two frames shown (a brightness pyramid of each frame, then block matching from 1/64 size down to 1/8 or 1/4). It works on the finished picture, so in every game and API of the add-on: no motion vectors, depth or Reflex. No frame is held back, so it adds no latency; it is not frame generation, and it doesn't use the game's camera as Reflex 2 does.
+  - **Fill missing frames** (`FrameWarp=1`): frames are shown as rendered; a cycle without a new frame shows the last one half way to where the next is expected.
+  - **Even pacing** (`FrameWarp=2`): every cycle shows the picture where the motion is at that moment (the game's frames per strobe cycle, measured over the last second), so all steps on screen are the same. A game that holds the strobe rate is left alone.
+  - What stands still on the screen is never moved, and never pulled over what moves next to it: HUD, text and a crosshair's one-pixel lines stay as rendered. A pixel counts as still when it is the same in both frames and most of the pixels around it are too, or the scene's motion doesn't explain why it is unchanged.
+  - `FrameWarpMaxAhead` (1.0 game frames), `FrameWarpMinRate` (75% of the strobe rate; below it frames repeat as before), `FrameWarpDetail` (8×8 or 4×4 pixel blocks).
+  - Tested so far only on synthetic frames (`tools/warp-test`: the add-on's own shaders and passes run through Direct3D 12 on a software GPU): a 1080p scene panning 23 pixels a frame with a static HUD, a crosshair and an object moving against the pan. Half a frame ahead, 5% of pixels are off by more than 16/255 against 33% for the repeated frame (4% and 33% with 4×4 blocks), the HUD and the crosshair identical to the frame as rendered. **Not yet tested in a game**, and the presenter-thread side (the frame kept in the ring, the passes in its command list) has only been compiled, not run.
+  - Known limits: edges between things that move differently can tear for that flash; regular patterns (stripes, fences, tiles) can wobble; a HUD that changes every frame moves with the scene; a CRT shader's mask moves with the picture.
+- **[DX] The staging ring has seven frames** (was six): frame warp keeps the frame shown before the current one. One more frame of video memory (33 MB at 4K, 66 MB for scRGB), with frame warp off too.
+- **[Vulkan]** No changes; frame warp is DX only for now.
+- **[Docs]** Settings guide: **Frame warp**, and its hotkey.
+
 ## [1.0.40] — 2026-11-14 (Manager 1.3.20)
 
 **Reflex frame limit with frame generation: in step with the strobe in Vulkan, and closer to the flash in both; tested games front and centre.**

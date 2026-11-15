@@ -1,0 +1,427 @@
+// ============================================================================
+// BFI Presenter -- frame warp, Direct3D 12 side: motion between the last two frames, measured on the GPU
+//
+// Copyright (C) 2026 artzox -- https://github.com/artzox/BFI-Presenter
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// What the presenter needs to show a frame moved ahead along its own motion (see common/bfi_warpclock.h for when
+// and how far):
+//
+//   1. Each new frame, once: its brightness at 1/4 size, and four more levels each half the size before (a pyramid).
+//      One pass over the frame and four tiny ones. The pyramid of the frame shown before is kept.
+//   2. Only when a frame is about to be shown moved: where each part of the newer frame was in the older one,
+//      coarse to fine. The smallest level tries every offset within 3 pixels (192 pixels of the game frame at 4K);
+//      each finer level starts from the level above (its own vector and its four neighbours', and no motion at all)
+//      and refines by a pixel, then half a pixel (the last level down to an eighth). Where the last level finds the
+//      picture unchanged from the frame before, the motion is none: a HUD stays put. Matching is by a 9-tap patch. The result is one vector per 8x8
+//      (or 4x4) block of the game frame with a confidence: where nothing matched (uncovered background, a cut) the
+//      picture is left where it is.
+//      A last pass evens the vectors out among neighbours that agree (a block's match is only good to a pixel or two).
+//   3. The per-refresh shader reads that texture (t3) and takes each pixel from further back along its motion --
+//      except what is the same pixel for pixel in the frame shown before (t4): that stands still on the screen
+//      (HUD, text, crosshair) and is shown as rendered.
+//
+// No game data is needed (no motion vectors, depth or camera): it works on the finished picture, HUD and ReShade
+// effects included -- and has their limits: see docs/settings-guide.md, "Frame warp".
+//
+// Uses the presenter's root signature (b0 constants, t0-t4 one SRV each, s0 linear clamp) and its vertex shader.
+// ============================================================================
+#pragma once
+
+static const char kWarpShader[] = R"HLSL(
+cbuffer W : register(b0)
+{
+    float2 texel;    // 1 / size of the level being drawn
+    float2 texel2;   // brightness pass: 1 / size of the game frame; motion pass: 1 / size of the coarser level
+    uint   wmode;    // brightness pass: 1 = the frame is linear (scRGB); motion pass: 1 = start from the coarser level,
+                     // +2 = the last (finest) level
+};
+Texture2D<float4> ta : register(t0);   // brightness: the game frame / the finer level. Motion: this level, newer frame
+Texture2D<float4> tb : register(t1);   // motion: this level, older frame
+Texture2D<float4> tc : register(t2);   // motion: the coarser level's vectors
+SamplerState linClamp : register(s0);
+
+float WLuma(float3 c)
+{
+    float y = dot(max(c, 0.0), float3(0.2126, 0.7152, 0.0722));
+    return wmode == 1 ? sqrt(y / (y + 1.0)) : y;       // linear light: compressed, so dark and bright areas match alike
+}
+
+// The frame's brightness at a quarter of its size: 4 bilinear taps, each the mean of 2x2 pixels.
+float4 PSWarpLuma(float4 pos : SV_Position) : SV_Target
+{
+    float2 uv = pos.xy * texel;
+    float y = WLuma(ta.SampleLevel(linClamp, uv + texel2 * float2(-1.0, -1.0), 0).rgb)
+            + WLuma(ta.SampleLevel(linClamp, uv + texel2 * float2( 1.0, -1.0), 0).rgb)
+            + WLuma(ta.SampleLevel(linClamp, uv + texel2 * float2(-1.0,  1.0), 0).rgb)
+            + WLuma(ta.SampleLevel(linClamp, uv + texel2 * float2( 1.0,  1.0), 0).rgb);
+    return float4(0.25 * y, 0.0, 0.0, 1.0);
+}
+
+// The next level: half the size (one bilinear tap between four pixels).
+float4 PSWarpDown(float4 pos : SV_Position) : SV_Target
+{
+    return float4(ta.SampleLevel(linClamp, pos.xy * texel, 0).r, 0.0, 0.0, 1.0);
+}
+
+#define PULL 0.05
+static const float2 kTap[9] = {
+    float2(-1.5, -1.5), float2(0.0, -1.5), float2(1.5, -1.5),
+    float2(-1.5,  0.0), float2(0.0,  0.0), float2(1.5,  0.0),
+    float2(-1.5,  1.5), float2(0.0,  1.5), float2(1.5,  1.5) };
+
+// How badly the patch around uv in the newer frame matches the older frame f further back (f in uv).
+float PatchCost(float2 uv, float2 f, float cur[9])
+{
+    float c = 0.0;
+    for (int i = 0; i < 9; i++) c += abs(cur[i] - tb.SampleLevel(linClamp, uv + kTap[i] * texel - f, 0).r);
+    return c;
+}
+
+// Motion: xy = how far the picture at this point moved from the older frame to the newer one (uv), z = confidence.
+float4 PSWarpFlow(float4 pos : SV_Position) : SV_Target
+{
+    float2 uv = pos.xy * texel;
+    float cur[9];
+    for (int i = 0; i < 9; i++) cur[i] = ta.SampleLevel(linClamp, uv + kTap[i] * texel, 0).r;
+    float2 best = float2(0.0, 0.0);
+    float2 lead = float2(0.0, 0.0);                      // what the level above found here
+    float bestC = PatchCost(uv, best, cur);              // standing still
+    // The last level: where the picture is the same as in the frame before, nothing moved -- or nothing that can be
+    // seen moving (a flat area). A HUD over a moving scene stays exactly where it is, fine text included, which the
+    // levels above can't tell from its background.
+    if ((wmode & 2) != 0 && bestC < 0.03) return float4(0.0, 0.0, 1.0, 1.0);
+    if ((wmode & 1) == 0)
+    {
+        // the smallest level: standing still unless an offset is clearly better
+        for (int y = -3; y <= 3; y++)
+        {
+            for (int x = -3; x <= 3; x++)
+            {
+                float2 o = float2(x, y);
+                float c = PatchCost(uv, o * texel, cur) + 0.01 + 0.004 * length(o);
+                if (c < bestC) { bestC = c; best = o * texel; }
+            }
+        }
+    }
+    else
+    {
+        static const float2 kN[5] = { float2(0.0, 0.0), float2(1.0, 0.0), float2(-1.0, 0.0), float2(0.0, 1.0), float2(0.0, -1.0) };
+        // The level above already found this area's motion: it is kept unless standing still or a neighbour's
+        // motion matches clearly better. (Preferring "still" here left low-contrast areas behind in a pan.)
+        bestC += 0.01;
+        for (int k = 0; k < 5; k++)
+        {
+            float2 f = tc.SampleLevel(linClamp, uv + kN[k] * texel2, 0).xy;
+            if (k == 0) lead = f;
+            float c = PatchCost(uv, f, cur) + (k == 0 ? 0.0 : 0.01);
+            if (c < bestC) { bestC = c; best = f; }
+        }
+    }
+    static const float2 kR[8] = { float2(-1.0, -1.0), float2(0.0, -1.0), float2(1.0, -1.0), float2(-1.0, 0.0),
+                                  float2(1.0, 0.0), float2(-1.0, 1.0), float2(0.0, 1.0), float2(1.0, 1.0) };
+    // a pixel, then half a pixel; the last level goes on to an eighth (one pixel of the game frame at 1/8 size)
+    float stepPx = 1.0;
+    int rounds = (wmode & 2) != 0 ? 4 : 2;
+    for (int r = 0; r < rounds; r++)
+    {
+        float2 base = best;
+        for (int k = 0; k < 8; k++)
+        {
+            float2 f = base + kR[k] * (stepPx * texel);
+            // Going more than half a pixel from what the level above found costs a little per pixel: in a repeating
+            // pattern (stripes, a fence, tiles) many offsets match equally well, and the larger area's motion is
+            // the right one. Within half a pixel the refinement is free.
+            float c = PatchCost(uv, f, cur) + 0.01 + 0.004 * stepPx + PULL * max(length((f - lead) / texel) - 0.5, 0.0);
+            if (c < bestC) { bestC = c; best = f; }
+        }
+        stepPx *= 0.5;
+    }
+    // Confidence from the match itself: full below a mean difference of 0.04 per tap, none from 0.10.
+    float conf = saturate((0.10 - bestC / 9.0) / 0.06);
+    return float4(best, conf, 1.0);
+}
+
+// The motion evened out: each vector becomes the mean of those around it (5x5) that agree with it to within about a
+// pixel of this level. One block's match is only good to a pixel or two of the game frame, which shows as a wobble in
+// fine detail; things that move together share one motion, and vectors of something moving differently (or standing
+// still) are left out, so the edges between them stay.
+float4 PSWarpSmooth(float4 pos : SV_Position) : SV_Target
+{
+    int2 q = int2(pos.xy);
+    float4 c = ta.Load(int3(q, 0));
+    float2 sum = float2(0.0, 0.0);
+    float wsum = 0.0;
+    for (int y = -2; y <= 2; y++)
+    {
+        for (int x = -2; x <= 2; x++)
+        {
+            float4 n = ta.SampleLevel(linClamp, (pos.xy + float2(x, y)) * texel, 0);
+            float2 d = (n.xy - c.xy) / texel;
+            float w = exp(-dot(d, d) / 1.125) * (0.05 + n.z);
+            sum += n.xy * w;
+            wsum += w;
+        }
+    }
+    return float4(sum / wsum, c.z, 1.0);
+}
+)HLSL";
+
+static const char *const kWarpEntry[] = { "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth" };
+static const int kWarpShN = 4;
+
+struct WarpConstants
+{
+    float    texelX, texelY, texel2X, texel2Y;
+    uint32_t mode;
+};
+
+struct WarpGpu
+{
+    static const int kLevels = 5;                       // 1/4, 1/8, 1/16, 1/32, 1/64 of the game frame
+    ID3D12Resource       *luma[2][kLevels] = {};        // brightness pyramids of the newest frame shown and the one before
+    ID3D12Resource       *flow[kLevels] = {};           // motion, per level
+    ID3D12Resource       *flowOut[2] = {};              // the last level's motion evened out, for level 0 and level 1 as the
+                                                        // last: what the per-refresh shader reads
+    ID3D12PipelineState  *psoLuma = nullptr, *psoDown = nullptr, *psoFlow = nullptr, *psoSmooth = nullptr;
+    ID3D12Device         *device = nullptr;             // the presenter's (not owned)
+    ID3D12DescriptorHeap *rtvHeap = nullptr;
+    ID3D12DescriptorHeap *srvHeap = nullptr;            // the presenter's (not owned)
+    UINT  w[kLevels] = {}, h[kLevels] = {};
+    UINT  srcW = 0, srcH = 0;
+    UINT  srvBase = 0, srvStride = 0, rtvStride = 0;
+    int   cur = 0;                                      // which pyramid holds the newest frame
+    UINT64 id[2] = {};                                  // the game frame in each pyramid (0 = none)
+    double t[2] = {};                                   // and when the game presented it
+    UINT64 flowNew = 0, flowOld = 0;                    // the pair of frames the motion texture was measured between
+    int   finest = 1;                                   // level the motion is refined down to: 1 = 1/8, 0 = 1/4 of the frame
+    bool  ok = false;
+
+    static const UINT kSrvCount = 3 * kLevels + 2;      // descriptors it takes in the presenter's SRV heap
+
+    static D3D12_RESOURCE_BARRIER Tr(ID3D12Resource *r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
+    {
+        D3D12_RESOURCE_BARRIER br = {};
+        br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        br.Transition.pResource   = r;
+        br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        br.Transition.StateBefore = a;
+        br.Transition.StateAfter  = b;
+        return br;
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE Srv(UINT i) const
+    {
+        D3D12_GPU_DESCRIPTOR_HANDLE hnd = srvHeap->GetGPUDescriptorHandleForHeapStart();
+        hnd.ptr += (UINT64)(srvBase + i) * srvStride;
+        return hnd;
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE LumaSrv(int p, int l) const { return Srv((UINT)(p * kLevels + l)); }
+    D3D12_GPU_DESCRIPTOR_HANDLE FlowSrvAt(int l) const { return Srv((UINT)(2 * kLevels + l)); }
+    // The motion texture the per-refresh shader reads.
+    int Last() const { return finest <= 0 ? 0 : 1; }    // the level the motion is refined down to
+    D3D12_GPU_DESCRIPTOR_HANDLE FlowSrv() const { return Srv((UINT)(3 * kLevels + Last())); }
+    D3D12_CPU_DESCRIPTOR_HANDLE Rtv(UINT i) const
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE hnd = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        hnd.ptr += (SIZE_T)i * rtvStride;
+        return hnd;
+    }
+
+    // psBlobs: PSWarpLuma, PSWarpDown, PSWarpFlow, PSWarpSmooth. heap/base: kSrvCount free descriptors in the presenter's SRV heap.
+    bool Init(ID3D12Device *dev, ID3D12RootSignature *rootSig, ID3DBlob *vs, ID3DBlob *const *psBlobs,
+              ID3D12DescriptorHeap *heap, UINT base, UINT frameW, UINT frameH)
+    {
+        ok = false;
+        if (!dev || !rootSig || !vs || !psBlobs[0] || !psBlobs[1] || !psBlobs[2] || !psBlobs[3] || !heap || frameW < 64 || frameH < 64) return false;
+        device = dev;
+        srvHeap = heap; srvBase = base; srcW = frameW; srcH = frameH;
+        srvStride = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        rtvStride = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        w[0] = (frameW + 3) / 4; h[0] = (frameH + 3) / 4;
+        for (int l = 1; l < kLevels; l++) { w[l] = (w[l - 1] + 1) / 2; h[l] = (h[l - 1] + 1) / 2; }
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rootSig;
+        pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.SampleDesc.Count = 1;
+        bool m = true;
+        pd.RTVFormats[0] = DXGI_FORMAT_R16_FLOAT;
+        pd.PS = { psBlobs[0]->GetBufferPointer(), psBlobs[0]->GetBufferSize() };
+        m = m && SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoLuma)));
+        pd.PS = { psBlobs[1]->GetBufferPointer(), psBlobs[1]->GetBufferSize() };
+        m = m && SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoDown)));
+        pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        pd.PS = { psBlobs[2]->GetBufferPointer(), psBlobs[2]->GetBufferSize() };
+        m = m && SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoFlow)));
+        pd.PS = { psBlobs[3]->GetBufferPointer(), psBlobs[3]->GetBufferSize() };
+        m = m && SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoSmooth)));
+
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = 3 * kLevels + 2;
+        m = m && SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
+
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        for (int i = 0; m && i < 3 * kLevels; i++)
+        {
+            const int l = i % kLevels;
+            const bool isFlow = i >= 2 * kLevels;
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width = w[l]; rd.Height = h[l]; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Format = isFlow ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R16_FLOAT;
+            rd.SampleDesc.Count = 1;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            D3D12_CLEAR_VALUE cv = {};
+            cv.Format = rd.Format;
+            ID3D12Resource **slot = isFlow ? &flow[l] : &luma[i / kLevels][l];
+            m = SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                       &cv, IID_PPV_ARGS(slot)));
+            if (!m) break;
+            (*slot)->SetName(isFlow ? L"BFI frame warp motion" : L"BFI frame warp brightness");
+            dev->CreateRenderTargetView(*slot, nullptr, Rtv((UINT)i));
+            sv.Format = rd.Format;
+            D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+            sh.ptr += (SIZE_T)(srvBase + (UINT)i) * srvStride;
+            dev->CreateShaderResourceView(*slot, &sv, sh);
+        }
+        m = m && MakeOut(0) && MakeOut(1);
+        if (!m) { Release(); return false; }
+        cur = 0; id[0] = id[1] = 0; t[0] = t[1] = 0.0; flowNew = flowOld = 0;
+        ok = true;
+        return true;
+    }
+
+    // The evened-out motion texture for `level` as the last one.
+    bool MakeOut(int level)
+    {
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w[level]; rd.Height = h[level]; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE cv = {};
+        cv.Format = rd.Format;
+        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                   &cv, IID_PPV_ARGS(&flowOut[level])))) return false;
+        flowOut[level]->SetName(L"BFI frame warp motion (evened out)");
+        device->CreateRenderTargetView(flowOut[level], nullptr, Rtv((UINT)(3 * kLevels + level)));
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+        sv.Format = rd.Format;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+        sh.ptr += (SIZE_T)(srvBase + 3 * kLevels + (UINT)level) * srvStride;
+        device->CreateShaderResourceView(flowOut[level], &sv, sh);
+        return true;
+    }
+
+    void Release()
+    {
+        for (int i = 0; i < 2; i++) if (flowOut[i]) { flowOut[i]->Release(); flowOut[i] = nullptr; }
+        if (psoSmooth) { psoSmooth->Release(); psoSmooth = nullptr; }
+        for (int p = 0; p < 2; p++)
+            for (int l = 0; l < kLevels; l++) if (luma[p][l]) { luma[p][l]->Release(); luma[p][l] = nullptr; }
+        for (int l = 0; l < kLevels; l++) if (flow[l]) { flow[l]->Release(); flow[l] = nullptr; }
+        if (psoLuma) { psoLuma->Release(); psoLuma = nullptr; }
+        if (psoDown) { psoDown->Release(); psoDown = nullptr; }
+        if (psoFlow) { psoFlow->Release(); psoFlow = nullptr; }
+        if (rtvHeap) { rtvHeap->Release(); rtvHeap = nullptr; }
+        ok = false;
+    }
+
+    // Forget the frames seen (frame warp switched off and on again, a gap in the frames).
+    void Forget() { id[0] = id[1] = 0; flowNew = flowOld = 0; }
+
+    // The frame the motion of `frameId` would be measured from, if that frame were shown now: 0 = none usable.
+    // (The frame before it must be the one shown just before, at most 4 game frames and a quarter second older.)
+    UINT64 PairFor(UINT64 frameId, double frameT) const
+    {
+        const UINT64 oldId = frameId == id[cur] ? id[1 - cur] : id[cur];
+        const double oldT  = frameId == id[cur] ? t[1 - cur] : t[cur];
+        if (!ok || !oldId || frameId <= oldId || frameId - oldId > 4) return 0;
+        if (frameT - oldT > 0.25 || frameT < oldT) return 0;
+        return oldId;
+    }
+
+    void Pass(ID3D12GraphicsCommandList *list, ID3D12PipelineState *pso, ID3D12Resource *target, UINT rtvIndex,
+              UINT tw, UINT th, const WarpConstants &wc)
+    {
+        D3D12_RESOURCE_BARRIER b = Tr(target, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(1, &b);
+        list->SetPipelineState(pso);
+        list->SetGraphicsRoot32BitConstants(0, sizeof(WarpConstants) / 4, &wc, 0);
+        D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)tw, (float)th, 0.0f, 1.0f };
+        D3D12_RECT sc = { 0, 0, (LONG)tw, (LONG)th };
+        list->RSSetViewports(1, &vp);
+        list->RSSetScissorRects(1, &sc);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = Rtv(rtvIndex);
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->DrawInstanced(3, 1, 0, 0);
+        b = Tr(target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(1, &b);
+    }
+
+    // A new frame is about to be shown for the first time: its brightness pyramid (the one before is kept).
+    // frameSrv: the frame (in a shader-resource state); linear: 1 for an scRGB frame. The caller has set the
+    // descriptor heap, root signature and topology, and sets its own pipeline state, constants and t0 again after.
+    void RecordLuma(ID3D12GraphicsCommandList *list, D3D12_GPU_DESCRIPTOR_HANDLE frameSrv, UINT64 frameId, double frameT, bool linear)
+    {
+        cur = 1 - cur;
+        id[cur] = frameId; t[cur] = frameT;
+        WarpConstants wc = {};
+        wc.texelX = 1.0f / (float)w[0]; wc.texelY = 1.0f / (float)h[0];
+        wc.texel2X = 1.0f / (float)srcW; wc.texel2Y = 1.0f / (float)srcH;
+        wc.mode = linear ? 1u : 0u;
+        list->SetGraphicsRootDescriptorTable(1, frameSrv);
+        Pass(list, psoLuma, luma[cur][0], (UINT)(cur * kLevels), w[0], h[0], wc);
+        for (int l = 1; l < kLevels; l++)
+        {
+            wc.texelX = 1.0f / (float)w[l]; wc.texelY = 1.0f / (float)h[l];
+            list->SetGraphicsRootDescriptorTable(1, LumaSrv(cur, l - 1));
+            Pass(list, psoDown, luma[cur][l], (UINT)(cur * kLevels + l), w[l], h[l], wc);
+        }
+    }
+
+    // The motion from the frame before to the newest, coarse to fine. Only when a frame is shown moved, and once per
+    // pair of frames. Sets t0-t2; the caller sets its own again after.
+    void RecordFlow(ID3D12GraphicsCommandList *list)
+    {
+        const int top = kLevels - 1;
+        const int stop = Last();
+        for (int l = top; l >= stop; l--)
+        {
+            WarpConstants wc = {};
+            wc.texelX = 1.0f / (float)w[l]; wc.texelY = 1.0f / (float)h[l];
+            wc.mode = (l < top ? 1u : 0u) | (l == stop ? 2u : 0u);
+            if (l < top) { wc.texel2X = 1.0f / (float)w[l + 1]; wc.texel2Y = 1.0f / (float)h[l + 1]; }
+            list->SetGraphicsRootDescriptorTable(1, LumaSrv(cur, l));
+            list->SetGraphicsRootDescriptorTable(2, LumaSrv(1 - cur, l));
+            list->SetGraphicsRootDescriptorTable(3, l < top ? FlowSrvAt(l + 1) : LumaSrv(cur, l));   // unused at the top level
+            Pass(list, psoFlow, flow[l], (UINT)(2 * kLevels + l), w[l], h[l], wc);
+        }
+        {
+            WarpConstants wc = {};
+            wc.texelX = 1.0f / (float)w[stop]; wc.texelY = 1.0f / (float)h[stop];
+            list->SetGraphicsRootDescriptorTable(1, FlowSrvAt(stop));
+            Pass(list, psoSmooth, flowOut[stop], (UINT)(3 * kLevels + stop), w[stop], h[stop], wc);
+        }
+        flowNew = id[cur]; flowOld = id[1 - cur];
+    }
+};

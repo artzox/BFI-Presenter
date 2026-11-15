@@ -23,7 +23,7 @@
 // Settings: "BFI Presenter" window in the ReShade overlay (saved to
 // BFIPresenter.ini next to this file).
 // Hotkeys:  Ctrl+Shift+B  BFI on/off      Ctrl+Shift+M  BFI <-> Variable MPRT
-//           Ctrl+Shift+R  reload ini
+//           Ctrl+Shift+R  reload ini        Ctrl+Shift+W  frame warp off / on
 // Diagnostics: with Diagnostics=1 in the ini, D3D12 DRED is enabled and a
 // device-removed report (last GPU operations, page-fault allocations) is
 // written to ReShade.log and BFIPresenter_dred.txt.
@@ -56,6 +56,7 @@
 #include "../common/bfi_vram.h"
 #include "../common/bfi_osd.h"
 #include "../common/bfi_clockdrift.h"
+#include "../common/bfi_warpclock.h"
 
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d12.lib")
@@ -94,7 +95,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.40"
+#define BFI_ADDON_VERSION "1.0.41-t1"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -112,6 +113,11 @@ struct Settings
     int   splitSide = 0;      // 0 = the left side without BFI, 1 = the right side
     int   splitPos = 50;      // the seam, percent of the width from the left
     int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
+    int   frameWarp = 0;      // FrameWarp: strobe cycles without a new game frame show the last one moved ahead along its
+                              // motion (no frame is held back: no added latency). 0 off, 1 fill missing frames, 2 even pacing
+    float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
+    int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
+    int   warpDetail = 0;     // FrameWarpDetail: motion measured per 0 = 8x8 block of the frame, 1 = 4x4 block
     int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
     int   osdCorner = 1;      // OsdCorner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
     int   osdGraph = 1;       // OsdGraph: frame-time graph
@@ -273,6 +279,10 @@ static void LoadSettings(Settings &s)
     s.splitSide = IniInt("SplitCompareSide", 0) ? 1 : 0;
     s.splitPos = std::max(5, std::min(95, IniInt("SplitComparePosition", 50)));
     s.splitSeam = std::max(0, std::min(400, IniInt("SplitCompareSeamPx", 0)));
+    s.frameWarp = std::max(0, std::min(2, IniInt("FrameWarp", 0)));
+    s.warpMax = std::max(0.25f, std::min(1.5f, IniFloat("FrameWarpMaxAhead", 1.0f)));
+    s.warpMinRate = std::max(40, std::min(95, IniInt("FrameWarpMinRate", 75)));
+    s.warpDetail = IniInt("FrameWarpDetail", 0) ? 1 : 0;
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -497,6 +507,10 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("SplitCompareSide", s.splitSide);
     IniWriteInt("SplitComparePosition", s.splitPos);
     IniWriteInt("SplitCompareSeamPx", s.splitSeam);
+    IniWriteInt("FrameWarp", s.frameWarp);
+    IniWriteFloat("FrameWarpMaxAhead", s.warpMax);
+    IniWriteInt("FrameWarpMinRate", s.warpMinRate);
+    IniWriteInt("FrameWarpDetail", s.warpDetail);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -612,6 +626,10 @@ struct Status
     double aplCut  = 0.0;                       // and the share of the boost it removes
     double hotArea = -1.0;                      // ABL guard: percent of the screen whose lit refresh exceeds the cap
     double ceilInUse = 0.0;                     // ABL guard: lit-refresh ceiling in effect (nits)                  // display refreshing slower than it can, with no missed refreshes
+    int    warpOn = 0;                          // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
+    int    warpCycles = 0;                      // per second: strobe cycles shown moved ahead
+    double warpRate = 0.0;                      // the game's frames per strobe cycle, as frame warp measures it
+    double warpAvg = 0.0;                       // average distance ahead of those cycles, in game frames
     int    reused = 0;                          // per second: refreshes that reused an already-drawn buffer   // per second: strobe cycles with no new game frame / frames never shown
     int    deviceLost = 0;
     int    flashHint = 0;                       // missed refreshes keep coming back (3 of the last 10 s; off after 30 s without)
@@ -810,7 +828,9 @@ static const UINT kMaxBuf = 8;
 // shown + three in flight left no room for a finished frame to wait for its
 // strobe cycle -- the game overwrote it unseen and only every 3rd-5th frame
 // reached the screen (God of War with DLSS 5 NR: 37 fps rendered, ~11 shown).
-static const UINT kStage  = 6;
+// Seven since frame warp: it keeps the frame shown before the current one (g_presPrevSlot), which would
+// otherwise take the slot a finished frame waits in.
+static const UINT kStage  = 7;
 
 static CRITICAL_SECTION       g_lock;
 static CRITICAL_SECTION       g_submitLock;      // serialises game-side Present calls (FG add-ons present from other threads)
@@ -845,6 +865,7 @@ static double                 g_stageTime[kStage] = {};
 static UINT64                 g_readFence[kStage] = {};    // presenter fence value of the last read
 static int                    g_presCurSlot = -1;          // staging slot the presenter is showing (g_lock)
 static int                    g_presCurSlot2 = -1;         // split comparison: the newer frame its side without BFI shows (g_lock)
+static int                    g_presPrevSlot = -1;         // frame warp: the frame shown before the current one (g_lock)
 static std::atomic<int>       g_slotWaits{0};
 // Swap chains the game recreates (God of War Ragnarok on loading) hung when
 // the presenter presented on the game's own queue, and also when moved to
@@ -1320,7 +1341,7 @@ static bool CreateFrameResources()
     {
         if (!(g_stage[s] = CreateTex(g_desc, gf, D3D12_RESOURCE_FLAG_NONE, L"BFI staging frame", s))) return false;
         g_stageFence[s] = g_stageId[s] = g_readFence[s] = 0;
-        g_presCurSlot = -1; g_presCurSlot2 = -1;
+        g_presCurSlot = -1; g_presCurSlot2 = -1; g_presPrevSlot = -1;
         g_stageTime[s] = 0.0;
     }
     g_cur = 0;
@@ -1560,7 +1581,7 @@ cbuffer C : register(b0)
     float dfloor;
     float knee;
     float ceilLin;    // panel ceiling, linear (1.0 = SDR white / 80 nits)
-    uint  flags;      // 1 roll-off, 2 sine, 4 invert, 8 rolling scan
+    uint  flags;      // 1 roll-off, 2 sine, 4 invert, 8 rolling scan, 1024 the game's frames are linear (scRGB; frame warp)
     float seam;       // rolling scan: blended zone between bands, fraction of the screen height
     float decay;      // rolling scan: phosphor decay time in sub-frames (0 = hard bands)
     float soften;     // 0..1: blend toward the steady average picture (LCD phase swap fade)
@@ -1576,16 +1597,117 @@ cbuffer C : register(b0)
     float rfxRamp;    // SDR to HDR, RenoFX HDR Boost (flags & 256): Ramp Intensity
     float rfxColor;   // its colour blend, 0..1 (0 = brightness only)
     float rfxApl;     // its APL Limiter: 1 = on (the scene average is in aplTex, measured from this frame)
+    float warp;       // frame warp: the frame is shown this share of its measured motion further on (0 = as rendered)
 };
 Texture2D<float4> src : register(t0);
 Texture2D<float> aplTex : register(t1);
 Texture2D<float4> srcNew : register(t2);  // split comparison: the newest game frame, for the side without BFI   // APL Limiter: the scene average (1x1); for its reduction pass, the 32x18 cells
+Texture2D<float4> srcPrev : register(t4); // frame warp: the game frame shown before this one (what stands still is not moved)
+Texture2D<float4> flowTex : register(t3); // frame warp: xy = how far the picture moved since the frame before (uv), z = confidence
 SamplerState linClamp : register(s0);
+
+// Frame warp (dx/bfi_warp.h): how far back along its motion the picture shown at uv is taken from, in uv. The vector
+// is read where the picture comes from (second step), so a moving area's own motion is used rather than what it
+// moves across; at most 8% of the screen.
+float2 WarpShift(float2 uv)
+{
+    float4 f = flowTex.SampleLevel(linClamp, uv, 0);
+    float2 d = f.xy * (f.z * warp);
+    f = flowTex.SampleLevel(linClamp, uv - d, 0);
+    return clamp(f.xy * (f.z * warp), -0.08, 0.08);
+}
+
+// Frame warp: a pixel that is the same in this frame and the one shown before it (8-bit: the same value; 10-bit:
+// within a step or two).
+bool Unchanged(int2 q)
+{
+    float3 a = src.Load(int3(q, 0)).rgb, b = srcPrev.Load(int3(q, 0)).rgb;
+    float3 tol = (flags & 1024) != 0 ? 0.002 * (0.1 + max(abs(a), abs(b))) : float3(0.0016, 0.0016, 0.0016);
+    return all(abs(a - b) <= tol);
+}
+// Does the pixel stand still on the screen (a HUD, text, a crosshair) rather than move with the scene? It is
+// unchanged, and either most of what is around it is too (5 of 8: the inside or the edge of something still, or an
+// area with nothing in it to see moving), or one around it is and the scene's motion does not explain it: the
+// frame before, one motion step back, shows something else there (a crosshair's one-pixel line over a moving
+// scene, the corner of a HUD). A pixel of a moving picture can be unchanged by chance, and along whole lines in a
+// regular pattern (stripes that moved by their own spacing): there the motion explains it, and it moves with the
+// rest.
+bool Still(int2 q, float2 size)
+{
+    if (!Unchanged(q)) return false;
+    int n = 0;
+    [unroll] for (int y = -1; y <= 1; y++)
+        [unroll] for (int x = -1; x <= 1; x++)
+            if ((x != 0 || y != 0) && Unchanged(q + int2(x, y))) n++;
+    if (n >= 5) return true;
+    if (n < 1) return false;
+    float2 c = float2(q) + 0.5;
+    float4 f = flowTex.SampleLevel(linClamp, c / size, 0);
+    float2 step = f.xy * f.z * size;                       // this part of the scene's motion since the frame before, pixels
+    if (dot(step, step) < 2.25) return true;               // under a pixel and a half: nothing to tell apart
+    float3 a = src.Load(int3(q, 0)).rgb;
+    float3 d = abs(a - srcPrev.SampleLevel(linClamp, (c - step) / size, 0).rgb);
+    float lim = (flags & 1024) != 0 ? 0.04 * (0.1 + max(max(a.r, a.g), a.b)) : 0.04;
+    return max(max(d.r, d.g), d.b) > lim;
+}
+
+// The game's frame moved ahead: each output pixel is taken from where its part of the picture is in the frame.
+// False = show the pixel as rendered: what stands still on the screen is never moved, and nothing that stands
+// still is pulled over what moves next to it (the edge of a HUD stays clean; the scene coming out from behind it
+// is shown as rendered for that flash).
+// Same size: Catmull-Rom (9 bilinear taps), so a moved frame is as sharp as one shown as rendered. Scaled down to
+// the window: the four-tap area filter, at the moved place.
+bool FetchWarped(float2 pos, out float3 c)
+{
+    c = float3(0, 0, 0);
+    uint w, h;
+    src.GetDimensions(w, h);
+    float2 size = float2(w, h);
+    float2 inv = 1.0 / size;
+    float2 cp = pos * srcPerOut;
+    float2 d = WarpShift(cp * inv) * size;
+    if (dot(d, d) < 0.0004) return false;                 // under 1/50 pixel
+    if (Still(int2(cp), size)) return false;
+    float2 p = clamp(cp - d, float2(0.5, 0.5), size - 0.5);
+    if (Still(int2(p), size)) return false;
+    if (srcPerOut.x > 1.0001 || srcPerOut.y > 1.0001)
+    {
+        float2 o = 0.25 * srcPerOut;
+        c = 0.25 * (src.SampleLevel(linClamp, (p + float2(-o.x, -o.y)) * inv, 0).rgb +
+                    src.SampleLevel(linClamp, (p + float2( o.x, -o.y)) * inv, 0).rgb +
+                    src.SampleLevel(linClamp, (p + float2(-o.x,  o.y)) * inv, 0).rgb +
+                    src.SampleLevel(linClamp, (p + float2( o.x,  o.y)) * inv, 0).rgb);
+        return true;
+    }
+    float2 tc = floor(p - 0.5) + 0.5;
+    float2 f = p - tc;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 t0 = (tc - 1.0) * inv, t3 = (tc + 2.0) * inv, t12 = (tc + w2 / w12) * inv;
+    c += src.SampleLevel(linClamp, float2(t0.x,  t0.y),  0).rgb * (w0.x  * w0.y);
+    c += src.SampleLevel(linClamp, float2(t12.x, t0.y),  0).rgb * (w12.x * w0.y);
+    c += src.SampleLevel(linClamp, float2(t3.x,  t0.y),  0).rgb * (w3.x  * w0.y);
+    c += src.SampleLevel(linClamp, float2(t0.x,  t12.y), 0).rgb * (w0.x  * w12.y);
+    c += src.SampleLevel(linClamp, float2(t12.x, t12.y), 0).rgb * (w12.x * w12.y);
+    c += src.SampleLevel(linClamp, float2(t3.x,  t12.y), 0).rgb * (w3.x  * w12.y);
+    c += src.SampleLevel(linClamp, float2(t0.x,  t3.y),  0).rgb * (w0.x  * w3.y);
+    c += src.SampleLevel(linClamp, float2(t12.x, t3.y),  0).rgb * (w12.x * w3.y);
+    c += src.SampleLevel(linClamp, float2(t3.x,  t3.y),  0).rgb * (w3.x  * w3.y);
+    return true;
+}
 
 // The game's frame at output pixel pos. Same size: the pixel itself. Larger (a 5K frame in a 4K window): four bilinear
 // taps across the output pixel's footprint, an area filter for up to 2x.
 float3 Fetch(float2 pos)
 {
+    if (warp != 0.0)
+    {
+        float3 m;
+        if (FetchWarped(pos, m)) return m;
+    }
     if (srcPerOut.x <= 1.0001 && srcPerOut.y <= 1.0001) return src.Load(int3(pos, 0)).rgb;
     uint w, h;
     src.GetDimensions(w, h);
@@ -2093,6 +2215,8 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
 }
 )HLSL";
 
+#include "bfi_warp.h"   // frame warp: motion between the last two frames (its shaders and passes)
+
 struct Constants
 {
     uint32_t outType, slot, frames, method;
@@ -2111,6 +2235,7 @@ struct Constants
     uint32_t splitMode;                // 0 off, 1 left side without BFI, 2 right side
     float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
     float    rfxApl;                    // its APL Limiter: 1 = on (GPU-measured from the frame being shown)
+    float    warp;                      // frame warp: share of the measured motion the frame is moved ahead (0 = off)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -2232,8 +2357,9 @@ typedef HRESULT (WINAPI *PFN_D3DCompile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHAD
 static bool Compile(PFN_D3DCompile compile, const char *entry, const char *target, ID3DBlob **out)
 {
     ID3DBlob *err = nullptr;
-    HRESULT hr = compile(kShader, sizeof(kShader) - 1, "bfi_presenter", nullptr, nullptr, entry, target,
-                         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out, &err);
+    const bool warpSrc = strncmp(entry, "PSWarp", 6) == 0;     // frame warp's passes have a source of their own
+    HRESULT hr = compile(warpSrc ? kWarpShader : kShader, (warpSrc ? sizeof(kWarpShader) : sizeof(kShader)) - 1, "bfi_presenter",
+                         nullptr, nullptr, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out, &err);
     if (FAILED(hr))
     {
         LOGE("BFI Presenter: shader %s failed: %s", entry, err ? (const char *)err->GetBufferPointer() : "?");
@@ -2274,9 +2400,11 @@ static void Trace(const char *fmt, ...)
 // compiled once per session on a thread started when the add-on loads (the game takes seconds to its first frame, so
 // they are usually ready), and kept on disk in BFIPresenter_shaders.bin next to the ini, keyed to the exact source and
 // compile flags: from the second start of a version there is no compile at all.
-static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce" };
-static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
-static const int kShN = 5;
+static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce",
+                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth" };   // the last four: kWarpShader (dx/bfi_warp.h)
+static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
+static const int kShN = 9;
+static const int kShWarp = 5;                    // first of the frame warp shaders
 static ID3DBlob *g_shBlob[kShN] = {};
 static HANDLE volatile g_shThread = nullptr;
 static volatile LONG g_shStarted = 0, g_shDone = 0;
@@ -2288,6 +2416,7 @@ static uint64_t ShaderKey()
     uint64_t h = 1469598103934665603ull;                      // FNV-1a over the source, the flags and the entry points
     auto mix = [&](const void *p, size_t n) { const uint8_t *b = (const uint8_t *)p; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; } };
     mix(kShader, sizeof(kShader) - 1);
+    mix(kWarpShader, sizeof(kWarpShader) - 1);
     const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
     mix(&flags, sizeof(flags));
     for (int i = 0; i < kShN; i++) { mix(kShEntry[i], strlen(kShEntry[i])); mix(kShTarget[i], strlen(kShTarget[i])); }
@@ -3272,6 +3401,17 @@ static DWORD WINAPI PresenterThread(void *)
     ID3D12DescriptorHeap *aplRtvHeap = nullptr;
     bool aplOk = false;
     UINT64 aplFrameId = ~0ull;
+    // Frame warp: the motion between the last two frames shown (dx/bfi_warp.h) and how far ahead each strobe cycle
+    // shows its frame (common/bfi_warpclock.h)
+    WarpGpu warp;
+    WarpClock warpClock;
+    ID3DBlob *psWarp[kWarpShN] = {};
+    double warpAhead = 0.0;                  // this strobe cycle: game frames ahead of the frame it shows
+    int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
+    UINT64 warpPrevId = 0;
+    int    secWarpCycles = 0, warpLastMode = 1;
+    double secWarpSum = 0.0;
+    bool   kwarp = false;
     UINT64 measFence = 0;
     IDXGIOutput *output = nullptr;
     UINT64 bufFence[kMaxBuf] = {};
@@ -3297,7 +3437,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage + 2;   // the stage frames, then the APL Limiter's cells and its 1x1 average
+    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount;   // the stage frames, the APL Limiter's cells and its 1x1 average, frame warp's textures
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
 
@@ -3338,6 +3478,7 @@ static DWORD WINAPI PresenterThread(void *)
         ID3DBlob *sh[kShN] = {};
         ok = ShaderGet(sh);
         vs = sh[0]; ps = sh[1]; psMeas = sh[2]; psAplC = sh[3]; psAplR = sh[4];   // ABL guard, APL Limiter optional
+        for (int i = 0; i < kWarpShN; i++) psWarp[i] = sh[kShWarp + i];             // frame warp optional
         if (!ok) LOGE("BFI Presenter: the presenter's shaders are not available");
     }
 
@@ -3351,7 +3492,11 @@ static DWORD WINAPI PresenterThread(void *)
         rangeApl.BaseShaderRegister = 1;                   // t1: the APL Limiter's value (or its cells)
         D3D12_DESCRIPTOR_RANGE rangeNew = range;
         rangeNew.BaseShaderRegister = 2;                   // t2: split comparison's newest game frame
-        D3D12_ROOT_PARAMETER params[4] = {};
+        D3D12_DESCRIPTOR_RANGE rangeFlow = range;
+        rangeFlow.BaseShaderRegister = 3;                  // t3: frame warp's motion
+        D3D12_DESCRIPTOR_RANGE rangePrev = range;
+        rangePrev.BaseShaderRegister = 4;                  // t4: frame warp's frame shown before
+        D3D12_ROOT_PARAMETER params[6] = {};
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
         params[0].Constants.Num32BitValues = sizeof(Constants) / 4;
@@ -3364,6 +3509,10 @@ static DWORD WINAPI PresenterThread(void *)
         params[2].DescriptorTable.pDescriptorRanges   = &rangeApl;
         params[3] = params[1];
         params[3].DescriptorTable.pDescriptorRanges   = &rangeNew;
+        params[4] = params[1];
+        params[4].DescriptorTable.pDescriptorRanges   = &rangeFlow;
+        params[5] = params[1];
+        params[5].DescriptorTable.pDescriptorRanges   = &rangePrev;
         D3D12_STATIC_SAMPLER_DESC samp = {};
         samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -3371,7 +3520,7 @@ static DWORD WINAPI PresenterThread(void *)
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 4;
+        rsd.NumParameters = 6;
         rsd.pParameters   = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers   = &samp;
@@ -3487,6 +3636,13 @@ static DWORD WINAPI PresenterThread(void *)
                 SafeRelease(psoAplC); SafeRelease(psoAplR); SafeRelease(aplCellRt); SafeRelease(aplRt); SafeRelease(aplRtvHeap);
             }
         }
+    }
+    if (ok)
+    {
+        // Frame warp's textures, sized from the game's frames (the staging ring)
+        const D3D12_RESOURCE_DESC fd = g_stage[0]->GetDesc();
+        if (!warp.Init(g_device, rootSig, vs, psWarp, srvHeap, kStage + 2, (UINT)fd.Width, fd.Height))
+            LOGW("BFI Presenter: frame warp unavailable (its shaders or textures could not be created)");
     }
     if (ok && FAILED(ScOutput(&output))) output = nullptr;
     // The display mode's own refresh rate (120 on the A95L). The VRR check
@@ -3658,6 +3814,20 @@ static DWORD WINAPI PresenterThread(void *)
             static bool kzPrev = false;
             if (kz && !kzPrev) { Osd::ResetTotals(Now()); LOGI("BFI Presenter: OSD totals reset"); }
             kzPrev = kz;
+        }
+        {
+            // Ctrl+Shift+W: frame warp off / back to the mode last used
+            const bool kw = KeyCombo('W');
+            if (kw && !kwarp)
+            {
+                EnterCriticalSection(&g_cfgLock);
+                if (g_shared.frameWarp) { warpLastMode = g_shared.frameWarp; g_shared.frameWarp = 0; }
+                else g_shared.frameWarp = warpLastMode;
+                const int fw = g_shared.frameWarp;
+                LeaveCriticalSection(&g_cfgLock);
+                LOGI("BFI Presenter: frame warp %s (Ctrl+Shift+W)", fw == 0 ? "off" : fw == 1 ? "on: fill missing frames" : "on: even pacing");
+            }
+            kwarp = kw;
         }
         if (r && !kr) { LoadShared(); LOGI("BFI Presenter: settings reloaded"); }
         // Ctrl+Shift+K: a marker in the log with the last second's state, to find a moment the player noticed (a
@@ -3891,6 +4061,15 @@ static DWORD WINAPI PresenterThread(void *)
         pickNew2 = pick;
         if (s.split && pick >= 0 && newest >= 0 && newestId > pickId) pickNew2 = newest;
         g_presCurSlot2 = pickNew2 != pick ? pickNew2 : -1;
+        // Frame warp keeps the frame shown before this one in the ring: what is the same in both stands still on the
+        // screen (a HUD) and is not moved.
+        if (!s.frameWarp || !warp.ok) { warpPrev = -1; warpPrevId = 0; }
+        else if (pick >= 0 && lastShown >= 0 && lastShownId && pickId != lastShownId)
+        {
+            warpPrev = (pick != lastShown && g_stageId[lastShown] == lastShownId) ? lastShown : -1;
+            warpPrevId = warpPrev >= 0 ? lastShownId : 0;
+        }
+        g_presPrevSlot = warpPrev;
         if (pick < 0)
         {
             int staged = 0;
@@ -3926,6 +4105,16 @@ static DWORD WINAPI PresenterThread(void *)
             else if (lastShownId && pickId > lastShownId + 1) secFrameSkips += (int)(pickId - lastShownId - 1);
         }
         pickTime = g_stageTime[pick];
+        // Frame warp: how far ahead of its frame this strobe cycle shows it. Decided once per cycle, so the lit and
+        // the dark refresh (and Variable MPRT's spill) show the same picture.
+        if (!s.frameWarp || !warp.ok)
+        {
+            if (warpClock.lastId) { warpClock.Reset(); warp.Forget(); }
+            warpAhead = 0.0;
+        }
+        else if (cycleStart)
+            warpAhead = warpClock.Cycle(s.frameWarp, pickId, pickTime, tVb, (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0),
+                                        (double)s.warpMax, (double)s.warpMinRate / 100.0);
         pickNew = cycleStart && pickId != lastShownId;
         pickRelT = (pickNew && g_relId[pickId % kRel] == pickId) ? g_relT[pickId % kRel] : 0.0;
         // Measured from when the frame's copy finished on the GPU, not from its Present: in God of War Ragnarok
@@ -4071,6 +4260,15 @@ static DWORD WINAPI PresenterThread(void *)
         }
         c.seam    = s.rollSeam;
         c.decay   = s.rollDecay;
+        // Frame warp: the motion is measured from the frame shown before this one, which may be more than one game
+        // frame older (frames never shown): the share of that motion for warpAhead game frames. In steps of 1/256, so
+        // the cycle's refreshes compare equal and drawn buffers can still be reused.
+        UINT64 warpOld = 0;
+        if (StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT) c.flags |= 1024u;
+        if (warpAhead > 0.0 && s.frameWarp && warp.ok && (warpOld = warp.PairFor(pickId, pickTime)) != 0 &&
+            warpPrev >= 0 && warpPrev != pick && warpPrevId == warpOld && g_stageId[warpPrev] == warpOld && g_stageFence[warpPrev] <= done)
+            c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
+        if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; }
 
         if (pickNew2 < 0) pickNew2 = pick;                       // picked later (the wait above): the same frame
         const UINT64 pickId2 = pickNew2 >= 0 ? g_stageId[pickNew2] : 0;
@@ -4081,6 +4279,7 @@ static DWORD WINAPI PresenterThread(void *)
             reserve = ++g_presFenceVal;
             g_readFence[pick] = reserve;
             if (pickNew2 != pick) g_readFence[pickNew2] = reserve;
+            if (c.warp != 0.0f) g_readFence[warpPrev] = reserve;
         }
         // The game never copies into the slot being shown (g_presCurSlot), so
         // the lock can go before waiting on the GPU.
@@ -4106,6 +4305,11 @@ static DWORD WINAPI PresenterThread(void *)
             D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &b2);
         }
+        if (c.warp != 0.0f)
+        {
+            D3D12_RESOURCE_BARRIER b3 = Transition(g_stage[warpPrev], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &b3);
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         rtv.ptr += (SIZE_T)bi * rtvStride;
         D3D12_GPU_DESCRIPTOR_HANDLE srv = srvHeap->GetGPUDescriptorHandleForHeapStart();
@@ -4121,6 +4325,32 @@ static DWORD WINAPI PresenterThread(void *)
             aplSrv.ptr += (UINT64)(kStage + 1) * srvStride;
         }
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        // Frame warp: a frame's first refresh measures its brightness pyramid (one pass over the frame, four tiny
+        // ones); the motion from the frame before is measured only when the frame is shown moved, once per pair.
+        if (s.frameWarp && warp.ok)
+        {
+            const int fin = s.warpDetail ? 0 : 1;
+            if (fin != warp.finest) { warp.finest = fin; warp.flowNew = 0; }
+            bool touched = false;
+            if (pickId != warp.id[warp.cur])
+            {
+                warp.RecordLuma(list, srv, pickId, pickTime, StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT);
+                touched = true;
+            }
+            if (c.warp != 0.0f && (warp.flowNew != pickId || warp.flowOld != warpOld)) { warp.RecordFlow(list); touched = true; }
+            if (touched)
+            {
+                list->SetPipelineState(pso);
+                list->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &c, 0);
+                list->SetGraphicsRootDescriptorTable(1, srv);
+            }
+        }
+        list->SetGraphicsRootDescriptorTable(4, warp.ok ? warp.FlowSrv() : srv);   // t3 (read only while a frame is shown moved)
+        {
+            D3D12_GPU_DESCRIPTOR_HANDLE psrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            psrv.ptr += (UINT64)(c.warp != 0.0f ? warpPrev : pick) * srvStride;
+            list->SetGraphicsRootDescriptorTable(5, psrv);                         // t4: the frame shown before (likewise)
+        }
         // RenoFX APL Limiter: measure the frame before its first refresh, so the boost uses its own average (as in
         // RenoFX). Its later refreshes reuse the value.
         if (aplOn && pickId != aplFrameId)
@@ -4211,6 +4441,11 @@ static DWORD WINAPI PresenterThread(void *)
         {
             D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             list->ResourceBarrier(1, &b2);
+        }
+        if (c.warp != 0.0f)
+        {
+            D3D12_RESOURCE_BARRIER b3 = Transition(g_stage[warpPrev], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(1, &b3);
         }
         if (FAILED(list->Close())) LOGE("BFI Presenter: presenter draw list failed to record (Close) -- see BFIPresenter_debug.txt with Diagnostics=2");
 
@@ -4535,6 +4770,27 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.late       = secLate;
             g_status.repeats    = rep > 0 ? rep : 0;
             g_status.frameRepeats = secFrameRepeats;
+            g_status.warpOn       = !s.frameWarp ? 0 : !warp.ok ? -1 : warpClock.engaged ? 2 : 1;
+            g_status.warpCycles   = secWarpCycles;
+            g_status.warpAvg      = secWarpCycles ? secWarpSum / secWarpCycles : 0.0;
+            g_status.warpRate     = warpClock.rate;
+            {
+                // the log says when frame warp starts and stops working (at most every 5 s)
+                static int warpWas = 0;
+                static double warpLogT = 0.0;
+                if (g_status.warpOn != warpWas && (g_status.warpOn == 2 || warpWas == 2) && t - warpLogT > 5.0)
+                {
+                    if (g_status.warpOn == 2)
+                        LOGI("BFI Presenter: frame warp at work (%s): the game makes %.0f%% of the strobe rate",
+                             s.frameWarp == 2 ? "even pacing" : "fill missing frames", warpClock.rate * 100.0);
+                    else LOGI("BFI Presenter: frame warp waiting (%s)", !s.frameWarp ? "switched off"
+                              : warpClock.rate > 0.0 ? "the game's frame rate is outside its range" : "no steady frame rate");
+                    warpLogT = t;
+                    warpWas = g_status.warpOn;
+                }
+                else if (g_status.warpOn != 2 && warpWas != 2) warpWas = g_status.warpOn;
+            }
+            secWarpCycles = 0; secWarpSum = 0.0;
             g_status.unevenRep    = secRepU;
             g_status.unevenSkip   = secSkipU;
             g_status.slotWaits    = g_slotWaits.exchange(0);
@@ -5512,6 +5768,8 @@ static DWORD WINAPI PresenterThread(void *)
     SafeRelease(aplRtvHeap);
     SafeRelease(psAplC);
     SafeRelease(psAplR);
+    warp.Release();
+    for (int i = 0; i < kWarpShN; i++) SafeRelease(psWarp[i]);
     SafeRelease(rootSig);
     SafeRelease(rsBlob);
     SafeRelease(rsErr);
@@ -5857,7 +6115,7 @@ static HRESULT SubmitGameFrameLocked()
         EnterCriticalSection(&g_lock);
         for (UINT i = 0; i < kStage; i++)
         {
-            if ((int)i == g_presCurSlot || (int)i == g_presCurSlot2) continue;
+            if ((int)i == g_presCurSlot || (int)i == g_presCurSlot2 || (int)i == g_presPrevSlot) continue;
             if (g_readFence[i] > pdone || g_stageFence[i] > gdone) continue;
             if (g_stageId[i] < bestId) { best = (int)i; bestId = g_stageId[i]; }
         }
@@ -8261,7 +8519,7 @@ static bool CreateStage11()
         g_stageFence[s] = g_stageId[s] = g_readFence[s] = 0;
         g_stageTime[s] = 0.0;
     }
-    g_presCurSlot = -1; g_presCurSlot2 = -1;
+    g_presCurSlot = -1; g_presCurSlot2 = -1; g_presPrevSlot = -1;
     g_stageNext = 0;
     LOGI("BFI Presenter: DX11: presenting %ux%u, format %u, %u buffers (game: %ux%u, format %u, %u buffers)%s",
          g_desc.Width, g_desc.Height, (unsigned)g_desc.Format, g_bufCount, g_srcW ? g_srcW : g_desc.Width,
@@ -8880,7 +9138,7 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
         EnterCriticalSection(&g_lock);
         for (UINT i = 0; i < kStage; i++)
         {
-            if ((int)i == g_presCurSlot || (int)i == g_presCurSlot2) continue;
+            if ((int)i == g_presCurSlot || (int)i == g_presCurSlot2 || (int)i == g_presPrevSlot) continue;
             if (g_readFence[i] > pdone || g_stageFence[i] > gdone) continue;
             if (g_stageId[i] < bestId) { best = (int)i; bestId = g_stageId[i]; }
         }
@@ -11114,6 +11372,34 @@ static void draw_overlay(reshade::api::effect_runtime *)
         // ---------------------------------------------------------- every cap
         ImGui::Spacing();
         ImGui::SeparatorText("Every cap");
+        ImGui::Combo("Frame warp (Ctrl+Shift+W)", &s.frameWarp, "Off\0Fill missing frames\0Even pacing (every frame)\0");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("For games that can't hold the strobe rate (54 fps against a 60 Hz strobe). A strobe cycle\n"
+                                                      "without a new game frame lights the last one again: the picture stands still, then jumps.\n"
+                                                      "Frame warp shows that frame moved ahead along its own motion instead, measured between the\n"
+                                                      "last two frames. No frame is held back, so it adds no latency (unlike frame generation).\n"
+                                                      "Fill missing frames: frames are shown as rendered, only the missing ones are filled.\n"
+                                                      "Even pacing: every frame is shown where the motion is at that moment, so all steps are\n"
+                                                      "the same -- smoothest, but most frames are then moved a little.\n"
+                                                      "Moved frames can show errors at the edges of things that move differently from what is\n"
+                                                      "behind them, and a CRT shader's mask moves with the picture.");
+        if (s.frameWarp)
+        {
+            ImGui::Indent(16.0f);
+            ImGui::SliderFloat("Furthest ahead (game frames)", &s.warpMax, 0.25f, 1.5f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("A frame is never shown further ahead than this. Lower = fewer errors, but a\n"
+                                                          "missing frame is only partly filled.");
+            ImGui::SliderInt("Only from (% of the strobe rate)", &s.warpMinRate, 40, 95);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame warp works while the game makes at least this share of the strobe rate\n"
+                                                          "(75%% of a 60 Hz strobe = 45 fps). Below it frames repeat as without it: the\n"
+                                                          "further a frame has to be moved, the more errors show.");
+            ImGui::Combo("Motion detail", &s.warpDetail, "Normal (8x8 pixel blocks)\0Fine (4x4 pixel blocks, more GPU time)\0");
+            if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see ReShade.log).");
+            else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
+                                                 st.warpRate * 100.0, st.warpCycles, st.warpAvg);
+            else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
+            else ImGui::Text("Waiting for the game's frame rate.");
+            ImGui::Unindent(16.0f);
+        }
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest latency shows the newest frame -- best at the Refresh cap, and needed by the hold at\nthe frame start. Smooth holds up to one finished frame in reserve (about one refresh more latency)\nso every frame is lit once and in order -- it only helps at the Half or Quarter cap.");
         if (s.pacingMode == 0)
