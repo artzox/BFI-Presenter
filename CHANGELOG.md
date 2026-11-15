@@ -10,6 +10,7 @@ Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply 
 ## [1.0.41] — unreleased
 
 - **[DX] The automatic frame cap no longer goes up and down every 2 minutes in Reflex games that can't hold the refresh rate.** With Reflex, the cap goes back up to Refresh rate when the game's reports say its frames fit well within a refresh. Those reports are taken under the cap, and some games need far more without it: Onimusha: Way of the Sword reported 5 ms per frame at 60 fps, then took 15 ms and ran at 65–71 of 120 fps once the cap was off. The cap stepped back down 3 s later, and the same thing happened every 2 minutes (6 times in 10 minutes), each a burst of unevenly dropped frames. A step up that comes back down within 30 s is now remembered for the session: the next one needs frames at least 20% lighter than those it went up on. One that holds 30 s or more clears it. The log says so: "the step up on Reflex's reports (… ms per frame) didn't hold".
+- **[DX] Fix: `PresenterResize` started BFI again in games without OptiScaler** (Ratchet & Clank: Rift Apart, Marvel's Spider-Man 2). Since 1.0.38 the hook on swap chain creation is installed only with OptiScaler (the Elden Ring crash, #119), and PresenterResize finds ReShade's swap chain through that hook: without it, nothing was resized and BFI kept waiting ("no hook on the game-facing swap chain"). The hook is now installed when `PresenterResize` is on too; with it off, nothing changes.
 
 ## [1.0.40] — 2026-11-14 (Manager 1.3.20)
 
