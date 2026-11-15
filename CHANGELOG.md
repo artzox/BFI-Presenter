@@ -7,7 +7,7 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [1.0.41] — unreleased (test build 1.0.41-t2)
+## [1.0.41] — unreleased (test build 1.0.41-t2b)
 
 **Frame warp: strobe cycles without a new game frame are filled, without holding frames back.**
 
@@ -21,6 +21,7 @@ Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply 
   - Tested so far only on synthetic frames (`tools/warp-test`: the add-on's own shaders and passes run through Direct3D 12 on a software GPU): a 1080p scene panning 23 pixels a frame with a static HUD, a crosshair and an object moving against the pan. Half a frame ahead, 6% of pixels are off by more than 16/255 against 33% for the repeated frame with whole-picture motion (5% with 8×8 blocks, 4% with 4×4), the HUD and the crosshair identical to the frame as rendered. **Not yet tested in a game**, and the presenter-thread side (the frame kept in the ring, the passes in its command list) has only been compiled, not run.
   - Known limits: edges between things that move differently can tear for that flash; regular patterns (stripes, fences, tiles) can wobble; a HUD that changes every frame moves with the scene; a CRT shader's mask moves with the picture.
 - **[DX] The staging ring has seven frames** (was six): frame warp keeps the frame shown before the current one. One more frame of video memory (33 MB at 4K, 66 MB for scRGB), with frame warp off too.
+- **[DX] The automatic frame cap no longer goes up and down every 2 minutes in Reflex games that can't hold the refresh rate.** With Reflex, the cap goes back up to Refresh rate when the game's reports say its frames fit well within a refresh. Those reports are taken under the cap, and some games need far more without it: Onimusha: Way of the Sword reported 5 ms per frame at 60 fps, then took 15 ms and ran at 65–71 of 120 fps once the cap was off. The cap stepped back down 3 s later, and the same thing happened every 2 minutes (6 times in 10 minutes), each a burst of unevenly dropped frames. A step up that comes back down within 30 s is now remembered for the session: the next one needs frames at least 20% lighter than those it went up on. One that holds 30 s or more clears it. The log says so: "the step up on Reflex's reports (… ms per frame) didn't hold".
 - **[Vulkan]** No changes; frame warp is DX only for now.
 - **[Docs]** Settings guide: **Frame warp**, and its hotkey.
 

@@ -193,7 +193,7 @@ How it caps depends on the game:
 
 Back to Refresh:
 
-- **Games with Reflex** report how long their frames take; the cap goes back up once those fit well within a refresh for 10 seconds.
+- **Games with Reflex** report how long their frames take; the cap goes back up once those fit well within a refresh for 10 seconds. The reports are taken under the cap and can promise more than the game holds without it, so a step up that comes back down within 30 seconds is remembered for the session: the next one waits for frames at least 20% lighter than those it went up on (v1.0.41).
 - **Other games:** it tries Refresh for about 3 seconds, after 30 s, then 60 s, then every 2 minutes while the game still can't hold it. A game well under the refresh rate (under 80%, e.g. 80 fps at 120 Hz) waits a minute before its first try and 5 minutes after a failed one, since each try is a few seconds of uneven frames; a game that drops back within 30 s of a successful try waits twice as long next time (v1.0.27). A game that comes back at exactly the strobe rate is at a limit of its own (a menu, an intro): it is tried again after 30 s, but after two such tries in a row only every 5 minutes, since a game locked to e.g. 60 fps all along gets a few seconds of frames off the strobe cycle with each try (v1.0.36; a new session starts at 30 s again). For a game you know is locked, choose **One game frame per strobe cycle** (or Half refresh) as the cap instead.
 - **With frame generation** under Reflex's limit it tries only every 5 minutes, since each try is a visible stutter.
 

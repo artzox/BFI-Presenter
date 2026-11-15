@@ -95,7 +95,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.41-t2"
+#define BFI_ADDON_VERSION "1.0.41-t2b"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3724,6 +3724,10 @@ static DWORD WINAPI PresenterThread(void *)
     bool   fgSkipLogged = false;  // the frame-generation try at Refresh rate skipped (logged once)
     int    fgFillSecs = 0;        // seconds in a row the frame-generation estimate said the game could fill the refresh rate
     double fgNeedNow = 0.0, fgTryNeedMs = 0.0, fgFailNeedMs = 0.0;   // GPU/CPU ms per rendered frame: now, at the try, at a failed try
+    // The step up by Reflex reports: the work per frame it went up on, and at a step up that came back down within 30 s.
+    // The reports are taken under the cap and can promise more than the game holds without it (Onimusha: Way of the
+    // Sword, 5 ms per frame at 60 fps, 15 ms and 65-71 of 120 fps without the cap: 3 s of uneven frames every 2 minutes).
+    double rfxUpNeedMs = 0.0, rfxFailNeedMs = 0.0;
     bool   reflexCap = false;     // the game frame cap applied with Reflex's frame limit (CapWithReflex)
     double rcOnT = -100.0, fpsAtRc = 0.0;
     double rfxChkT = -100.0;      // start of the collapse check after a step-down with Reflex's limit (moved on by stalls)
@@ -5223,6 +5227,19 @@ static DWORD WINAPI PresenterThread(void *)
                             // light corner) counts as failed too, so the next one waits for clearly lighter frames (Control,
                             // 3x: up at 02:10:59, down 9 s later at 65 fps).
                             if (fg && t - capUpT < 30.0 && fgTryNeedMs > 0.0) { fgFailNeedMs = fgTryNeedMs; fgSkipLogged = false; }
+                            // A step up by Reflex reports that didn't hold: the next one needs clearly lighter frames than
+                            // these. One that held 30 s or more clears it.
+                            if (rfxUpNeedMs > 0.0)
+                            {
+                                if (t - capUpT < 30.0)
+                                {
+                                    rfxFailNeedMs = rfxFailNeedMs > 0.0 && rfxFailNeedMs < rfxUpNeedMs ? rfxFailNeedMs : rfxUpNeedMs;
+                                    LOGI("BFI Presenter: automatic frame cap: the step up on Reflex's reports (%.1f ms per frame) didn't "
+                                         "hold -- the next one needs frames under %.1f ms", rfxUpNeedMs, 0.8 * rfxFailNeedMs);
+                                }
+                                else rfxFailNeedMs = 0.0;
+                                rfxUpNeedMs = 0.0;
+                            }
                             // Well under the refresh rate: first try after a minute -- unless the game holds exactly the strobe rate,
                             // which is a limit of its own (an intro, a menu), not a struggle: tries every 30 s cost nothing there.
                             const bool atStrobe = fabs(fpsA - hzA / s.frames) < 0.02 * hzA / s.frames;
@@ -5241,10 +5258,12 @@ static DWORD WINAPI PresenterThread(void *)
                         double needMs = rsLast.gpuActiveMs;
                         if (rsLast.simMs > needMs) needMs = rsLast.simMs;
                         if (rsLast.submitMs > needMs) needMs = rsLast.submitMs;
-                        capUpSecs = (!hitchPaused && needMs < 0.85 * refMs) ? capUpSecs + 1 : 0;
+                        capUpSecs = (!hitchPaused && needMs < 0.85 * refMs &&
+                                     (rfxFailNeedMs <= 0.0 || needMs < 0.8 * rfxFailNeedMs)) ? capUpSecs + 1 : 0;
                         if (capUpSecs >= 10 && t - capSwitchT >= stayMin)
                         {
                             autoCapDown = false; capDownSecs = capUpSecs = 0; capSwitchT = t; capUpT = t;
+                            rfxUpNeedMs = needMs;
                             LOGI("BFI Presenter: automatic frame cap: Refresh rate -- game frames take %.1f ms (GPU %.1f, "
                                  "simulation %.1f, submit %.1f), within a refresh", needMs, rsLast.gpuActiveMs, rsLast.simMs, rsLast.submitMs);
                         }
@@ -5258,6 +5277,7 @@ static DWORD WINAPI PresenterThread(void *)
                         // No Reflex reports (or frame generation, whose reports are for rendered frames):
                         // try Refresh for a few seconds.
                         autoCapDown = false; capProbe = true; probeSecs = probeGood = 0; capSwitchT = t; capUpT = t;
+                        rfxUpNeedMs = 0.0;
                         fgTryNeedMs = fg ? fgNeedNow : 0.0; fgFillSecs = 0;
                     }
                 }
