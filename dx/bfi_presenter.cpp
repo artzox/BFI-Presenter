@@ -8063,8 +8063,12 @@ static void InstallOuterFactoryHook()
     {
         char why[160];
         const char *opti = OptiScalerFound(why, sizeof(why));
-        if (!opti) { LOGI("BFI Presenter: outer swap chain hook not needed (no OptiScaler in this game; HookOuterSwapChain=2 forces it)"); return; }
-        LOGI("BFI Presenter: OptiScaler found (%s) -- outer swap chain hook for FSR frame generation", opti);
+        // PresenterResize finds ReShade's game-facing swap chain through this hook too (OuterCheck): without it nothing
+        // resizes (Ratchet & Clank, Spider-Man 2 since 1.0.38).
+        const bool selfResize = GetPrivateProfileIntA("BFI", "PresenterResize", 0, g_iniPath) != 0;
+        if (!opti && !selfResize) { LOGI("BFI Presenter: outer swap chain hook not needed (no OptiScaler in this game; HookOuterSwapChain=2 forces it)"); return; }
+        if (opti) LOGI("BFI Presenter: OptiScaler found (%s) -- outer swap chain hook for FSR frame generation", opti);
+        else LOGI("BFI Presenter: outer swap chain hook for PresenterResize (to find the game-facing swap chain)");
     }
     typedef HRESULT (WINAPI *PFN_CF2)(UINT, REFIID, void **);
     typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void **);
