@@ -165,6 +165,22 @@ BFI Presenter is free software under the [GNU General Public License v3.0](LICEN
 
 Strobing flickers at 60 Hz by design (rolling scan with phosphor fade softens it). If you are sensitive to flicker or flashing images, take care, and use the hotkey (Ctrl+Shift+B by default) to turn the strobe off.
 
+## Antivirus warnings
+
+A few antivirus engines (on VirusTotal usually 2–3 of about 70) flag the manager app, the motion test or the release zips as a trojan or as "malicious". These are false positives: the files are built from the source in this repository, and nothing in them is hidden. They get flagged because:
+
+- they are **not code-signed**, and new files have no download reputation yet; Windows SmartScreen shows "Windows protected your PC" for the same reason (**More info** → **Run anyway**);
+- they are built with **MinGW** as static, stripped executables, a kind of file heuristic and machine-learning engines are suspicious of;
+- the **manager** does things malware also does: it downloads from GitHub and a few mod sites (BFI Presenter releases, ReShade versions, the RenoDX, Luma and REFramework lists, PCGamingWiki), unpacks zips, writes DLLs named like system DLLs (`dxgi.dll`, `dinput8.dll`) into game folders, edits the games' NVIDIA driver profiles and adds one per-user registry entry for the Vulkan layer (all listed above under *No warranty*);
+- the **add-on** hooks the game's swap chain inside the game's process, as ReShade itself does.
+
+If you want to be sure:
+
+- download only from this repository's [Releases](https://github.com/artzox/BFI-Presenter/releases) page;
+- or build the files yourself (see [Building from source](#building-from-source));
+- if Microsoft Defender quarantines a file, you can restore it and report it as a false positive at [Microsoft's file submission page](https://www.microsoft.com/en-us/wdsi/filesubmission); other vendors have their own forms;
+- if you see a detection, please open an issue with the file, its version and **the engine names and detection names**. Names ending in `!ml`, or labelled "ML", "Static ML" or a bare "Malicious", come from machine-learning models guessing from the file's shape (Microsoft's `Trojan:Win32/Wacatac.C!ml` is a common one for unsigned programs); a generic name such as `Trojan.Win32.Agent` from a single engine is the same kind of guess. A named malware family from several major engines would be worth a closer look.
+
 ## No warranty — use at your own risk
 
 BFI Presenter is provided "as is", without warranty of any kind, and the author is not liable for any damage or loss arising from its use, as set out in sections 15 and 16 of the [GPL](LICENSE). You install it into your own games, together with third-party tools such as ReShade, and you are responsible for your own hardware, drivers and settings.
