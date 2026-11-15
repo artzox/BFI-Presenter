@@ -13,14 +13,9 @@
 // This clock decides, once per strobe cycle, HOW FAR ahead of the newest frame the picture is shown, in game frames
 // ("ahead": 0 = the frame as rendered, 0.5 = half way to where the next frame is expected).
 //
-//   Fill (mode 1):  frames are shown as rendered; only a cycle without a new frame shows the last one moved ahead,
-//                   half way for a single missing frame (steps 1, 1, 0.5, 0.5, 1 ... instead of 1, 1, 0, 1, 1).
-//   Even (mode 2):  every cycle shows the picture where the game's motion is at that moment: the position advances
-//                   by the game's measured frames-per-cycle each cycle (0.9 at 54 fps), so every step on screen is
-//                   the same. Most frames are then moved a little.
-//
-// The picture never steps backward: "ahead" only falls when a new frame arrives, and by no more than that frame's
-// own step.
+// Frames are shown as rendered; only a cycle without a new frame shows the last one moved ahead, half way for a
+// single missing frame (steps 1, 1, 0.5, 0.5, 1 ... instead of 1, 1, 0, 1, 1). (Test builds t1-t2 also had an "even
+// pacing" mode that moved every frame a little; it moved frames that were fine, so it was dropped.)
 // ============================================================================
 #pragma once
 #include <cmath>
@@ -68,14 +63,12 @@ struct WarpClock
 
     // Once per strobe cycle, at its start. id: the frame the cycle shows; frameT: when the game presented it;
     // now: the pick; cycleSec: one strobe cycle. Returns how far ahead of that frame to show it (game frames).
-    double Cycle(int mode, uint64_t id, double frameT, double now, double cycleSec, double maxAhead, double minRate)
+    double Cycle(bool on, uint64_t id, double frameT, double now, double cycleSec, double maxAhead, double minRate)
     {
         const bool isNew = id != lastId;
-        double step = 0.0;
         if (isNew)
         {
             const bool jump = lastId == 0 || id < lastId || id - lastId > 16 || frameT - lastNewT > 0.5;
-            step = jump ? 1.0e9 : (double)(id - lastId);
             if (jump) { histN = histAt = 0; }
             histId[histAt] = id; histT[histAt] = frameT;
             histAt = (histAt + 1) % kHist;
@@ -86,35 +79,20 @@ struct WarpClock
         }
         else repeats++;
 
-        engaged = mode != 0 && rate >= minRate && rate <= 2.5 && maxAhead > 0.0;
+        engaged = on && rate >= minRate && rate <= 2.5 && maxAhead > 0.0;
         if (!engaged)
         {
             if (isNew) ahead = 0.0;                        // never backward: the offset goes as the next frame arrives
             return ahead;
         }
-        // A game that holds the strobe rate (or a whole multiple of it) has nothing to even out: moving every frame
-        // would only cost picture quality, so Even fills the odd missing frame there, as Fill does.
-        const bool locked = rate > 0.9 && std::fabs(rate - std::floor(rate + 0.5)) < 0.012;
-        if (mode == 1 || locked)
-        {
-            if (isNew) return ahead = 0.0;                 // frames are shown as rendered
-            // n-th cycle in a row without a frame, of the N the frame rate predicts: n / (N + 1) of the way.
-            int N = (int)std::floor(1.0 / rate + 0.5) - 1;
-            if (N < 1) N = 1;
-            const int n = repeats < N ? repeats : N;       // a stall: stay where the last expected fill was
-            double a = (double)n / (double)(N + 1);
-            if (a > maxAhead) a = maxAhead;
-            if (a > ahead) ahead = a;
-            return ahead;
-        }
-        // Even: the position on screen moves on by the game's frames per cycle; a new frame takes its own step off.
-        // While frames have stopped coming (a hitch, loading) the picture waits at the limit.
-        double a = ahead + rate - step;
-        a *= 0.99;                                         // settles back toward the frames as rendered (measuring errors)
-        if (a < 0.0) a = 0.0;
+        if (isNew) return ahead = 0.0;                     // frames are shown as rendered
+        // n-th cycle in a row without a frame, of the N the frame rate predicts: n / (N + 1) of the way.
+        int N = (int)std::floor(1.0 / rate + 0.5) - 1;
+        if (N < 1) N = 1;
+        const int n = repeats < N ? repeats : N;           // a stall: stay where the last expected fill was
+        double a = (double)n / (double)(N + 1);
         if (a > maxAhead) a = maxAhead;
-        if (!isNew && a < ahead) a = ahead;                // no step backward on a cycle without a new frame
-        ahead = a;
+        if (a > ahead) ahead = a;
         return ahead;
     }
 };

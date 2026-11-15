@@ -144,67 +144,45 @@ float4 PSWarpFlow(float4 pos : SV_Position) : SV_Target
     return float4(best, conf, 1.0);
 }
 
-// The motion evened out: each vector becomes the mean of those around it (5x5) that agree with it to within about a
-// pixel of this level. One block's match is only good to a pixel or two of the game frame, which shows as a wobble in
-// fine detail; things that move together share one motion, and vectors of something moving differently (or standing
-// still) are left out, so the edges between them stay.
-//
-// Whole-picture motion (wmode 1; ta = the 1/8 level's vectors, the target is the 1/32 level's size): the mean of all
-// the vectors within about a block and a half of this one (a 7x7 grid of taps, soft weights), leaving out the places
+// The motion evened out for the whole picture (ta = the 1/8 level's vectors, the target is the 1/32 level's size):
+// the mean of all the vectors within about a block and a half of this one (a 7x7 grid of taps, soft weights), leaving out the places
 // where nothing was measured. The motion then changes only gradually across the screen -- the camera's motion, with
 // its depth -- so nothing can tear or wobble; what moves on its own is carried with its surroundings.
 float4 PSWarpSmooth(float4 pos : SV_Position) : SV_Target
 {
     float2 sum = float2(0.0, 0.0);
     float wsum = 0.0;
-    if (wmode == 1)
+    for (int y = -3; y <= 3; y++)
     {
-        for (int y = -3; y <= 3; y++)
+        for (int x = -3; x <= 3; x++)
         {
-            for (int x = -3; x <= 3; x++)
-            {
-                float4 n = ta.SampleLevel(linClamp, (pos.xy + 0.5 * float2(x, y)) * texel, 0);
-                float g = exp(-float(x * x + y * y) / 6.0);
-                sum += n.xy * g;                   // places with nothing measured hold 0, 0 and w 0
-                wsum += n.w * g;
-            }
-        }
-        if (wsum <= 0.02) return float4(0.0, 0.0, 1.0, 0.0);
-        // Once more, counting each vector by how well it agrees with that mean (within about two pixels of the 1/8
-        // level): a few wrong matches, or something small moving on its own, then don't pull the whole area off.
-        float2 m = sum / wsum;
-        float2 sum2 = float2(0.0, 0.0);
-        float wsum2 = 0.0;
-        for (int y2 = -3; y2 <= 3; y2++)
-        {
-            for (int x2 = -3; x2 <= 3; x2++)
-            {
-                float4 n = ta.SampleLevel(linClamp, (pos.xy + 0.5 * float2(x2, y2)) * texel, 0);
-                if (n.w > 0.001)
-                {
-                    float2 d = (n.xy / n.w - m) / (texel2 * 2.0);
-                    float g = exp(-float(x2 * x2 + y2 * y2) / 6.0) * exp(-dot(d, d) * 0.5) * n.w;
-                    sum2 += (n.xy / n.w) * g;
-                    wsum2 += g;
-                }
-            }
-        }
-        return wsum2 > 1e-4 ? float4(sum2 / wsum2, 1.0, 1.0) : float4(m, 1.0, 1.0);
-    }
-    int2 q = int2(pos.xy);
-    float4 c = ta.Load(int3(q, 0));
-    for (int y = -2; y <= 2; y++)
-    {
-        for (int x = -2; x <= 2; x++)
-        {
-            float4 n = ta.SampleLevel(linClamp, (pos.xy + float2(x, y)) * texel, 0);
-            float2 d = (n.xy - c.xy) / texel;
-            float w = exp(-dot(d, d) / 1.125) * (0.05 + n.z);
-            sum += n.xy * w;
-            wsum += w;
+            float4 n = ta.SampleLevel(linClamp, (pos.xy + 0.5 * float2(x, y)) * texel, 0);
+            float g = exp(-float(x * x + y * y) / 6.0);
+            sum += n.xy * g;                   // places with nothing measured hold 0, 0 and w 0
+            wsum += n.w * g;
         }
     }
-    return float4(sum / wsum, c.z, c.w);
+    if (wsum <= 0.02) return float4(0.0, 0.0, 1.0, 0.0);
+    // Once more, counting each vector by how well it agrees with that mean (within about two pixels of the 1/8
+    // level): a few wrong matches, or something small moving on its own, then don't pull the whole area off.
+    float2 m = sum / wsum;
+    float2 sum2 = float2(0.0, 0.0);
+    float wsum2 = 0.0;
+    for (int y2 = -3; y2 <= 3; y2++)
+    {
+        for (int x2 = -3; x2 <= 3; x2++)
+        {
+            float4 n = ta.SampleLevel(linClamp, (pos.xy + 0.5 * float2(x2, y2)) * texel, 0);
+            if (n.w > 0.001)
+            {
+                float2 d = (n.xy / n.w - m) / (texel2 * 2.0);
+                float g = exp(-float(x2 * x2 + y2 * y2) / 6.0) * exp(-dot(d, d) * 0.5) * n.w;
+                sum2 += (n.xy / n.w) * g;
+                wsum2 += g;
+            }
+        }
+    }
+    return wsum2 > 1e-4 ? float4(sum2 / wsum2, 1.0, 1.0) : float4(m, 1.0, 1.0);
 }
 )HLSL";
 
@@ -235,8 +213,6 @@ struct WarpGpu
     UINT64 id[2] = {};                                  // the game frame in each pyramid (0 = none)
     double t[2] = {};                                   // and when the game presented it
     UINT64 flowNew = 0, flowOld = 0;                    // the pair of frames the motion texture was measured between
-    int   finest = 1;                                   // level the motion is refined down to: 1 = 1/8, 0 = 1/4 of the frame;
-                                                        // 3 = whole-picture motion (measured at 1/8, averaged at 1/32)
     bool  ok = false;
 
     static const UINT kSrvCount = 4 * kLevels;      // descriptors it takes in the presenter's SRV heap
@@ -260,9 +236,10 @@ struct WarpGpu
     D3D12_GPU_DESCRIPTOR_HANDLE LumaSrv(int p, int l) const { return Srv((UINT)(p * kLevels + l)); }
     D3D12_GPU_DESCRIPTOR_HANDLE FlowSrvAt(int l) const { return Srv((UINT)(2 * kLevels + l)); }
     // The motion texture the per-refresh shader reads.
-    bool Whole() const { return finest >= 2; }          // whole-picture motion: measured at 1/8, averaged widely at 1/32
-    int Last() const { return finest <= 0 ? 0 : 1; }    // the level the motion is refined down to
-    int Out() const { return Whole() ? 3 : Last(); }    // the size of the texture the per-refresh shader reads
+    // Whole-picture motion: measured down to 1/8 of the frame, averaged widely at 1/32. (Test builds t1-t2 also had
+    // motion per 8x8 or 4x4 block; it tore where things moved differently, so it was dropped.)
+    static int Last() { return 1; }                     // the level the motion is refined down to (1/8)
+    static int Out() { return 3; }                      // the size of the texture the per-refresh shader reads (1/32)
     D3D12_GPU_DESCRIPTOR_HANDLE FlowSrv() const { return Srv((UINT)(3 * kLevels + Out())); }
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(UINT i) const
     {
@@ -465,7 +442,7 @@ struct WarpGpu
             const int o = Out();
             wc.texelX = 1.0f / (float)w[o]; wc.texelY = 1.0f / (float)h[o];
             wc.texel2X = 1.0f / (float)w[stop]; wc.texel2Y = 1.0f / (float)h[stop];
-            wc.mode = Whole() ? 1u : 0u;
+            wc.mode = 1u;
             list->SetGraphicsRootDescriptorTable(1, FlowSrvAt(stop));
             Pass(list, psoSmooth, flowOut[o], (UINT)(3 * kLevels + o), w[o], h[o], wc);
         }

@@ -3,7 +3,7 @@
 #include <random>
 #include <vector>
 // Simulate a game at `fps` against a strobe of 60 cycles/s, lowest-latency pick (newest finished frame).
-static void Run(int mode, double fps, double jitterMs, double maxAhead, double minRate, bool hitch = false)
+static void Run(bool mode, double fps, double jitterMs, double maxAhead, double minRate, bool hitch = false)
 {
     std::mt19937 rng(7);
     std::normal_distribution<double> nd(0.0, jitterMs / 1000.0);
@@ -33,12 +33,11 @@ static void Run(int mode, double fps, double jitterMs, double maxAhead, double m
     }
     const double m = s1 / n, sd = std::sqrt(s2 / n - m * m);
     printf("mode %d  %5.1f fps jitter %.1f ms%s: step mean %.3f sd %.3f worst dev %.2f  backward %d  repeats/s %.1f  avg ahead %.2f  rate %.3f\n",
-           mode, fps, jitterMs, hitch ? " +hitch" : "", m, sd, worst, back, rep * 60.0 / n, sumA / n, c.rate);
+           (int)mode, fps, jitterMs, hitch ? " +hitch" : "", m, sd, worst, back, rep * 60.0 / n, sumA / n, c.rate);
 }
 int main()
 {
     for (double fps : { 54.0, 57.0, 48.0, 59.5, 60.0, 40.0, 30.0, 70.0 })
-        for (int mode = 0; mode <= 2; mode++) Run(mode, fps, 0.8, 1.0, 0.45);
-    Run(1, 54, 0.8, 1.0, 0.75, true); Run(2, 54, 0.8, 1.0, 0.75, true);
-    Run(2, 40, 0.8, 1.0, 0.75);
+        for (int mode = 0; mode <= 1; mode++) Run(mode != 0, fps, 0.8, 1.0, 0.45);
+    Run(true, 54, 0.8, 1.0, 0.75, true);
 }

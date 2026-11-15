@@ -95,7 +95,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.41-t2b"
+#define BFI_ADDON_VERSION "1.0.41-t4"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -113,12 +113,10 @@ struct Settings
     int   splitSide = 0;      // 0 = the left side without BFI, 1 = the right side
     int   splitPos = 50;      // the seam, percent of the width from the left
     int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
-    int   frameWarp = 0;      // FrameWarp: strobe cycles without a new game frame show the last one moved ahead along its
-                              // motion (no frame is held back: no added latency). 0 off, 1 fill missing frames, 2 even pacing
+    int   frameWarp = 0;      // FrameWarp (test): a strobe cycle without a new game frame shows the last one moved ahead
+                              // along the camera's motion instead of lit again (no frame is held back: no added latency)
     float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
-    int   warpDetail = 2;     // FrameWarpDetail: 2 = whole picture (the 8x8 vectors averaged widely: smooth, fewest errors),
-                              // 0 = motion per 8x8 block of the frame, 1 = per 4x4 block
     int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
     int   osdCorner = 1;      // OsdCorner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
     int   osdGraph = 1;       // OsdGraph: frame-time graph
@@ -280,10 +278,9 @@ static void LoadSettings(Settings &s)
     s.splitSide = IniInt("SplitCompareSide", 0) ? 1 : 0;
     s.splitPos = std::max(5, std::min(95, IniInt("SplitComparePosition", 50)));
     s.splitSeam = std::max(0, std::min(400, IniInt("SplitCompareSeamPx", 0)));
-    s.frameWarp = std::max(0, std::min(2, IniInt("FrameWarp", 0)));
+    s.frameWarp = IniInt("FrameWarp", 0) != 0 ? 1 : 0;      // 2 (even pacing, test builds t1-t2) is gone: fill
     s.warpMax = std::max(0.25f, std::min(1.5f, IniFloat("FrameWarpMaxAhead", 1.0f)));
     s.warpMinRate = std::max(40, std::min(95, IniInt("FrameWarpMinRate", 75)));
-    s.warpDetail = std::max(0, std::min(2, IniInt("FrameWarpDetail", 2)));
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -511,7 +508,6 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarp", s.frameWarp);
     IniWriteFloat("FrameWarpMaxAhead", s.warpMax);
     IniWriteInt("FrameWarpMinRate", s.warpMinRate);
-    IniWriteInt("FrameWarpDetail", s.warpDetail);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -3410,7 +3406,7 @@ static DWORD WINAPI PresenterThread(void *)
     double warpAhead = 0.0;                  // this strobe cycle: game frames ahead of the frame it shows
     int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
     UINT64 warpPrevId = 0;
-    int    secWarpCycles = 0, warpLastMode = 1;
+    int    secWarpCycles = 0;
     double secWarpSum = 0.0;
     bool   kwarp = false;
     UINT64 measFence = 0;
@@ -3821,16 +3817,15 @@ static DWORD WINAPI PresenterThread(void *)
             kzPrev = kz;
         }
         {
-            // Ctrl+Shift+W: frame warp off / back to the mode last used
+            // Ctrl+Shift+W: frame warp on / off
             const bool kw = KeyCombo('W');
             if (kw && !kwarp)
             {
                 EnterCriticalSection(&g_cfgLock);
-                if (g_shared.frameWarp) { warpLastMode = g_shared.frameWarp; g_shared.frameWarp = 0; }
-                else g_shared.frameWarp = warpLastMode;
+                g_shared.frameWarp = g_shared.frameWarp ? 0 : 1;
                 const int fw = g_shared.frameWarp;
                 LeaveCriticalSection(&g_cfgLock);
-                LOGI("BFI Presenter: frame warp %s (Ctrl+Shift+W)", fw == 0 ? "off" : fw == 1 ? "on: fill missing frames" : "on: even pacing");
+                LOGI("BFI Presenter: frame warp %s (Ctrl+Shift+W)", fw ? "on" : "off");
             }
             kwarp = kw;
         }
@@ -3925,7 +3920,8 @@ static DWORD WINAPI PresenterThread(void *)
                 fprintf(rfxf, "time_s,game_fps,cap_set,cap_period,auto_cap,auto_cap_probe,fg_active,pacing,jit,jit_state,jit_est_ms,ahead,"
                               "reflex_limit_us,release_to_flash_ms,release_to_flash_max_ms,frames_shown,"
                               "rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,"
-                              "rfx_gpu_active_ms,rfx_sim_ms,rfx_submit_ms,rfx_queue_ms,rendered_fps,align_slack_p10_ms,align_shift_ms\n");
+                              "rfx_gpu_active_ms,rfx_sim_ms,rfx_submit_ms,rfx_queue_ms,rendered_fps,align_slack_p10_ms,align_shift_ms,"
+                              "frame_repeats,warp_state,warp_filled,warp_ahead\n");
         }
         else if (!s.log && logf)
         {
@@ -4334,8 +4330,6 @@ static DWORD WINAPI PresenterThread(void *)
         // ones); the motion from the frame before is measured only when the frame is shown moved, once per pair.
         if (s.frameWarp && warp.ok)
         {
-            const int fin = s.warpDetail == 2 ? 3 : s.warpDetail == 1 ? 0 : 1;
-            if (fin != warp.finest) { warp.finest = fin; warp.flowNew = 0; }
             bool touched = false;
             if (pickId != warp.id[warp.cur])
             {
@@ -4786,8 +4780,8 @@ static DWORD WINAPI PresenterThread(void *)
                 if (g_status.warpOn != warpWas && (g_status.warpOn == 2 || warpWas == 2) && t - warpLogT > 5.0)
                 {
                     if (g_status.warpOn == 2)
-                        LOGI("BFI Presenter: frame warp at work (%s): the game makes %.0f%% of the strobe rate",
-                             s.frameWarp == 2 ? "even pacing" : "fill missing frames", warpClock.rate * 100.0);
+                        LOGI("BFI Presenter: frame warp at work (fill missing frames): the game makes %.0f%% of the strobe rate",
+                             warpClock.rate * 100.0);
                     else LOGI("BFI Presenter: frame warp waiting (%s)", !s.frameWarp ? "switched off"
                               : warpClock.rate > 0.0 ? "the game's frame rate is outside its range" : "no steady frame rate");
                     warpLogT = t;
@@ -5718,13 +5712,14 @@ static DWORD WINAPI PresenterThread(void *)
                 LeaveCriticalSection(&g_cfgLock);
                 if (rfxf)
                 {
-                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f\n",
+                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f\n",
                             t, stNow.gameFps, userCap, perNow, stNow.autoCapDown, stNow.autoCapProbe, stNow.fgActive, s.pacingMode,
                             s.capJit, stNow.lrState, stNow.lrEst, stNow.aheadInUse, rs.limitUs,
                             relN ? relSum / relN : -1.0, relN ? relMax : -1.0, relN, rs.frames, rs.simGpuMs, rs.simPresentMs,
                             rs.inputGpuMs, rs.gpuFrameMs, rs.gpuActiveMs, rs.simMs, rs.submitMs, rs.queueMs,
                             Now() - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : -1.0,
-                            alignLogSlack >= 0.0 ? alignLogSlack * 1000.0 : -1.0, alignShiftTot * 1000.0);
+                            alignLogSlack >= 0.0 ? alignLogSlack * 1000.0 : -1.0, alignShiftTot * 1000.0,
+                            stNow.frameRepeats, stNow.warpOn, stNow.warpCycles, stNow.warpAvg);
                     fflush(rfxf);
                 }
                 relSum = relMax = 0.0; relN = 0;
@@ -11398,16 +11393,21 @@ static void draw_overlay(reshade::api::effect_runtime *)
         // ---------------------------------------------------------- every cap
         ImGui::Spacing();
         ImGui::SeparatorText("Every cap");
-        ImGui::Combo("Frame warp (Ctrl+Shift+W)", &s.frameWarp, "Off\0Fill missing frames\0Even pacing (every frame)\0");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("For games that can't hold the strobe rate (54 fps against a 60 Hz strobe). A strobe cycle\n"
-                                                      "without a new game frame lights the last one again: the picture stands still, then jumps.\n"
-                                                      "Frame warp shows that frame moved ahead along its own motion instead, measured between the\n"
-                                                      "last two frames. No frame is held back, so it adds no latency (unlike frame generation).\n"
-                                                      "Fill missing frames: frames are shown as rendered, only the missing ones are filled.\n"
-                                                      "Even pacing: every frame is shown where the motion is at that moment, so all steps are\n"
-                                                      "the same -- smoothest, but most frames are then moved a little.\n"
-                                                      "Moved frames can show errors at the edges of things that move differently from what is\n"
-                                                      "behind them, and a CRT shader's mask moves with the picture.");
+        bool fw = s.frameWarp != 0;
+        if (ImGui::Checkbox("Frame warp: fill missing frames (test, Ctrl+Shift+W)", &fw)) s.frameWarp = fw ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("For games that run just under the strobe rate (50-59 fps against a 60 Hz strobe). A strobe\n"
+                                                      "cycle without a new game frame normally lights the last one again: the picture stands\n"
+                                                      "still for a flash, then jumps. Frame warp shows that frame moved part of the way along the\n"
+                                                      "camera's motion instead. Frames that arrive in time are shown exactly as rendered, and no\n"
+                                                      "frame is held back, so it adds no latency (unlike frame generation).\n"
+                                                      "\n"
+                                                      "Worth trying: a game that holds about 75-99%% of the strobe rate and misses a frame now and\n"
+                                                      "then, in camera pans and turns.\n"
+                                                      "Not useful: the game holds the strobe rate (nothing to fill); far below it (use the Half\n"
+                                                      "cap or frame generation); with frame generation; for hitches and loading stalls; for things\n"
+                                                      "that move on their own (a character, a car), which keep their stutter.\n"
+                                                      "A filled flash is a guess: edges of things moving against the background can smear for that\n"
+                                                      "flash, and a CRT shader's mask moves with the picture. Test build: see the settings guide.");
         if (s.frameWarp)
         {
             ImGui::Indent(16.0f);
@@ -11418,12 +11418,6 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame warp works while the game makes at least this share of the strobe rate\n"
                                                           "(75%% of a 60 Hz strobe = 45 fps). Below it frames repeat as without it: the\n"
                                                           "further a frame has to be moved, the more errors show.");
-            ImGui::Combo("Motion", &s.warpDetail, "Per area, 8x8 pixel blocks\0Per area, 4x4 pixel blocks (more GPU time)\0Whole picture (smooth: fewest errors)\0");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Whole picture: the frame is moved by the camera's motion, measured coarsely and smoothed, so\n"
-                                                          "nothing tears or wobbles. Things that move on their own (a character crossing the view)\n"
-                                                          "are carried with their surroundings and keep their own stutter.\n"
-                                                          "Per area: each small block gets its own motion. Everything is filled, but edges between\n"
-                                                          "things that move differently can tear, and regular patterns can wobble.");
             if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see ReShade.log).");
             else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);

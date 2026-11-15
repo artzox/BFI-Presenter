@@ -90,10 +90,9 @@ static void Download(ID3D12Resource *tex, D3D12_RESOURCE_STATES st, UINT w, UINT
     for (UINT y = 0; y < h; y++) fwrite(p + (size_t)y * pitch, 1, (size_t)w * bpp, o);
     fclose(o); rb->Unmap(0, nullptr); rb->Release();
 }
-int main(int argc, char **argv)
+int main()
 {
     const UINT W = 1920, H = 1080;
-    const int finest = argc > 1 ? atoi(argv[1]) : 1;
     HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
     PFN_D3DCompile compile = (PFN_D3DCompile)(void *)GetProcAddress(dc, "D3DCompile");
     CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)));
@@ -158,8 +157,7 @@ int main(int argc, char **argv)
 
     WarpGpu warp;
     if (!warp.Init(dev, rs, vs, pw, srvHeap, kStage, W, H)) { printf("warp.Init failed\n"); return 1; }
-    warp.finest = finest;
-    printf("warp levels: "); for (int l = 0; l < WarpGpu::kLevels; l++) printf("%ux%u ", warp.w[l], warp.h[l]); printf(" finest %d\n", finest); fflush(stdout);
+    printf("warp levels: "); for (int l = 0; l < WarpGpu::kLevels; l++) printf("%ux%u ", warp.w[l], warp.h[l]); printf("\n"); fflush(stdout);
 
     auto srvOf = [&](UINT i) { D3D12_GPU_DESCRIPTOR_HANDLE g = srvHeap->GetGPUDescriptorHandleForHeapStart(); g.ptr += (UINT64)i * ss; return g; };
     // the presenter's sequence for two frames, then refreshes of frame 2 shown moved

@@ -233,32 +233,40 @@ It costs latency: about 10–20 ms more than just-in-time release (Silent Hill 2
 
 ### Every cap
 
-**Frame warp** · `FrameWarp`, `FrameWarpMaxAhead`, `FrameWarpMinRate`, `FrameWarpDetail` · default: off, 1.0, 75, Whole picture · DX add-on, test (v1.0.41)\
-For games that can't hold the strobe rate, e.g. 54 fps against a 60 Hz strobe. Six times a second a strobe cycle then has no new game frame, the presenter lights the last one again, and the picture stands still for one flash and jumps at the next: stutter. With frame warp, that cycle shows the last frame **moved ahead along its own motion**. The motion is measured on the GPU between the last two frames shown, from the finished picture, so it works in every game: no motion vectors, depth or Reflex needed.
+**Frame warp** · `FrameWarp`, `FrameWarpMaxAhead`, `FrameWarpMinRate` · default: off, 1.0, 75 · DX add-on, **test feature** (v1.0.41)\
+Fills strobe cycles that have no new game frame. When a game misses the strobe rate now and then, e.g. 57 fps against a 60 Hz strobe, about three times a second the presenter has no new frame for a strobe cycle and lights the last one again. The picture stands still for one flash and jumps at the next: a stutter you can see especially in camera pans, because BFI makes motion sharp. With frame warp, that cycle shows the last frame **moved part of the way along the camera's motion** instead, half way to where the next frame is expected. Frames that arrive in time are shown exactly as rendered; only the missing ones are filled.
 
-It is not frame generation. Frame generation holds each frame back until the next one exists and shows a picture between the two, which costs a frame of latency. Frame warp never waits: it only carries the newest frame forward, so the latency is the same as without it. What it can't do is bring your input in sooner, as Reflex 2's Frame Warp does with the game's camera: it continues the motion the last two frames showed.
+The motion is measured on the GPU between the last two frames, from the finished picture, so it works in every DX game without motion vectors, depth or Reflex. It is averaged over the whole picture, so it follows the camera (with its depth) and nothing tears.
 
-- **Fill missing frames**: frames are shown as rendered. Only a cycle without a new frame is filled, half way to where the next frame is expected (steps of 1, 1, ½, ½, 1 instead of 1, 1, 0, 1, 1). 9 of 10 flashes at 54 fps are untouched.
-- **Even pacing**: every cycle shows the picture where the motion is at that moment. A 54 fps game's frames are 18.5 ms apart but lit 16.7 ms apart, so each is moved ahead by what is missing (0.9, 0.8 … 0.1, 0 of a frame), and every step on screen is the same. Smoothest, but most frames are moved a little, and it uses more GPU time. A game that holds the strobe rate is left alone (only an odd missing frame is filled).
+It is **not frame generation**. Frame generation holds each frame back until the next one exists and shows a picture in between, which costs a frame of latency. Frame warp never waits: it only carries the newest frame on, so latency is the same as without it. It also doesn't bring your input in sooner (as Reflex 2's Frame Warp does with the game's camera); it continues the motion of the last two frames.
 
-What stands still on the screen is never moved: a pixel that is the same in both frames is shown as rendered when most of the pixels around it are unchanged too, or when the scene's motion doesn't explain why it is unchanged. So a HUD, subtitles and a crosshair stay sharp and still, down to one-pixel lines, and the scene next to them is not smeared over them.
+**When it can help**
+- The game runs **just under the strobe rate**: about 75–99% of it (45–59 fps at a 60 Hz strobe), so single frames go missing now and then.
+- The motion is **mostly the camera**: turning, panning, driving, flying.
+- You use plain BFI, without a CRT shader, or one whose mask you don't mind moving on filled flashes.
 
-**Furthest ahead** limits how far a frame is carried (game frames). **Only from** is the lowest frame rate it works at, in percent of the strobe rate: below it frames repeat as before, because the further a frame has to be carried, the more errors show. **Motion** chooses how the frame is moved:
-- **Whole picture** (default): the motion is measured in 8×8 pixel blocks and then averaged over a wide area, leaving out odd vectors, so it changes only gradually across the screen: the camera's motion, with its depth. Nothing can tear or wobble. Things that move on their own (a character crossing the view) are carried with their surroundings, so they keep their own stutter.
-- **Per area**, 8×8 or 4×4 pixel blocks: each block keeps its own motion. Everything is filled, moving things included, but the limits below show more.
+**When it doesn't help, or makes things worse**
+- **The game holds the strobe rate** (60 of 60): there is nothing to fill. It does no harm, but costs a little GPU time.
+- **Far below the strobe rate** (under about 75%): each frame would have to be carried a long way, and the errors grow. Use the **Half** cap (one frame every two strobe cycles), or frame generation, instead. Below **Only from** frame warp stops by itself.
+- **With frame generation**: the generated frames already fill the strobe cycles.
+- **Hitches and loading stalls** (a frame that takes 50 ms or more): these aren't filled; the picture waits at the limit.
+- **A GPU-bound game**: frame warp adds a little GPU work, which can cost a frame or two in a game already at 99% GPU load.
+- **Things that move on their own** (a character running across the screen, a car beside you, enemies) are carried with their surroundings, so they keep their stutter. In a third-person game the character often barely moves on screen while the world does, which is fine; an object crossing the view is not filled.
 
-The on-screen display (Ctrl+Shift+F) has a line for it: how many of the second's strobe cycles were shown moved, and how far ahead on average.
+**What a filled flash can show** (only for that one flash, 1 in 20 at 57 fps):
+- The edge of something moving against the background can smear or bend a little.
+- What comes out from behind something isn't in the last frame, so it is filled from its surroundings.
+- A sudden stop or turn overshoots: the frame is carried on in the direction it was moving.
+- A HUD that changes every frame (film grain or an effect drawn over it, an animated minimap) moves with the scene. A still HUD, subtitles and a crosshair are never moved, down to one-pixel lines.
+- With a CRT shader, the scanlines and mask are part of the picture and move with it: expect shimmer in the mask.
 
-Its limits, so you know what you are looking at:
-- Per area: where two things move differently (a character crossing in front of a panning background), the edge between them can tear or smear for that one flash. Whole picture: that thing is bent a little with its surroundings instead. What comes out from behind something isn't in the frame, so it is filled from the surroundings.
-- Per area: regular patterns (stripes, a fence, tiles, a grate) match themselves at many offsets, so their motion can be measured wrong in places: they can wobble on a moved flash.
-- A HUD that changes every frame (film grain or a ReShade effect drawn over it, an animated minimap) can't be told from the scene and moves with it.
-- With a CRT shader (CRT-Standalone), the scanlines and mask are part of the picture and move with it on warped flashes: expect shimmer in the mask. Better with plain BFI.
-- Changes of direction: the frame is carried on in the direction it was moving, so a sudden stop or turn overshoots for one flash.
-- It needs the game's frames to arrive steadily. Heavy hitches aren't filled (the picture waits at the limit).
+**How to tell if it helps you.** Play the same scene with it on and off (**Ctrl+Shift+W** switches it). The on-screen display (Ctrl+Shift+F) shows whether it is at work and how many strobe cycles a second it filled; the fps and "repeated" counters stay the same, because the game makes the same frames. The timing log's `BFIPresenter_reflex_*.csv` has the same per second (`frame_repeats`, `warp_state`, `warp_filled`, `warp_ahead`). If you don't see a difference, or the errors bother you more than the stutter, leave it off.
 
-It costs one small pass per game frame, plus the motion measurement and a heavier draw on the flashes that are moved, and one more staging image of video memory.\
-*When to change it:* turn it on (start with Fill missing frames) for a game that stays a few fps under the strobe rate and stutters. Hotkey: Ctrl+Shift+W switches it off and back on, to compare. If its errors bother you more than the stutter, lower Furthest ahead or leave it off. The overlay shows whether it is at work, the game's share of the strobe rate, and how many cycles a second are moved.
+**Furthest ahead** limits how far a frame is carried, in game frames (lower: fewer errors, a missing frame only partly filled). **Only from** is the lowest frame rate it works at, in percent of the strobe rate.
+
+*So far:* on synthetic frames (`tools/warp-test`: a scene panning 23 pixels a frame, with a HUD and a crosshair), a filled flash half a frame ahead has 6% of pixels visibly off, against 33% for the repeated frame, with the HUD and crosshair untouched. In games: Onimusha: Way of the Sword at 58–60 fps showed no visible errors and seemed to have fewer visible repeats; in Townfall there was no clear benefit. Whole-picture motion was the only one that looked right in Assassin's Creed Unity, 007 First Light and Returnal. It is a test feature because the benefit is small and not yet confirmed: reports either way are welcome. Test builds t1–t2 also had an "even pacing" mode (every frame moved a little) and motion per 8×8 or 4×4 block; both showed too many errors in games and were removed.
+
+It costs one small pass per game frame, the motion measurement and a heavier draw on filled flashes, and one more staging image of video memory (33 MB at 4K).
 
 **Frame pacing** · `FramePacing` · default: Lowest latency (new ini files)
 - **Lowest latency** always shows the newest image: quickest response.
