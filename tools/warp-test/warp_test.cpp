@@ -207,9 +207,9 @@ int main(int argc, char **argv)
         char name[64]; snprintf(name, sizeof(name), "out%d.rgba", pass);
         Download(out, D3D12_RESOURCE_STATE_RENDER_TARGET, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, 4, name);
     }
-    Download(warp.flowOut[finest], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, warp.w[finest], warp.h[finest], DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "flow.f16");
+    Download(warp.flowOut[warp.Out()], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, warp.w[warp.Out()], warp.h[warp.Out()], DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "flow.f16");
     Download(warp.luma[warp.cur][0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, warp.w[0], warp.h[0], DXGI_FORMAT_R16_FLOAT, 2, "luma0.f16");
-    printf("flow %ux%u done\n", warp.w[finest], warp.h[finest]);
+    printf("flow %ux%u done\n", warp.w[warp.Out()], warp.h[warp.Out()]);
     warp.Release();
     return 0;
 }

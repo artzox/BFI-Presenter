@@ -14,4 +14,4 @@ Checks frame warp without a game:
 
 What to expect (1.0.41-t1, 8x8 blocks): background motion within a quarter of a pixel of the truth in the median,
 HUD and crosshair pixels changed by the warp: 0, pixels off by more than 16/255 half a frame ahead: about 5% (33% when
-the frame is repeated instead); with 4x4 blocks (`./run.sh 0`) about 4%.
+the frame is repeated instead); with 4x4 blocks (`./run.sh 0`) about 4%; with whole-picture motion (`./run.sh 3`) about 6%, without torn edges.

@@ -32,9 +32,10 @@ static const char kWarpShader[] = R"HLSL(
 cbuffer W : register(b0)
 {
     float2 texel;    // 1 / size of the level being drawn
-    float2 texel2;   // brightness pass: 1 / size of the game frame; motion pass: 1 / size of the coarser level
+    float2 texel2;   // brightness pass: 1 / size of the game frame; motion pass: 1 / size of the coarser level;
+                     // evening-out pass for whole-picture motion: 1 / size of the level the vectors come from
     uint   wmode;    // brightness pass: 1 = the frame is linear (scRGB); motion pass: 1 = start from the coarser level,
-                     // +2 = the last (finest) level
+                     // +2 = the last level. Evening-out pass: 1 = whole-picture motion
 };
 Texture2D<float4> ta : register(t0);   // brightness: the game frame / the finer level. Motion: this level, newer frame
 Texture2D<float4> tb : register(t1);   // motion: this level, older frame
@@ -90,7 +91,8 @@ float4 PSWarpFlow(float4 pos : SV_Position) : SV_Target
     // The last level: where the picture is the same as in the frame before, nothing moved -- or nothing that can be
     // seen moving (a flat area). A HUD over a moving scene stays exactly where it is, fine text included, which the
     // levels above can't tell from its background.
-    if ((wmode & 2) != 0 && bestC < 0.03) return float4(0.0, 0.0, 1.0, 1.0);
+    // (w = 0: no motion was measured here; whole-picture motion leaves these out of its average.)
+    if ((wmode & 2) != 0 && bestC < 0.03) return float4(0.0, 0.0, 1.0, 0.0);
     if ((wmode & 1) == 0)
     {
         // the smallest level: standing still unless an offset is clearly better
@@ -146,12 +148,51 @@ float4 PSWarpFlow(float4 pos : SV_Position) : SV_Target
 // pixel of this level. One block's match is only good to a pixel or two of the game frame, which shows as a wobble in
 // fine detail; things that move together share one motion, and vectors of something moving differently (or standing
 // still) are left out, so the edges between them stay.
+//
+// Whole-picture motion (wmode 1; ta = the 1/8 level's vectors, the target is the 1/32 level's size): the mean of all
+// the vectors within about a block and a half of this one (a 7x7 grid of taps, soft weights), leaving out the places
+// where nothing was measured. The motion then changes only gradually across the screen -- the camera's motion, with
+// its depth -- so nothing can tear or wobble; what moves on its own is carried with its surroundings.
 float4 PSWarpSmooth(float4 pos : SV_Position) : SV_Target
 {
-    int2 q = int2(pos.xy);
-    float4 c = ta.Load(int3(q, 0));
     float2 sum = float2(0.0, 0.0);
     float wsum = 0.0;
+    if (wmode == 1)
+    {
+        for (int y = -3; y <= 3; y++)
+        {
+            for (int x = -3; x <= 3; x++)
+            {
+                float4 n = ta.SampleLevel(linClamp, (pos.xy + 0.5 * float2(x, y)) * texel, 0);
+                float g = exp(-float(x * x + y * y) / 6.0);
+                sum += n.xy * g;                   // places with nothing measured hold 0, 0 and w 0
+                wsum += n.w * g;
+            }
+        }
+        if (wsum <= 0.02) return float4(0.0, 0.0, 1.0, 0.0);
+        // Once more, counting each vector by how well it agrees with that mean (within about two pixels of the 1/8
+        // level): a few wrong matches, or something small moving on its own, then don't pull the whole area off.
+        float2 m = sum / wsum;
+        float2 sum2 = float2(0.0, 0.0);
+        float wsum2 = 0.0;
+        for (int y2 = -3; y2 <= 3; y2++)
+        {
+            for (int x2 = -3; x2 <= 3; x2++)
+            {
+                float4 n = ta.SampleLevel(linClamp, (pos.xy + 0.5 * float2(x2, y2)) * texel, 0);
+                if (n.w > 0.001)
+                {
+                    float2 d = (n.xy / n.w - m) / (texel2 * 2.0);
+                    float g = exp(-float(x2 * x2 + y2 * y2) / 6.0) * exp(-dot(d, d) * 0.5) * n.w;
+                    sum2 += (n.xy / n.w) * g;
+                    wsum2 += g;
+                }
+            }
+        }
+        return wsum2 > 1e-4 ? float4(sum2 / wsum2, 1.0, 1.0) : float4(m, 1.0, 1.0);
+    }
+    int2 q = int2(pos.xy);
+    float4 c = ta.Load(int3(q, 0));
     for (int y = -2; y <= 2; y++)
     {
         for (int x = -2; x <= 2; x++)
@@ -163,7 +204,7 @@ float4 PSWarpSmooth(float4 pos : SV_Position) : SV_Target
             wsum += w;
         }
     }
-    return float4(sum / wsum, c.z, 1.0);
+    return float4(sum / wsum, c.z, c.w);
 }
 )HLSL";
 
@@ -181,8 +222,8 @@ struct WarpGpu
     static const int kLevels = 5;                       // 1/4, 1/8, 1/16, 1/32, 1/64 of the game frame
     ID3D12Resource       *luma[2][kLevels] = {};        // brightness pyramids of the newest frame shown and the one before
     ID3D12Resource       *flow[kLevels] = {};           // motion, per level
-    ID3D12Resource       *flowOut[2] = {};              // the last level's motion evened out, for level 0 and level 1 as the
-                                                        // last: what the per-refresh shader reads
+    ID3D12Resource       *flowOut[kLevels] = {};        // the last level's motion evened out, one for each level that can
+                                                        // be the last: what the per-refresh shader reads
     ID3D12PipelineState  *psoLuma = nullptr, *psoDown = nullptr, *psoFlow = nullptr, *psoSmooth = nullptr;
     ID3D12Device         *device = nullptr;             // the presenter's (not owned)
     ID3D12DescriptorHeap *rtvHeap = nullptr;
@@ -194,10 +235,11 @@ struct WarpGpu
     UINT64 id[2] = {};                                  // the game frame in each pyramid (0 = none)
     double t[2] = {};                                   // and when the game presented it
     UINT64 flowNew = 0, flowOld = 0;                    // the pair of frames the motion texture was measured between
-    int   finest = 1;                                   // level the motion is refined down to: 1 = 1/8, 0 = 1/4 of the frame
+    int   finest = 1;                                   // level the motion is refined down to: 1 = 1/8, 0 = 1/4 of the frame;
+                                                        // 3 = whole-picture motion (measured at 1/8, averaged at 1/32)
     bool  ok = false;
 
-    static const UINT kSrvCount = 3 * kLevels + 2;      // descriptors it takes in the presenter's SRV heap
+    static const UINT kSrvCount = 4 * kLevels;      // descriptors it takes in the presenter's SRV heap
 
     static D3D12_RESOURCE_BARRIER Tr(ID3D12Resource *r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
     {
@@ -218,8 +260,10 @@ struct WarpGpu
     D3D12_GPU_DESCRIPTOR_HANDLE LumaSrv(int p, int l) const { return Srv((UINT)(p * kLevels + l)); }
     D3D12_GPU_DESCRIPTOR_HANDLE FlowSrvAt(int l) const { return Srv((UINT)(2 * kLevels + l)); }
     // The motion texture the per-refresh shader reads.
+    bool Whole() const { return finest >= 2; }          // whole-picture motion: measured at 1/8, averaged widely at 1/32
     int Last() const { return finest <= 0 ? 0 : 1; }    // the level the motion is refined down to
-    D3D12_GPU_DESCRIPTOR_HANDLE FlowSrv() const { return Srv((UINT)(3 * kLevels + Last())); }
+    int Out() const { return Whole() ? 3 : Last(); }    // the size of the texture the per-refresh shader reads
+    D3D12_GPU_DESCRIPTOR_HANDLE FlowSrv() const { return Srv((UINT)(3 * kLevels + Out())); }
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(UINT i) const
     {
         D3D12_CPU_DESCRIPTOR_HANDLE hnd = rtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -265,7 +309,7 @@ struct WarpGpu
 
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hd.NumDescriptors = 3 * kLevels + 2;
+        hd.NumDescriptors = 4 * kLevels;
         m = m && SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
 
         D3D12_HEAP_PROPERTIES hp = {};
@@ -297,7 +341,7 @@ struct WarpGpu
             sh.ptr += (SIZE_T)(srvBase + (UINT)i) * srvStride;
             dev->CreateShaderResourceView(*slot, &sv, sh);
         }
-        m = m && MakeOut(0) && MakeOut(1);
+        for (int l = 0; m && l < kLevels - 1; l++) m = MakeOut(l);
         if (!m) { Release(); return false; }
         cur = 0; id[0] = id[1] = 0; t[0] = t[1] = 0.0; flowNew = flowOld = 0;
         ok = true;
@@ -334,7 +378,7 @@ struct WarpGpu
 
     void Release()
     {
-        for (int i = 0; i < 2; i++) if (flowOut[i]) { flowOut[i]->Release(); flowOut[i] = nullptr; }
+        for (int i = 0; i < kLevels; i++) if (flowOut[i]) { flowOut[i]->Release(); flowOut[i] = nullptr; }
         if (psoSmooth) { psoSmooth->Release(); psoSmooth = nullptr; }
         for (int p = 0; p < 2; p++)
             for (int l = 0; l < kLevels; l++) if (luma[p][l]) { luma[p][l]->Release(); luma[p][l] = nullptr; }
@@ -418,9 +462,12 @@ struct WarpGpu
         }
         {
             WarpConstants wc = {};
-            wc.texelX = 1.0f / (float)w[stop]; wc.texelY = 1.0f / (float)h[stop];
+            const int o = Out();
+            wc.texelX = 1.0f / (float)w[o]; wc.texelY = 1.0f / (float)h[o];
+            wc.texel2X = 1.0f / (float)w[stop]; wc.texel2Y = 1.0f / (float)h[stop];
+            wc.mode = Whole() ? 1u : 0u;
             list->SetGraphicsRootDescriptorTable(1, FlowSrvAt(stop));
-            Pass(list, psoSmooth, flowOut[stop], (UINT)(3 * kLevels + stop), w[stop], h[stop], wc);
+            Pass(list, psoSmooth, flowOut[o], (UINT)(3 * kLevels + o), w[o], h[o], wc);
         }
         flowNew = id[cur]; flowOld = id[1 - cur];
     }

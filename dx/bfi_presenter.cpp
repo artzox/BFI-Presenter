@@ -95,7 +95,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.41-t1"
+#define BFI_ADDON_VERSION "1.0.41-t2"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -117,7 +117,8 @@ struct Settings
                               // motion (no frame is held back: no added latency). 0 off, 1 fill missing frames, 2 even pacing
     float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
-    int   warpDetail = 0;     // FrameWarpDetail: motion measured per 0 = 8x8 block of the frame, 1 = 4x4 block
+    int   warpDetail = 2;     // FrameWarpDetail: 2 = whole picture (the 8x8 vectors averaged widely: smooth, fewest errors),
+                              // 0 = motion per 8x8 block of the frame, 1 = per 4x4 block
     int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
     int   osdCorner = 1;      // OsdCorner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
     int   osdGraph = 1;       // OsdGraph: frame-time graph
@@ -282,7 +283,7 @@ static void LoadSettings(Settings &s)
     s.frameWarp = std::max(0, std::min(2, IniInt("FrameWarp", 0)));
     s.warpMax = std::max(0.25f, std::min(1.5f, IniFloat("FrameWarpMaxAhead", 1.0f)));
     s.warpMinRate = std::max(40, std::min(95, IniInt("FrameWarpMinRate", 75)));
-    s.warpDetail = IniInt("FrameWarpDetail", 0) ? 1 : 0;
+    s.warpDetail = std::max(0, std::min(2, IniInt("FrameWarpDetail", 2)));
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -4329,7 +4330,7 @@ static DWORD WINAPI PresenterThread(void *)
         // ones); the motion from the frame before is measured only when the frame is shown moved, once per pair.
         if (s.frameWarp && warp.ok)
         {
-            const int fin = s.warpDetail ? 0 : 1;
+            const int fin = s.warpDetail == 2 ? 3 : s.warpDetail == 1 ? 0 : 1;
             if (fin != warp.finest) { warp.finest = fin; warp.flowNew = 0; }
             bool touched = false;
             if (pickId != warp.id[warp.cur])
@@ -10805,6 +10806,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
     d.gameFps = g_status.gameFps; d.refreshHz = g_status.refreshHz; d.frames = g_shared.frames;
     d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
     d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
+    d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
     LeaveCriticalSection(&g_cfgLock);
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
 }
@@ -11392,7 +11394,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame warp works while the game makes at least this share of the strobe rate\n"
                                                           "(75%% of a 60 Hz strobe = 45 fps). Below it frames repeat as without it: the\n"
                                                           "further a frame has to be moved, the more errors show.");
-            ImGui::Combo("Motion detail", &s.warpDetail, "Normal (8x8 pixel blocks)\0Fine (4x4 pixel blocks, more GPU time)\0");
+            ImGui::Combo("Motion", &s.warpDetail, "Per area, 8x8 pixel blocks\0Per area, 4x4 pixel blocks (more GPU time)\0Whole picture (smooth: fewest errors)\0");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Whole picture: the frame is moved by the camera's motion, measured coarsely and smoothed, so\n"
+                                                          "nothing tears or wobbles. Things that move on their own (a character crossing the view)\n"
+                                                          "are carried with their surroundings and keep their own stutter.\n"
+                                                          "Per area: each small block gets its own motion. Everything is filled, but edges between\n"
+                                                          "things that move differently can tear, and regular patterns can wobble.");
             if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see ReShade.log).");
             else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
