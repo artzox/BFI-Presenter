@@ -233,19 +233,20 @@ It costs latency: about 10–20 ms more than just-in-time release (Silent Hill 2
 
 ### Every cap
 
-**Frame warp** · `FrameWarp`, `FrameWarpMaxAhead`, `FrameWarpMinRate`, `FrameWarpDetail` · default: off, 1.0, 75, Whole picture · DX add-on, test (v1.0.41)\
+**Frame warp** · `FrameWarp`, `FrameWarpMaxAhead`, `FrameWarpMinRate`, `FrameWarpMotion` · default: off, 1.0, 75, Shift · DX add-on, test (v1.0.41)\
 For games that can't hold the strobe rate, e.g. 54 fps against a 60 Hz strobe. Six times a second a strobe cycle then has no new game frame, the presenter lights the last one again, and the picture stands still for one flash and jumps at the next: stutter. With frame warp, that cycle shows the last frame **moved ahead along its own motion**. The motion is measured on the GPU between the last two frames shown, from the finished picture, so it works in every game: no motion vectors, depth or Reflex needed.
 
 It is not frame generation. Frame generation holds each frame back until the next one exists and shows a picture between the two, which costs a frame of latency. Frame warp never waits: it only carries the newest frame forward, so the latency is the same as without it. What it can't do is bring your input in sooner, as Reflex 2's Frame Warp does with the game's camera: it continues the motion the last two frames showed.
 
-- **Fill missing frames**: frames are shown as rendered. Only a cycle without a new frame is filled, half way to where the next frame is expected (steps of 1, 1, ½, ½, 1 instead of 1, 1, 0, 1, 1). 9 of 10 flashes at 54 fps are untouched.
+- **Fill missing frames**: for a game that nearly holds the strobe rate and drops the odd frame (58–59 fps). Well below it (50 fps), half-steps ten times a second still read as stutter: use Even pacing there. Frames are shown as rendered. Only a cycle without a new frame is filled, half way to where the next frame is expected (steps of 1, 1, ½, ½, 1 instead of 1, 1, 0, 1, 1). 9 of 10 flashes at 54 fps are untouched.
 - **Even pacing**: every cycle shows the picture where the motion is at that moment. A 54 fps game's frames are 18.5 ms apart but lit 16.7 ms apart, so each is moved ahead by what is missing (0.9, 0.8 … 0.1, 0 of a frame), and every step on screen is the same. Smoothest, but most frames are moved a little, and it uses more GPU time. A game that holds the strobe rate is left alone (only an odd missing frame is filled).
 
 What stands still on the screen is never moved: a pixel that is the same in both frames is shown as rendered when most of the pixels around it are unchanged too, or when the scene's motion doesn't explain why it is unchanged. So a HUD, subtitles and a crosshair stay sharp and still, down to one-pixel lines, and the scene next to them is not smeared over them.
 
 **Furthest ahead** limits how far a frame is carried (game frames). **Only from** is the lowest frame rate it works at, in percent of the strobe rate: below it frames repeat as before, because the further a frame has to be carried, the more errors show. **Motion** chooses how the frame is moved:
-- **Whole picture** (default): the motion is measured in 8×8 pixel blocks and then averaged over a wide area, leaving out odd vectors, so it changes only gradually across the screen: the camera's motion, with its depth. Nothing can tear or wobble. Things that move on their own (a character crossing the view) are carried with their surroundings, so they keep their own stutter.
-- **Per area**, 8×8 or 4×4 pixel blocks: each block keeps its own motion. Everything is filled, moving things included, but the limits below show more.
+- **Shift the whole frame** (default): all the measured motion is reduced to one, the motion most of the picture shares, which is the camera turning. The frame is moved as it is by that much, in whole pixels, so every pixel shown is one the game drew: nothing bends, tears or shimmers. The strip at the edge the picture moves away from has nothing to show and is stretched from the edge. It evens out camera turns, the motion that stutters most visibly. What moves differently keeps its own stutter: near things against far ones while walking or strafing, a character crossing the view. Moving straight ahead has no common motion and isn't evened.
+- **Bend**: areas get their own motion, averaged widely. More is evened out, but parts of the picture can pinch and warp.
+- **Per 8×8 / 4×4 block** (tests): each block keeps its own motion; shimmer and skewed parts all around (Assassin's Creed Unity, t1 and t2).
 
 The on-screen display (Ctrl+Shift+F) has a line for it: how many of the second's strobe cycles were shown moved, and how far ahead on average.
 

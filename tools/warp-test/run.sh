@@ -9,4 +9,4 @@ python3 extract_presenter.py
 [ -f f0.rgba ] || python3 make_frames.py
 x86_64-w64-mingw32-g++ -O1 -std=c++17 -static -I ../../third_party/mingw-shim warp_test.cpp -o warp_test.exe -ld3d12 -ldxgi -ldxguid
 WINEDEBUG=-all WINEDLLOVERRIDES="d3dcompiler_47=n" ${WINE:-wine} warp_test.exe ${1:-1}
-case "${1:-1}" in 0) python3 check.py 480 270;; 3) python3 check.py 60 34;; *) python3 check.py 240 135;; esac
+case "${1:-1}" in 0) python3 check.py 480 270;; 3) python3 check.py 60 34;; 4) python3 check.py 240 135 shift;; *) python3 check.py 240 135;; esac

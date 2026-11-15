@@ -95,7 +95,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.41-t2"
+#define BFI_ADDON_VERSION "1.0.41-t3"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -117,8 +117,8 @@ struct Settings
                               // motion (no frame is held back: no added latency). 0 off, 1 fill missing frames, 2 even pacing
     float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
-    int   warpDetail = 2;     // FrameWarpDetail: 2 = whole picture (the 8x8 vectors averaged widely: smooth, fewest errors),
-                              // 0 = motion per 8x8 block of the frame, 1 = per 4x4 block
+    int   warpMotion = 0;     // FrameWarpMotion: 0 = shift: the frame is moved as it is, by the one motion most of it shares,
+                              // in whole pixels; 1 = bend: motion averaged over wide areas; 2 / 3 = per 8x8 / 4x4 block (tests)
     int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
     int   osdCorner = 1;      // OsdCorner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
     int   osdGraph = 1;       // OsdGraph: frame-time graph
@@ -283,7 +283,7 @@ static void LoadSettings(Settings &s)
     s.frameWarp = std::max(0, std::min(2, IniInt("FrameWarp", 0)));
     s.warpMax = std::max(0.25f, std::min(1.5f, IniFloat("FrameWarpMaxAhead", 1.0f)));
     s.warpMinRate = std::max(40, std::min(95, IniInt("FrameWarpMinRate", 75)));
-    s.warpDetail = std::max(0, std::min(2, IniInt("FrameWarpDetail", 2)));
+    s.warpMotion = std::max(0, std::min(3, IniInt("FrameWarpMotion", 0)));
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -511,7 +511,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarp", s.frameWarp);
     IniWriteFloat("FrameWarpMaxAhead", s.warpMax);
     IniWriteInt("FrameWarpMinRate", s.warpMinRate);
-    IniWriteInt("FrameWarpDetail", s.warpDetail);
+    IniWriteInt("FrameWarpMotion", s.warpMotion);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -1582,7 +1582,8 @@ cbuffer C : register(b0)
     float dfloor;
     float knee;
     float ceilLin;    // panel ceiling, linear (1.0 = SDR white / 80 nits)
-    uint  flags;      // 1 roll-off, 2 sine, 4 invert, 8 rolling scan, 1024 the game's frames are linear (scRGB; frame warp)
+    uint  flags;      // 1 roll-off, 2 sine, 4 invert, 8 rolling scan, 1024 the game's frames are linear (scRGB; frame warp),
+                      // 2048 frame warp moves by whole pixels (shift)
     float seam;       // rolling scan: blended zone between bands, fraction of the screen height
     float decay;      // rolling scan: phosphor decay time in sub-frames (0 = hard bands)
     float soften;     // 0..1: blend toward the steady average picture (LCD phase swap fade)
@@ -1667,6 +1668,7 @@ bool FetchWarped(float2 pos, out float3 c)
     float2 inv = 1.0 / size;
     float2 cp = pos * srcPerOut;
     float2 d = WarpShift(cp * inv) * size;
+    if ((flags & 2048) != 0) d = round(d);                // shift: whole pixels, so every pixel shown is one the game drew
     if (dot(d, d) < 0.0004) return false;                 // under 1/50 pixel
     if (Still(int2(cp), size)) return false;
     float2 p = clamp(cp - d, float2(0.5, 0.5), size - 0.5);
@@ -2402,9 +2404,9 @@ static void Trace(const char *fmt, ...)
 // they are usually ready), and kept on disk in BFIPresenter_shaders.bin next to the ini, keyed to the exact source and
 // compile flags: from the second start of a version there is no compile at all.
 static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce",
-                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth" };   // the last four: kWarpShader (dx/bfi_warp.h)
-static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
-static const int kShN = 9;
+                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGlobal" };   // the last five: kWarpShader (dx/bfi_warp.h)
+static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
+static const int kShN = 10;
 static const int kShWarp = 5;                    // first of the frame warp shaders
 static ID3DBlob *g_shBlob[kShN] = {};
 static HANDLE volatile g_shThread = nullptr;
@@ -4266,6 +4268,7 @@ static DWORD WINAPI PresenterThread(void *)
         // the cycle's refreshes compare equal and drawn buffers can still be reused.
         UINT64 warpOld = 0;
         if (StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT) c.flags |= 1024u;
+        if (s.frameWarp && s.warpMotion == 0) c.flags |= 2048u;
         if (warpAhead > 0.0 && s.frameWarp && warp.ok && (warpOld = warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrev >= 0 && warpPrev != pick && warpPrevId == warpOld && g_stageId[warpPrev] == warpOld && g_stageFence[warpPrev] <= done)
             c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
@@ -4330,8 +4333,9 @@ static DWORD WINAPI PresenterThread(void *)
         // ones); the motion from the frame before is measured only when the frame is shown moved, once per pair.
         if (s.frameWarp && warp.ok)
         {
-            const int fin = s.warpDetail == 2 ? 3 : s.warpDetail == 1 ? 0 : 1;
-            if (fin != warp.finest) { warp.finest = fin; warp.flowNew = 0; }
+            const int fin = s.warpMotion <= 1 ? 3 : s.warpMotion == 3 ? 0 : 1;
+            const bool sh = s.warpMotion == 0;
+            if (fin != warp.finest || sh != warp.shift) { warp.finest = fin; warp.shift = sh; warp.flowNew = 0; }
             bool touched = false;
             if (pickId != warp.id[warp.cur])
             {
@@ -11394,12 +11398,13 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame warp works while the game makes at least this share of the strobe rate\n"
                                                           "(75%% of a 60 Hz strobe = 45 fps). Below it frames repeat as without it: the\n"
                                                           "further a frame has to be moved, the more errors show.");
-            ImGui::Combo("Motion", &s.warpDetail, "Per area, 8x8 pixel blocks\0Per area, 4x4 pixel blocks (more GPU time)\0Whole picture (smooth: fewest errors)\0");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Whole picture: the frame is moved by the camera's motion, measured coarsely and smoothed, so\n"
-                                                          "nothing tears or wobbles. Things that move on their own (a character crossing the view)\n"
-                                                          "are carried with their surroundings and keep their own stutter.\n"
-                                                          "Per area: each small block gets its own motion. Everything is filled, but edges between\n"
-                                                          "things that move differently can tear, and regular patterns can wobble.");
+            ImGui::Combo("Motion", &s.warpMotion, "Shift the whole frame\0Bend (areas move separately, smoothed)\0Per 8x8 block (test)\0Per 4x4 block (test)\0");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shift: the frame is moved as it is, by the one motion most of the picture shares (the\n"
+                                                          "camera turning), in whole pixels. Nothing bends, tears or shimmers; a strip at the edge\n"
+                                                          "the picture moves away from is stretched. What moves differently (near things while\n"
+                                                          "walking, a character crossing) keeps its own stutter; moving straight ahead isn't evened.\n"
+                                                          "Bend and the block modes give each area its own motion: more is evened out, but parts of\n"
+                                                          "the picture can pinch, skew or shimmer.");
             if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see ReShade.log).");
             else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);

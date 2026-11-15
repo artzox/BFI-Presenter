@@ -158,7 +158,8 @@ int main(int argc, char **argv)
 
     WarpGpu warp;
     if (!warp.Init(dev, rs, vs, pw, srvHeap, kStage, W, H)) { printf("warp.Init failed\n"); return 1; }
-    warp.finest = finest;
+    warp.finest = finest == 4 ? 3 : finest;
+    warp.shift = finest == 4;
     printf("warp levels: "); for (int l = 0; l < WarpGpu::kLevels; l++) printf("%ux%u ", warp.w[l], warp.h[l]); printf(" finest %d\n", finest); fflush(stdout);
 
     auto srvOf = [&](UINT i) { D3D12_GPU_DESCRIPTOR_HANDLE g = srvHeap->GetGPUDescriptorHandleForHeapStart(); g.ptr += (UINT64)i * ss; return g; };
@@ -170,6 +171,7 @@ int main(int argc, char **argv)
         const UINT64 pickId = pick + 100;
         const double pickT = 1.0 + 0.0185 * pick;
         Constants c = {};
+        if (finest == 4) c.flags |= 2048u;
         c.frames = 2; c.method = 2; c.gain = 0.5f; c.knee = 0.75f; c.ceilLin = 1.0f; c.srcPerOutX = c.srcPerOutY = 1.0f;
         UINT64 old = 0;
         const double ahead = pass == 0 ? 0.0 : shares[pass - 1];
@@ -207,7 +209,8 @@ int main(int argc, char **argv)
         char name[64]; snprintf(name, sizeof(name), "out%d.rgba", pass);
         Download(out, D3D12_RESOURCE_STATE_RENDER_TARGET, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, 4, name);
     }
-    Download(warp.flowOut[warp.Out()], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, warp.w[warp.Out()], warp.h[warp.Out()], DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "flow.f16");
+    if (warp.shift) Download(warp.flowOne, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "flow1.f16");
+    Download(warp.shift ? warp.flow[1] : warp.flowOut[warp.Out()], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, warp.w[warp.shift ? 1 : warp.Out()], warp.h[warp.shift ? 1 : warp.Out()], DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "flow.f16");
     Download(warp.luma[warp.cur][0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, warp.w[0], warp.h[0], DXGI_FORMAT_R16_FLOAT, 2, "luma0.f16");
     printf("flow %ux%u done\n", warp.w[warp.Out()], warp.h[warp.Out()]);
     warp.Release();

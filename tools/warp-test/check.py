@@ -43,3 +43,12 @@ d=np.abs(o[2]-f15).max(-1); d0=np.abs(f1-f15).max(-1)
 print('pixels off by more than 16/255 (half frame ahead): repeat %.1f%%  warped %.1f%%'%(100*(d0>16/255).mean(),100*(d>16/255).mean()))
 d=np.abs(o[3]-f2).max(-1); d0=np.abs(f1-f2).max(-1)
 print('pixels off by more than 16/255 (one frame ahead):  repeat %.1f%%  warped %.1f%%'%(100*(d0>16/255).mean(),100*(d>16/255).mean()))
+import os
+if os.path.exists('flow1.f16') and len(sys.argv)>3 and sys.argv[3]=='shift':
+    g=np.fromfile('flow1.f16',np.float16).astype(np.float32)
+    print('one motion for the frame: (%.2f, %.2f) px, the pan is (22, -7)'%(g[0]*W,g[1]*H))
+    # a shifted frame holds only pixels the game drew: compare with f1 moved by the rounded shift
+    dx,dy=int(round(g[0]*W*0.5)),int(round(g[1]*H*0.5))
+    sh=np.roll(f1,(dy,dx),(0,1)); m=bgm&(np.roll(bgm,(dy,dx),(0,1)))
+    m[:40]=m[-40:]=False; m[:,:40]=m[:,-40:]=False
+    print('half a frame ahead = the frame moved by (%d, %d) whole pixels: %.2f%% of background pixels differ from that'%(dx,dy,100*(np.abs(o[2]-sh).max(-1)[m]>1/255).mean()))

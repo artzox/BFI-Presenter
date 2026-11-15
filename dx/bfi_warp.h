@@ -17,6 +17,8 @@
 //      (or 4x4) block of the game frame with a confidence: where nothing matched (uncovered background, a cut) the
 //      picture is left where it is.
 //      A last pass evens the vectors out among neighbours that agree (a block's match is only good to a pixel or two).
+//      Shift (the default): all of it reduced to ONE motion, the one most of the picture shares (the camera's turn).
+//      The frame is then moved as it is, by whole pixels: nothing in it can bend, tear or shimmer.
 //   3. The per-refresh shader reads that texture (t3) and takes each pixel from further back along its motion --
 //      except what is the same pixel for pixel in the frame shown before (t4): that stands still on the screen
 //      (HUD, text, crosshair) and is shown as rendered.
@@ -206,10 +208,41 @@ float4 PSWarpSmooth(float4 pos : SV_Position) : SV_Target
     }
     return float4(sum / wsum, c.z, c.w);
 }
+
+// One motion for the whole frame (the target is 1x1; ta = the 1/8 level's vectors): the motion most of the picture
+// shares -- the camera's turn. The mean of all the vectors, then four more times counting each by how close it is to
+// the last result (within 16, 6, 2.4, then 1.2 pixels of the game frame), which settles on the largest group and
+// leaves out what moves differently. Places with nothing measured (w 0) don't count, poor matches count less.
+float4 PSWarpGlobal(float4 pos : SV_Position) : SV_Target
+{
+    uint w, h;
+    ta.GetDimensions(w, h);
+    float2 m = float2(0.0, 0.0);
+    float got = 0.0;
+    static const float kSig[5] = { 1e6, 2.0, 0.75, 0.3, 0.15 };   // in pixels of the 1/8 level
+    for (int it = 0; it < 5; it++)
+    {
+        float2 sum = float2(0.0, 0.0);
+        float wsum = 0.0;
+        for (uint y = 0; y < h; y++)
+        {
+            for (uint x = 0; x < w; x++)
+            {
+                float4 n = ta.Load(int3(x, y, 0));
+                float2 d = (n.xy - m) / (texel2 * kSig[it]);
+                float g = n.w * n.z * exp(-0.5 * dot(d, d));
+                sum += n.xy * g;
+                wsum += g;
+            }
+        }
+        if (wsum > 1e-4) { m = sum / wsum; got = 1.0; }
+    }
+    return float4(m, 1.0, got);
+}
 )HLSL";
 
-static const char *const kWarpEntry[] = { "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth" };
-static const int kWarpShN = 4;
+static const char *const kWarpEntry[] = { "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGlobal" };
+static const int kWarpShN = 5;
 
 struct WarpConstants
 {
@@ -224,7 +257,9 @@ struct WarpGpu
     ID3D12Resource       *flow[kLevels] = {};           // motion, per level
     ID3D12Resource       *flowOut[kLevels] = {};        // the last level's motion evened out, one for each level that can
                                                         // be the last: what the per-refresh shader reads
-    ID3D12PipelineState  *psoLuma = nullptr, *psoDown = nullptr, *psoFlow = nullptr, *psoSmooth = nullptr;
+    ID3D12PipelineState  *psoLuma = nullptr, *psoDown = nullptr, *psoFlow = nullptr, *psoSmooth = nullptr, *psoGlobal = nullptr;
+    ID3D12Resource       *flowOne = nullptr;            // 1x1: one motion for the whole frame (shift)
+    bool  shift = false;                                // the frame is shifted as a whole by that one motion
     ID3D12Device         *device = nullptr;             // the presenter's (not owned)
     ID3D12DescriptorHeap *rtvHeap = nullptr;
     ID3D12DescriptorHeap *srvHeap = nullptr;            // the presenter's (not owned)
@@ -239,7 +274,7 @@ struct WarpGpu
                                                         // 3 = whole-picture motion (measured at 1/8, averaged at 1/32)
     bool  ok = false;
 
-    static const UINT kSrvCount = 4 * kLevels;      // descriptors it takes in the presenter's SRV heap
+    static const UINT kSrvCount = 4 * kLevels + 1;      // descriptors it takes in the presenter's SRV heap
 
     static D3D12_RESOURCE_BARRIER Tr(ID3D12Resource *r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
     {
@@ -260,10 +295,10 @@ struct WarpGpu
     D3D12_GPU_DESCRIPTOR_HANDLE LumaSrv(int p, int l) const { return Srv((UINT)(p * kLevels + l)); }
     D3D12_GPU_DESCRIPTOR_HANDLE FlowSrvAt(int l) const { return Srv((UINT)(2 * kLevels + l)); }
     // The motion texture the per-refresh shader reads.
-    bool Whole() const { return finest >= 2; }          // whole-picture motion: measured at 1/8, averaged widely at 1/32
+    bool Whole() const { return shift || finest >= 2; }          // whole-picture motion: measured at 1/8, averaged widely at 1/32
     int Last() const { return finest <= 0 ? 0 : 1; }    // the level the motion is refined down to
     int Out() const { return Whole() ? 3 : Last(); }    // the size of the texture the per-refresh shader reads
-    D3D12_GPU_DESCRIPTOR_HANDLE FlowSrv() const { return Srv((UINT)(3 * kLevels + Out())); }
+    D3D12_GPU_DESCRIPTOR_HANDLE FlowSrv() const { return Srv((UINT)(shift ? 4 * kLevels : 3 * kLevels + Out())); }
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(UINT i) const
     {
         D3D12_CPU_DESCRIPTOR_HANDLE hnd = rtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -271,12 +306,12 @@ struct WarpGpu
         return hnd;
     }
 
-    // psBlobs: PSWarpLuma, PSWarpDown, PSWarpFlow, PSWarpSmooth. heap/base: kSrvCount free descriptors in the presenter's SRV heap.
+    // psBlobs: PSWarpLuma, PSWarpDown, PSWarpFlow, PSWarpSmooth, PSWarpGlobal. heap/base: kSrvCount free descriptors in the presenter's SRV heap.
     bool Init(ID3D12Device *dev, ID3D12RootSignature *rootSig, ID3DBlob *vs, ID3DBlob *const *psBlobs,
               ID3D12DescriptorHeap *heap, UINT base, UINT frameW, UINT frameH)
     {
         ok = false;
-        if (!dev || !rootSig || !vs || !psBlobs[0] || !psBlobs[1] || !psBlobs[2] || !psBlobs[3] || !heap || frameW < 64 || frameH < 64) return false;
+        if (!dev || !rootSig || !vs || !psBlobs[0] || !psBlobs[1] || !psBlobs[2] || !psBlobs[3] || !psBlobs[4] || !heap || frameW < 64 || frameH < 64) return false;
         device = dev;
         srvHeap = heap; srvBase = base; srcW = frameW; srcH = frameH;
         srvStride = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -306,10 +341,12 @@ struct WarpGpu
         m = m && SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoFlow)));
         pd.PS = { psBlobs[3]->GetBufferPointer(), psBlobs[3]->GetBufferSize() };
         m = m && SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoSmooth)));
+        pd.PS = { psBlobs[4]->GetBufferPointer(), psBlobs[4]->GetBufferSize() };
+        m = m && SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoGlobal)));
 
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hd.NumDescriptors = 4 * kLevels;
+        hd.NumDescriptors = 4 * kLevels + 1;
         m = m && SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
 
         D3D12_HEAP_PROPERTIES hp = {};
@@ -342,37 +379,41 @@ struct WarpGpu
             dev->CreateShaderResourceView(*slot, &sv, sh);
         }
         for (int l = 0; m && l < kLevels - 1; l++) m = MakeOut(l);
+        m = m && MakeOut(-1);
         if (!m) { Release(); return false; }
         cur = 0; id[0] = id[1] = 0; t[0] = t[1] = 0.0; flowNew = flowOld = 0;
         ok = true;
         return true;
     }
 
-    // The evened-out motion texture for `level` as the last one.
+    // The evened-out motion texture for `level` as the last one; -1: the 1x1 texture for one motion for the frame.
     bool MakeOut(int level)
     {
+        const bool one = level < 0;
+        ID3D12Resource **slot = one ? &flowOne : &flowOut[level];
+        const UINT index = one ? 4 * kLevels : 3 * kLevels + (UINT)level;
         D3D12_HEAP_PROPERTIES hp = {};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC rd = {};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width = w[level]; rd.Height = h[level]; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Width = one ? 1 : w[level]; rd.Height = one ? 1 : h[level]; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
         rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         rd.SampleDesc.Count = 1;
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         D3D12_CLEAR_VALUE cv = {};
         cv.Format = rd.Format;
         if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                                   &cv, IID_PPV_ARGS(&flowOut[level])))) return false;
-        flowOut[level]->SetName(L"BFI frame warp motion (evened out)");
-        device->CreateRenderTargetView(flowOut[level], nullptr, Rtv((UINT)(3 * kLevels + level)));
+                                                   &cv, IID_PPV_ARGS(slot)))) return false;
+        (*slot)->SetName(one ? L"BFI frame warp motion (whole frame)" : L"BFI frame warp motion (evened out)");
+        device->CreateRenderTargetView(*slot, nullptr, Rtv(index));
         D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
         sv.Format = rd.Format;
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sv.Texture2D.MipLevels = 1;
         D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
-        sh.ptr += (SIZE_T)(srvBase + 3 * kLevels + (UINT)level) * srvStride;
-        device->CreateShaderResourceView(flowOut[level], &sv, sh);
+        sh.ptr += (SIZE_T)(srvBase + index) * srvStride;
+        device->CreateShaderResourceView(*slot, &sv, sh);
         return true;
     }
 
@@ -380,6 +421,8 @@ struct WarpGpu
     {
         for (int i = 0; i < kLevels; i++) if (flowOut[i]) { flowOut[i]->Release(); flowOut[i] = nullptr; }
         if (psoSmooth) { psoSmooth->Release(); psoSmooth = nullptr; }
+        if (psoGlobal) { psoGlobal->Release(); psoGlobal = nullptr; }
+        if (flowOne) { flowOne->Release(); flowOne = nullptr; }
         for (int p = 0; p < 2; p++)
             for (int l = 0; l < kLevels; l++) if (luma[p][l]) { luma[p][l]->Release(); luma[p][l] = nullptr; }
         for (int l = 0; l < kLevels; l++) if (flow[l]) { flow[l]->Release(); flow[l] = nullptr; }
@@ -467,7 +510,8 @@ struct WarpGpu
             wc.texel2X = 1.0f / (float)w[stop]; wc.texel2Y = 1.0f / (float)h[stop];
             wc.mode = Whole() ? 1u : 0u;
             list->SetGraphicsRootDescriptorTable(1, FlowSrvAt(stop));
-            Pass(list, psoSmooth, flowOut[o], (UINT)(3 * kLevels + o), w[o], h[o], wc);
+            if (shift) Pass(list, psoGlobal, flowOne, (UINT)(4 * kLevels), 1, 1, wc);     // texel2: the 1/8 level
+            else Pass(list, psoSmooth, flowOut[o], (UINT)(3 * kLevels + o), w[o], h[o], wc);
         }
         flowNew = id[cur]; flowOld = id[1 - cur];
     }
