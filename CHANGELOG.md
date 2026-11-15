@@ -7,6 +7,10 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.41] — unreleased
+
+- **[DX] The automatic frame cap no longer goes up and down every 2 minutes in Reflex games that can't hold the refresh rate.** With Reflex, the cap goes back up to Refresh rate when the game's reports say its frames fit well within a refresh. Those reports are taken under the cap, and some games need far more without it: Onimusha: Way of the Sword reported 5 ms per frame at 60 fps, then took 15 ms and ran at 65–71 of 120 fps once the cap was off. The cap stepped back down 3 s later, and the same thing happened every 2 minutes (6 times in 10 minutes), each a burst of unevenly dropped frames. A step up that comes back down within 30 s is now remembered for the session: the next one needs frames at least 20% lighter than those it went up on. One that holds 30 s or more clears it. The log says so: "the step up on Reflex's reports (… ms per frame) didn't hold".
+
 ## [1.0.40] — 2026-11-14 (Manager 1.3.20)
 
 **Reflex frame limit with frame generation: in step with the strobe in Vulkan, and closer to the flash in both; tested games front and centre.**
