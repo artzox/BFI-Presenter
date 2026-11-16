@@ -332,12 +332,30 @@ function analyse(s){
   // game-side frame times
   if(G){ const o=G.map(r=>r.outside_ms).filter(v=>v>0&&v<2000), t=G.map(r=>r.total_ms-(r.cap_ms>0?r.cap_ms:0)-(r.ahead_ms>0?r.ahead_ms:0)).filter(v=>v>=0);   // the frame cap's wait is intended, not presenter time
     out.facts.game={p50:pct(o,.5),p90:pct(o,.9),p99:pct(o,.99),pres:mean(t),presP99:pct(t,.99)}; }
+  // 1.0.41: frame warp (fill missing frames) -- per second in the reflex CSV: repeated strobe cycles, how many it
+  // filled, how far ahead, and (from 1.0.41) its GPU time on the presenter's queue.
+  if(R && R.length && "warp_state" in R[0]){
+    const on=R.filter(r=>r.warp_state===2), wait=R.filter(r=>r.warp_state===1), na=R.filter(r=>r.warp_state<0);
+    const w={secs:R.length,on:on.length,wait:wait.length,na:na.length,
+      repOn:on.reduce((a,r)=>a+(r.frame_repeats>0?r.frame_repeats:0),0), filled:on.reduce((a,r)=>a+(r.warp_filled>0?r.warp_filled:0),0),
+      repAll:R.reduce((a,r)=>a+(r.frame_repeats>0?r.frame_repeats:0),0),
+      ahead:mean(on.filter(r=>r.warp_ahead>0).map(r=>r.warp_ahead)), fpsOn:mean(on.filter(r=>r.game_fps>3).map(r=>r.game_fps))};
+    if("warp_pass_gpu_ms" in R[0]){
+      w.pass=mean(R.filter(r=>r.warp_pass_gpu_ms>=0).map(r=>r.warp_pass_gpu_ms));
+      w.passes=mean(R.filter(r=>r.warp_pass_gpu_ms>=0).map(r=>r.warp_passes));
+      w.draw=mean(R.filter(r=>r.draw_gpu_ms>=0).map(r=>r.draw_gpu_ms));
+      w.drawW=mean(R.filter(r=>r.draw_warped_gpu_ms>=0).map(r=>r.draw_warped_gpu_ms));
+      const perSec=(isNaN(w.pass)?0:w.pass*(w.passes||0))+(isNaN(w.drawW)||isNaN(w.draw)?0:Math.max(0,w.drawW-w.draw)*(on.length?w.filled/Math.max(1,on.length):0));
+      w.share=perSec/10;   // ms of GPU time a second -> percent
+    }
+    if(w.on||w.wait||w.na) out.facts.warp=w;
+  }
   // ReShade.log events in this session's window
   if(s.rs){
     out.facts.exe=s.rs.exe; out.facts.version=s.rs.version;
     const w=stampSec(s.stamp); const dur=(s.t1-s.t0)/1000;
     const inWin=e=> w==null || (e.sec>=w-120 && e.sec<=w+dur+5);
-    const keep=/automatic frame cap|frame start|learned for this game|remembered data|automatic frames ahead|slower than the strobe|against the strobe|vblank pacing|frame generation (active|not active)|Reflex frame limit|fell to|hitch guard: BFI paused|just-in-time release (off|at its limit)|WATCHDOG|swap chain recreated|waiting for the game's first resize|BFI starts|not elevated|frame limiter|presents\/s|collapsed|game frame cap with Reflex/;
+    const keep=/automatic frame cap|frame start|learned for this game|remembered data|automatic frames ahead|slower than the strobe|against the strobe|vblank pacing|frame generation (active|not active)|Reflex frame limit|fell to|hitch guard: BFI paused|just-in-time release (off|at its limit)|WATCHDOG|swap chain recreated|waiting for the game's first resize|BFI starts|not elevated|frame limiter|presents\/s|collapsed|game frame cap with Reflex|frame warp/;
     for(const e of s.rs.ev) if(inWin(e) && keep.test(e.text)) out.events.push(e);
     out.allEv=s.rs.ev;
   }
@@ -418,6 +436,15 @@ function findings(out,hz,frames){
       add(d>=1?"good":"info",`Held at the frame start: ${f1(hs.m.r2f)} ms from release to flash, against ${f1(ps.m.r2f)} ms with the cap held at the present (${d>=0?f1(d)+" ms quicker":f1(-d)+" ms slower"}).`); }
     else if(hs) add("info",`The automatic cap held the game at the frame start (one game frame per strobe cycle)${hs.m.startMs>0?", started "+f1(hs.m.startMs)+" ms into the strobe cycle":""}: ${f1(hs.m.r2f)} ms from release to flash.`);
   }
+  if(out.facts.warp){ const w=out.facts.warp;
+    if(w.na && !w.on) add("warn","Frame warp was on but not available (its shaders or textures couldn't be created; see ReShade.log).");
+    else if(w.on){
+      const share=w.repOn?w.filled/w.repOn*100:NaN;
+      add(w.repOn?"good":"info",`Frame warp was at work for ${w.on} s${isNaN(w.fpsOn)?"":" (game at "+f0(w.fpsOn)+" fps)"}: it filled ${w.filled} of ${w.repOn} repeated strobe cycles${isNaN(share)?"":" ("+(share>=99&&share<100?share.toFixed(1)+"%":fp(share))+")"}${isNaN(w.ahead)?"":", "+w.ahead.toFixed(2)+" frames ahead on average"}${w.repOn?" (the Repeated and Cadence columns count them before filling)":""}.${w.repOn?"":" The game held the strobe rate, so there was nothing to fill."}`);
+      if(!isNaN(w.pass)) add("info",`Frame warp's GPU time: ${w.pass.toFixed(3)} ms per new game frame (${f0(w.passes)} a second)${isNaN(w.drawW)||isNaN(w.draw)?"":`, and ${(w.drawW-w.draw).toFixed(3)} ms more for a filled flash's draw (${w.drawW.toFixed(3)} against ${w.draw.toFixed(3)} ms)`}: about ${w.share<0.1?"0.1":w.share.toFixed(1)}% of the GPU. It adds no latency.`);
+    }
+    if(w.wait>=10 && w.wait>w.on) add("info",`Frame warp waited ${w.wait} s: the game's frame rate was outside its range (below Only from, or above the strobe rate), or there was no steady frame rate (loading).`);
+  }
   if(out.facts.game && out.facts.game.presP99>3) add("warn",`Time inside the presenter's Present reached ${f1(out.facts.game.presP99)} ms (99th percentile). Normally it is well under 1 ms.`);
   if(!out.segments.length) add("info","No per-second data in these files. Add the matching _reflex_ or _log_ CSV.");
   if(!F.length && out.best) add("good","Nothing stands out: the presenter kept its cadence in every setting tried.");
@@ -489,7 +516,7 @@ function render(results,isExample){
     const name=r.facts.exe||"Session";
     const when=r.stamp?r.stamp.replace(/^(\d{4})(\d\d)(\d\d)_(\d\d)(\d\d)(\d\d)$/,"$1-$2-$3 $4:$5:$6"):"";
     sec.innerHTML=`<div class="s-head"><h2>${isExample?'<span class="example">Example</span> ':""}${esc(name)}</h2><span class="sub">${esc(when)}${r.facts.version?" · v"+esc(r.facts.version):""}</span></div>
-    <div class="facts"><span>Display <b>${isNaN(r.facts.hz)?"–":f0(r.facts.hz)+" Hz"}</b></span><span>Frames per cycle <b>${r.facts.frames}</b></span><span>Strobe <b>${f0(r.facts.hz/r.facts.frames)} Hz</b></span>${r.facts.game?`<span>Game frame time <b>${f1(r.facts.game.p50)}</b> ms median, <b>${f1(r.facts.game.p99)}</b> ms p99</span><span>Presenter time per frame <b>${f1(r.facts.game.pres)}</b> ms</span>`:""}</div>
+    <div class="facts"><span>Display <b>${isNaN(r.facts.hz)?"–":f0(r.facts.hz)+" Hz"}</b></span><span>Frames per cycle <b>${r.facts.frames}</b></span><span>Strobe <b>${f0(r.facts.hz/r.facts.frames)} Hz</b></span>${r.facts.game?`<span>Game frame time <b>${f1(r.facts.game.p50)}</b> ms median, <b>${f1(r.facts.game.p99)}</b> ms p99</span><span>Presenter time per frame <b>${f1(r.facts.game.pres)}</b> ms</span>`:""}${r.facts.warp&&r.facts.warp.on?`<span>Frame warp <b>${r.facts.warp.filled}</b> of <b>${r.facts.warp.repOn}</b> repeats filled${isNaN(r.facts.warp.pass)?"":`, <b>${r.facts.warp.pass.toFixed(2)}</b> ms GPU per frame`}</span>`:""}</div>
     <div class="verdict"><h3>Verdict</h3><div class="best">${r.best?`Best here: <em>${esc(r.bestText)}</em>`:"Not enough data to rank the settings (each needs 8 seconds or more)."}</div>
       <ul class="find">${r.findings.map(f=>`<li><span class="tag ${f.lvl}">${{good:"OK",warn:"Check",bad:"Problem",info:"Note"}[f.lvl]}</span><span>${esc(f.t)}</span></li>`).join("")}</ul></div>
     ${r.timeline.length?`<div class="chart"><div class="legend"><span><i style="background:var(--s1)"></i>Presented fps</span><span><i style="background:var(--s2)"></i>New frames shown per second</span><span class="note">Shaded bands: the setting in use</span></div>${chart(r.timeline,r.segments)}</div>`:""}
