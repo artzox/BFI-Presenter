@@ -18,6 +18,9 @@ struct OsdData
     bool   paused = false;     // hitch guard has BFI paused
     bool   bfiOn = true;
     double relFlashMs = -1.0;  // game released -> lit flash (average), -1 = not measured
+    int    warpOn = 0;         // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
+    int    warped = 0;         // per second: strobe cycles shown moved ahead
+    double warpAhead = 0.0;    // and how far on average, in game frames
     double now = 0.0;          // Now() seconds, for the totals' time
 };
 
@@ -142,6 +145,10 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
     ImGui::TextColored(trouble ? kWarn : kGood, "lost %d (%lld)   repeated %d (%lld)   missed %d (%lld)", d.lost, g_totLost.load(),
                        d.repeated, g_totRep.load(), d.missed, g_totMiss.load());
     if (d.paused) { ImGui::SameLine(); ImGui::TextColored(kBad, "  BFI paused"); }
+    // frame warp: how many of the second's strobe cycles were shown moved ahead (the repeated ones among them are filled)
+    if (d.warpOn == 2) ImGui::TextColored(kGood, "frame warp: %d of %.0f cycles moved (%.2f frames ahead)", d.warped, cycles, d.warpAhead);
+    else if (d.warpOn == 1) ImGui::TextDisabled("frame warp: waiting (frame rate outside its range)");
+    else if (d.warpOn < 0) ImGui::TextColored(kBad, "frame warp: not available");
     {
         const double since = g_totSince.load();
         const int el = since > 0.0 && d.now > since ? (int)(d.now - since) : 0;

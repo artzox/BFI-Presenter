@@ -6,7 +6,7 @@ The [Vulkan layer](../vulkan/README.md) covers Vulkan games and DirectX 9–11 g
 
 ## How it works
 
-- **Direct3D 12:** the game and ReShade (including CRT-Standalone) render into stand-in back buffers. Each finished frame is copied into a ring of six staging images. A high-priority presenter thread waits for every vblank, picks a game frame, draws the strobe refresh from it, and presents.
+- **Direct3D 12:** the game and ReShade (including CRT-Standalone) render into stand-in back buffers. Each finished frame is copied into a ring of seven staging images. A high-priority presenter thread waits for every vblank, picks a game frame, draws the strobe refresh from it, and presents.
 - **Direct3D 11:** the game keeps its own DX11 device (so DLSS and ReShade work as usual). Its frames are copied to shared textures, and the add-on's own D3D12 presenter shows them through a window laid over the game's. Use a borderless or windowed mode.
 - **Direct3D 9:** ReShade (6.8 or newer) creates the game's device as Direct3D 9Ex, which can share textures, and the game is kept windowed. Each frame is copied into a shared texture, picked up by the add-on's own D3D11 device and shown by the same presenter as DX11 games.
 - **The strobe:** each refresh is one sub-frame of the cycle (2 at 120 Hz: one lit, one dark). The shader applies gain in display light (SDR, scRGB or HDR10), BFI with highlight roll-off or the Variable MPRT brightness budget, dark floor, sine BFI, inverted cycle and rolling scan.

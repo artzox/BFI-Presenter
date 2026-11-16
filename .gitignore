@@ -22,3 +22,9 @@ BFIPresenter_locations.*
 BFIPresenter.ini
 BFIPresenter_update_log.csv
 BFIPresenter_backups/
+
+# tools/warp-test outputs
+tools/warp-test/*.rgba
+tools/warp-test/*.f16
+tools/warp-test/gen_presenter.h
+tools/warp-test/clock_test

@@ -193,7 +193,7 @@ How it caps depends on the game:
 
 Back to Refresh:
 
-- **Games with Reflex** report how long their frames take; the cap goes back up once those fit well within a refresh for 10 seconds.
+- **Games with Reflex** report how long their frames take; the cap goes back up once those fit well within a refresh for 10 seconds. The reports are taken under the cap and can promise more than the game holds without it, so a step up that comes back down within 30 seconds is remembered for the session: the next one waits for frames at least 20% lighter than those it went up on (v1.0.41).
 - **Other games:** it tries Refresh for about 3 seconds, after 30 s, then 60 s, then every 2 minutes while the game still can't hold it. A game well under the refresh rate (under 80%, e.g. 80 fps at 120 Hz) waits a minute before its first try and 5 minutes after a failed one, since each try is a few seconds of uneven frames; a game that drops back within 30 s of a successful try waits twice as long next time (v1.0.27). A game that comes back at exactly the strobe rate is at a limit of its own (a menu, an intro): it is tried again after 30 s, but after two such tries in a row only every 5 minutes, since a game locked to e.g. 60 fps all along gets a few seconds of frames off the strobe cycle with each try (v1.0.36; a new session starts at 30 s again). For a game you know is locked, choose **One game frame per strobe cycle** (or Half refresh) as the cap instead.
 - **With frame generation** under Reflex's limit it tries only every 5 minutes, since each try is a visible stutter.
 
@@ -232,6 +232,41 @@ It costs latency: about 10–20 ms more than just-in-time release (Silent Hill 2
 *When to change it:* leave off. Turn on only for a game that still stutters at Half or Quarter while the overlay shows just-in-time release switching off, and compare.
 
 ### Every cap
+
+**Frame warp** · `FrameWarp`, `FrameWarpMaxAhead`, `FrameWarpMinRate` · default: off, 1.0, 75 · DX add-on (the Vulkan layer is planned), **test feature** (v1.0.41)\
+Fills strobe cycles that have no new game frame. When a game misses the strobe rate now and then, e.g. 57 fps against a 60 Hz strobe, about three times a second the presenter has no new frame for a strobe cycle and lights the last one again. The picture stands still for one flash and jumps at the next: a stutter you can see especially in camera pans, because BFI makes motion sharp. With frame warp, that cycle shows the last frame **moved part of the way along the camera's motion** instead, half way to where the next frame is expected. Frames that arrive in time are shown exactly as rendered; only the missing ones are filled.
+
+The motion is measured on the GPU between the last two frames, from the finished picture, so it works in every DX game without motion vectors, depth or Reflex. It is averaged over the whole picture, so it follows the camera (with its depth) and nothing tears.
+
+It is **not frame generation**. Frame generation holds each frame back until the next one exists and shows a picture in between, which costs a frame of latency. Frame warp never waits: it only carries the newest frame on, so latency is the same as without it. It also doesn't bring your input in sooner (as Reflex 2's Frame Warp does with the game's camera); it continues the motion of the last two frames.
+
+**When it can help**
+- The game runs **just under the strobe rate**: about 75–99% of it (45–59 fps at a 60 Hz strobe), so single frames go missing now and then.
+- The motion is **mostly the camera**: turning, panning, driving, flying.
+- You use plain BFI, without a CRT shader, or one whose mask you don't mind moving on filled flashes.
+- **With frame generation it works too**, there is just less to fill: the generated frames cover most strobe cycles, and frame warp fills the ones still missed (Control with DLSS frame generation 3×: 103 of 105 filled).
+
+**When it doesn't help, or makes things worse**
+- **The game holds the strobe rate** (60 of 60): there is nothing to fill. It does no harm, but costs a little GPU time.
+- **Far below the strobe rate** (under about 75%): each frame would have to be carried a long way, and the errors grow. Use the **Half** cap (one frame every two strobe cycles), or frame generation, instead. Below **Only from** frame warp stops by itself.
+- **Hitches and loading stalls** (a frame that takes 50 ms or more): these aren't filled; the picture waits at the limit.
+- **A GPU-bound game**: frame warp adds a little GPU work, which can cost a frame or two in a game already at 99% GPU load.
+- **Things that move on their own** (a character running across the screen, a car beside you, enemies) are carried with their surroundings, so they keep their stutter. In a third-person game the character often barely moves on screen while the world does, which is fine; an object crossing the view is not filled.
+
+**What a filled flash can show** (only for that one flash, 1 in 20 at 57 fps):
+- The edge of something moving against the background can smear or bend a little.
+- What comes out from behind something isn't in the last frame, so it is filled from its surroundings.
+- A sudden stop or turn overshoots: the frame is carried on in the direction it was moving.
+- A HUD that changes every frame (film grain or an effect drawn over it, an animated minimap) moves with the scene. A still HUD, subtitles and a crosshair are never moved, down to one-pixel lines.
+- With a CRT shader, the scanlines and mask are part of the picture and move with it: expect shimmer in the mask.
+
+**How to tell if it helps you.** Play the same scene with it on and off (**Ctrl+Shift+W** switches it). The on-screen display (Ctrl+Shift+F) shows whether it is at work and how many strobe cycles a second it filled; the fps and "repeated" counters stay the same, because the game makes the same frames. The timing log's `BFIPresenter_reflex_*.csv` has the same per second (`frame_repeats`, `warp_state`, `warp_filled`, `warp_ahead`). The log also times frame warp on the GPU while it runs: `warp_pass_gpu_ms` (its passes on a new game frame, and the motion measurement), `warp_passes` (how many a second), and the per-refresh draw with and without a filled flash (`draw_gpu_ms`, `draw_warped_gpu_ms`). If you don't see a difference, or the errors bother you more than the stutter, leave it off.
+
+**Furthest ahead** limits how far a frame is carried, in game frames (lower: fewer errors, a missing frame only partly filled). **Only from** is the lowest frame rate it works at, in percent of the strobe rate.
+
+*So far:* on synthetic frames (`tools/warp-test`: a scene panning 23 pixels a frame, with a HUD and a crosshair), a filled flash half a frame ahead has 6% of pixels visibly off, against 33% for the repeated frame, with the HUD and crosshair untouched. In games: Onimusha: Way of the Sword at 58–60 fps showed no visible errors and seemed to have fewer visible repeats; in Ratchet & Clank: Rift Apart, Control (with DLSS frame generation 3×) and Townfall it filled nearly every repeat. Whole-picture motion was the only one that looked right in Assassin's Creed Unity, 007 First Light and Returnal. It is a test feature because the benefit is small and not yet confirmed: reports either way are welcome. Test builds t1–t2 also had an "even pacing" mode (every frame moved a little) and motion per 8×8 or 4×4 block; both showed too many errors in games and were removed.
+
+**What it costs.** No latency: frames that arrive in time are shown as rendered and nothing waits. GPU time, measured in Townfall at 4K on an RTX 5080: 0.07 ms per new game frame for its passes, and 0.14 ms more for the draw of a filled flash (0.33 against 0.19 ms), so under 0.5% of the GPU in all; it filled 897 of 898 repeated strobe cycles there at 57 fps. One more staging image of video memory (33 MB at 4K).
 
 **Frame pacing** · `FramePacing` · default: Lowest latency (new ini files)
 - **Lowest latency** always shows the newest image: quickest response.
@@ -398,6 +433,7 @@ The DX add-on compiles its shaders once per session, while the game starts up, a
 | Ctrl+Shift+M | Switch BFI ↔ Variable MPRT |
 | Ctrl+Shift+S | Rolling scan on / off |
 | Ctrl+Shift+C | Split comparison on / off: one side of the screen without BFI |
+| Ctrl+Shift+W | Frame warp off / back on (DX add-on) |
 | Ctrl+Shift+F | On-screen display on / off: frame rate, lost frames, frame-time graph, CPU / GPU load |
 | Ctrl+Shift+Z | On-screen display: reset the lost / repeated / missed totals |
 | Ctrl+Shift+R | Reload `BFIPresenter.ini` after editing it |
