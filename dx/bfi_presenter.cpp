@@ -95,7 +95,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.41-t4"
+#define BFI_ADDON_VERSION "1.0.41-t5"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3391,6 +3391,14 @@ static DWORD WINAPI PresenterThread(void *)
     ID3D12PipelineState *pso = nullptr, *psoMeas = nullptr;
     ID3DBlob *vs = nullptr, *ps = nullptr, *psMeas = nullptr, *psAplC = nullptr, *psAplR = nullptr, *rsBlob = nullptr, *rsErr = nullptr;
     ID3D12Resource *measRt = nullptr, *measRb = nullptr;
+    // Frame warp's GPU time (timing log): four timestamps per real buffer -- around frame warp's own passes and
+    // around the per-refresh draw -- read back when that buffer is next recorded (its list is done by then).
+    ID3D12QueryHeap *tsHeap = nullptr;
+    ID3D12Resource  *tsRb = nullptr;
+    double tsToMs = 0.0;
+    bool   tsPending[kMaxBuf] = {}, tsPasses[kMaxBuf] = {}, tsWarped[kMaxBuf] = {};
+    double secWarpPassMs = 0.0, secDrawWarpMs = 0.0, secDrawPlainMs = 0.0;
+    int    secWarpPassN = 0, secDrawWarpN = 0, secDrawPlainN = 0;
     ID3D12DescriptorHeap *measHeap = nullptr;
     // RenoFX APL Limiter on the GPU: the frame's 32x18 cells and their 1x1 average, drawn before its first refresh
     ID3D12PipelineState *psoAplC = nullptr, *psoAplR = nullptr;
@@ -3640,6 +3648,24 @@ static DWORD WINAPI PresenterThread(void *)
         const D3D12_RESOURCE_DESC fd = g_stage[0]->GetDesc();
         if (!warp.Init(g_device, rootSig, vs, psWarp, srvHeap, kStage + 2, (UINT)fd.Width, fd.Height))
             LOGW("BFI Presenter: frame warp unavailable (its shaders or textures could not be created)");
+        UINT64 freq = 0;
+        if (queue && SUCCEEDED(queue->GetTimestampFrequency(&freq)) && freq)
+        {
+            D3D12_QUERY_HEAP_DESC qd = {};
+            qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+            qd.Count = 4 * kMaxBuf;
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC bd = {};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = 8 * 4 * kMaxBuf; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (SUCCEEDED(g_device->CreateQueryHeap(&qd, IID_PPV_ARGS(&tsHeap))) &&
+                SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                            nullptr, IID_PPV_ARGS(&tsRb))))
+                tsToMs = 1000.0 / (double)freq;
+            else { SafeRelease(tsHeap); SafeRelease(tsRb); }
+        }
     }
     if (ok && FAILED(ScOutput(&output))) output = nullptr;
     // The display mode's own refresh rate (120 on the A95L). The VRR check
@@ -3921,7 +3947,7 @@ static DWORD WINAPI PresenterThread(void *)
                               "reflex_limit_us,release_to_flash_ms,release_to_flash_max_ms,frames_shown,"
                               "rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,"
                               "rfx_gpu_active_ms,rfx_sim_ms,rfx_submit_ms,rfx_queue_ms,rendered_fps,align_slack_p10_ms,align_shift_ms,"
-                              "frame_repeats,warp_state,warp_filled,warp_ahead\n");
+                              "frame_repeats,warp_state,warp_filled,warp_ahead,warp_pass_gpu_ms,warp_passes,draw_gpu_ms,draw_warped_gpu_ms\n");
         }
         else if (!s.log && logf)
         {
@@ -4295,6 +4321,26 @@ static DWORD WINAPI PresenterThread(void *)
         if (reuse) secReused++;
         else
         {
+        if (tsPending[bi] && tsRb)                      // this buffer's last list is done (its fence waited above)
+        {
+            UINT64 *q = nullptr;
+            D3D12_RANGE rr = { (SIZE_T)(8 * 4 * bi), (SIZE_T)(8 * 4 * (bi + 1)) };
+            if (SUCCEEDED(tsRb->Map(0, &rr, (void **)&q)) && q)
+            {
+                const UINT64 *t = q + 4 * bi;
+                const double passMs = t[1] >= t[0] ? (double)(t[1] - t[0]) * tsToMs : -1.0;
+                const double drawMs = t[3] >= t[2] ? (double)(t[3] - t[2]) * tsToMs : -1.0;
+                if (tsPasses[bi] && passMs >= 0.0 && passMs < 50.0) { secWarpPassMs += passMs; secWarpPassN++; }
+                if (drawMs >= 0.0 && drawMs < 50.0)
+                {
+                    if (tsWarped[bi]) { secDrawWarpMs += drawMs; secDrawWarpN++; }
+                    else { secDrawPlainMs += drawMs; secDrawPlainN++; }
+                }
+                D3D12_RANGE wr = { 0, 0 };
+                tsRb->Unmap(0, &wr);
+            }
+            tsPending[bi] = false;
+        }
         alloc[bi]->Reset();
         list->Reset(alloc[bi], pso);
         D3D12_RESOURCE_BARRIER br[2] = {
@@ -4328,6 +4374,9 @@ static DWORD WINAPI PresenterThread(void *)
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         // Frame warp: a frame's first refresh measures its brightness pyramid (one pass over the frame, four tiny
         // ones); the motion from the frame before is measured only when the frame is shown moved, once per pair.
+        const bool tsOn = tsHeap && logf;                // timed only while the timing log runs
+        if (tsOn) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 0);
+        bool warpTouched = false;
         if (s.frameWarp && warp.ok)
         {
             bool touched = false;
@@ -4337,6 +4386,7 @@ static DWORD WINAPI PresenterThread(void *)
                 touched = true;
             }
             if (c.warp != 0.0f && (warp.flowNew != pickId || warp.flowOld != warpOld)) { warp.RecordFlow(list); touched = true; }
+            warpTouched = touched;
             if (touched)
             {
                 list->SetPipelineState(pso);
@@ -4344,6 +4394,7 @@ static DWORD WINAPI PresenterThread(void *)
                 list->SetGraphicsRootDescriptorTable(1, srv);
             }
         }
+        if (tsOn) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 1);
         list->SetGraphicsRootDescriptorTable(4, warp.ok ? warp.FlowSrv() : srv);   // t3 (read only while a frame is shown moved)
         {
             D3D12_GPU_DESCRIPTOR_HANDLE psrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
@@ -4397,7 +4448,14 @@ static DWORD WINAPI PresenterThread(void *)
         list->RSSetScissorRects(1, &sc);
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (tsOn) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 2);
         list->DrawInstanced(3, 1, 0, 0);
+        if (tsOn)
+        {
+            list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 3);
+            list->ResolveQueryData(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi, 4, tsRb, (UINT64)(8 * 4 * bi));
+            tsPending[bi] = true; tsPasses[bi] = warpTouched; tsWarped[bi] = c.warp != 0.0f;
+        }
         if (((ablOn && c.method < 2) || aplOn) && !measFence && pickId != lastShownId)
         {
             Constants mc = c;
@@ -5712,14 +5770,19 @@ static DWORD WINAPI PresenterThread(void *)
                 LeaveCriticalSection(&g_cfgLock);
                 if (rfxf)
                 {
-                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f\n",
+                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f,%.3f,%d,%.3f,%.3f\n",
                             t, stNow.gameFps, userCap, perNow, stNow.autoCapDown, stNow.autoCapProbe, stNow.fgActive, s.pacingMode,
                             s.capJit, stNow.lrState, stNow.lrEst, stNow.aheadInUse, rs.limitUs,
                             relN ? relSum / relN : -1.0, relN ? relMax : -1.0, relN, rs.frames, rs.simGpuMs, rs.simPresentMs,
                             rs.inputGpuMs, rs.gpuFrameMs, rs.gpuActiveMs, rs.simMs, rs.submitMs, rs.queueMs,
                             Now() - g_rfxRenderedT.load() < 3.0 ? g_rfxRenderedFps.load() : -1.0,
                             alignLogSlack >= 0.0 ? alignLogSlack * 1000.0 : -1.0, alignShiftTot * 1000.0,
-                            stNow.frameRepeats, stNow.warpOn, stNow.warpCycles, stNow.warpAvg);
+                            stNow.frameRepeats, stNow.warpOn, stNow.warpCycles, stNow.warpAvg,
+                            secWarpPassN ? secWarpPassMs / secWarpPassN : -1.0, secWarpPassN,
+                            secDrawPlainN ? secDrawPlainMs / secDrawPlainN : -1.0,
+                            secDrawWarpN ? secDrawWarpMs / secDrawWarpN : -1.0);
+                    secWarpPassMs = secDrawWarpMs = secDrawPlainMs = 0.0;
+                    secWarpPassN = secDrawWarpN = secDrawPlainN = 0;
                     fflush(rfxf);
                 }
                 relSum = relMax = 0.0; relN = 0;
@@ -5776,6 +5839,8 @@ static DWORD WINAPI PresenterThread(void *)
     SafeRelease(measRt);
     SafeRelease(measRb);
     SafeRelease(measHeap);
+    SafeRelease(tsHeap);
+    SafeRelease(tsRb);
     SafeRelease(psMeas);
     SafeRelease(psoAplC);
     SafeRelease(psoAplR);
@@ -11404,8 +11469,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "Worth trying: a game that holds about 75-99%% of the strobe rate and misses a frame now and\n"
                                                       "then, in camera pans and turns.\n"
                                                       "Not useful: the game holds the strobe rate (nothing to fill); far below it (use the Half\n"
-                                                      "cap or frame generation); with frame generation; for hitches and loading stalls; for things\n"
-                                                      "that move on their own (a character, a car), which keep their stutter.\n"
+                                                      "cap or frame generation); for hitches and loading stalls; for things that move on their own\n"
+                                                      "(a character, a car), which keep their stutter. With frame generation it works, with less to fill.\n"
                                                       "A filled flash is a guess: edges of things moving against the background can smear for that\n"
                                                       "flash, and a CRT shader's mask moves with the picture. Test build: see the settings guide.");
         if (s.frameWarp)

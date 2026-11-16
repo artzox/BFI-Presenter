@@ -7,14 +7,14 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
-## [1.0.41] — unreleased (test build 1.0.41-t4)
+## [1.0.41] — unreleased (test build 1.0.41-t5)
 
 **Frame warp: strobe cycles without a new game frame are filled, without holding frames back.**
 
 - **[DX] Frame warp (test feature)** (`FrameWarp`, off by default, Ctrl+Shift+W; under Every cap in the overlay). A game that runs just under the strobe rate (57 fps against a 60 Hz strobe) leaves strobe cycles without a new frame; the presenter lit the last frame again, so the picture stood still for a flash and then jumped. With frame warp that cycle shows the last frame moved half way along the camera's motion, measured on the GPU between the last two frames (a brightness pyramid of each frame, block matching down to 1/8 size, then averaged over the whole picture so nothing tears). Frames that arrive in time are shown as rendered. It works on the finished picture, so in every game: no motion vectors, depth or Reflex. No frame is held back, so it adds no latency; it is not frame generation.
-  - **For** a game at about 75–99% of the strobe rate that misses single frames, in camera motion. **Not for** a game that holds the strobe rate (nothing to fill), one far below it (the Half cap or frame generation do better), frame generation, or hitches. Things that move on their own keep their stutter. The settings guide explains when to use it and what a filled flash can show.
+  - **For** a game at about 75–99% of the strobe rate that misses single frames, in camera motion. **Not for** a game that holds the strobe rate (nothing to fill), one far below it (the Half cap or frame generation do better), or hitches. With frame generation it works, with less to fill (Control with DLSS frame generation 3×: 103 of 105 repeated cycles filled). Things that move on their own keep their stutter. The settings guide explains when to use it and what a filled flash can show.
   - A still HUD, text and a crosshair's one-pixel lines are never moved.
-  - **On-screen display:** a line with the strobe cycles filled a second. **Timing log:** the reflex csv has `frame_repeats`, `warp_state`, `warp_filled` and `warp_ahead` per second, to compare on and off.
+  - **On-screen display:** a line with the strobe cycles filled a second. **Timing log:** the reflex csv has `frame_repeats`, `warp_state`, `warp_filled` and `warp_ahead` per second, to compare on and off, and frame warp's GPU time (`warp_pass_gpu_ms`, `warp_passes`, `draw_gpu_ms`, `draw_warped_gpu_ms`; GPU timestamps on the presenter's queue, only while the log runs).
   - `FrameWarpMaxAhead` (1.0 game frames), `FrameWarpMinRate` (75% of the strobe rate; below it frames repeat as before).
   - Removed after testing (t1–t2): **even pacing** (`FrameWarp=2`, every frame moved a little: too many errors where frames were fine) and motion **per 8×8 or 4×4 block** (`FrameWarpDetail`: tore the picture where things moved differently). `FrameWarp=2` in an old ini now means on.
   - Tested on synthetic frames (`tools/warp-test`): half a frame ahead, 6% of pixels visibly off against 33% for the repeated frame, HUD and crosshair unchanged. In games: Onimusha: Way of the Sword showed no visible errors and seemed to have fewer visible repeats; Townfall showed no clear benefit. It stays a test feature until the benefit is clearer.

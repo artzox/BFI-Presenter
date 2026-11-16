@@ -244,11 +244,11 @@ It is **not frame generation**. Frame generation holds each frame back until the
 - The game runs **just under the strobe rate**: about 75–99% of it (45–59 fps at a 60 Hz strobe), so single frames go missing now and then.
 - The motion is **mostly the camera**: turning, panning, driving, flying.
 - You use plain BFI, without a CRT shader, or one whose mask you don't mind moving on filled flashes.
+- **With frame generation it works too**, there is just less to fill: the generated frames cover most strobe cycles, and frame warp fills the ones still missed (Control with DLSS frame generation 3×: 103 of 105 filled).
 
 **When it doesn't help, or makes things worse**
 - **The game holds the strobe rate** (60 of 60): there is nothing to fill. It does no harm, but costs a little GPU time.
 - **Far below the strobe rate** (under about 75%): each frame would have to be carried a long way, and the errors grow. Use the **Half** cap (one frame every two strobe cycles), or frame generation, instead. Below **Only from** frame warp stops by itself.
-- **With frame generation**: the generated frames already fill the strobe cycles.
 - **Hitches and loading stalls** (a frame that takes 50 ms or more): these aren't filled; the picture waits at the limit.
 - **A GPU-bound game**: frame warp adds a little GPU work, which can cost a frame or two in a game already at 99% GPU load.
 - **Things that move on their own** (a character running across the screen, a car beside you, enemies) are carried with their surroundings, so they keep their stutter. In a third-person game the character often barely moves on screen while the world does, which is fine; an object crossing the view is not filled.
@@ -260,7 +260,7 @@ It is **not frame generation**. Frame generation holds each frame back until the
 - A HUD that changes every frame (film grain or an effect drawn over it, an animated minimap) moves with the scene. A still HUD, subtitles and a crosshair are never moved, down to one-pixel lines.
 - With a CRT shader, the scanlines and mask are part of the picture and move with it: expect shimmer in the mask.
 
-**How to tell if it helps you.** Play the same scene with it on and off (**Ctrl+Shift+W** switches it). The on-screen display (Ctrl+Shift+F) shows whether it is at work and how many strobe cycles a second it filled; the fps and "repeated" counters stay the same, because the game makes the same frames. The timing log's `BFIPresenter_reflex_*.csv` has the same per second (`frame_repeats`, `warp_state`, `warp_filled`, `warp_ahead`). If you don't see a difference, or the errors bother you more than the stutter, leave it off.
+**How to tell if it helps you.** Play the same scene with it on and off (**Ctrl+Shift+W** switches it). The on-screen display (Ctrl+Shift+F) shows whether it is at work and how many strobe cycles a second it filled; the fps and "repeated" counters stay the same, because the game makes the same frames. The timing log's `BFIPresenter_reflex_*.csv` has the same per second (`frame_repeats`, `warp_state`, `warp_filled`, `warp_ahead`). From v1.0.41-t5 the log also times frame warp on the GPU while it runs: `warp_pass_gpu_ms` (its passes on a new game frame, and the motion measurement), `warp_passes` (how many a second), and the per-refresh draw with and without a filled flash (`draw_gpu_ms`, `draw_warped_gpu_ms`). If you don't see a difference, or the errors bother you more than the stutter, leave it off.
 
 **Furthest ahead** limits how far a frame is carried, in game frames (lower: fewer errors, a missing frame only partly filled). **Only from** is the lowest frame rate it works at, in percent of the strobe rate.
 
