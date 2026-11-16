@@ -144,6 +144,7 @@ struct Settings
     int   autoAhead = 1;      // automatic: 1 frame ahead, 2 while the game keeps missing strobe cycles
     int   presBuffers = 3;    // real swap chain buffers for the presenter (read when presentation moves)
     int   queueAhead = 0;     // with vblank pacing: keep this many extra presents queued (0 or 1)
+    int   queueDark = 0;      // QueueDarkRefresh (test): the cycle's second refresh is drawn and queued right after the lit one
     int   laterRelease = 0;   // Lowest latency + Refresh cap: release the game just in time for the pick
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
@@ -318,6 +319,7 @@ static void LoadSettings(Settings &s)
     s.smoothCatchUp = IniInt("SmoothCatchUp", 0) ? 1 : 0;
     s.presBuffers = IniInt("PresenterBuffers", 3);
     s.queueAhead = IniInt("QueueAhead", 0) ? 1 : 0;
+    s.queueDark = IniInt("QueueDarkRefresh", 0) ? 1 : 0;
     s.laterRelease = IniInt("LaterRelease", 0) ? 1 : 0;
     s.capJit = IniInt("CapJustInTime", 1) ? 1 : 0;
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
@@ -545,6 +547,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("SmoothCatchUp", s.smoothCatchUp);
     IniWriteInt("PresenterBuffers", s.presBuffers);
     IniWriteInt("QueueAhead", s.queueAhead);
+    IniWriteInt("QueueDarkRefresh", s.queueDark);
     IniWriteInt("LaterRelease", s.laterRelease);
     IniWriteInt("CapJustInTime", s.capJit);
     IniWriteInt("AutoFrameCap", s.autoCap);
@@ -3788,6 +3791,14 @@ static DWORD WINAPI PresenterThread(void *)
     int    relN = 0;
     FILE  *rfxf = nullptr;         // BFIPresenter_reflex_*.csv, one line a second while the timing log is on
     bool refillNow = false;          // present again without waiting for the next vblank
+    // QueueDarkRefresh: the refresh after the lit one shows the same game frame, so it is drawn and presented right
+    // after the lit refresh instead of one vblank later. A stall while it is drawn (most late presents in Control and
+    // Jusant fell there: 45 of 49 and 55 of 60) then has two refreshes of room instead of one, and the lit refresh's
+    // pick doesn't move: no added latency. The next lit refresh is picked two vblanks after this one's.
+    bool pairNext = false;           // this iteration: the refresh queued behind the lit one (no vblank wait)
+    double pairVbT = 0.0;            // > 0: the vblank the lit refresh of the last pair was drawn at
+    int pairBlocked = 0;             // presents of the queued refresh that blocked (the queue takes only one)
+    bool pairOff = false;            // ... three times: off for this session
     bool vsyncOverridden = false;    // the driver is not honouring the presenter's VSync
     int  vsyncFastSecs = 0;          // seconds in a row with presents well above the refresh count
     int  queuedNow = -1;
@@ -3935,7 +3946,7 @@ static DWORD WINAPI PresenterThread(void *)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,present_count,sync_refresh_count,"
                               "bfi,method,frames,gain,floor,rolloff,pacing,cap,ahead,vblank,queue_ahead,queued,"
                               "wait_vblank_ms,wait_gpu_ms,submit_ms,present_ms,hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,"
-                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup\n");
+                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup,paired\n");
                 LOGI("BFI Presenter: timing log started: %s", path);
             }
             snprintf(path, sizeof(path), "%.*sBFIPresenter_reflex_%04u%02u%02u_%02u%02u%02u.csv",
@@ -3971,15 +3982,42 @@ static DWORD WINAPI PresenterThread(void *)
         // at a steady 60 fps, visible judder under BFI in every pacing mode
         // (The Midnight Walk).
         bool tickedAtVb = false;
-        if ((s.pacing || vsyncOverridden) && output && !refillNow)
+        const bool pairIter = pairNext;      // the refresh queued behind the lit one: drawn now, no vblank wait, no tick
+        pairNext = false;
+        if (pairIter) {}
+        else if ((s.pacing || vsyncOverridden) && output && !refillNow)
         {
+            auto tick = [&](uint64_t pres, double tt) {
+                g_strobeFrames.store(s.frames);
+                g_sleepGrid.store(s.sleepGrid);
+                g_tickSlot.store((int)((pres - phaseShift) % (uint64_t)s.frames));
+                g_tickT.store(tt);
+                g_tickCount.fetch_add(1);
+                SetEvent(g_tickEvent);
+            };
             output->WaitForVBlank();
-            g_strobeFrames.store(s.frames);
-            g_sleepGrid.store(s.sleepGrid);
-            g_tickSlot.store((int)((presents - phaseShift) % (uint64_t)s.frames));
-            g_tickT.store(Now());
-            g_tickCount.fetch_add(1);
-            SetEvent(g_tickEvent);
+            if (pairVbT > 0.0)
+            {
+                // After a pair two refreshes have been presented: this is the vblank the queued one would have been
+                // drawn at, and the next lit refresh is picked one vblank later. If the queued refresh was held up past
+                // this vblank, the wait above already returned at the later one: its tick is sent late, so the game's
+                // frame cap still gets one tick per refresh.
+                const double perP = 1.0 / (modeHz > 1.0 ? modeHz : 120.0);
+                const double tw = Now();
+                if (tw < pairVbT + 1.5 * perP)
+                {
+                    tick(presents - 1, tw);
+                    output->WaitForVBlank();
+                    tick(presents, Now());
+                }
+                else
+                {
+                    tick(presents - 1, tw - perP);
+                    tick(presents, tw);
+                }
+                pairVbT = 0.0;
+            }
+            else tick(presents, Now());
             tickedAtVb = true;
         }
         refillNow = false;
@@ -4593,11 +4631,37 @@ static DWORD WINAPI PresenterThread(void *)
             }
         }
         else { soften = 0.0f; swapState = 0; gradPhase = 0.0; gradHold = -1.0; }
-        if (!tickedAtVb)
+        if (!tickedAtVb && !pairIter)
         {
             g_tickT.store(Now());
             g_tickCount.fetch_add(1);
             SetEvent(g_tickEvent);
+        }
+        // QueueDarkRefresh: after the lit refresh of a 2+ refresh cycle, the next one (the same game frame) follows at
+        // once. Not with Queue one refresh ahead (its own queue), the LCD savers (they shift the cycle), the hitch
+        // guard's steady picture, or fewer than 3 presenter buffers.
+        if (pairIter)
+        {
+            // The second present should return at once. If it waits for the first one's vblank, the presenter's queue
+            // takes only one present and pairing would shift the strobe: off for this session.
+            if (tPres - tSub > 0.5 / (modeHz > 1.0 ? modeHz : 120.0) && !pairOff && ++pairBlocked >= 3)
+            {
+                pairOff = true;
+                LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited %.1f ms "
+                     "(the swap chain takes one pending present)", (tPres - tSub) * 1000.0);
+            }
+        }
+        else if (s.queueDark && !pairOff && tickedAtVb && s.pacing && !s.queueAhead && !vsyncOverridden && n >= 3 && s.enabled &&
+                 s.frames >= 2 && slotNow == 0 && !hitchPaused && swapState == 0 && soften <= 0.0f && !GradualSaverOn(s) && SUCCEEDED(hr))
+        {
+            pairNext = true;
+            pairVbT = tVb;
+            static bool pairLogged = false;
+            if (!pairLogged)
+            {
+                pairLogged = true;
+                LOGI("BFI Presenter: QueueDarkRefresh on (test): the refresh after the lit one is queued with it");
+            }
         }
         if (s.pacing && s.queueAhead && n >= 3 && !vsyncOverridden)
         {
@@ -4629,6 +4693,13 @@ static DWORD WINAPI PresenterThread(void *)
             secPhC += cos(ang); secPhS += sin(ang); secPhN++;
         }
         if (t - lastT > 1.5 / (modeHz > 0.0 ? modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
+        {
+            secLate++;
+            lateTimes[lateIdx++ & 3] = t;
+        }
+        // A queued refresh (QueueDarkRefresh) is late only when it wasn't presented before the vblank it was meant for,
+        // two after the one its lit refresh was drawn at.
+        else if (pairIter && pairVbT > 0.0 && t > pairVbT + 1.9 / (modeHz > 0.0 ? modeHz : 120.0))
         {
             secLate++;
             lateTimes[lateIdx++ & 3] = t;
@@ -5799,16 +5870,18 @@ static DWORD WINAPI PresenterThread(void *)
             EnterCriticalSection(&g_cfgLock);
             lrLog.lrState = g_status.lrState; lrLog.lrEst = g_status.lrEst; lrLog.lrMargin = g_status.lrMargin;
             LeaveCriticalSection(&g_cfgLock);
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d\n", t * 1000.0,
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d\n", t * 1000.0,
                     (unsigned long long)presents, c.slot,
                     (unsigned long long)pickId, (t - pickTime) * 1000.0, (t - lastT) * 1000.0,
                     sok ? (int)st.PresentCount : -1, sok ? (int)st.SyncRefreshCount : -1,
                     s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     g_maxAhead.load(), s.pacing, s.queueAhead, queuedNow,
                     (tVb - tLoop0) * 1000.0, (tFence - tVb) * 1000.0, (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f, hotArea, rawAvg,
-                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp);
+                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp, pairIter ? 1 : 0);
         }
-        lastT = t;
+        // A queued refresh is shown one refresh after the lit one it follows: the next interval is counted from there
+        // (or the lit refresh after it, two vblanks on, would read as a missed refresh).
+        lastT = pairIter ? lastT + 1.0 / (modeHz > 1.0 ? modeHz : 120.0) : t;
         if (pickId != lastShownId) lastNewFrameT = Now();
         if (pickId != lastShownId)
         {
