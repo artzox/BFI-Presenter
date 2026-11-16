@@ -8,7 +8,7 @@ The same presenter-clocked black frame insertion as the [DX add-on](../dx/README
   - The game and ReShade render into stand-in images.
   - Each finished frame, with ReShade's effects and the CRT shader already applied, is copied into a small staging ring.
   - The presenter thread strobes it at vblank on its own GPU queue, exactly like the DX version.
-- **Settings window:** when ReShade is in the game, the layer adds a **BFI Presenter (Vulkan)** tab to the ReShade overlay. ReShade isn't required: without it, edit the ini (the layer picks up the change within a second; Ctrl+Shift+R reloads at once) (Ctrl+Shift+B toggles BFI, Ctrl+Shift+M the method, Ctrl+Shift+S rolling scan, Ctrl+Shift+O rebuilds the swap chain, Ctrl+Shift+K puts a marker in the log). DOOM Eternal runs this way.
+- **Settings window:** when ReShade is in the game, the layer adds a **BFI Presenter (Vulkan)** tab to the ReShade overlay. ReShade isn't required: without it, edit the ini (the layer picks up the change within a second; Ctrl+Shift+R reloads at once) (Ctrl+Shift+B toggles BFI, Ctrl+Shift+M the method, Ctrl+Shift+S rolling scan, Ctrl+Shift+W frame warp, Ctrl+Shift+O rebuilds the swap chain, Ctrl+Shift+K puts a marker in the log). DOOM Eternal runs this way.
 - **Off unless asked:** the layer does nothing at all in a game whose folder has no `BFIPresenter.ini`. It writes no files and changes nothing there.
 
 ## Install (once)
