@@ -28,3 +28,5 @@ tools/warp-test/*.rgba
 tools/warp-test/*.f16
 tools/warp-test/gen_presenter.h
 tools/warp-test/clock_test
+tools/warp-test/gen_constants_vk.h
+tools/warp-test/vk_warp_test

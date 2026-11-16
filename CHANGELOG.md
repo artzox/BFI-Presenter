@@ -7,6 +7,13 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.42] — unreleased (Vulkan test build 1.0.42-vt1)
+
+- **[Vulkan] Frame warp (test feature)**, as in the DX add-on since 1.0.41 (`FrameWarp`, off by default, Ctrl+Shift+W; under Every cap in the overlay): a strobe cycle without a new game frame shows the last frame moved half way along the camera's motion instead of lighting it again. The same passes as DX, as compute shaders (`vulkan/shaders/warp.comp`, `vulkan/bfi_warp_vk.h`), on the graphics queue or the realtime compute queue; the BFI shader reads the motion and the frame shown before from a third descriptor set. `FrameWarpMaxAhead`, `FrameWarpMinRate` and the on-screen display line as in DX.
+  - The staging ring has seven frames (was six): frame warp keeps the frame shown before the current one.
+  - **Timing log:** `BFIPresenterVK_log_*.csv` gets `warp_ahead` (game frames ahead on a filled refresh, 0 otherwise) and the presenter's GPU time from timestamps (`warp_pass_gpu_ms`, `draw_gpu_ms`, `draw_was_warped`; read back a few refreshes later, while the log runs).
+  - Tested on synthetic frames (`tools/warp-test/run_vk.sh`: the layer's own warp code and BFI compute shader on Mesa's software Vulkan driver): the same results as the DX add-on (half a frame ahead, 5.8% of pixels visibly off against 33% for the repeated frame; HUD and crosshair unchanged). **Not yet tested in a game.**
+
 ## [1.0.41] — 2026-11-16
 
 **Frame warp (test feature): strobe cycles without a new game frame are filled, without holding frames back; the automatic frame cap stops retrying in Reflex games; PresenterResize works again.**

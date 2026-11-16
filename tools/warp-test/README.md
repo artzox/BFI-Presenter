@@ -9,6 +9,8 @@ Checks frame warp without a game:
   against the pan (`make_frames.py`), then the second frame shown half a frame and one frame ahead. `check.py`
   compares the result with the true picture at that moment, and the measured motion with the real one.
 
+`run_vk.sh` does the same for the Vulkan layer (`vk_warp_test.cpp`: the layer's own `bfi_warp_vk.h`, its warp passes and its BFI compute shader, on Linux with any Vulkan driver; Mesa's lavapipe works without a GPU: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ./run_vk.sh`). It gives the same numbers as the DX test.
+
 `./run.sh` builds and runs all of it (MinGW-w64, python3 with numpy and scipy; Wine with a Vulkan driver, or run
 `warp_test.exe` on Windows). `d3dcompiler_47.dll` must be next to `warp_test.exe`.
 

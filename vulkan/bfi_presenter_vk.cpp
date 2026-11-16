@@ -57,8 +57,9 @@
 #include <vector>
 
 #include "shaders_spv.h"
+#include "../common/bfi_warpclock.h"   // frame warp: how far ahead each strobe cycle shows its frame (shared with DX)
 
-#define BFI_VERSION "1.0.41"
+#define BFI_VERSION "1.0.42-vt1"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -268,6 +269,10 @@ struct Settings
     int   osdGraph = 1;       // OsdGraph: frame-time graph
     int   osdLoads = 1;       // OsdLoads: CPU / GPU load
     float osdScale = 1.0f;    // OsdScale: text size
+    int   frameWarp = 0;      // FrameWarp (test): a strobe cycle without a new game frame shows the last one moved ahead
+                              // along the camera's motion instead of lit again (as in the DX add-on, v1.0.41)
+    float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
+    int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
@@ -374,6 +379,9 @@ static void LoadSettings(Settings &s)
     s.splitPos = std::max(5, std::min(95, KvInt(kv, "SplitComparePosition", 50)));
     s.splitSeam = std::max(0, std::min(400, KvInt(kv, "SplitCompareSeamPx", 0)));
     s.osd = KvInt(kv, "Osd", 0) ? 1 : 0;
+    s.frameWarp = KvInt(kv, "FrameWarp", 0) != 0 ? 1 : 0;
+    s.warpMax = Clamp(KvFloat(kv, "FrameWarpMaxAhead", 1.0f), 0.25f, 1.5f);
+    s.warpMinRate = Clamp(KvInt(kv, "FrameWarpMinRate", 75), 40, 95);
     s.osdCorner = std::max(0, std::min(3, KvInt(kv, "OsdCorner", 1)));
     s.osdGraph = KvInt(kv, "OsdGraph", 1) ? 1 : 0;
     s.osdLoads = KvInt(kv, "OsdLoads", 1) ? 1 : 0;
@@ -449,7 +457,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -484,6 +492,9 @@ struct Status
     double driftFps = 0.0, driftHz = 0.0, driftSuggest = 0.0, driftSlip = 0.0;
     int    late = 0, frameRepeats = 0, frameSkips = 0, slotWaits = 0, reused = 0;
     int    unevenRep = 0, unevenSkip = 0;   // per second: strobe cycles short of / ahead of the expected step
+    int    warpOn = 0;                      // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
+    int    warpCycles = 0;                  // per second: strobe cycles shown moved ahead
+    double warpAvg = 0.0, warpRate = 0.0;   // their average offset (game frames); the game's frames per strobe cycle
     int    lrState = 0;                     // just-in-time release: 0 off, 1 measuring, 2 active, 3 at its limit
     double lrEst = 0.0, lrMargin = 0.0;
     int    lrMisses = 0;
@@ -562,7 +573,8 @@ struct InstanceData
     X(QueueSubmit2) X(QueueSubmit2KHR) X(QueueBindSparse) X(AcquireNextImage2KHR) X(WaitForPresentKHR) \
     X(GetSwapchainStatusKHR) X(ReleaseSwapchainImagesEXT) X(GetDeviceQueue2) \
     X(AcquireFullScreenExclusiveModeEXT) X(ReleaseFullScreenExclusiveModeEXT) \
-    X(SetLatencySleepModeNV) X(LatencySleepNV) X(CreateComputePipelines) X(CmdDispatch)
+    X(SetLatencySleepModeNV) X(LatencySleepNV) X(CreateComputePipelines) X(CmdDispatch) \
+ X(CreateQueryPool) X(DestroyQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults)
 
 struct Swapchain;
 struct DeviceData
@@ -625,7 +637,7 @@ static int  g_dumpFrames = 0;      // diagnostics: write the first N presented r
 
 // ---------------------------------------------------------------- swap chain state
 static const uint32_t kMaxImg = 8;
-static const uint32_t kStage  = 6;       // ring of finished game frames
+static const uint32_t kStage  = 7;       // ring of finished game frames (seven since frame warp: it keeps the frame shown before)
 
 struct Constants
 {
@@ -645,6 +657,7 @@ struct Constants
     uint32_t splitMode;           // 0 off, 1 left side without BFI, 2 right side
     float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
     float    rfxApl;                    // its APL Limiter: 1 = on (GPU-measured from the frame being shown)
+    float    warp;                      // frame warp: share of the measured motion the frame is moved ahead (0 = off)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -803,6 +816,7 @@ struct Swapchain
     uint64_t       slotReadSub[kStage] = {};    // presenter submission that last read the slot
     int            presCurSlot = -1;
     int            presCurSlot2 = -1;           // split comparison: the newer frame its side without BFI shows
+    int            presPrevSlot = -1;           // frame warp: the frame shown before the current one (kept in the ring)
     std::map<uint32_t, CopyCmds> copyCmds;      // per queue family the game presents from
     std::mutex     lock;                        // stage arrays
     std::mutex     submitLock;                  // game-side presents
@@ -1090,6 +1104,10 @@ static bool KeyCombo(int vk)
 }
 
 // ---------------------------------------------------------------- presenter resources
+static VkShaderModule MakeShader(DeviceData *d, const uint32_t *code, size_t bytes);
+static VkPipeline MakeComputePipeline(DeviceData *d, VkPipelineLayout pl, VkShaderModule cs);
+#include "bfi_warp_vk.h"   // frame warp: the motion passes and the BFI shader's set 2
+
 struct PresenterRes
 {
     VkRenderPass          rp = VK_NULL_HANDLE, rpMeas = VK_NULL_HANDLE;
@@ -1145,6 +1163,12 @@ struct PresenterRes
     VkShaderModule        csApl = VK_NULL_HANDLE;
     VkPipeline            psoA = VK_NULL_HANDLE;   // null: the limiter is unavailable
     bool                  aplInit = false;         // aplImg moved to GENERAL
+    // Frame warp (bfi_warp_vk.h) and its GPU time (timing log): four timestamps per real image -- around frame warp's
+    // passes and around the BFI pass -- read back when that image's command buffer is next recorded.
+    WarpVk                warp;
+    VkQueryPool           tsPool = VK_NULL_HANDLE;
+    double                tsToMs = 0.0;
+    bool                  tsPending[kMaxImg] = {}, tsPasses[kMaxImg] = {}, tsWarped[kMaxImg] = {};
 };
 
 static VkRenderPass MakeRenderPass(DeviceData *d, VkFormat fmt, VkImageLayout finalLayout)
@@ -1336,10 +1360,10 @@ static void CreateRtRes(Swapchain *sc, PresenterRes &R)
         dli.bindingCount = 3;
         dli.pBindings = b;
         p = d->CreateDescriptorSetLayout(dev, &dli, nullptr, &R.dslC) == VK_SUCCESS;
-        VkDescriptorSetLayout sl2[2] = { R.dslC, R.dslN };
+        VkDescriptorSetLayout sl2[3] = { R.dslC, R.dslN, R.warp.dslW };
         VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Constants) };
         VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        pli.setLayoutCount = 2;
+        pli.setLayoutCount = 3;
         pli.pSetLayouts = sl2;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pr;
@@ -1510,10 +1534,11 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         dln.bindingCount = 1;
         dln.pBindings = &bn;
         p = d->CreateDescriptorSetLayout(dev, &dln, nullptr, &R.dslN) == VK_SUCCESS;
-        VkDescriptorSetLayout sl2[2] = { R.dsl, R.dslN };
+        p = p && R.warp.CreateLayout(d);                   // set 2: frame warp (bfi_warp_vk.h)
+        VkDescriptorSetLayout sl2[3] = { R.dsl, R.dslN, R.warp.dslW };
         VkPushConstantRange pr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Constants) };
         VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        pli.setLayoutCount = 2;
+        pli.setLayoutCount = 3;
         pli.pSetLayouts = sl2;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pr;
@@ -1671,6 +1696,12 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
             d->UpdateDescriptorSets(dev, 1, &w, 0, nullptr);
         }
     }
+    if (p)
+    {
+        // Frame warp: set 2 is needed by the BFI pipelines; its passes are optional.
+        p = R.warp.Init(d, sc->stageView, sc->extent.width, sc->extent.height);
+        if (p && !R.warp.ok) LOGW("BFI Presenter: frame warp unavailable (its compute passes could not be created)");
+    }
     if (!p)
     {
         if (R.pso) { d->DestroyPipeline(dev, R.pso, nullptr); R.pso = VK_NULL_HANDLE; }
@@ -1760,12 +1791,33 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         R.measPtr = nullptr;
     }
     CreateRtRes(sc, R);
+    // Frame warp's GPU time (timing log): timestamps on the queue the presenter records for, if it has them.
+    if (d->CreateQueryPool && d->CmdWriteTimestamp && d->CmdResetQueryPool && d->GetQueryPoolResults)
+    {
+        uint32_t nf = 0;
+        d->inst->GetPhysicalDeviceQueueFamilyProperties(d->phys, &nf, nullptr);
+        std::vector<VkQueueFamilyProperties> qf(nf);
+        d->inst->GetPhysicalDeviceQueueFamilyProperties(d->phys, &nf, qf.data());
+        const uint32_t fam = R.rt ? d->rtFamily : d->family;
+        VkPhysicalDeviceProperties pp = {};
+        d->inst->GetPhysicalDeviceProperties(d->phys, &pp);
+        if (fam < nf && qf[fam].timestampValidBits > 0 && pp.limits.timestampPeriod > 0.0f)
+        {
+            VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = 4 * kMaxImg;
+            if (d->CreateQueryPool(dev, &qi, nullptr, &R.tsPool) == VK_SUCCESS) R.tsToMs = (double)pp.limits.timestampPeriod * 1e-6;
+        }
+    }
     return true;
 }
 
 static void DestroyPresenterRes(DeviceData *d, PresenterRes &R)
 {
     VkDevice dev = d->device;
+    R.warp.Release(d);
+    if (R.tsPool && d->DestroyQueryPool) d->DestroyQueryPool(dev, R.tsPool, nullptr);
+    R.tsPool = VK_NULL_HANDLE;
     for (uint32_t i = 0; i < kMaxImg; i++)
     {
         if (R.fb[i]) d->DestroyFramebuffer(dev, R.fb[i], nullptr);
@@ -2151,7 +2203,18 @@ static void PresenterThread(Swapchain *sc)
     int capDownSecs = 0, probeSecs = 0, probeGood = 0, userCap = 1;
     double capSwitchT = -100.0, probeWait = 30.0, capUpT = -100.0;
     bool capProbe = false, fgWas = false, rfxFgKnown = false;   // rfxFgKnown: the Reflex frame counts have agreed for 3 s
-    bool kb = false, km = false, kr = false, krs = false, ksp = false, kosd = false;
+    bool kb = false, km = false, kr = false, krs = false, ksp = false, kosd = false, kwarp = false;
+    // Frame warp (as in the DX add-on): how far ahead each strobe cycle shows its frame, the frame shown before it
+    // (kept in the ring), and its GPU time for the timing log.
+    WarpClock warpClock;
+    double   warpAhead = 0.0;
+    int      warpPrev = -1;
+    uint64_t warpPrevId = 0;
+    bool     warpPrevReady = false, cycleStartW = false;
+    int      secWarpCycles = 0;
+    double   secWarpSum = 0.0;
+    double   tsPassMs = -1.0, tsDrawMs = -1.0;   // the last GPU times read back (timing log)
+    int      tsDrawWarped = 0;
     FILE *logf = nullptr;
     double monitorCheckT = Now();
     int dumpLeft = g_dumpFrames;
@@ -2160,6 +2223,21 @@ static void PresenterThread(Swapchain *sc)
     {
         // hotkeys (edge-triggered) act on the shared settings
         const bool b = KeyCombo('B'), m = KeyCombo('M'), r = KeyCombo('R'), rs = KeyCombo('S'), sp = KeyCombo('C'), ko = KeyCombo('F'), kz = KeyCombo('Z');
+        {
+            // Ctrl+Shift+W: frame warp on / off
+            const bool kw = KeyCombo('W');
+            if (kw && !kwarp)
+            {
+                int fw;
+                {
+                    std::lock_guard<std::mutex> l(g_cfgLock);
+                    g_shared.frameWarp = g_shared.frameWarp ? 0 : 1;
+                    fw = g_shared.frameWarp;
+                }
+                LOGI("BFI Presenter: frame warp %s (Ctrl+Shift+W)", fw ? "on" : "off");
+            }
+            kwarp = kw;
+        }
         if ((b && !kb) || (m && !km) || (rs && !krs) || (sp && !ksp) || (ko && !kosd))
         {
             std::lock_guard<std::mutex> l(g_cfgLock);
@@ -2224,7 +2302,7 @@ static void PresenterThread(Swapchain *sc)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,bfi,method,frames,gain,floor,rolloff,"
                               "pacing,cap,ahead,vblank,wait_vblank_ms,acquire_ms,wait_gpu_ms,submit_ms,present_ms,reused,"
                               "hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,queue_ahead,smooth_catchup,"
-                              "release_to_flash_ms,ready_before_pick_ms\n");
+                              "release_to_flash_ms,ready_before_pick_ms,warp_ahead,warp_pass_gpu_ms,draw_gpu_ms,draw_was_warped\n");
                 LOGI("BFI Presenter: timing log started: %s", path.c_str());
             }
         }
@@ -2394,6 +2472,17 @@ static void PresenterThread(Swapchain *sc)
                     }
                 }
             }
+            // Frame warp keeps the frame shown before this one in the ring: what is the same in both stands still on
+            // the screen (a HUD) and is not moved.
+            cycleStartW = cycleStart;
+            if (!s.frameWarp || !R.warp.ok) { warpPrev = -1; warpPrevId = 0; }
+            else if (pick >= 0 && lastShown >= 0 && lastShownId && pickId != lastShownId)
+            {
+                warpPrev = (pick != lastShown && sc->stageId[lastShown] == lastShownId) ? lastShown : -1;
+                warpPrevId = warpPrev >= 0 ? lastShownId : 0;
+            }
+            sc->presPrevSlot = warpPrev;
+            warpPrevReady = warpPrev >= 0 && warpPrev != pick && sc->stageId[warpPrev] == warpPrevId && sc->copyDone[warpPrev];
         }
         if (pick < 0)
         {
@@ -2536,6 +2625,24 @@ static void PresenterThread(Swapchain *sc)
             break;
         }
 
+        // Frame warp: how far ahead of its frame this strobe cycle shows it, decided once per cycle (the lit and dark
+        // refreshes show the same picture), as the share of the motion measured from the frame shown before, in 1/256.
+        if (!s.frameWarp || !R.warp.ok)
+        {
+            if (warpClock.lastId) { warpClock.Reset(); R.warp.Forget(); }
+            warpAhead = 0.0;
+        }
+        else if (cycleStartW)
+            warpAhead = warpClock.Cycle(true, pickId, pickTime, Now(), (double)s.frames * sc->period.load(),
+                                        (double)s.warpMax, (double)s.warpMinRate / 100.0);
+        uint64_t warpOld = 0;
+        c.warp = 0.0f;
+        if (warpAhead > 0.0 && s.frameWarp && R.warp.ok && !copyMode && (warpOld = R.warp.PairFor(pickId, pickTime)) != 0 &&
+            warpPrevReady && warpPrevId == warpOld)
+            c.warp = (float)(std::floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
+        if (cycleStartW && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; }
+        if (sc->format == VK_FORMAT_R16G16B16A16_SFLOAT) c.flags |= 1024u;   // linear frames (frame warp's comparisons)
+
         bool dumpNow = false;
         if (pickNew2 < 0) pickNew2 = pick;
         const uint64_t pickId2 = sc->stageId[pickNew2];
@@ -2575,6 +2682,45 @@ static void PresenterThread(Swapchain *sc)
                 ab = ImgBarrier(R.aplImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
                 d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, rd, 0, 0, nullptr, 0, nullptr, 1, &ab);
             }
+            // Frame warp's GPU time: this image's last command buffer is done (its fence was waited above).
+            if (R.tsPool)
+            {
+                if (R.tsPending[idx])
+                {
+                    uint64_t q[4] = {};
+                    if (d->GetQueryPoolResults(dev, R.tsPool, 4 * idx, 4, sizeof(q), q, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+                    {
+                        const double passMs = q[1] >= q[0] ? (double)(q[1] - q[0]) * R.tsToMs : -1.0;
+                        const double drawMs = q[3] >= q[2] ? (double)(q[3] - q[2]) * R.tsToMs : -1.0;
+                        tsPassMs = R.tsPasses[idx] && passMs < 50.0 ? passMs : -1.0;
+                        tsDrawMs = drawMs < 50.0 ? drawMs : -1.0;
+                        tsDrawWarped = R.tsWarped[idx] ? 1 : 0;
+                    }
+                    R.tsPending[idx] = false;
+                }
+                d->CmdResetQueryPool(cb, R.tsPool, 4 * idx, 4);
+            }
+            const bool tsOn = R.tsPool && logf && !copyMode;
+            if (tsOn) d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, R.tsPool, 4 * idx + 0);
+            bool warpTouched = false;
+            if (!copyMode && R.warp.ready)
+            {
+                R.warp.ToGeneral(d, cb);
+                // A frame's first refresh measures its brightness pyramid; the motion from the frame before is measured
+                // only when the frame is shown moved, once per pair.
+                if (s.frameWarp && R.warp.ok)
+                {
+                    if (pickId != R.warp.id[R.warp.cur])
+                    {
+                        R.warp.RecordLuma(d, cb, (uint32_t)pick, pickId, pickTime, (c.flags & 1024u) != 0);
+                        warpTouched = true;
+                    }
+                    if (c.warp != 0.0f && (R.warp.flowNew != pickId || R.warp.flowOld != warpOld)) { R.warp.RecordFlow(d, cb); warpTouched = true; }
+                    if (warpTouched) R.warp.ToShade(d, cb);
+                }
+            }
+            if (tsOn) d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, R.tsPool, 4 * idx + 1);
+            VkDescriptorSet warpSet = R.warp.ready ? R.warp.dsW[pick][c.warp != 0.0f ? warpPrev : pick] : VK_NULL_HANDLE;
             if (copyMode)
             {
                 VkImageMemoryBarrier br2[2] = {
@@ -2603,8 +2749,11 @@ static void PresenterThread(Swapchain *sc)
                 d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.psoC);
                 d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plC, 0, 1, &R.dsC[pick], 0, nullptr);
                 d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plC, 1, 1, &R.dsN[pickNew2], 0, nullptr);
+                if (warpSet) d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.plC, 2, 1, &warpSet, 0, nullptr);
                 d->CmdPushConstants(cb, R.plC, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cc), &cc);
+                if (tsOn) d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, R.tsPool, 4 * idx + 2);
                 d->CmdDispatch(cb, (sc->extent.width + 7) / 8, (sc->extent.height + 7) / 8, 1);
+                if (tsOn) d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, R.tsPool, 4 * idx + 3);
                 VkImageMemoryBarrier b2[2] = {
                     ImgBarrier(R.mid, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT),
                     ImgBarrier(sc->realImg[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT) };
@@ -2668,12 +2817,15 @@ static void PresenterThread(Swapchain *sc)
                 d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.pso);
                 d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.pl, 0, 1, &R.ds[pick], 0, nullptr);
                 d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.pl, 1, 1, &R.dsN[pickNew2], 0, nullptr);
+                if (warpSet) d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, R.pl, 2, 1, &warpSet, 0, nullptr);
                 d->CmdPushConstants(cb, R.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(c), &c);
                 VkViewport vp = { 0.0f, 0.0f, (float)sc->extent.width, (float)sc->extent.height, 0.0f, 1.0f };
                 VkRect2D scis = { { 0, 0 }, sc->extent };
                 d->CmdSetViewport(cb, 0, 1, &vp);
                 d->CmdSetScissor(cb, 0, 1, &scis);
+                if (tsOn) d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, R.tsPool, 4 * idx + 2);
                 d->CmdDraw(cb, 3, 1, 0, 0);
+                if (tsOn) d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, R.tsPool, 4 * idx + 3);
                 d->CmdEndRenderPass(cb);
                 if (R.dumpPtr && dumpLeft > 0)
                 {
@@ -2720,11 +2872,13 @@ static void PresenterThread(Swapchain *sc)
                 }
             }
             d->EndCommandBuffer(cb);
+            if (tsOn) { R.tsPending[idx] = true; R.tsPasses[idx] = warpTouched; R.tsWarped[idx] = c.warp != 0.0f; }
             presSub++;
             {
                 std::lock_guard<std::mutex> l(sc->lock);
                 sc->slotReadSub[pick] = presSub;
                 if (pickNew2 >= 0) sc->slotReadSub[pickNew2] = presSub;
+                if (c.warp != 0.0f && warpPrev >= 0) sc->slotReadSub[warpPrev] = presSub;
             }
             bufSub[idx] = presSub;
             VkPipelineStageFlags waitStage = (copyMode || R.rt) ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -3060,6 +3214,25 @@ static void PresenterThread(Swapchain *sc)
             }
             g_status.frameRepeats = secFrameRepeats;
             g_status.frameSkips   = secFrameSkips;
+            {
+                const int wOn = !s.frameWarp ? 0 : !R.warp.ok ? -1 : warpClock.engaged ? 2 : 1;
+                static int warpWas = 0;
+                static double warpLogT = 0.0;
+                if (wOn != warpWas && (wOn == 2 || warpWas == 2) && t - warpLogT > 5.0)
+                {
+                    if (wOn == 2) LOGI("BFI Presenter: frame warp at work (fill missing frames): the game makes %.0f%% of the strobe rate", warpClock.rate * 100.0);
+                    else LOGI("BFI Presenter: frame warp waiting (%s)", !s.frameWarp ? "switched off"
+                              : warpClock.rate > 0.0 ? "the game's frame rate is outside its range" : "no steady frame rate");
+                    warpLogT = t;
+                    warpWas = wOn;
+                }
+                else if (wOn != 2 && warpWas != 2) warpWas = wOn;
+                g_status.warpOn = wOn;
+                g_status.warpCycles = secWarpCycles;
+                g_status.warpAvg = secWarpCycles ? secWarpSum / secWarpCycles : 0.0;
+                g_status.warpRate = warpClock.rate;
+                secWarpCycles = 0; secWarpSum = 0.0;
+            }
             Osd::AddSecond(secFrameSkips, secFrameRepeats, secLate, Now());
             g_status.unevenRep    = secRepU;
             g_status.qaPrimes     = secQaPrimes;
@@ -3739,13 +3912,14 @@ static void PresenterThread(Swapchain *sc)
                 std::lock_guard<std::mutex> l(g_cfgLock);
                 lrSt = g_status.lrState; lrE = g_status.lrEst; lrM = g_status.lrMargin;
             }
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f\n",
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
                     t * 1000.0, (unsigned long long)presents, c.slot, (unsigned long long)pickId, (t - pickTime) * 1000.0,
                     (t - lastT) * 1000.0, s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     sc->maxAhead.load(), vblank ? 1 : 0, (tVb - tLoop0) * 1000.0, (tAcq - tVb) * 1000.0, (tFence - tAcq) * 1000.0,
                     (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, reuse ? 1 : 0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f,
                     litAvg, rawAvg, lrSt, sc->lrLead.load() * 1000.0, lrE, lrM, qa ? (primeIter ? 2 : qaPrimed ? 1 : 0) : -1, s.smoothCatchUp,
-                    relFlashMs, pickReadyMs);
+                    relFlashMs, pickReadyMs, c.warp != 0.0f ? warpAhead : 0.0, tsPassMs, tsDrawMs, tsDrawWarped);
+            tsPassMs = tsDrawMs = -1.0;
             if ((presents % 120) == 0) fflush(logf);
         }
         lastT = t;
@@ -4267,7 +4441,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
             uint64_t bestId = ~0ull;
             for (uint32_t i = 0; i < kStage; i++)
             {
-                if ((int)i == sc->presCurSlot || (int)i == sc->presCurSlot2 || sc->slotReadSub[i] > pdone) continue;
+                if ((int)i == sc->presCurSlot || (int)i == sc->presCurSlot2 || (int)i == sc->presPrevSlot || sc->slotReadSub[i] > pdone) continue;
                 if (sc->stageId[i] < bestId) { slot = (int)i; bestId = sc->stageId[i]; }
             }
             if (slot >= 0) { sc->stageId[slot] = 0; sc->copyDone[slot] = false; }   // being rewritten: not selectable
@@ -4281,7 +4455,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
         sc->slotWaits.fetch_add(1);
         std::lock_guard<std::mutex> l(sc->lock);
         slot = (sc->presCurSlot + 1) % (int)kStage;
-        if (slot == sc->presCurSlot2) slot = (slot + 1) % (int)kStage;
+        while (slot == sc->presCurSlot2 || slot == sc->presPrevSlot || slot == sc->presCurSlot) slot = (slot + 1) % (int)kStage;
         sc->stageId[slot] = 0;
         sc->copyDone[slot] = false;
     }
@@ -5906,6 +6080,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
         d.gameFps = g_status.gameFps; d.refreshHz = g_status.refreshHz; d.frames = g_shared.frames;
         d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
         d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running;
+        d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
     }
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
 }
@@ -6382,6 +6557,38 @@ static void draw_overlay(reshade::api::effect_runtime *)
         // ---------------------------------------------------------- every cap
         ImGui::Spacing();
         ImGui::SeparatorText("Every cap");
+        bool fw = s.frameWarp != 0;
+        if (ImGui::Checkbox("Frame warp: fill missing frames (test, Ctrl+Shift+W)", &fw)) s.frameWarp = fw ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("For games that run just under the strobe rate (50-59 fps against a 60 Hz strobe). A strobe\n"
+                                                      "cycle without a new game frame normally lights the last one again: the picture stands\n"
+                                                      "still for a flash, then jumps. Frame warp shows that frame moved part of the way along the\n"
+                                                      "camera's motion instead. Frames that arrive in time are shown exactly as rendered, and no\n"
+                                                      "frame is held back, so it adds no latency (unlike frame generation).\n"
+                                                      "\n"
+                                                      "Worth trying: a game that holds about 75-99%% of the strobe rate and misses a frame now and\n"
+                                                      "then, in camera pans and turns.\n"
+                                                      "Not useful: the game holds the strobe rate (nothing to fill); far below it (use the Half\n"
+                                                      "cap or frame generation); for hitches and loading stalls; for things that move on their own\n"
+                                                      "(a character, a car), which keep their stutter. With frame generation it works, with less to fill.\n"
+                                                      "A filled flash is a guess: edges of things moving against the background can smear for that\n"
+                                                      "flash, and a CRT shader's mask moves with the picture. Vulkan layer: test build, see the settings guide.");
+        if (s.frameWarp)
+        {
+            ImGui::Indent(16.0f);
+            ImGui::SliderFloat("Furthest ahead (game frames)", &s.warpMax, 0.25f, 1.5f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("A frame is never shown further ahead than this. Lower = fewer errors, but a\n"
+                                                          "missing frame is only partly filled.");
+            ImGui::SliderInt("Only from (% of the strobe rate)", &s.warpMinRate, 40, 95);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame warp works while the game makes at least this share of the strobe rate\n"
+                                                          "(75%% of a 60 Hz strobe = 45 fps). Below it frames repeat as without it: the\n"
+                                                          "further a frame has to be moved, the more errors show.");
+            if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see BFIPresenterVK.log).");
+            else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
+                                                 st.warpRate * 100.0, st.warpCycles, st.warpAvg);
+            else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
+            else ImGui::Text("Waiting for the game's frame rate.");
+            ImGui::Unindent(16.0f);
+        }
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest latency shows the newest frame -- best at the Refresh cap, and needed to time the\nframe start. Smooth holds up to one finished frame in reserve (about one refresh more latency)\nso every frame is lit once and in order -- it only helps at the Half or Quarter cap.");
         if (s.pacingMode == 0)

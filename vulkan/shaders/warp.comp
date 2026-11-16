@@ -1,0 +1,144 @@
+#version 450
+// Frame warp, Vulkan layer: the motion between the last two frames, measured on the GPU. The same passes as the
+// DX add-on's (dx/bfi_warp.h, which explains them), as compute shaders: PASS is set at compile time.
+//   PASS 0  brightness at 1/4 size (ta = the game frame)
+//   PASS 1  the next pyramid level, half the size (ta = the finer level)
+//   PASS 2  motion at one level, coarse to fine (ta = this level of the newer frame, tb = of the older, tc = the
+//           coarser level's vectors)
+//   PASS 3  the motion evened out for the whole picture (ta = the 1/8 level's vectors; the target is 1/32 size)
+// Every target is rgba16f (always usable as a storage image); pixel centres as in a pixel shader.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D ta;
+layout(set = 0, binding = 1) uniform sampler2D tb;
+layout(set = 0, binding = 2) uniform sampler2D tc;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform W
+{
+    vec2 texel;      // 1 / size of the level being written
+    vec2 texel2;     // PASS 0: 1 / size of the game frame; PASS 2: 1 / size of the coarser level; PASS 3: of the 1/8 level
+    uint wmode;      // PASS 0: 1 = the frame is linear (scRGB). PASS 2: 1 = start from the coarser level, +2 = the last level
+} wc;
+
+float WLuma(vec3 c)
+{
+    float y = dot(max(c, 0.0), vec3(0.2126, 0.7152, 0.0722));
+    return wc.wmode == 1u ? sqrt(y / (y + 1.0)) : y;
+}
+
+#if PASS == 2
+const float PULL = 0.05;
+const vec2 kTap[9] = vec2[9](
+    vec2(-1.5, -1.5), vec2(0.0, -1.5), vec2(1.5, -1.5),
+    vec2(-1.5,  0.0), vec2(0.0,  0.0), vec2(1.5,  0.0),
+    vec2(-1.5,  1.5), vec2(0.0,  1.5), vec2(1.5,  1.5));
+float cur[9];
+float PatchCost(vec2 uv, vec2 f)
+{
+    float c = 0.0;
+    for (int i = 0; i < 9; i++) c += abs(cur[i] - textureLod(tb, uv + kTap[i] * wc.texel - f, 0.0).r);
+    return c;
+}
+vec4 Flow(vec2 pos)
+{
+    vec2 uv = pos * wc.texel;
+    for (int i = 0; i < 9; i++) cur[i] = textureLod(ta, uv + kTap[i] * wc.texel, 0.0).r;
+    vec2 best = vec2(0.0);
+    vec2 lead = vec2(0.0);
+    float bestC = PatchCost(uv, best);
+    if ((wc.wmode & 2u) != 0u && bestC < 0.03) return vec4(0.0, 0.0, 1.0, 0.0);
+    if ((wc.wmode & 1u) == 0u)
+    {
+        for (int y = -3; y <= 3; y++)
+            for (int x = -3; x <= 3; x++)
+            {
+                vec2 o = vec2(x, y);
+                float c = PatchCost(uv, o * wc.texel) + 0.01 + 0.004 * length(o);
+                if (c < bestC) { bestC = c; best = o * wc.texel; }
+            }
+    }
+    else
+    {
+        const vec2 kN[5] = vec2[5](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0));
+        bestC += 0.01;
+        for (int k = 0; k < 5; k++)
+        {
+            vec2 f = textureLod(tc, uv + kN[k] * wc.texel2, 0.0).xy;
+            if (k == 0) lead = f;
+            float c = PatchCost(uv, f) + (k == 0 ? 0.0 : 0.01);
+            if (c < bestC) { bestC = c; best = f; }
+        }
+    }
+    const vec2 kR[8] = vec2[8](vec2(-1.0, -1.0), vec2(0.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 0.0),
+                               vec2(1.0, 0.0), vec2(-1.0, 1.0), vec2(0.0, 1.0), vec2(1.0, 1.0));
+    float stepPx = 1.0;
+    int rounds = (wc.wmode & 2u) != 0u ? 4 : 2;
+    for (int r = 0; r < rounds; r++)
+    {
+        vec2 base = best;
+        for (int k = 0; k < 8; k++)
+        {
+            vec2 f = base + kR[k] * (stepPx * wc.texel);
+            float c = PatchCost(uv, f) + 0.01 + 0.004 * stepPx + PULL * max(length((f - lead) / wc.texel) - 0.5, 0.0);
+            if (c < bestC) { bestC = c; best = f; }
+        }
+        stepPx *= 0.5;
+    }
+    float conf = clamp((0.10 - bestC / 9.0) / 0.06, 0.0, 1.0);
+    return vec4(best, conf, 1.0);
+}
+#endif
+
+#if PASS == 3
+vec4 Smooth(vec2 pos)
+{
+    vec2 sum = vec2(0.0);
+    float wsum = 0.0;
+    for (int y = -3; y <= 3; y++)
+        for (int x = -3; x <= 3; x++)
+        {
+            vec4 n = textureLod(ta, (pos + 0.5 * vec2(x, y)) * wc.texel, 0.0);
+            float g = exp(-float(x * x + y * y) / 6.0);
+            sum += n.xy * g;
+            wsum += n.w * g;
+        }
+    if (wsum <= 0.02) return vec4(0.0, 0.0, 1.0, 0.0);
+    vec2 m = sum / wsum;
+    vec2 sum2 = vec2(0.0);
+    float wsum2 = 0.0;
+    for (int y2 = -3; y2 <= 3; y2++)
+        for (int x2 = -3; x2 <= 3; x2++)
+        {
+            vec4 n = textureLod(ta, (pos + 0.5 * vec2(x2, y2)) * wc.texel, 0.0);
+            if (n.w > 0.001)
+            {
+                vec2 d = (n.xy / n.w - m) / (wc.texel2 * 2.0);
+                float g = exp(-float(x2 * x2 + y2 * y2) / 6.0) * exp(-dot(d, d) * 0.5) * n.w;
+                sum2 += (n.xy / n.w) * g;
+                wsum2 += g;
+            }
+        }
+    return wsum2 > 1e-4 ? vec4(sum2 / wsum2, 1.0, 1.0) : vec4(m, 1.0, 1.0);
+}
+#endif
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(dst);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    vec2 pos = vec2(p) + 0.5;
+#if PASS == 0
+    vec2 uv = pos * wc.texel;
+    float y = WLuma(textureLod(ta, uv + wc.texel2 * vec2(-1.0, -1.0), 0.0).rgb)
+            + WLuma(textureLod(ta, uv + wc.texel2 * vec2( 1.0, -1.0), 0.0).rgb)
+            + WLuma(textureLod(ta, uv + wc.texel2 * vec2(-1.0,  1.0), 0.0).rgb)
+            + WLuma(textureLod(ta, uv + wc.texel2 * vec2( 1.0,  1.0), 0.0).rgb);
+    imageStore(dst, p, vec4(0.25 * y, 0.0, 0.0, 1.0));
+#elif PASS == 1
+    imageStore(dst, p, vec4(textureLod(ta, pos * wc.texel, 0.0).r, 0.0, 0.0, 1.0));
+#elif PASS == 2
+    imageStore(dst, p, Flow(pos));
+#else
+    imageStore(dst, p, Smooth(pos));
+#endif
+}
