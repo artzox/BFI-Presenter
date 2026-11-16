@@ -12,7 +12,7 @@ Checks frame warp without a game:
 `./run.sh` builds and runs all of it (MinGW-w64, python3 with numpy and scipy; Wine with a Vulkan driver, or run
 `warp_test.exe` on Windows). `d3dcompiler_47.dll` must be next to `warp_test.exe`.
 
-What to expect (whole-picture motion, the only mode since 1.0.41-t4): HUD and crosshair pixels changed by the warp: 0;
+What to expect (whole-picture motion, the only mode since 1.0.41): HUD and crosshair pixels changed by the warp: 0;
 pixels off by more than 16/255 half a frame ahead: about 6%, without torn edges (33% when the frame is repeated
 instead). Test builds t1-t2 also had motion per 8x8 and 4x4 block (about 5% and 4% here), dropped because it tore
 the picture in games.
