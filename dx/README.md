@@ -169,6 +169,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 | Ctrl+Shift+B | BFI on / off (the presenter keeps running) |
 | Ctrl+Shift+M | BFI ↔ Variable MPRT |
 | Ctrl+Shift+S | Rolling scan on / off |
+| Ctrl+Shift+W | Frame warp on / off (test feature: fills strobe cycles without a new game frame; see the settings guide) |
 | Ctrl+Shift+R | Reload `BFIPresenter.ini` |
 | Ctrl+Shift+K | Marker in `ReShade.log` with the last second's state, to find a moment you noticed |
 

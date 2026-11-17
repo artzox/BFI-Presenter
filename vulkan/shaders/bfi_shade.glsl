@@ -3,6 +3,90 @@
 // Split comparison: the newest game frame, for the side without BFI (set 1).
 layout(set = 1, binding = 0) uniform sampler2D srcNew;
 
+// Frame warp (set 2, see warp.comp and dx/bfi_warp.h): the measured motion, the game frame shown before this one, and
+// this frame again with a linear sampler (src samples nearest).
+layout(set = 2, binding = 0) uniform sampler2D flowTex;   // xy = how far the picture moved since the frame before (uv), z = confidence
+layout(set = 2, binding = 1) uniform sampler2D srcPrev;
+layout(set = 2, binding = 2) uniform sampler2D srcLin;
+
+// How far back along its motion the picture shown at uv is taken from, in uv (read where the picture comes from, so a
+// moving area's own motion is used); at most 8% of the screen.
+vec2 WarpShift(vec2 uv)
+{
+    vec4 f = textureLod(flowTex, uv, 0.0);
+    vec2 d = f.xy * (f.z * pc.warp);
+    f = textureLod(flowTex, uv - d, 0.0);
+    return clamp(f.xy * (f.z * pc.warp), -0.08, 0.08);
+}
+// A pixel that is the same in this frame and the one shown before it.
+bool Unchanged(ivec2 q, ivec2 size)
+{
+    if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) return true;
+    vec3 a = texelFetch(src, q, 0).rgb, b = texelFetch(srcPrev, q, 0).rgb;
+    vec3 tol = (pc.flags & 1024u) != 0u ? 0.002 * (0.1 + max(abs(a), abs(b))) : vec3(0.0016);
+    return all(lessThanEqual(abs(a - b), tol));
+}
+// Does the pixel stand still on the screen (a HUD, text, a crosshair) rather than move with the scene? (As in DX.)
+bool Still(ivec2 q, vec2 size)
+{
+    ivec2 isz = ivec2(size);
+    if (!Unchanged(q, isz)) return false;
+    int n = 0;
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++)
+            if ((x != 0 || y != 0) && Unchanged(q + ivec2(x, y), isz)) n++;
+    if (n >= 5) return true;
+    if (n < 1) return false;
+    vec2 c = vec2(q) + 0.5;
+    vec4 f = textureLod(flowTex, c / size, 0.0);
+    vec2 step = f.xy * f.z * size;
+    if (dot(step, step) < 2.25) return true;
+    vec3 a = texelFetch(src, q, 0).rgb;
+    vec3 d = abs(a - textureLod(srcPrev, (c - step) / size, 0.0).rgb);
+    float lim = (pc.flags & 1024u) != 0u ? 0.04 * (0.1 + max(max(a.r, a.g), a.b)) : 0.04;
+    return max(max(d.r, d.g), d.b) > lim;
+}
+// The game's frame moved ahead (Catmull-Rom, 9 bilinear taps). False = show the pixel as rendered.
+bool FetchWarped(vec2 fc, out vec3 c)
+{
+    c = vec3(0.0);
+    vec2 size = vec2(textureSize(src, 0));
+    vec2 inv = 1.0 / size;
+    vec2 d = WarpShift(fc * inv) * size;
+    if (dot(d, d) < 0.0004) return false;
+    if (Still(ivec2(fc), size)) return false;
+    vec2 p = clamp(fc - d, vec2(0.5), size - 0.5);
+    if (Still(ivec2(p), size)) return false;
+    vec2 tc = floor(p - 0.5) + 0.5;
+    vec2 f = p - tc;
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2;
+    vec2 t0 = (tc - 1.0) * inv, t3 = (tc + 2.0) * inv, t12 = (tc + w2 / w12) * inv;
+    c += textureLod(srcLin, vec2(t0.x,  t0.y),  0.0).rgb * (w0.x  * w0.y);
+    c += textureLod(srcLin, vec2(t12.x, t0.y),  0.0).rgb * (w12.x * w0.y);
+    c += textureLod(srcLin, vec2(t3.x,  t0.y),  0.0).rgb * (w3.x  * w0.y);
+    c += textureLod(srcLin, vec2(t0.x,  t12.y), 0.0).rgb * (w0.x  * w12.y);
+    c += textureLod(srcLin, vec2(t12.x, t12.y), 0.0).rgb * (w12.x * w12.y);
+    c += textureLod(srcLin, vec2(t3.x,  t12.y), 0.0).rgb * (w3.x  * w12.y);
+    c += textureLod(srcLin, vec2(t0.x,  t3.y),  0.0).rgb * (w0.x  * w3.y);
+    c += textureLod(srcLin, vec2(t12.x, t3.y),  0.0).rgb * (w12.x * w3.y);
+    c += textureLod(srcLin, vec2(t3.x,  t3.y),  0.0).rgb * (w3.x  * w3.y);
+    return true;
+}
+// The game's frame at output pixel fc (same size), moved ahead on a filled strobe cycle.
+vec3 Fetch(vec2 fc)
+{
+    if (pc.warp != 0.0)
+    {
+        vec3 m;
+        if (FetchWarped(fc, m)) return m;
+    }
+    return texelFetch(src, ivec2(fc), 0).rgb;
+}
+
 // BFI highlight roll-off: hue-preserving shoulder toward the ceiling P.
 vec3 Rolloff(vec3 lin, float g, float P, float k)
 {
@@ -117,7 +201,7 @@ float DecayShare(uint s, float phi, float T, float n)
 // The BFI picture for one pixel (fc: its centre, in pixels).
 vec4 BfiShade(vec2 fc)
 {
-    vec3 c = texelFetch(src, ivec2(fc.xy), 0).rgb;
+    vec3 c = Fetch(fc);
     if (pc.method == 2u) return vec4(pc.outType >= 4u ? Encode(Decode(c)) : c, 1.0);
     vec3 lin = Decode(c);
     float litGain = LitGain();

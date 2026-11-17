@@ -7,6 +7,21 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.42] — 2026-11-16
+
+**Frame warp comes to the Vulkan layer; the log analyzer shows the repeats left after frame warp, for DX and Vulkan.**
+
+- **[Vulkan] Frame warp (test feature)**, as in the DX add-on since 1.0.41 (`FrameWarp`, off by default, Ctrl+Shift+W; under Every cap in the overlay): a strobe cycle without a new game frame shows the last frame moved half way along the camera's motion instead of lighting it again. The same passes as DX, as compute shaders (`vulkan/shaders/warp.comp`, `vulkan/bfi_warp_vk.h`), on the graphics queue or the realtime compute queue; the BFI shader reads the motion and the frame shown before from a third descriptor set. `FrameWarpMaxAhead`, `FrameWarpMinRate` and the on-screen display line as in DX.
+  - The staging ring has seven frames (was six): frame warp keeps the frame shown before the current one.
+  - **Timing log:** `BFIPresenterVK_log_*.csv` gets `warp_ahead` (game frames ahead on a filled refresh, 0 otherwise) and the presenter's GPU time from timestamps (`warp_pass_gpu_ms`, `draw_gpu_ms`, `draw_was_warped`; read back a few refreshes later, while the log runs). `BFIPresenterVK.log` says when frame warp is at work or waiting.
+  - Tested on synthetic frames (`tools/warp-test/run_vk.sh`: the layer's own warp code and BFI compute shader on Mesa's software Vulkan driver): the same results as the DX add-on. **In games:** Indiana Jones and the Great Circle (DLSS frame generation 2×, about 60 fps): 243 of 243 and 155 of 213 repeats filled, the rest in a few seconds of loading; Driveclub (shadPS4 port, 45–55 fps against a 60 Hz strobe, Reflex + Boost, `FrameWarpMinRate=60`): 2,376 of 2,636 filled (90%), every one above 75% of the strobe rate. **Cost** (4K, RTX 5080): 0.05–0.12 ms per new game frame and 0.07–0.15 ms more per filled flash, under 1% of the GPU; no added latency.
+  - A game that often runs at 60–75% of the strobe rate (Driveclub) can lower `FrameWarpMinRate` to 60 in its own `BFIPresenter.ini`; the default stays 75.
+- **[DX]** No changes; version number only.
+- **[Tools]** (Tools 1.0.42) **Log analyzer:**
+  - A **Repeated after warp** column (and in the copied summary): the repeats left on screen after frame warp filled them, and the cadence counted after filling (Townfall: 4.9% off-cadence before, 0.4% after; hover the cadence for the figure before).
+  - Seconds while frame warp waited (frame rate outside its range: menus, loading, or a game below `FrameWarpMinRate`) get a row of their own, so their repeats aren't read as frame warp failing in play; the "game ran slower than the cap" note for them is information, not a warning.
+  - **Vulkan:** frame warp from the 1.0.42 `BFIPresenterVK_log_*.csv` with `BFIPresenterVK.log` (repeats filled while at work, frames ahead, GPU time, the waiting row). Vulkan games with frame generation and the layer's Reflex frame limit are now counted against that limit (Indiana Jones: 0.3% off-cadence, not 100%).
+
 ## [1.0.41] — 2026-11-16
 
 **Frame warp (test feature): strobe cycles without a new game frame are filled, without holding frames back; the automatic frame cap stops retrying in Reflex games; PresenterResize works again.**
@@ -21,7 +36,8 @@ Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply 
 - **[DX] The staging ring has seven frames** (was six): frame warp keeps the frame shown before the current one. One more frame of video memory (33 MB at 4K, 66 MB for scRGB), with frame warp off too.
 - **[DX] The automatic frame cap no longer goes up and down every 2 minutes in Reflex games that can't hold the refresh rate.** With Reflex, the cap goes back up to Refresh rate when the game's reports say its frames fit well within a refresh. Those reports are taken under the cap, and some games need far more without it: Onimusha: Way of the Sword reported 5 ms per frame at 60 fps, then took 15 ms and ran at 65–71 of 120 fps once the cap was off. The cap stepped back down 3 s later, and the same thing happened every 2 minutes (6 times in 10 minutes), each a burst of unevenly dropped frames. A step up that comes back down within 30 s is now remembered for the session: the next one needs frames at least 20% lighter than those it went up on. One that holds 30 s or more clears it. The log says so: "the step up on Reflex's reports (… ms per frame) didn't hold".
 - **[DX] Fix: `PresenterResize` started BFI again in games without OptiScaler** (Ratchet & Clank: Rift Apart, Marvel's Spider-Man 2). Since 1.0.38 the hook on swap chain creation is installed only with OptiScaler (the Elden Ring crash, #119), and PresenterResize finds ReShade's swap chain through that hook: without it, nothing was resized and BFI kept waiting ("no hook on the game-facing swap chain"). The hook is now installed when `PresenterResize` is on too; with it off, nothing changes.
-- **[Vulkan]** No changes; frame warp comes to the Vulkan layer in a later version.
+- **[Vulkan]** No changes; frame warp comes to the Vulkan layer in 1.0.42.
+- **[Tools]** (Tools 1.0.41) **Log analyzer reports frame warp** from the 1.0.41 reflex CSV: the repeated strobe cycles it filled while at work and how far ahead (Townfall: 897 of 898, 0.50 frames ahead), its GPU time per game frame and per filled flash with the share of the GPU (Townfall: 0.068 ms, +0.136 ms, about 0.4%), when it waited or wasn't available, a line in the session header and its log lines among the presenter events. Motion test unchanged; the tools zip no longer carries old Vulkan layer zips (1.0.33–1.0.36) bundled by mistake.
 - **[Docs]** Settings guide: **Frame warp**, and its hotkey. README: **Antivirus warnings** (why a few engines flag the files, and how to check them).
 
 ## [1.0.40] — 2026-11-14 (Manager 1.3.20)

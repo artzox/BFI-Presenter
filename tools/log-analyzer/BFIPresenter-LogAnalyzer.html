@@ -122,7 +122,7 @@ footer{color:var(--ink-3);font-size:12.5px;max-width:80ch}
   <div id="out" style="display:flex;flex-direction:column;gap:22px"></div>
 
   <footer>
-    How it reads the logs: a flash is a lit refresh. At the cap in use the presenter expects a set number of new game frames per flash (one at Half, two at Refresh with 2 frames per cycle). <b>Repeated</b> counts flashes that showed the previous frame again, <b>skipped</b> counts flashes where a frame was dropped. Seconds below 3 fps (loading) and hitch-guard pauses are left out. Input to flash is the game's Reflex time from input to present plus the presenter's release-to-flash time, so it needs a Reflex game. Rows under 8 seconds are shown but not ranked.
+    How it reads the logs: a flash is a lit refresh. At the cap in use the presenter expects a set number of new game frames per flash (one at Half, two at Refresh with 2 frames per cycle). <b>Repeated</b> counts flashes that showed the previous frame again, <b>skipped</b> counts flashes where a frame was dropped. <b>Repeated after warp</b> (DX 1.0.41, Vulkan 1.0.42) takes off the repeats frame warp filled with the frame moved on, and the cadence counts what was left on screen (hover it for the figure before); seconds where frame warp waited, because the frame rate was outside its range (menus, loading), get a row of their own. Seconds below 3 fps (loading) and hitch-guard pauses are left out. Input to flash is the game's Reflex time from input to present plus the presenter's release-to-flash time, so it needs a Reflex game. Rows under 8 seconds are shown but not ranked.
   </footer>
 </div>
 
@@ -254,12 +254,27 @@ function analyse(s){
       // Refresh (cap_period 1) and holds the game before its next frame -- one game frame per strobe cycle.
       const hold=!rl && !r.fg_active && r.cap_set===1 && r.auto_cap===1 && per<=1 ? 1 : 0;
       if(hold) per=frames;
-      const key=[r.cap_set,per,r.pacing,r.fg_active?1:0,rl?1:0,hold].join("|");
+      // 1.0.41: seconds while frame warp waited (frame rate outside its range: menus, loading, a game far below the
+      // strobe rate) get a row of their own, so their repeats aren't read as frame warp failing in play.
+      const wwait=r.warp_state===1?1:0;
+      const key=[r.cap_set,per,r.pacing,r.fg_active?1:0,rl?1:0,hold,wwait].join("|");
       secRows.push({t:r.time_s,key,r,per,rl});
     }
   }
   // lit-refresh cadence from the per-present log
   const litStats={}; // key -> {n,rep,skip,unevenRuns...}
+  // 1.0.42: the Vulkan layer logs frame warp per refresh (warp_ahead, warp_pass_gpu_ms, draw_gpu_ms, draw_was_warped)
+  // and its state in BFIPresenterVK.log ("frame warp at work" / "waiting", on the same clock as time_ms).
+  const vkW=L && L.length && "warp_ahead" in L[0] && !(R && R.length && "warp_state" in R[0]);
+  let vkEv=[];
+  if(vkW && s.rs && s.rs.vk) vkEv=s.rs.ev.filter(e=>/^frame warp (at work|waiting)/.test(e.text)).map(e=>({t:e.rel*1000,st:/at work/.test(e.text)?2:1}));
+  function vkState(tms){ if(!vkW) return 0; let st=vkEv.length?0:2; for(const e of vkEv){ if(e.t<=tms) st=e.st; else break; } return st; }
+  // Vulkan layer: its own frame limit at the game's Reflex sleep (frame generation) sets the game's rate, as
+  // reflex_limit_us does in the DX reflex CSV: "... Reflex sleep on (33333 us per rendered frame, frame generation 2x)".
+  let vkLim=[];
+  if(!R && s.rs && s.rs.vk) for(const e of s.rs.ev){ const m=e.text.match(/^frame limit at the game's Reflex sleep (on|off) \((\d+) us per rendered frame, frame generation (\d+)x\)/);
+    if(m) vkLim.push({t:e.rel*1000,us:m[1]==="on"?(+m[2])/Math.max(1,+m[3]):0}); }
+  function vkLimitAt(tms){ let us=0; for(const e of vkLim){ if(e.t<=tms) us=e.us; else break; } return us; }
   function keyAt(tms){
     if(!secRows.length) return null;
     let lo=0,hi=secRows.length-1; const ts=tms/1000;
@@ -275,13 +290,15 @@ function analyse(s){
       const sr=keyAt(b.time_ms);
       let key, per;
       if(sr){ if(sr.r.game_fps<3) continue; key=sr.key; per=sr.per; }
-      else { per=capPeriod(a.cap,a.frames); key=[a.cap,per,a.pacing,-1,-1,0].join("|"); }
+      else { per=capPeriod(a.cap,a.frames); const lu=vkLimitAt(b.time_ms); if(lu>0 && hz>0) per=Math.max(1,Math.round(lu*hz/1e6));
+        key=[a.cap,per,a.pacing,lu>0?1:-1,lu>0?1:-1,0,vkState(b.time_ms)===1?1:0].join("|"); }
       const st=litStats[key]||(litStats[key]={n:0,rep:0,skip:0,off:0,per,frames:a.frames,secs:0,runFrames:0,runOff:0,run:0,last:null});
       st.n++; st.secs+=dt/1000;
       if(b.release_to_flash_ms>0){st.r2fSum=(st.r2fSum||0)+b.release_to_flash_ms; st.r2fN=(st.r2fN||0)+1;}
       if(b.ready_before_pick_ms>=0){st.rdy=st.rdy||[]; st.rdy.push(b.ready_before_pick_ms);}
       const d=b.frame_id-a.frame_id;
       const E=per>0?a.frames/per:0;
+      if(vkW){ st.vkW=1; if(d===0 && b.warp_ahead>0) st.wfill=(st.wfill||0)+1; }
       if(E>=1){ const e=Math.round(E); if(d!==e) st.off++; if(d===0) st.rep++; else if(d>e) st.skip++; }
       else if(E>0){ // several flashes per game frame expected
         const K=Math.round(1/E);
@@ -299,7 +316,7 @@ function analyse(s){
     for(const k in litStats){ const sg=pushSeg(k); sg.secs=Math.round(litStats[k].secs); }
   }
   for(const key in segs){
-    const sg=segs[key]; const [cap,per,pac,fg,rl,hold]=key.split("|").map(Number);
+    const sg=segs[key]; const [cap,per,pac,fg,rl,hold,wwait]=key.split("|").map(Number);
     const rows=sg.rows;
     const m=(c,f=v=>v>=0)=>mean(rows.map(r=>r[c]).filter(f));
     const presented=rows.length?m("game_fps"):NaN;
@@ -319,7 +336,17 @@ function analyse(s){
     const rep = ls&&ls.n? ls.rep/ls.n*100 : NaN, skip= ls&&ls.n? ls.skip/ls.n*100 : NaN;
     const uneven = ls&&ls.n? ls.off/ls.n*100 : (isNaN(shown)?NaN:Math.max(0,(1-shown/ideal)*100));
     const startMs=hold&&rows.length?m("align_shift_ms",v=>v>0):NaN;
-    sg.m={cap,per,pac,fg,rl,hold,startMs,ready,presented,rendered,shown,ideal,r2f,s2p,i2f:(s2p>0&&r2f>0)?s2p+r2f:NaN,submit,gpu,autoCap,jitLimit,rep,skip,uneven,target:per>0?hz/per:hz};
+    // Repeated after frame warp: the share of repeats it filled in these seconds (reflex CSV, 1.0.41) taken off.
+    let repAfter=NaN;
+    if(rows.length && "warp_state" in rows[0]){
+      const armed=rows.filter(r=>r.warp_state===2);
+      if(armed.length){ const wr=rows.reduce((a,r)=>a+(r.frame_repeats>0?r.frame_repeats:0),0), wf=rows.reduce((a,r)=>a+(r.warp_filled>0?r.warp_filled:0),0);
+        repAfter=isNaN(rep)?NaN:(wr>0?rep*Math.max(0,1-wf/wr):rep); }
+      else if(wwait) repAfter=rep;   // waiting: nothing filled
+    } else if(ls && ls.vkW && ls.n && !isNaN(rep)) repAfter=Math.max(0,(ls.rep-(ls.wfill||0))/ls.n*100);   // Vulkan, per refresh
+    sg.m={cap,per,pac,fg,rl,hold,wwait,repAfter,startMs,ready,presented,rendered,shown,ideal,r2f,s2p,i2f:(s2p>0&&r2f>0)?s2p+r2f:NaN,submit,gpu,autoCap,jitLimit,rep,skip,uneven,target:per>0?hz/per:hz};
+    // Cadence as shown on screen: repeats frame warp filled no longer count (unevenRaw keeps the figure before it).
+    if(!isNaN(repAfter) && !isNaN(uneven) && !isNaN(rep) && rep>repAfter){ sg.m.unevenRaw=uneven; sg.m.uneven=Math.max(0,uneven-(rep-repAfter)); }
     sg.label=modeLabel(sg.m,hz,frames);
     out.segments.push(sg);
   }
@@ -339,7 +366,7 @@ function analyse(s){
     const w={secs:R.length,on:on.length,wait:wait.length,na:na.length,
       repOn:on.reduce((a,r)=>a+(r.frame_repeats>0?r.frame_repeats:0),0), filled:on.reduce((a,r)=>a+(r.warp_filled>0?r.warp_filled:0),0),
       repAll:R.reduce((a,r)=>a+(r.frame_repeats>0?r.frame_repeats:0),0),
-      ahead:mean(on.filter(r=>r.warp_ahead>0).map(r=>r.warp_ahead)), fpsOn:mean(on.filter(r=>r.game_fps>3).map(r=>r.game_fps))};
+      ahead:mean(on.filter(r=>r.warp_ahead>0).map(r=>r.warp_ahead)), fpsOn:pct(on.filter(r=>r.game_fps>3).map(r=>r.game_fps),.5)};
     if("warp_pass_gpu_ms" in R[0]){
       w.pass=mean(R.filter(r=>r.warp_pass_gpu_ms>=0).map(r=>r.warp_pass_gpu_ms));
       w.passes=mean(R.filter(r=>r.warp_pass_gpu_ms>=0).map(r=>r.warp_passes));
@@ -349,6 +376,23 @@ function analyse(s){
       w.share=perSec/10;   // ms of GPU time a second -> percent
     }
     if(w.on||w.wait||w.na) out.facts.warp=w;
+  }
+  if(vkW){
+    const lit=L.filter(r=>r.slot===0); let prev=null, onT=0, waitT=0, repOn=0, filled=0, newOn=0; const ah=[];
+    for(let i=0;i<lit.length;i++){ const b=lit[i]; const st=vkState(b.time_ms);
+      if(i>0 && !b.hitch_paused && !lit[i-1].hitch_paused){ const dt=(b.time_ms-lit[i-1].time_ms)/1000; if(dt<0.5){ if(st===2) onT+=dt; else if(st===1) waitT+=dt; }
+        if(st===2){ if(b.frame_id===prev){ repOn++; if(b.warp_ahead>0){ filled++; ah.push(b.warp_ahead); } } else newOn++; } }
+      prev=b.frame_id; }
+    const ps=L.filter(r=>r.warp_pass_gpu_ms>=0).map(r=>r.warp_pass_gpu_ms);
+    const w={vk:true,secs:Math.round(onT+waitT),on:Math.round(onT),wait:Math.round(waitT),na:0,repOn,filled,ahead:mean(ah),fpsOn:onT>0?newOn/onT:NaN};
+    if(ps.length){
+      w.pass=mean(ps); w.passes=onT>0?newOn/onT:NaN;
+      w.draw=mean(lit.filter(r=>r.draw_gpu_ms>=0&&r.draw_was_warped!==1).map(r=>r.draw_gpu_ms));
+      w.drawW=mean(lit.filter(r=>r.draw_gpu_ms>=0&&r.draw_was_warped===1).map(r=>r.draw_gpu_ms));
+      const perSec=w.pass*(w.passes||0)+(isNaN(w.drawW)||isNaN(w.draw)?0:Math.max(0,w.drawW-w.draw)*(onT>0?filled/onT:0));
+      w.share=perSec/10;
+    }
+    if(w.on||w.wait) out.facts.warp=w;
   }
   // ReShade.log events in this session's window
   if(s.rs){
@@ -368,6 +412,7 @@ function modeLabel(m,hz,frames){
   if(m.hold===1) parts.push("auto cap → "+Math.round(hz/m.per)+" fps, held at the frame start"+(m.startMs>0?" +"+m.startMs.toFixed(1)+" ms into the cycle":""));
   else if(m.cap===1 && m.per>1) parts.push((m.rl===1?"Reflex limit":"auto cap")+" → "+Math.round(hz/m.per)+" fps"+(m.rl===1?"":", held at the present"));
   else if(m.rl===1) parts.push("Reflex frame limit");
+  if(m.wwait===1) parts.push("frame warp waiting: frame rate outside its range (menus, loading)");
   return {main:name+(m.pac in PACING?" + "+PACING[m.pac]:""), sub:[(m.fg===1?"frame generation on":m.fg===0?"frame generation off":null),...parts].filter(Boolean).join(" · ")};
 }
 function f0(v){return isNaN(v)?"–":Math.round(v).toString()}
@@ -383,7 +428,7 @@ function findings(out,hz,frames){
   for(const s of out.segments){ const m=s.m, nm=s.label.main+(s.label.sub?` (${s.label.sub})`:"");
     if(s.secs<5) continue;
     if(m.per>0 && !isNaN(m.presented) && m.presented<0.93*m.target && !(m.fg===1&&m.cap===1&&!m.rl))
-      add("warn",`${nm}: the game ran ${f0(m.presented)} fps against the cap's ${f0(m.target)}, so frames miss their flash. ${m.cap===1?"Turn on the automatic frame cap or use Half refresh.":"A lower cap or lighter game settings even it out."}`);
+      add(m.wwait===1?"info":"warn",`${nm}: the game ran ${f0(m.presented)} fps against the cap's ${f0(m.target)}, so frames miss their flash${m.wwait===1?" (frame warp waits this far below the strobe rate). If this was a menu, loading or a cutscene, it can be ignored; in play, a lower cap or lighter settings even it out.":". "+(m.cap===1?"Turn on the automatic frame cap or use Half refresh.":"A lower cap or lighter game settings even it out.")}`);
     if(m.fg===1 && m.cap===1 && !m.rl && m.presented>0.55*hz && m.presented<0.93*hz)
       add("bad",`${nm}: frame generation ran uncapped at ${f0(m.presented)} fps, between the strobe rate and the refresh rate, which judders. No Reflex limit was in use${ev.some(e=>/fell to/.test(e.text))?" (the game collapsed under it earlier)":""}. If ${f0(m.rendered)} rendered fps × the frame-generation factor lands near ${f0(hz/frames)}, try Half refresh + Smooth.`);
     if(m.fg===1 && m.cap===2 && m.pac===1 && m.uneven>5)
@@ -440,8 +485,8 @@ function findings(out,hz,frames){
     if(w.na && !w.on) add("warn","Frame warp was on but not available (its shaders or textures couldn't be created; see ReShade.log).");
     else if(w.on){
       const share=w.repOn?w.filled/w.repOn*100:NaN;
-      add(w.repOn?"good":"info",`Frame warp was at work for ${w.on} s${isNaN(w.fpsOn)?"":" (game at "+f0(w.fpsOn)+" fps)"}: it filled ${w.filled} of ${w.repOn} repeated strobe cycles${isNaN(share)?"":" ("+(share>=99&&share<100?share.toFixed(1)+"%":fp(share))+")"}${isNaN(w.ahead)?"":", "+w.ahead.toFixed(2)+" frames ahead on average"}${w.repOn?" (the Repeated and Cadence columns count them before filling)":""}.${w.repOn?"":" The game held the strobe rate, so there was nothing to fill."}`);
-      if(!isNaN(w.pass)) add("info",`Frame warp's GPU time: ${w.pass.toFixed(3)} ms per new game frame (${f0(w.passes)} a second)${isNaN(w.drawW)||isNaN(w.draw)?"":`, and ${(w.drawW-w.draw).toFixed(3)} ms more for a filled flash's draw (${w.drawW.toFixed(3)} against ${w.draw.toFixed(3)} ms)`}: about ${w.share<0.1?"0.1":w.share.toFixed(1)}% of the GPU. It adds no latency.`);
+      add(w.repOn?"good":"info",`Frame warp was at work for ${w.on} s${isNaN(w.fpsOn)?"":" (game at "+f0(w.fpsOn)+" fps)"}: it filled ${w.filled} of ${w.repOn} repeated strobe cycles${isNaN(share)?"":" ("+(share>=99&&share<100?share.toFixed(1)+"%":fp(share))+")"}${isNaN(w.ahead)?"":", "+w.ahead.toFixed(2)+" frames ahead on average"}${w.repOn?" (Repeated counts them before filling, Repeated after warp what was left)":""}.${w.repOn?"":" The game held the strobe rate, so there was nothing to fill."}`);
+      if(!isNaN(w.pass)) add("info",`Frame warp's GPU time: ${w.pass.toFixed(3)} ms per new game frame (${f0(w.passes)} a second)${isNaN(w.drawW)||isNaN(w.draw)?"":(w.drawW-w.draw<0.01?`; a filled flash's draw took no measurable extra (${w.drawW.toFixed(3)} against ${w.draw.toFixed(3)} ms)`:`, and ${(w.drawW-w.draw).toFixed(3)} ms more for a filled flash's draw (${w.drawW.toFixed(3)} against ${w.draw.toFixed(3)} ms)`)}: about ${w.share<0.1?"0.1":w.share.toFixed(1)}% of the GPU. It adds no latency.`);
     }
     if(w.wait>=10 && w.wait>w.on) add("info",`Frame warp waited ${w.wait} s: the game's frame rate was outside its range (below Only from, or above the strobe rate), or there was no steady frame rate (loading).`);
   }
@@ -459,12 +504,12 @@ function segRow(sg,isBest,extraFirst){
   <td class="num">${sg.secs}s${sg.stall?`<br><span class="note">+${sg.stall}s loading</span>`:""}</td>
   <td class="num">${f0(m.presented)}</td><td class="num">${f0(m.rendered)}</td>
   <td class="num">${isNaN(m.shown)?"–":f1(m.shown)+" / "+f0(m.ideal)}</td>
-  <td class="num">${fp(m.rep)}</td><td class="num">${fp(m.skip)}</td>
-  <td>${g?`<span class="pill ${g[0]}">${g[1]} ${fp(m.uneven)}</span>`:"–"}</td>
+  <td class="num">${fp(m.rep)}</td><td class="num">${fp(m.repAfter)}</td><td class="num">${fp(m.skip)}</td>
+  <td>${g?`<span class="pill ${g[0]}"${isNaN(m.unevenRaw)?"":` title="${fp(m.unevenRaw)} before frame warp filled the repeats"`}>${g[1]} ${fp(m.uneven)}</span>`:"–"}</td>
   <td class="num">${f0(m.r2f)}</td><td class="num">${f0(m.i2f)}</td>
   <td class="num">${f0(m.submit)} / ${f0(m.gpu)}</td></tr>`;
 }
-const THEAD=`<thead><tr><th>Mode</th><th>Time</th><th>Presented fps</th><th>Rendered fps</th><th>New frames / s (of ideal)</th><th>Repeated</th><th>Skipped</th><th>Cadence</th><th>Release → flash ms</th><th>Input → flash ms</th><th>Submit / GPU ms</th></tr></thead>`;
+const THEAD=`<thead><tr><th>Mode</th><th>Time</th><th>Presented fps</th><th>Rendered fps</th><th>New frames / s (of ideal)</th><th>Repeated</th><th title="Repeated flashes left after frame warp filled them (DX: 1.0.41 reflex CSV; Vulkan: 1.0.42 log CSV with BFIPresenterVK.log)">Repeated after warp</th><th>Skipped</th><th>Cadence</th><th>Release → flash ms</th><th>Input → flash ms</th><th>Submit / GPU ms</th></tr></thead>`;
 
 function chart(tl,segments){
   if(!tl.length) return "";
@@ -541,8 +586,8 @@ function summaryText(){
   for(const r of LAST){
     t+=`## ${r.facts.exe||"Session"} ${r.stamp||""}${r.facts.version?" (v"+r.facts.version+")":""}\n`;
     if(r.bestText) t+=`Best: ${r.bestText}\n`;
-    t+=`\n| Mode | Time | Presented | Rendered | New frames/s | Repeated | Skipped | Off-cadence | Release→flash | Input→flash |\n|---|---|---|---|---|---|---|---|---|---|\n`;
-    for(const sg of r.segments){if(sg.secs<3) continue; const m=sg.m; t+=`| ${sg.label.main}${sg.label.sub?" ("+sg.label.sub+")":""} | ${sg.secs}s | ${f0(m.presented)} | ${f0(m.rendered)} | ${isNaN(m.shown)?"–":f1(m.shown)+"/"+f0(m.ideal)} | ${fp(m.rep)} | ${fp(m.skip)} | ${fp(m.uneven)} | ${f0(m.r2f)} | ${f0(m.i2f)} |\n`;}
+    t+=`\n| Mode | Time | Presented | Rendered | New frames/s | Repeated | After warp | Skipped | Off-cadence | Release→flash | Input→flash |\n|---|---|---|---|---|---|---|---|---|---|---|\n`;
+    for(const sg of r.segments){if(sg.secs<3) continue; const m=sg.m; t+=`| ${sg.label.main}${sg.label.sub?" ("+sg.label.sub+")":""} | ${sg.secs}s | ${f0(m.presented)} | ${f0(m.rendered)} | ${isNaN(m.shown)?"–":f1(m.shown)+"/"+f0(m.ideal)} | ${fp(m.rep)} | ${fp(m.repAfter)} | ${fp(m.skip)} | ${fp(m.uneven)} | ${f0(m.r2f)} | ${f0(m.i2f)} |\n`;}
     for(const f of r.findings) t+=`- ${f.t}\n`;
     t+="\n";
   }
