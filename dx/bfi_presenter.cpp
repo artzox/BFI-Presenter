@@ -3314,6 +3314,8 @@ static void ReflexTick(int limitUs, ReflexSecond &out);
 // thread of its own: the calls took at most 0.6 ms either way, in Control, Jusant and Returnal, so nothing to move.)
 static std::atomic<double> g_rtMs{-1.0};
 static int g_showOverlaysBoot = -1;            // ShowOverlays as read at start (-1 not yet); fixed for the session
+static std::atomic<int> g_presHeldMask{0};      // last 8 seconds, newest in bit 0: the presenter's presents held below the refresh rate
+static std::atomic<double> g_presHeldRate{0.0}; // presents a second in the last such second
 static std::atomic<int> g_darkState{0};   // QueueDarkRefresh: 0 not yet, 1 running, 2 off for this session (the queued present waited)
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
 static double g_coarseTargetS = 0.005;        // the coarse alignment's margin (presenter thread only)
@@ -4705,8 +4707,19 @@ static DWORD WINAPI PresenterThread(void *)
                         // Overlay hooks (ShowOverlays=1) make the queued present wait for the lit one's overlay drawing
                         // (Cocoon, t6: off with ShowOverlays=1, 1 wait in 120 without).
                         const bool viaOverlays = g_showOverlaysBoot == 1;
-                        g_darkState.store(viaOverlays ? 3 : 2);
-                        if (viaOverlays)
+                        // A frame limiter on the presenter's presents holds the queued one back (Spider-Man 2, t9: off at
+                        // 18:40:33, then "held to 116.0 presents/s" -- NVIDIA's own cap under the refresh rate).
+                        const int heldMask = g_presHeldMask.load();
+                        int heldN = 0;
+                        for (int b = 0; b < 4; b++) heldN += (heldMask >> b) & 1;
+                        const bool viaLimiter = !viaOverlays && heldN >= 2;
+                        g_darkState.store(viaOverlays ? 3 : viaLimiter ? 4 : 2);
+                        if (viaLimiter)
+                            LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
+                                 "pairs -- a frame limiter holds the presenter's presents (%.1f a second): RTSS's frame limit, Max Frame Rate "
+                                 "in the NVIDIA control panel, or NVIDIA's cap under the refresh rate with Low Latency Mode Ultra or Reflex "
+                                 "plus G-SYNC and VSync; with those off it can run", pairBlocked, pairSeen, g_presHeldRate.load());
+                        else if (viaOverlays)
                             LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
                                  "pairs -- the overlays drawn in each present (ShowOverlays=1) hold it up; ShowOverlays=0 lets it run",
                                  pairBlocked, pairSeen);
@@ -4951,13 +4964,18 @@ static DWORD WINAPI PresenterThread(void *)
                 // presents through, so the strobe slips a refresh every half
                 // second or so. VRR would pull the display rate down with it.
                 const double prate = secPresents / (t - secStart);
-                limitSecs = (prate < 0.985 * hz && prate > 0.5 * hz && secLate < 3 && hz > 0.97 * peakHz) ? limitSecs + 1 : 0;
+                const bool heldSec = prate < 0.985 * hz && prate > 0.5 * hz && secLate < 3 && hz > 0.97 * peakHz;
+                limitSecs = heldSec ? limitSecs + 1 : 0;
+                g_presHeldMask.store(((g_presHeldMask.load() << 1) | (heldSec ? 1 : 0)) & 0xFF);
+                if (heldSec) g_presHeldRate.store(prate);
                 if (limitSecs == 3 && !limitLogged)
                 {
                     limitLogged = true;
                     LOGW("BFI Presenter: the presenter is held to %.1f presents/s on a %.1f Hz display -- a frame limiter "
-                         "is acting on it (RTSS: set the frame limit to 0 for this game). The strobe slips a refresh "
-                         "about %.0f times a second, which shows as flicker.", prate, hz, hz - prate);
+                         "is acting on it: RTSS's frame limit, Max Frame Rate in the NVIDIA control panel, or NVIDIA's own cap a little under "
+                         "the refresh rate (e.g. 116 at 120 Hz) that Low Latency Mode Ultra or Reflex sets with G-SYNC and VSync on -- set "
+                         "those to off / 0 for this game. The strobe slips a refresh about %.0f times a second, which shows as flicker.",
+                         prate, hz, hz - prate);
                 }
             }
             if (sok && haveStats) rep = (int)(st.SyncRefreshCount - lastSync) - (int)(st.PresentCount - lastPC);
@@ -11846,7 +11864,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
                               GradualSaverOn(s) ? "not in use while an LCD saver is on" :
                               g_darkState.load() == 2 ? "off for this session: the swap chain takes one pending present (see the log)" :
                               g_darkState.load() == 3 ? "off for this session: the overlays (Show overlays) hold up the queued present; "
-                                                        "turn Show overlays off to use it" : nullptr;
+                                                        "turn Show overlays off to use it" :
+                              g_darkState.load() == 4 ? "off for this session: a frame limiter holds the presenter's presents (RTSS, the NVIDIA "
+                                                        "control panel's Max Frame Rate, or Low Latency Mode Ultra / Reflex with G-SYNC + VSync); "
+                                                        "see the log" : nullptr;
             if (why)
             {
                 ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
