@@ -3834,7 +3834,9 @@ static DWORD WINAPI PresenterThread(void *)
     int pairBlocked = 0, pairSeen = 0, pairLogs = 0;   // queued refreshes whose present blocked, and all of them, in the current window
     int pairBadWins = 0;             // windows in a row where most queued presents waited (two switch it off)
     double pairStartT = 0.0;         // when the dark queue first ran this session (not judged for its first 5 s)
-    bool pairOff = false;            // ... three times: off for this session
+    bool pairOff = false;            // off now (the queued presents kept waiting)
+    double pairRetryT = 0.0;         // when it tries again (0: off for the session)
+    int pairRetries = 0;             // tries again after 1, 2, 4 and 8 minutes, then stays off
     double secStatsMs = 0.0, secVramMs = -1.0;   // the once-a-second block's calls into DXGI and the driver, timed for the reflex log
     bool vsyncOverridden = false;    // the driver is not honouring the presenter's VSync
     int  vsyncFastSecs = 0;          // seconds in a row with presents well above the refresh count
@@ -4704,6 +4706,13 @@ static DWORD WINAPI PresenterThread(void *)
                     if (pairBadWins >= 2)
                     {
                         pairOff = true;
+                        // Waits can come and go (Spider-Man 2, t10: 0.1 ms for 5 minutes, then every queued present 8 ms, one
+                        // refresh, with no frame limiter and no late presents): it tries again later, four times.
+                        const int retryS = pairRetries < 4 ? 60 << pairRetries : 0;
+                        pairRetryT = retryS > 0 ? tPres + retryS : 0.0;
+                        char again[64];
+                        if (retryS > 0) snprintf(again, sizeof(again), "off for %d min (tries again then)", retryS / 60);
+                        else snprintf(again, sizeof(again), "off for this session");
                         // Overlay hooks (ShowOverlays=1) make the queued present wait for the lit one's overlay drawing
                         // (Cocoon, t6: off with ShowOverlays=1, 1 wait in 120 without).
                         const bool viaOverlays = g_showOverlaysBoot == 1;
@@ -4715,23 +4724,32 @@ static DWORD WINAPI PresenterThread(void *)
                         const bool viaLimiter = !viaOverlays && heldN >= 2;
                         g_darkState.store(viaOverlays ? 3 : viaLimiter ? 4 : 2);
                         if (viaLimiter)
-                            LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
+                            LOGW("BFI Presenter: QueueDarkRefresh %s: the queued refresh's present waited in %d of %d "
                                  "pairs -- a frame limiter holds the presenter's presents (%.1f a second): RTSS's frame limit, Max Frame Rate "
                                  "in the NVIDIA control panel, or NVIDIA's cap under the refresh rate with Low Latency Mode Ultra or Reflex "
-                                 "plus G-SYNC and VSync; with those off it can run", pairBlocked, pairSeen, g_presHeldRate.load());
+                                 "plus G-SYNC and VSync; with those off it can run", again, pairBlocked, pairSeen, g_presHeldRate.load());
                         else if (viaOverlays)
-                            LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
+                            LOGW("BFI Presenter: QueueDarkRefresh %s: the queued refresh's present waited in %d of %d "
                                  "pairs -- the overlays drawn in each present (ShowOverlays=1) hold it up; ShowOverlays=0 lets it run",
-                                 pairBlocked, pairSeen);
+                                 again, pairBlocked, pairSeen);
                         else
-                            LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
-                                 "pairs (the swap chain takes one pending present)", pairBlocked, pairSeen);
+                            LOGW("BFI Presenter: QueueDarkRefresh %s: the queued refresh's present waited in %d of %d "
+                                 "pairs (the swap chain took only one pending present)", again, pairBlocked, pairSeen);
                     }
                     else if (pairBlocked > 0 && ++pairLogs <= 20)
                         LOGI("BFI Presenter: QueueDarkRefresh: the queued refresh's present waited in %d of the last %d pairs", pairBlocked, pairSeen);
                     pairSeen = pairBlocked = 0;
                 }
             }
+        }
+        else if (s.queueDark && pairOff && pairRetryT > 0.0 && tPres >= pairRetryT)
+        {
+            pairOff = false;
+            pairRetries++;
+            pairSeen = pairBlocked = pairBadWins = 0;
+            pairStartT = 0.0;                // judged again from 5 s after it starts
+            g_darkState.store(0);
+            LOGI("BFI Presenter: QueueDarkRefresh: trying again (try %d of 4)", pairRetries);
         }
         else if (s.queueDark && !pairOff && tickedAtVb && s.pacing && !s.queueAhead && !vsyncOverridden && n >= 3 && s.enabled &&
                  s.frames >= 2 && slotNow == 0 && !hitchPaused && swapState == 0 && soften <= 0.0f && !GradualSaverOn(s) && SUCCEEDED(hr))
@@ -11862,10 +11880,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
                               bufs < 3 ? (s.presBuffers >= 3 ? "not in use yet: 3 presenter buffers apply at the game's next resize"
                                                              : "not in use: needs 3 presenter buffers") :
                               GradualSaverOn(s) ? "not in use while an LCD saver is on" :
-                              g_darkState.load() == 2 ? "off for this session: the swap chain takes one pending present (see the log)" :
-                              g_darkState.load() == 3 ? "off for this session: the overlays (Show overlays) hold up the queued present; "
+                              g_darkState.load() == 2 ? "off for now: the queued presents kept waiting (see the log; it tries again later)" :
+                              g_darkState.load() == 3 ? "off for now: the overlays (Show overlays) hold up the queued present; "
                                                         "turn Show overlays off to use it" :
-                              g_darkState.load() == 4 ? "off for this session: a frame limiter holds the presenter's presents (RTSS, the NVIDIA "
+                              g_darkState.load() == 4 ? "off for now: a frame limiter holds the presenter's presents (RTSS, the NVIDIA "
                                                         "control panel's Max Frame Rate, or Low Latency Mode Ultra / Reflex with G-SYNC + VSync); "
                                                         "see the log" : nullptr;
             if (why)
