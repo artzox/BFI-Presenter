@@ -183,6 +183,7 @@ struct Settings
     int   queuePriority = 2;  // presenter GPU queue: 0 normal, 1 high, 2 realtime if allowed else high
     int   pacing   = 1;       // 1 = wait for vblank before each present, 0 = present queue only
     int   log      = 0;
+    int   logGpuTimes = 1;   // LogGpuTimes: with the timing log, the presenter's draws are timed on the GPU (timestamp queries)
     int   dx11     = 1;       // manage DX11 games (through the add-on's own D3D12 presenter)
     // SDR to HDR (DX11, DX9, OpenGL: the presenter's own swap chain): an SDR game on an HDR display is presented as
     // HDR10, so the lit refresh has headroom above SDR white (as the Vulkan layer). Applies when the swap chain is next created.
@@ -380,6 +381,7 @@ static void LoadSettings(Settings &s)
     g_maxAhead.store(s.autoAhead && s.maxAhead ? 1 : s.maxAhead);
     s.pacing   = IniInt("WaitForVBlank", 1);
     s.log      = IniInt("Log", 0);
+    s.logGpuTimes = IniInt("LogGpuTimes", 1) ? 1 : 0;
     s.dx11     = IniInt("DX11Support", 1) ? 1 : 0;
     s.sdrToHdr = IniInt("SdrToHdr", 1) ? 1 : 0;
     s.sdrWhite = IniFloat("SdrWhiteNits", 200.0f);
@@ -4448,7 +4450,7 @@ static DWORD WINAPI PresenterThread(void *)
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         // Frame warp: a frame's first refresh measures its brightness pyramid (one pass over the frame, four tiny
         // ones); the motion from the frame before is measured only when the frame is shown moved, once per pair.
-        const bool tsOn = tsHeap && logf;                // timed only while the timing log runs
+        const bool tsOn = tsHeap && logf && s.logGpuTimes;   // timed only while the timing log runs (LogGpuTimes=0: not at all)
         if (tsOn) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 0);
         bool warpTouched = false;
         if (s.frameWarp && warp.ok)
