@@ -3830,6 +3830,8 @@ static DWORD WINAPI PresenterThread(void *)
     double pairVbT = 0.0;            // > 0: the vblank the lit refresh of the last pair was drawn at
     double pairLitPresS = 0.0;       // how long the lit refresh's Present call took (overlays drawn in it: Cocoon 4.4 ms)
     int pairBlocked = 0, pairSeen = 0, pairLogs = 0;   // queued refreshes whose present blocked, and all of them, in the current window
+    int pairBadWins = 0;             // windows in a row where most queued presents waited (two switch it off)
+    double pairStartT = 0.0;         // when the dark queue first ran this session (not judged for its first 5 s)
     bool pairOff = false;            // ... three times: off for this session
     double secStatsMs = 0.0, secVramMs = -1.0;   // the once-a-second block's calls into DXGI and the driver, timed for the reflex log
     bool vsyncOverridden = false;    // the driver is not honouring the presenter's VSync
@@ -4681,7 +4683,11 @@ static DWORD WINAPI PresenterThread(void *)
             // Judged over 120 steady pairs (2 s): a swap chain that holds one pending present blocks nearly every one,
             // while a stall at start or in loading blocks a few (Control, t1: off after 3 waits in its first second,
             // while the game was still loading).
-            if (!pairOff && !hitchPaused)
+            // Not judged while the game starts up (Soul Reaver, OpenGL, t7: off after 115 waits of 120 in its first
+            // 3 s, around a hitch pause, then 0.09 ms presents for the rest of the session), and a hitch pause starts
+            // the window again.
+            if (hitchPaused) pairSeen = pairBlocked = pairBadWins = 0;
+            else if (!pairOff && tPres - pairStartT >= 5.0)
             {
                 pairSeen++;
                 // Waited: the call took half a refresh, and a quarter of a refresh longer than the lit one's. Overlay
@@ -4692,7 +4698,8 @@ static DWORD WINAPI PresenterThread(void *)
                 if (prDur > 0.5 / prHz && prDur - pairLitPresS > 0.25 / prHz) pairBlocked++;
                 if (pairSeen >= 120)
                 {
-                    if (pairBlocked * 2 > pairSeen)
+                    pairBadWins = pairBlocked * 2 > pairSeen ? pairBadWins + 1 : 0;
+                    if (pairBadWins >= 2)
                     {
                         pairOff = true;
                         // Overlay hooks (ShowOverlays=1) make the queued present wait for the lit one's overlay drawing
@@ -4719,6 +4726,7 @@ static DWORD WINAPI PresenterThread(void *)
             pairNext = true;
             pairVbT = tVb;
             pairLitPresS = tPres - tSub;
+            if (pairStartT <= 0.0) pairStartT = tPres;
             g_darkState.store(1);
             static bool pairLogged = false;
             if (!pairLogged)
