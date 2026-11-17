@@ -3797,7 +3797,7 @@ static DWORD WINAPI PresenterThread(void *)
     // pick doesn't move: no added latency. The next lit refresh is picked two vblanks after this one's.
     bool pairNext = false;           // this iteration: the refresh queued behind the lit one (no vblank wait)
     double pairVbT = 0.0;            // > 0: the vblank the lit refresh of the last pair was drawn at
-    int pairBlocked = 0;             // presents of the queued refresh that blocked (the queue takes only one)
+    int pairBlocked = 0, pairSeen = 0, pairLogs = 0;   // queued refreshes whose present blocked, and all of them, in the current window
     bool pairOff = false;            // ... three times: off for this session
     bool vsyncOverridden = false;    // the driver is not honouring the presenter's VSync
     int  vsyncFastSecs = 0;          // seconds in a row with presents well above the refresh count
@@ -4644,11 +4644,25 @@ static DWORD WINAPI PresenterThread(void *)
         {
             // The second present should return at once. If it waits for the first one's vblank, the presenter's queue
             // takes only one present and pairing would shift the strobe: off for this session.
-            if (tPres - tSub > 0.5 / (modeHz > 1.0 ? modeHz : 120.0) && !pairOff && ++pairBlocked >= 3)
+            // Judged over 120 steady pairs (2 s): a swap chain that holds one pending present blocks nearly every one,
+            // while a stall at start or in loading blocks a few (Control, t1: off after 3 waits in its first second,
+            // while the game was still loading).
+            if (!pairOff && !hitchPaused)
             {
-                pairOff = true;
-                LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited %.1f ms "
-                     "(the swap chain takes one pending present)", (tPres - tSub) * 1000.0);
+                pairSeen++;
+                if (tPres - tSub > 0.5 / (modeHz > 1.0 ? modeHz : 120.0)) pairBlocked++;
+                if (pairSeen >= 120)
+                {
+                    if (pairBlocked * 2 > pairSeen)
+                    {
+                        pairOff = true;
+                        LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
+                             "pairs (the swap chain takes one pending present)", pairBlocked, pairSeen);
+                    }
+                    else if (pairBlocked > 0 && ++pairLogs <= 20)
+                        LOGI("BFI Presenter: QueueDarkRefresh: the queued refresh's present waited in %d of the last %d pairs", pairBlocked, pairSeen);
+                    pairSeen = pairBlocked = 0;
+                }
             }
         }
         else if (s.queueDark && !pairOff && tickedAtVb && s.pacing && !s.queueAhead && !vsyncOverridden && n >= 3 && s.enabled &&
