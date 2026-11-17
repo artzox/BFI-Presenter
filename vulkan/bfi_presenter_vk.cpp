@@ -59,7 +59,7 @@
 #include "shaders_spv.h"
 #include "../common/bfi_warpclock.h"   // frame warp: how far ahead each strobe cycle shows its frame (shared with DX)
 
-#define BFI_VERSION "1.0.42"
+#define BFI_VERSION "1.0.43"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform

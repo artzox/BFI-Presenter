@@ -126,6 +126,7 @@ Game fps, refreshes per second (should equal the display rate), frame age, uneve
 |---|---|---|
 | Wait for vblank | `WaitForVBlank` (1) | One present per refresh, nothing queued: lowest latency. Needed by just-in-time release |
 | Queue one refresh ahead | `QueueAhead` (0) | Keeps one extra present queued (needs 3 presenter buffers), so an occasional late refresh doesn't flash. +1 refresh (~8 ms) of latency |
+| Queue the dark refresh with the lit one | `QueueDarkRefresh` (1) | The dark refresh (same game frame) is presented right after the lit one: fewer late refreshes, and those left are dark flickers, not bright flashes. No added latency. Needs 3 presenter buffers; not with Queue one refresh ahead; turns itself off where the swap chain can't take it |
 | Presenter buffers | `PresenterBuffers` (3) | Real swap-chain buffers behind the presenter (2–4); applies at the game's next resize |
 | Present on own queue | `PresentOnOwnQueue` (1) | Present and draw on the add-on's own GPU queue, independent of the game's GPU load; applies when the game next creates its swap chain |
 | Hitch guard | `HitchGuard` (1) | While the presenter misses refreshes (3 within half a second) or the game delivers no new frame for the loading time, every refresh is shown at the strobe's average brightness. BFI returns after 1 s without either |

@@ -95,7 +95,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.42"
+#define BFI_ADDON_VERSION "1.0.43"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -144,6 +144,7 @@ struct Settings
     int   autoAhead = 1;      // automatic: 1 frame ahead, 2 while the game keeps missing strobe cycles
     int   presBuffers = 3;    // real swap chain buffers for the presenter (read when presentation moves)
     int   queueAhead = 0;     // with vblank pacing: keep this many extra presents queued (0 or 1)
+    int   queueDark = 1;      // QueueDarkRefresh: the cycle's second refresh is drawn and queued right after the lit one
     int   laterRelease = 0;   // Lowest latency + Refresh cap: release the game just in time for the pick
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
@@ -153,6 +154,7 @@ struct Settings
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
     int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
+    int   learnReflex = 1;       // LearnReflexStart: the Reflex frame limit starts where its alignment settled last time
     int   threadBoost = 1;       // PresenterThreadBoost: the presenter thread registered with MMCSS (applies at the next start)
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap without Reflex holds the game before its next frame starts
     int   fgLimitNoReflex = 1; // FrameGenLimitWithoutReflex: frame generation without Reflex limited to one presented frame per strobe cycle
@@ -318,6 +320,7 @@ static void LoadSettings(Settings &s)
     s.smoothCatchUp = IniInt("SmoothCatchUp", 0) ? 1 : 0;
     s.presBuffers = IniInt("PresenterBuffers", 3);
     s.queueAhead = IniInt("QueueAhead", 0) ? 1 : 0;
+    s.queueDark = IniInt("QueueDarkRefresh", 1) ? 1 : 0;
     s.laterRelease = IniInt("LaterRelease", 0) ? 1 : 0;
     s.capJit = IniInt("CapJustInTime", 1) ? 1 : 0;
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
@@ -329,6 +332,7 @@ static void LoadSettings(Settings &s)
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = IniInt("LearnPerGame", 1) ? 1 : 0;
+    s.learnReflex = IniInt("LearnReflexStart", 1) ? 1 : 0;
     s.threadBoost = IniInt("PresenterThreadBoost", 1) ? 1 : 0;
     s.autoCapOwn = IniInt("AutoCapOwnWithoutFg", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
@@ -545,6 +549,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("SmoothCatchUp", s.smoothCatchUp);
     IniWriteInt("PresenterBuffers", s.presBuffers);
     IniWriteInt("QueueAhead", s.queueAhead);
+    IniWriteInt("QueueDarkRefresh", s.queueDark);
     IniWriteInt("LaterRelease", s.laterRelease);
     IniWriteInt("CapJustInTime", s.capJit);
     IniWriteInt("AutoFrameCap", s.autoCap);
@@ -555,6 +560,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameGenLimitWithoutReflex", s.fgLimitNoReflex);
     IniWriteInt("AutoCapAtFrameStart", s.autoCapFrameStart);
     IniWriteInt("LearnPerGame", s.learnPerGame);
+    IniWriteInt("LearnReflexStart", s.learnReflex);
     IniWriteInt("PresenterThreadBoost", s.threadBoost);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
@@ -2826,6 +2832,12 @@ struct LearnRec
     double bestMs = 0.0;    // release -> flash at that start time
     double hz = 0.0;        // the refresh rate and frames per strobe cycle it was learned at
     int    frames = 0;
+    // The Reflex frame limit at the game's sleep (LearnReflexStart): where in the strobe cycle its frames start once the
+    // alignment has settled, the margin it settled with, and the frame-generation factor that was for.
+    double rfxMs = -1.0;    // start in the strobe cycle (ms), -1 not known
+    double rfxMarginMs = 0.0;   // frames ready this long before the pick (the alignment's target then)
+    int    rfxFg = 0;       // 1 = no frame generation, 2-4 = its factor
+    int    rfxGaveUp = 0;   // 1 = the alignment went round the strobe cycle (the game's frames don't follow it)
 };
 static SRWLOCK     g_learnLock = SRWLOCK_INIT;
 static std::string g_learnKey;          // section in use ("" = none read yet)
@@ -2920,6 +2932,13 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
         snprintf(b, sizeof(b), "%ld", (long)std::lround(out.bestMs * 1000.0)); WritePrivateProfileStringA(sec, "ReleaseToFlashUs", b, path);
         snprintf(b, sizeof(b), "%ld", (long)std::lround(out.hz * 1000.0));     WritePrivateProfileStringA(sec, "RefreshMilliHz", b, path);
         snprintf(b, sizeof(b), "%d", out.frames);                             WritePrivateProfileStringA(sec, "Frames", b, path);
+        if (out.rfxFg > 0)
+        {
+            snprintf(b, sizeof(b), "%ld", (long)std::lround(out.rfxMs * 1000.0));       WritePrivateProfileStringA(sec, "ReflexStartUs", b, path);
+            snprintf(b, sizeof(b), "%ld", (long)std::lround(out.rfxMarginMs * 1000.0)); WritePrivateProfileStringA(sec, "ReflexMarginUs", b, path);
+            snprintf(b, sizeof(b), "%d", out.rfxFg);                                   WritePrivateProfileStringA(sec, "ReflexFrameGen", b, path);
+        }
+        if (out.rfxGaveUp) WritePrivateProfileStringA(sec, "ReflexAlignGaveUp", "1", path);
     }
     if (forget && !cur.empty())
     {
@@ -2948,6 +2967,13 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
         r.fsMs   = get("FrameStartUs", 0) / 1000.0;
         r.bestMs = get("ReleaseToFlashUs", 0) / 1000.0;
         r.hz     = get("RefreshMilliHz", 0) / 1000.0;
+        r.rfxFg  = (int)get("ReflexFrameGen", 0);
+        if (r.rfxFg > 0)
+        {
+            r.rfxMs       = get("ReflexStartUs", -1000) / 1000.0;
+            r.rfxMarginMs = get("ReflexMarginUs", 0) / 1000.0;
+        }
+        r.rfxGaveUp = (int)get("ReflexAlignGaveUp", 0);
     }
     AcquireSRWLockExclusive(&g_learnLock);
     g_learnKey = key;
@@ -3284,7 +3310,15 @@ struct ReflexSecond
     int    limitUs = 0;          // Reflex frame limit in effect
 };
 static void ReflexTick(int limitUs, ReflexSecond &out);
+// How long the last ReflexTick took (its calls into NVIDIA's driver), for the reflex log. (1.0.43 tests also ran it on a
+// thread of its own: the calls took at most 0.6 ms either way, in Control, Jusant and Returnal, so nothing to move.)
+static std::atomic<double> g_rtMs{-1.0};
+static int g_showOverlaysBoot = -1;            // ShowOverlays as read at start (-1 not yet); fixed for the session
+static std::atomic<int> g_darkState{0};   // QueueDarkRefresh: 0 not yet, 1 running, 2 off for this session (the queued present waited)
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
+static double g_coarseTargetS = 0.005;        // the coarse alignment's margin (presenter thread only)
+static std::atomic<int> g_sleepPhaseUs{-1};   // where in the strobe cycle the sleep limit starts frames now (-1: not on the grid)
+static std::atomic<double> g_sleepPhaseT{0.0};
 static std::atomic<int> g_sleepGrid{1};       // SleepLimitGrid (copied from the settings)
 static std::atomic<bool> g_alignHunted{false}; // ReflexAlign gave up this session (kept moving earlier: the game's own stutters)
 static std::atomic<bool> g_fgXess{false};     // the game presents through XeSS frame generation's swap chain (libxess_fg.dll)
@@ -3788,6 +3822,18 @@ static DWORD WINAPI PresenterThread(void *)
     int    relN = 0;
     FILE  *rfxf = nullptr;         // BFIPresenter_reflex_*.csv, one line a second while the timing log is on
     bool refillNow = false;          // present again without waiting for the next vblank
+    // QueueDarkRefresh: the refresh after the lit one shows the same game frame, so it is drawn and presented right
+    // after the lit refresh instead of one vblank later. A stall while it is drawn (most late presents in Control and
+    // Jusant fell there: 45 of 49 and 55 of 60) then has two refreshes of room instead of one, and the lit refresh's
+    // pick doesn't move: no added latency. The next lit refresh is picked two vblanks after this one's.
+    bool pairNext = false;           // this iteration: the refresh queued behind the lit one (no vblank wait)
+    double pairVbT = 0.0;            // > 0: the vblank the lit refresh of the last pair was drawn at
+    double pairLitPresS = 0.0;       // how long the lit refresh's Present call took (overlays drawn in it: Cocoon 4.4 ms)
+    int pairBlocked = 0, pairSeen = 0, pairLogs = 0;   // queued refreshes whose present blocked, and all of them, in the current window
+    int pairBadWins = 0;             // windows in a row where most queued presents waited (two switch it off)
+    double pairStartT = 0.0;         // when the dark queue first ran this session (not judged for its first 5 s)
+    bool pairOff = false;            // ... three times: off for this session
+    double secStatsMs = 0.0, secVramMs = -1.0;   // the once-a-second block's calls into DXGI and the driver, timed for the reflex log
     bool vsyncOverridden = false;    // the driver is not honouring the presenter's VSync
     int  vsyncFastSecs = 0;          // seconds in a row with presents well above the refresh count
     int  queuedNow = -1;
@@ -3935,7 +3981,7 @@ static DWORD WINAPI PresenterThread(void *)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,present_count,sync_refresh_count,"
                               "bfi,method,frames,gain,floor,rolloff,pacing,cap,ahead,vblank,queue_ahead,queued,"
                               "wait_vblank_ms,wait_gpu_ms,submit_ms,present_ms,hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,"
-                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup\n");
+                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup,paired\n");
                 LOGI("BFI Presenter: timing log started: %s", path);
             }
             snprintf(path, sizeof(path), "%.*sBFIPresenter_reflex_%04u%02u%02u_%02u%02u%02u.csv",
@@ -3947,7 +3993,8 @@ static DWORD WINAPI PresenterThread(void *)
                               "reflex_limit_us,release_to_flash_ms,release_to_flash_max_ms,frames_shown,"
                               "rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,"
                               "rfx_gpu_active_ms,rfx_sim_ms,rfx_submit_ms,rfx_queue_ms,rendered_fps,align_slack_p10_ms,align_shift_ms,"
-                              "frame_repeats,warp_state,warp_filled,warp_ahead,warp_pass_gpu_ms,warp_passes,draw_gpu_ms,draw_warped_gpu_ms\n");
+                              "frame_repeats,warp_state,warp_filled,warp_ahead,warp_pass_gpu_ms,warp_passes,draw_gpu_ms,draw_warped_gpu_ms,"
+                              "sec_block_ms,rfx_tick_ms,vram_ms,stats_max_ms\n");
         }
         else if (!s.log && logf)
         {
@@ -3971,15 +4018,42 @@ static DWORD WINAPI PresenterThread(void *)
         // at a steady 60 fps, visible judder under BFI in every pacing mode
         // (The Midnight Walk).
         bool tickedAtVb = false;
-        if ((s.pacing || vsyncOverridden) && output && !refillNow)
+        const bool pairIter = pairNext;      // the refresh queued behind the lit one: drawn now, no vblank wait, no tick
+        pairNext = false;
+        if (pairIter) {}
+        else if ((s.pacing || vsyncOverridden) && output && !refillNow)
         {
+            auto tick = [&](uint64_t pres, double tt) {
+                g_strobeFrames.store(s.frames);
+                g_sleepGrid.store(s.sleepGrid);
+                g_tickSlot.store((int)((pres - phaseShift) % (uint64_t)s.frames));
+                g_tickT.store(tt);
+                g_tickCount.fetch_add(1);
+                SetEvent(g_tickEvent);
+            };
             output->WaitForVBlank();
-            g_strobeFrames.store(s.frames);
-            g_sleepGrid.store(s.sleepGrid);
-            g_tickSlot.store((int)((presents - phaseShift) % (uint64_t)s.frames));
-            g_tickT.store(Now());
-            g_tickCount.fetch_add(1);
-            SetEvent(g_tickEvent);
+            if (pairVbT > 0.0)
+            {
+                // After a pair two refreshes have been presented: this is the vblank the queued one would have been
+                // drawn at, and the next lit refresh is picked one vblank later. If the queued refresh was held up past
+                // this vblank, the wait above already returned at the later one: its tick is sent late, so the game's
+                // frame cap still gets one tick per refresh.
+                const double perP = 1.0 / (modeHz > 1.0 ? modeHz : 120.0);
+                const double tw = Now();
+                if (tw < pairVbT + 1.5 * perP)
+                {
+                    tick(presents - 1, tw);
+                    output->WaitForVBlank();
+                    tick(presents, Now());
+                }
+                else
+                {
+                    tick(presents - 1, tw - perP);
+                    tick(presents, tw);
+                }
+                pairVbT = 0.0;
+            }
+            else tick(presents, Now());
             tickedAtVb = true;
         }
         refillNow = false;
@@ -4593,11 +4667,86 @@ static DWORD WINAPI PresenterThread(void *)
             }
         }
         else { soften = 0.0f; swapState = 0; gradPhase = 0.0; gradHold = -1.0; }
-        if (!tickedAtVb)
+        if (!tickedAtVb && !pairIter)
         {
             g_tickT.store(Now());
             g_tickCount.fetch_add(1);
             SetEvent(g_tickEvent);
+        }
+        // QueueDarkRefresh: after the lit refresh of a 2+ refresh cycle, the next one (the same game frame) follows at
+        // once. Not with Queue one refresh ahead (its own queue), the LCD savers (they shift the cycle), the hitch
+        // guard's steady picture, or fewer than 3 presenter buffers.
+        if (pairIter)
+        {
+            // The second present should return at once. If it waits for the first one's vblank, the presenter's queue
+            // takes only one present and pairing would shift the strobe: off for this session.
+            // Judged over 120 steady pairs (2 s): a swap chain that holds one pending present blocks nearly every one,
+            // while a stall at start or in loading blocks a few (Control, t1: off after 3 waits in its first second,
+            // while the game was still loading).
+            // Not judged while the game starts up (Soul Reaver, OpenGL, t7: off after 115 waits of 120 in its first
+            // 3 s, around a hitch pause, then 0.09 ms presents for the rest of the session), and a hitch pause starts
+            // the window again.
+            if (hitchPaused) pairSeen = pairBlocked = pairBadWins = 0;
+            else if (!pairOff && tPres - pairStartT >= 5.0)
+            {
+                pairSeen++;
+                // Waited: the call took half a refresh, and a quarter of a refresh longer than the lit one's. Overlay
+                // hooks (ShowOverlays=1) draw inside every Present, the lit one too (Cocoon, t3: 4.4 ms each, judged
+                // as 120 waits of 120 and switched off), while a swap chain that holds one present makes only the
+                // queued one wait until the lit refresh's vblank.
+                const double prHz = modeHz > 1.0 ? modeHz : 120.0, prDur = tPres - tSub;
+                if (prDur > 0.5 / prHz && prDur - pairLitPresS > 0.25 / prHz) pairBlocked++;
+                if (pairSeen >= 120)
+                {
+                    pairBadWins = pairBlocked * 2 > pairSeen ? pairBadWins + 1 : 0;
+                    if (pairBadWins >= 2)
+                    {
+                        pairOff = true;
+                        // Overlay hooks (ShowOverlays=1) make the queued present wait for the lit one's overlay drawing
+                        // (Cocoon, t6: off with ShowOverlays=1, 1 wait in 120 without).
+                        const bool viaOverlays = g_showOverlaysBoot == 1;
+                        g_darkState.store(viaOverlays ? 3 : 2);
+                        if (viaOverlays)
+                            LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
+                                 "pairs -- the overlays drawn in each present (ShowOverlays=1) hold it up; ShowOverlays=0 lets it run",
+                                 pairBlocked, pairSeen);
+                        else
+                            LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
+                                 "pairs (the swap chain takes one pending present)", pairBlocked, pairSeen);
+                    }
+                    else if (pairBlocked > 0 && ++pairLogs <= 20)
+                        LOGI("BFI Presenter: QueueDarkRefresh: the queued refresh's present waited in %d of the last %d pairs", pairBlocked, pairSeen);
+                    pairSeen = pairBlocked = 0;
+                }
+            }
+        }
+        else if (s.queueDark && !pairOff && tickedAtVb && s.pacing && !s.queueAhead && !vsyncOverridden && n >= 3 && s.enabled &&
+                 s.frames >= 2 && slotNow == 0 && !hitchPaused && swapState == 0 && soften <= 0.0f && !GradualSaverOn(s) && SUCCEEDED(hr))
+        {
+            pairNext = true;
+            pairVbT = tVb;
+            pairLitPresS = tPres - tSub;
+            if (pairStartT <= 0.0) pairStartT = tPres;
+            g_darkState.store(1);
+            static bool pairLogged = false;
+            if (!pairLogged)
+            {
+                pairLogged = true;
+                LOGI("BFI Presenter: QueueDarkRefresh on: the refresh after the lit one is queued with it");
+            }
+        }
+        // Why the dark queue isn't used, once per session (Cocoon, t3: PresenterBuffers=2 left in its ini, nothing in the log).
+        if (s.queueDark && s.enabled && s.frames >= 2 && !pairOff && !pairIter)
+        {
+            static bool pairWhyLogged = false;
+            const char *why = !s.pacing ? "Wait for vblank is off" : s.queueAhead ? "Queue one refresh ahead is on" :
+                              n < 3 ? "fewer than 3 presenter buffers (PresenterBuffers)" : GradualSaverOn(s) ? "an LCD saver is on" :
+                              vsyncOverridden ? "the driver is not honouring VSync" : nullptr;
+            if (why && !pairWhyLogged && presents > 600)
+            {
+                pairWhyLogged = true;
+                LOGI("BFI Presenter: QueueDarkRefresh not used: %s", why);
+            }
         }
         if (s.pacing && s.queueAhead && n >= 3 && !vsyncOverridden)
         {
@@ -4629,6 +4778,13 @@ static DWORD WINAPI PresenterThread(void *)
             secPhC += cos(ang); secPhS += sin(ang); secPhN++;
         }
         if (t - lastT > 1.5 / (modeHz > 0.0 ? modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
+        {
+            secLate++;
+            lateTimes[lateIdx++ & 3] = t;
+        }
+        // A queued refresh (QueueDarkRefresh) is late only when it wasn't presented before the vblank it was meant for,
+        // two after the one its lit refresh was drawn at.
+        else if (pairIter && pairVbT > 0.0 && t > pairVbT + 1.9 / (modeHz > 0.0 ? modeHz : 120.0))
         {
             secLate++;
             lateTimes[lateIdx++ & 3] = t;
@@ -4744,7 +4900,9 @@ static DWORD WINAPI PresenterThread(void *)
                 g_status.fgLimitUs = want;
             }
             DXGI_FRAME_STATISTICS st = {};
+            const double tSt0 = Now();
             const bool sok = SUCCEEDED(ScStats(&st));
+            secStatsMs = std::max(secStatsMs, (Now() - tSt0) * 1000.0);
             int rep = 0;
             const double rate = secPresents / (t - secStart);
             if (!vsyncOverridden)
@@ -4883,7 +5041,9 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 static int overWin = 0, underSecs = 0;
                 double vu = 0.0, vbud = 0.0;
+                const double tVr0 = Now();
                 const bool have = VramMB(vu, vbud) && vbud > 0.0;
+                secVramMs = (Now() - tVr0) * 1000.0;
                 const bool over = have && vu > vbud;
                 overWin = ((overWin << 1) | (over ? 1 : 0)) & 31;
                 int nOver = 0; for (int b = 0; b < 5; b++) nOver += (overWin >> b) & 1;
@@ -5683,7 +5843,8 @@ static DWORD WINAPI PresenterThread(void *)
                     // 5 ms to spare. Not within 20 s of the "moving them earlier" nudge, at most once per 20 s.
                     {
                         static int coarseSecs = 0;
-                        static double coarseT = -1e9, coarseTarget = 0.005, coarseHoldT = -1e9;
+                        static double coarseT = -1e9, coarseHoldT = -1e9;
+                        double &coarseTarget = g_coarseTargetS;
                         // The nudge moves the frames ~9 ms earlier itself: no step of this one on top of it (Dead Space,
                         // both in the same second: 40 of 60 frames shown for 3 s, until the next nudge).
                         const bool nudging = t < phaseUntil;
@@ -5724,6 +5885,80 @@ static DWORD WINAPI PresenterThread(void *)
                         }
                         else coarseSecs = 0;
                     }
+                    // Learned per game (LearnReflexStart, test): the alignments above find where frames should start each
+                    // time the limit comes on, and that takes a while (Jusant without frame generation: 1.5 minutes with
+                    // 3.5-5.6 frames missing a second while ReflexAlign moved 20 ms and widened its margin to 5 ms; Control
+                    // with frame generation: later and earlier steps undoing each other). The settled start (its place in
+                    // the strobe cycle) and margin are kept per game, refresh rate, frames per cycle and frame-generation
+                    // factor, and the limit starts there the next time. The alignments go on as usual from that start.
+                    {
+                        static bool rlWas = false, rlApplied = false, rlGaveUpSaved = false;
+                        static double rlOnT = 0.0, rlMoveT = 0.0, rlLastPh = -1.0;
+                        static int rlQuiet = 0;
+                        const int fgF = std::max(1, std::min(4, g_sleepFgFactor.load()));
+                        const bool rlFg = !fgPace && g_sleepLimitUs.load() > 0 && fgF > 1 && locked && g_sleepGrid.load() && !g_fgXess.load();
+                        const bool rlNoFg = atSleepNoFg && g_sleepGrid.load() != 0;
+                        const bool rlOn = s.learnPerGame && s.learnReflex && learnMine.frames > 0 && (rlFg || rlNoFg) && cyc > 0.0;
+                        const int phUs = g_sleepPhaseUs.load();
+                        const bool phOk = phUs >= 0 && t - g_sleepPhaseT.load() < 1.0;
+                        if (rlOn && !rlWas) { rlOnT = t; rlApplied = false; rlMoveT = t; rlLastPh = -1.0; rlQuiet = 0; }
+                        rlWas = rlOn;
+                        if (rlOn && phOk)
+                        {
+                            const double ph = phUs * 1e-6;
+                            if (!rlApplied && t - rlOnT >= 2.0)
+                            {
+                                rlApplied = true;
+                                if (learnMine.rfxGaveUp && s.reflexAlign && !g_alignHunted.exchange(true))
+                                {
+                                    rlGaveUpSaved = true;
+                                    LOGI("BFI Presenter: ReflexAlign off for this session: in an earlier session this game's frames didn't "
+                                         "follow it -- the limit keeps its place");
+                                }
+                                if (learnMine.rfxMs >= 0.0 && learnMine.rfxFg == fgF && learnMine.rfxMs < cyc * 1000.0)
+                                {
+                                    double d = learnMine.rfxMs * 0.001 - ph;
+                                    d = std::fmod(d + 1.5 * cyc, cyc) - 0.5 * cyc;        // the shorter way round the cycle
+                                    const int du = (int)(d * 1e6);
+                                    if (du) { shiftUs.fetch_add(du); alignShiftTot += d; }
+                                    if (rlNoFg && learnMine.rfxMarginMs > 0.0) alignTarget = std::max(alignTarget, std::min(0.008, learnMine.rfxMarginMs * 0.001));
+                                    if (rlFg && learnMine.rfxMarginMs > 0.0) g_coarseTargetS = std::max(g_coarseTargetS, std::min(0.008, learnMine.rfxMarginMs * 0.001));
+                                    rlMoveT = t; rlLastPh = learnMine.rfxMs * 0.001;
+                                    LOGI("BFI Presenter: frame limit at the game's Reflex sleep: start time learned for this game in an earlier "
+                                         "session (start +%.1f ms in the cycle, %.1f ms to spare; moved %+.1f ms)",
+                                         learnMine.rfxMs, learnMine.rfxMarginMs, d * 1000.0);
+                                }
+                            }
+                            // Settled: 60 s since the limit came on, 30 s since the start last moved, and 5 s in a row
+                            // holding the cap with at most 1 frame repeated or skipped.
+                            if (rlLastPh < 0.0 || fabs(std::fmod(ph - rlLastPh + 1.5 * cyc, cyc) - 0.5 * cyc) > 0.0003) { rlLastPh = ph; rlMoveT = t; }
+                            const double presCapL = hzL > 0.0 ? hzL / s.frames : 0.0;
+                            const bool holdsL = rlFg ? (presCapL > 0.0 && stNow.gameFps > 0.95 * presCapL && stNow.gameFps < 1.05 * presCapL) : holds;
+                            rlQuiet = (holdsL && !hitchPaused && p10 >= 0.0 && stNow.frameRepeats + stNow.frameSkips <= 1) ? rlQuiet + 1 : 0;
+                            if (rlApplied && t - rlOnT >= 60.0 && t - rlMoveT >= 30.0 && rlQuiet >= 5)
+                            {
+                                const double margin = rlNoFg && s.reflexAlign && !g_alignHunted.load() ? alignTarget : g_coarseTargetS;
+                                const bool changed = learnMine.rfxFg != fgF || learnMine.rfxMs < 0.0 ||
+                                                     fabs(std::fmod(ph * 1000.0 - learnMine.rfxMs + 1.5 * cyc * 1000.0, cyc * 1000.0) - 0.5 * cyc * 1000.0) > 0.75 ||
+                                                     fabs(margin * 1000.0 - learnMine.rfxMarginMs) > 0.75;
+                                if (changed)
+                                {
+                                    learnMine.rfxMs = ph * 1000.0; learnMine.rfxMarginMs = margin * 1000.0; learnMine.rfxFg = fgF;
+                                    LearnPost(learnMine);
+                                    LOGI("BFI Presenter: frame limit at the game's Reflex sleep: start time kept for this game (start +%.1f ms "
+                                         "in the cycle, %.1f ms to spare, frame generation %dx)", learnMine.rfxMs, learnMine.rfxMarginMs, fgF);
+                                }
+                            }
+                        }
+                        // The alignment gave up this session (it went round the strobe cycle): remembered, so the next
+                        // session doesn't try again.
+                        if (s.learnPerGame && s.learnReflex && learnMine.frames > 0 && g_alignHunted.load() && !rlGaveUpSaved && !learnMine.rfxGaveUp)
+                        {
+                            rlGaveUpSaved = true;
+                            learnMine.rfxGaveUp = 1;
+                            LearnPost(learnMine);
+                        }
+                    }
                     EnterCriticalSection(&g_cfgLock);
                     g_status.alignSlackMs = p10 >= 0.0 ? p10 * 1000.0 : -1.0;
                     g_status.alignShiftMs = alignShiftTot * 1000.0;
@@ -5760,7 +5995,11 @@ static DWORD WINAPI PresenterThread(void *)
                     }
                     presPrev = stNow.gameFps;
                 }
-                ReflexTick(limitUs, rs);
+                {
+                    const double tRt0 = Now();
+                    ReflexTick(limitUs, rs);
+                    g_rtMs.store((Now() - tRt0) * 1000.0);
+                }
                 rsLast = rs; rsLastT = t;
                 if (rs.frames > 0) rsEverT = t;
                 EnterCriticalSection(&g_cfgLock);
@@ -5770,7 +6009,7 @@ static DWORD WINAPI PresenterThread(void *)
                 LeaveCriticalSection(&g_cfgLock);
                 if (rfxf)
                 {
-                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f,%.3f,%d,%.3f,%.3f\n",
+                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                             t, stNow.gameFps, userCap, perNow, stNow.autoCapDown, stNow.autoCapProbe, stNow.fgActive, s.pacingMode,
                             s.capJit, stNow.lrState, stNow.lrEst, stNow.aheadInUse, rs.limitUs,
                             relN ? relSum / relN : -1.0, relN ? relMax : -1.0, relN, rs.frames, rs.simGpuMs, rs.simPresentMs,
@@ -5780,13 +6019,15 @@ static DWORD WINAPI PresenterThread(void *)
                             stNow.frameRepeats, stNow.warpOn, stNow.warpCycles, stNow.warpAvg,
                             secWarpPassN ? secWarpPassMs / secWarpPassN : -1.0, secWarpPassN,
                             secDrawPlainN ? secDrawPlainMs / secDrawPlainN : -1.0,
-                            secDrawWarpN ? secDrawWarpMs / secDrawWarpN : -1.0);
+                            secDrawWarpN ? secDrawWarpMs / secDrawWarpN : -1.0,
+                            (Now() - t) * 1000.0, g_rtMs.load(), secVramMs, secStatsMs);
                     secWarpPassMs = secDrawWarpMs = secDrawPlainMs = 0.0;
                     secWarpPassN = secDrawWarpN = secDrawPlainN = 0;
                     fflush(rfxf);
                 }
                 relSum = relMax = 0.0; relN = 0;
             }
+            secStatsMs = 0.0;
             secStart = t; secPresents = 0; secLate = 0; ageSum = 0.0; secSlowPres = 0;
             if (g_device->GetDeviceRemovedReason() != S_OK) { DumpDeviceRemoved(g_device, "presenter check"); break; }
             if (g_dx11.load()) Sync11Window();
@@ -5794,21 +6035,25 @@ static DWORD WINAPI PresenterThread(void *)
         if (logf)
         {
             DXGI_FRAME_STATISTICS st = {};
+            const double tSt1 = Now();
             const bool sok = SUCCEEDED(ScStats(&st));
+            secStatsMs = std::max(secStatsMs, (Now() - tSt1) * 1000.0);
             Status lrLog;
             EnterCriticalSection(&g_cfgLock);
             lrLog.lrState = g_status.lrState; lrLog.lrEst = g_status.lrEst; lrLog.lrMargin = g_status.lrMargin;
             LeaveCriticalSection(&g_cfgLock);
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d\n", t * 1000.0,
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d\n", t * 1000.0,
                     (unsigned long long)presents, c.slot,
                     (unsigned long long)pickId, (t - pickTime) * 1000.0, (t - lastT) * 1000.0,
                     sok ? (int)st.PresentCount : -1, sok ? (int)st.SyncRefreshCount : -1,
                     s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     g_maxAhead.load(), s.pacing, s.queueAhead, queuedNow,
                     (tVb - tLoop0) * 1000.0, (tFence - tVb) * 1000.0, (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f, hotArea, rawAvg,
-                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp);
+                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp, pairIter ? 1 : 0);
         }
-        lastT = t;
+        // A queued refresh is shown one refresh after the lit one it follows: the next interval is counted from there
+        // (or the lit refresh after it, two vblanks on, would read as a missed refresh).
+        lastT = pairIter ? lastT + 1.0 / (modeHz > 1.0 ? modeHz : 120.0) : t;
         if (pickId != lastShownId) lastNewFrameT = Now();
         if (pickId != lastShownId)
         {
@@ -7059,6 +7304,8 @@ static int __cdecl hk_NvSleep(IUnknown *dev)
                 double ph = std::fmod(phase, cyc);
                 if (ph < 0.0) ph += cyc;
                 nextT = cycStart + ph + std::floor((nextT - cycStart - ph) / cyc + 0.5) * cyc;
+                g_sleepPhaseUs.store((int)(ph * 1e6));
+                g_sleepPhaseT.store(now);
             }
         }
         while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
@@ -7444,7 +7691,6 @@ static void PrepareDirectCalls()
 // ShowOverlays, as it was when the presenter first presented: overlays set themselves up on the first
 // present they see and remember things such as the queue (God of War Ragnarok crashed when that changed),
 // so the path is not switched while the game runs.
-static int g_showOverlaysBoot = -1;
 
 static HRESULT OwnPresent()
 {
@@ -11583,6 +11829,40 @@ static void draw_overlay(reshade::api::effect_runtime *)
         bool qa = s.queueAhead != 0;
         if (ImGui::Checkbox("Queue one refresh ahead (needs 3 presenter buffers, Wait for vblank on)", &qa)) s.queueAhead = qa ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keeps exactly one extra present queued, so an occasional late slot is covered\nwithout a flash. +1 refresh (8 ms) of latency. Unlike Wait for vblank off, the\nqueue never grows, so the driver doesn't throttle the game.");
+        bool qd = s.queueDark != 0;
+        if (ImGui::Checkbox("Queue the dark refresh with the lit one (needs 3 presenter buffers, Wait for vblank on)", &qd)) s.queueDark = qd ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The dark refresh shows the same game frame, so it is drawn and presented right after the lit one\n"
+                                                      "instead of one refresh later. A stall while it is drawn then has two refreshes of room: fewer\n"
+                                                      "late refreshes, and the ones left are mostly dark flickers rather than bright flashes.\n"
+                                                      "No added latency. Turns itself off for the session if the swap chain can't take it. On by default.");
+        if (s.queueDark && s.enabled && s.frames >= 2)
+        {
+            // Why it isn't running: the settings that rule it out, then what the presenter found.
+            const int bufs = st.presBufs > 0 ? st.presBufs : s.presBuffers;
+            const char *why = !s.pacing ? "not in use: needs Wait for vblank on" :
+                              s.queueAhead ? "not in use while Queue one refresh ahead is on" :
+                              bufs < 3 ? (s.presBuffers >= 3 ? "not in use yet: 3 presenter buffers apply at the game's next resize"
+                                                             : "not in use: needs 3 presenter buffers") :
+                              GradualSaverOn(s) ? "not in use while an LCD saver is on" :
+                              g_darkState.load() == 2 ? "off for this session: the swap chain takes one pending present (see the log)" :
+                              g_darkState.load() == 3 ? "off for this session: the overlays (Show overlays) hold up the queued present; "
+                                                        "turn Show overlays off to use it" : nullptr;
+            if (why)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+                ImGui::TextWrapped("Dark refresh queue %s.", why);
+                ImGui::PopStyleColor(1);
+                if (!s.queueAhead && s.pacing && s.presBuffers < 3)
+                {
+                    if (ImGui::SmallButton("Use 3 presenter buffers")) { s.presBuffers = 3; IniWriteInt("PresenterBuffers", 3); }
+                }
+            }
+            else if (g_darkState.load() == 1)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(in use)");
+            }
+        }
         ImGui::SliderInt("Presenter buffers (applies at the game's next resize)", &s.presBuffers, 2, 4);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Real swap chain buffers behind the presenter. With 3 or 4 AND 'Wait for vblank' off,\nthe presenter queues frames ahead, so a late slot no longer holds a lit or dark frame\ntwice (a flash) -- at the cost of 1-2 refreshes (8-17 ms) of extra latency.");
         if (ImGui::Checkbox("Present on own queue (applies when the game next creates its swap chain)", &oq)) s.ownQueue = oq ? 1 : 0;

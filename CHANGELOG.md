@@ -7,6 +7,20 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.43] — 2026-11-17
+
+**The dark refresh is queued with the lit one: fewer late refreshes and no bright flashes from them, with no added latency; the Reflex frame limit's start is remembered per game.**
+
+- **[DX] Queue the dark refresh with the lit one** (`QueueDarkRefresh`, on by default; under Presenter in the settings window). The refresh after the lit one shows the same game frame, so it is drawn and presented right after the lit refresh instead of one vblank later. A stall while it is drawn, where most late refreshes fell (Control: 45 of 49; Jusant: 55 of 60), then has two refreshes of room instead of one, and the lit refresh's pick doesn't move: no added latency. Needs 2 or more frames per strobe cycle, 3 presenter buffers and Wait for vblank; not with Queue one refresh ahead or the LCD savers.
+  - **Results** (late refreshes outside hitch pauses): Control about 2.6–3.1 a minute against 5.0 without; Onimusha: Way of the Sword 0–0.2 a minute; Alan Wake (DX9), Soul Reaver I-II (OpenGL), DOOM 3 BFG Edition (32-bit OpenGL): none; South of Midnight 1 in 2.7 minutes; Cocoon (DX11) 1 in 1.4 minutes. The refreshes still late fall on the lit refresh, so what is left is mostly a brief dark flicker instead of a bright flash (Townfall, Jusant).
+  - **Turns itself off for the session** when the queued present keeps waiting for the lit one: Returnal after it rebuilt its swap chain, and games with `ShowOverlays=1`, whose overlays drawn in every present hold it up (Cocoon). It is judged from 5 s after it starts, over windows of 120 pairs, and goes off after two windows in a row where most queued presents waited longer than the lit one; a hitch pause starts the count again, so loading doesn't switch it off (Soul Reaver at start-up). The log says why it went off, naming `ShowOverlays` when the overlays are the cause.
+  - **When it isn't in use**, the settings window says why in amber (Queue one refresh ahead on, fewer than 3 presenter buffers, with a **Use 3 presenter buffers** button, Wait for vblank off, an LCD saver on, or off for the session), and the log says it once: `QueueDarkRefresh not used: …`.
+  - Timing log: a `paired` column (1 on a queued dark refresh).
+- **[DX] The Reflex frame limit starts where it settled last time** (`LearnReflexStart`, on by default, with `LearnPerGame`). Where ReflexAlign or the coarse alignment left the game's frames in the strobe cycle, and the margin, is kept in `BFIPresenter_learned.ini` per game, refresh rate, frames per cycle and frame-generation factor, saved once the limit has been on for 60 s and still for 30 s. The next session starts there 2 s after the limit comes on, by the shorter way round the cycle, and ReflexAlign steers from there as usual. Dead Space: settled 3 s after the limit came on, against 30 s the first time; Jusant with frame generation 2×: 22.1 ms from release to flash on the next launch against 24.2 ms; Control: about 24 ms against 27–28 ms. A game whose frames went round the strobe cycle under ReflexAlign (Returnal) is remembered too, and starts the next session with ReflexAlign off.
+- **[DX]** Reflex log (`BFIPresenter_reflex_*.csv`): `sec_block_ms`, `rfx_tick_ms`, `vram_ms` and `stats_max_ms` time the presenter's own once-a-second calls into DXGI, Reflex and the driver. In Control and Jusant they stayed under 1.3 ms and 0.6 ms, so they aren't a cause of late refreshes.
+- **[Vulkan]** No changes; version number only. The dark refresh queue is not in the Vulkan layer.
+- **[Docs]** Settings guide: **Queue the dark refresh with the lit one**, and the Reflex start under **Remember per game**.
+
 ## [1.0.42] — 2026-11-16
 
 **Frame warp comes to the Vulkan layer; the log analyzer shows the repeats left after frame warp, for DX and Vulkan.**
