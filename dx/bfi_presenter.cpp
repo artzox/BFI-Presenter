@@ -4062,9 +4062,9 @@ static DWORD WINAPI PresenterThread(void *)
                     // queued present waits again, this branch is taken again, and the extra refresh in the queue never
                     // drains (Spider-Man 2, t11-t13: 8 ms queued presents and frame age +1 refresh after one missed
                     // refresh, with Reflex on or off, borderless or exclusive). One more vblank empties it -- the dark
-                    // refresh shows one refresh longer, once. At most once in 2 s: a swap chain that really holds one
+                    // refresh shows one refresh longer, once. At most once in 0.5 s (Returnal, t14: stuck again 0.2 s after a skip, 104 waiting pairs until the 2 s limit ran out): a swap chain that really holds one
                     // pending present waits every pair, and the safeguard below switches the dark queue off instead.
-                    if (pairWaited && tw - pairDrainT >= 2.0)
+                    if (pairWaited && tw - pairDrainT >= 0.5)
                     {
                         output->WaitForVBlank();
                         pairDrainT = Now();
