@@ -144,7 +144,7 @@ struct Settings
     int   autoAhead = 1;      // automatic: 1 frame ahead, 2 while the game keeps missing strobe cycles
     int   presBuffers = 3;    // real swap chain buffers for the presenter (read when presentation moves)
     int   queueAhead = 0;     // with vblank pacing: keep this many extra presents queued (0 or 1)
-    int   queueDark = 0;      // QueueDarkRefresh (test): the cycle's second refresh is drawn and queued right after the lit one
+    int   queueDark = 1;      // QueueDarkRefresh: the cycle's second refresh is drawn and queued right after the lit one
     int   laterRelease = 0;   // Lowest latency + Refresh cap: release the game just in time for the pick
     int   capJit = 1;         // Half / Quarter cap: release just in time for the lit refresh (both pacing modes)
     int   autoCap = 1;        // Refresh cap: one game frame per strobe cycle while the game can't hold the refresh rate
@@ -159,7 +159,6 @@ struct Settings
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap without Reflex holds the game before its next frame starts
     int   fgLimitNoReflex = 1; // FrameGenLimitWithoutReflex: frame generation without Reflex limited to one presented frame per strobe cycle
     int   reflexAtSleep = 1;  // ReflexLimitAtSleep: pace the game's own frames in its Reflex sleep call instead of the driver's limit
-    int   driverOff = 0;      // DriverCallsOffThread (test): the once-a-second Reflex calls into the driver run on a thread of their own
                               // (with frame generation: Reflex's frame limit at one presented frame per cycle)
     float laterReleaseMs = 1.5f; // safety margin on top of the measured build time (widened automatically)
     int   deferRecreated = 1; // recreated swap chains: no BFI until the game resizes (safe)
@@ -321,7 +320,7 @@ static void LoadSettings(Settings &s)
     s.smoothCatchUp = IniInt("SmoothCatchUp", 0) ? 1 : 0;
     s.presBuffers = IniInt("PresenterBuffers", 3);
     s.queueAhead = IniInt("QueueAhead", 0) ? 1 : 0;
-    s.queueDark = IniInt("QueueDarkRefresh", 0) ? 1 : 0;
+    s.queueDark = IniInt("QueueDarkRefresh", 1) ? 1 : 0;
     s.laterRelease = IniInt("LaterRelease", 0) ? 1 : 0;
     s.capJit = IniInt("CapJustInTime", 1) ? 1 : 0;
     s.autoCap = IniInt("AutoFrameCap", 1) ? 1 : 0;
@@ -330,7 +329,6 @@ static void LoadSettings(Settings &s)
     s.reflexAlignCoarse = IniInt("ReflexAlignCoarse", 1) ? 1 : 0;
     s.sleepGrid = IniInt("SleepLimitGrid", 1) ? 1 : 0;
     s.reflexAtSleep = IniInt("ReflexLimitAtSleep", 1) ? 1 : 0;
-    s.driverOff = IniInt("DriverCallsOffThread", 0) ? 1 : 0;
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = IniInt("LearnPerGame", 1) ? 1 : 0;
@@ -3312,67 +3310,9 @@ struct ReflexSecond
     int    limitUs = 0;          // Reflex frame limit in effect
 };
 static void ReflexTick(int limitUs, ReflexSecond &out);
-// DriverCallsOffThread (test): ReflexTick calls into NVIDIA's driver (the frame limit, the latency reports), and those
-// calls can wait on the same lock the game's own submissions hold. On the presenter's thread a wait there delays the
-// next refresh (present stalls of 5-9 ms once a second in Onimusha and Control). With the option on, a worker thread
-// makes the calls: the presenter posts the limit it wants and reads the last finished result, one second older.
-static HANDLE              g_rtEv = nullptr, g_rtThread = nullptr;
-static std::atomic<bool>   g_rtPending{false}, g_rtBusy{false};
-static std::atomic<int>    g_rtLimit{0};
-static std::atomic<double> g_rtMs{-1.0};          // how long the last ReflexTick took (either thread)
-static SRWLOCK             g_rtLock = SRWLOCK_INIT;
-static ReflexSecond        g_rtOut;
-static DWORD WINAPI RfxWorker(void *)
-{
-    for (;;)
-    {
-        WaitForSingleObject(g_rtEv, INFINITE);
-        if (!g_rtPending.load()) continue;
-        g_rtBusy.store(true);
-        if (g_rtPending.exchange(false))
-        {
-            ReflexSecond o;
-            const double t0 = Now();
-            ReflexTick(g_rtLimit.load(), o);
-            g_rtMs.store((Now() - t0) * 1000.0);
-            AcquireSRWLockExclusive(&g_rtLock);
-            g_rtOut = o;
-            ReleaseSRWLockExclusive(&g_rtLock);
-        }
-        g_rtBusy.store(false);
-    }
-    return 0;
-}
-// Presenter thread, once a second.
-static void ReflexTickVia(bool worker, int limitUs, ReflexSecond &out)
-{
-    if (!worker)
-    {
-        const double t0 = Now();
-        ReflexTick(limitUs, out);
-        g_rtMs.store((Now() - t0) * 1000.0);
-        return;
-    }
-    if (!g_rtEv) g_rtEv = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    if (!g_rtThread && g_rtEv)
-    {
-        g_rtThread = CreateThread(nullptr, 0, RfxWorker, nullptr, 0, nullptr);
-        if (g_rtThread) LOGI("BFI Presenter: DriverCallsOffThread on (test): the Reflex calls run on their own thread");
-    }
-    if (!g_rtThread) { ReflexTick(limitUs, out); return; }
-    AcquireSRWLockShared(&g_rtLock);
-    out = g_rtOut;
-    ReleaseSRWLockShared(&g_rtLock);
-    g_rtLimit.store(limitUs);
-    g_rtPending.store(true);
-    SetEvent(g_rtEv);
-}
-// The presenter is stopping: no call left running or waiting that would set a limit again.
-static void ReflexWorkerQuiesce()
-{
-    g_rtPending.store(false);
-    for (int i = 0; i < 200 && g_rtBusy.load(); i++) Sleep(1);
-}
+// How long the last ReflexTick took (its calls into NVIDIA's driver), for the reflex log. (1.0.43 tests also ran it on a
+// thread of its own: the calls took at most 0.6 ms either way, in Control, Jusant and Returnal, so nothing to move.)
+static std::atomic<double> g_rtMs{-1.0};
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
 static double g_coarseTargetS = 0.005;        // the coarse alignment's margin (presenter thread only)
 static std::atomic<int> g_sleepPhaseUs{-1};   // where in the strobe cycle the sleep limit starts frames now (-1: not on the grid)
@@ -4049,7 +3989,7 @@ static DWORD WINAPI PresenterThread(void *)
                               "rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,"
                               "rfx_gpu_active_ms,rfx_sim_ms,rfx_submit_ms,rfx_queue_ms,rendered_fps,align_slack_p10_ms,align_shift_ms,"
                               "frame_repeats,warp_state,warp_filled,warp_ahead,warp_pass_gpu_ms,warp_passes,draw_gpu_ms,draw_warped_gpu_ms,"
-                              "sec_block_ms,rfx_tick_ms,vram_ms,stats_max_ms,driver_off\n");
+                              "sec_block_ms,rfx_tick_ms,vram_ms,stats_max_ms\n");
         }
         else if (!s.log && logf)
         {
@@ -4765,7 +4705,7 @@ static DWORD WINAPI PresenterThread(void *)
             if (!pairLogged)
             {
                 pairLogged = true;
-                LOGI("BFI Presenter: QueueDarkRefresh on (test): the refresh after the lit one is queued with it");
+                LOGI("BFI Presenter: QueueDarkRefresh on: the refresh after the lit one is queued with it");
             }
         }
         if (s.pacing && s.queueAhead && n >= 3 && !vsyncOverridden)
@@ -5949,13 +5889,13 @@ static DWORD WINAPI PresenterThread(void *)
                                          learnMine.rfxMs, learnMine.rfxMarginMs, d * 1000.0);
                                 }
                             }
-                            // Settled: 30 s since the limit came on, 20 s since the start last moved, and 5 s in a row
+                            // Settled: 60 s since the limit came on, 30 s since the start last moved, and 5 s in a row
                             // holding the cap with at most 1 frame repeated or skipped.
                             if (rlLastPh < 0.0 || fabs(std::fmod(ph - rlLastPh + 1.5 * cyc, cyc) - 0.5 * cyc) > 0.0003) { rlLastPh = ph; rlMoveT = t; }
                             const double presCapL = hzL > 0.0 ? hzL / s.frames : 0.0;
                             const bool holdsL = rlFg ? (presCapL > 0.0 && stNow.gameFps > 0.95 * presCapL && stNow.gameFps < 1.05 * presCapL) : holds;
                             rlQuiet = (holdsL && !hitchPaused && p10 >= 0.0 && stNow.frameRepeats + stNow.frameSkips <= 1) ? rlQuiet + 1 : 0;
-                            if (rlApplied && t - rlOnT >= 30.0 && t - rlMoveT >= 20.0 && rlQuiet >= 5)
+                            if (rlApplied && t - rlOnT >= 60.0 && t - rlMoveT >= 30.0 && rlQuiet >= 5)
                             {
                                 const double margin = rlNoFg && s.reflexAlign && !g_alignHunted.load() ? alignTarget : g_coarseTargetS;
                                 const bool changed = learnMine.rfxFg != fgF || learnMine.rfxMs < 0.0 ||
@@ -6015,7 +5955,11 @@ static DWORD WINAPI PresenterThread(void *)
                     }
                     presPrev = stNow.gameFps;
                 }
-                ReflexTickVia(s.driverOff != 0, limitUs, rs);
+                {
+                    const double tRt0 = Now();
+                    ReflexTick(limitUs, rs);
+                    g_rtMs.store((Now() - tRt0) * 1000.0);
+                }
                 rsLast = rs; rsLastT = t;
                 if (rs.frames > 0) rsEverT = t;
                 EnterCriticalSection(&g_cfgLock);
@@ -6025,7 +5969,7 @@ static DWORD WINAPI PresenterThread(void *)
                 LeaveCriticalSection(&g_cfgLock);
                 if (rfxf)
                 {
-                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
+                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                             t, stNow.gameFps, userCap, perNow, stNow.autoCapDown, stNow.autoCapProbe, stNow.fgActive, s.pacingMode,
                             s.capJit, stNow.lrState, stNow.lrEst, stNow.aheadInUse, rs.limitUs,
                             relN ? relSum / relN : -1.0, relN ? relMax : -1.0, relN, rs.frames, rs.simGpuMs, rs.simPresentMs,
@@ -6036,7 +5980,7 @@ static DWORD WINAPI PresenterThread(void *)
                             secWarpPassN ? secWarpPassMs / secWarpPassN : -1.0, secWarpPassN,
                             secDrawPlainN ? secDrawPlainMs / secDrawPlainN : -1.0,
                             secDrawWarpN ? secDrawWarpMs / secDrawWarpN : -1.0,
-                            (Now() - t) * 1000.0, g_rtMs.load(), secVramMs, secStatsMs, s.driverOff);
+                            (Now() - t) * 1000.0, g_rtMs.load(), secVramMs, secStatsMs);
                     secWarpPassMs = secDrawWarpMs = secDrawPlainMs = 0.0;
                     secWarpPassN = secDrawWarpN = secDrawPlainN = 0;
                     fflush(rfxf);
@@ -8476,7 +8420,6 @@ static void ReleaseAll()
     // The frame limits are set by the presenter thread once a second; with it stopped they must not stay on, or a
     // recreated swap chain's pass-through (no BFI until the game resizes it) ran at the old cap (Onimusha: 30 fps,
     // the 2x frame generation limit, after the game recreated its swap chain).
-    ReflexWorkerQuiesce();
     if (g_sleepLimitUs.exchange(0) > 0) LOGI("BFI Presenter: frame limit at the game's Reflex sleep off (presenter stopped)");
 #ifdef _WIN64
     g_rfxWantLimitUs.store(0);

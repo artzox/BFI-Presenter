@@ -5862,7 +5862,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_LatencySleepNV(VkDevice device, VkSwap
     // frame generation (the automatic frame cap's limit paces that), and not after the game collapsed under a limit.
     if (us <= 0 && g_active && g_vkOwnLimit.load() && g_vkFgFactor.load() <= 1 && !g_vkRfxBad.load())
     {
-        const int own = g_vkLlMinUs.load();
+        // Under 2 ms (over 500 fps) isn't a frame cap: RPCS3 sets 640-750 us every frame.
+        const int ownRaw = g_vkLlMinUs.load();
+        const int own = ownRaw >= 2000 ? ownRaw : 0;
         if (own > 0) us = own;
         static int ownWas = 0;
         if ((own > 0) != (ownWas > 0) || (own > 0 && std::abs(own - ownWas) * 4 > std::max(ownWas, 1)))
