@@ -154,6 +154,7 @@ struct Settings
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
     int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
+    int   learnReflex = 0;       // LearnReflexStart (test): the Reflex frame limit starts where its alignment settled last time
     int   threadBoost = 1;       // PresenterThreadBoost: the presenter thread registered with MMCSS (applies at the next start)
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap without Reflex holds the game before its next frame starts
     int   fgLimitNoReflex = 1; // FrameGenLimitWithoutReflex: frame generation without Reflex limited to one presented frame per strobe cycle
@@ -331,6 +332,7 @@ static void LoadSettings(Settings &s)
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = IniInt("LearnPerGame", 1) ? 1 : 0;
+    s.learnReflex = IniInt("LearnReflexStart", 0) ? 1 : 0;
     s.threadBoost = IniInt("PresenterThreadBoost", 1) ? 1 : 0;
     s.autoCapOwn = IniInt("AutoCapOwnWithoutFg", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
@@ -558,6 +560,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameGenLimitWithoutReflex", s.fgLimitNoReflex);
     IniWriteInt("AutoCapAtFrameStart", s.autoCapFrameStart);
     IniWriteInt("LearnPerGame", s.learnPerGame);
+    IniWriteInt("LearnReflexStart", s.learnReflex);
     IniWriteInt("PresenterThreadBoost", s.threadBoost);
     IniWriteFloat("LaterReleaseMarginMs", s.laterReleaseMs);
     IniWriteInt("WaitForResizeOnRecreatedSwapChain", s.deferRecreated);
@@ -2829,6 +2832,12 @@ struct LearnRec
     double bestMs = 0.0;    // release -> flash at that start time
     double hz = 0.0;        // the refresh rate and frames per strobe cycle it was learned at
     int    frames = 0;
+    // The Reflex frame limit at the game's sleep (LearnReflexStart): where in the strobe cycle its frames start once the
+    // alignment has settled, the margin it settled with, and the frame-generation factor that was for.
+    double rfxMs = -1.0;    // start in the strobe cycle (ms), -1 not known
+    double rfxMarginMs = 0.0;   // frames ready this long before the pick (the alignment's target then)
+    int    rfxFg = 0;       // 1 = no frame generation, 2-4 = its factor
+    int    rfxGaveUp = 0;   // 1 = the alignment went round the strobe cycle (the game's frames don't follow it)
 };
 static SRWLOCK     g_learnLock = SRWLOCK_INIT;
 static std::string g_learnKey;          // section in use ("" = none read yet)
@@ -2923,6 +2932,13 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
         snprintf(b, sizeof(b), "%ld", (long)std::lround(out.bestMs * 1000.0)); WritePrivateProfileStringA(sec, "ReleaseToFlashUs", b, path);
         snprintf(b, sizeof(b), "%ld", (long)std::lround(out.hz * 1000.0));     WritePrivateProfileStringA(sec, "RefreshMilliHz", b, path);
         snprintf(b, sizeof(b), "%d", out.frames);                             WritePrivateProfileStringA(sec, "Frames", b, path);
+        if (out.rfxFg > 0)
+        {
+            snprintf(b, sizeof(b), "%ld", (long)std::lround(out.rfxMs * 1000.0));       WritePrivateProfileStringA(sec, "ReflexStartUs", b, path);
+            snprintf(b, sizeof(b), "%ld", (long)std::lround(out.rfxMarginMs * 1000.0)); WritePrivateProfileStringA(sec, "ReflexMarginUs", b, path);
+            snprintf(b, sizeof(b), "%d", out.rfxFg);                                   WritePrivateProfileStringA(sec, "ReflexFrameGen", b, path);
+        }
+        if (out.rfxGaveUp) WritePrivateProfileStringA(sec, "ReflexAlignGaveUp", "1", path);
     }
     if (forget && !cur.empty())
     {
@@ -2951,6 +2967,13 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
         r.fsMs   = get("FrameStartUs", 0) / 1000.0;
         r.bestMs = get("ReleaseToFlashUs", 0) / 1000.0;
         r.hz     = get("RefreshMilliHz", 0) / 1000.0;
+        r.rfxFg  = (int)get("ReflexFrameGen", 0);
+        if (r.rfxFg > 0)
+        {
+            r.rfxMs       = get("ReflexStartUs", -1000) / 1000.0;
+            r.rfxMarginMs = get("ReflexMarginUs", 0) / 1000.0;
+        }
+        r.rfxGaveUp = (int)get("ReflexAlignGaveUp", 0);
     }
     AcquireSRWLockExclusive(&g_learnLock);
     g_learnKey = key;
@@ -3288,6 +3311,9 @@ struct ReflexSecond
 };
 static void ReflexTick(int limitUs, ReflexSecond &out);
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
+static double g_coarseTargetS = 0.005;        // the coarse alignment's margin (presenter thread only)
+static std::atomic<int> g_sleepPhaseUs{-1};   // where in the strobe cycle the sleep limit starts frames now (-1: not on the grid)
+static std::atomic<double> g_sleepPhaseT{0.0};
 static std::atomic<int> g_sleepGrid{1};       // SleepLimitGrid (copied from the settings)
 static std::atomic<bool> g_alignHunted{false}; // ReflexAlign gave up this session (kept moving earlier: the game's own stutters)
 static std::atomic<bool> g_fgXess{false};     // the game presents through XeSS frame generation's swap chain (libxess_fg.dll)
@@ -5754,7 +5780,8 @@ static DWORD WINAPI PresenterThread(void *)
                     // 5 ms to spare. Not within 20 s of the "moving them earlier" nudge, at most once per 20 s.
                     {
                         static int coarseSecs = 0;
-                        static double coarseT = -1e9, coarseTarget = 0.005, coarseHoldT = -1e9;
+                        static double coarseT = -1e9, coarseHoldT = -1e9;
+                        double &coarseTarget = g_coarseTargetS;
                         // The nudge moves the frames ~9 ms earlier itself: no step of this one on top of it (Dead Space,
                         // both in the same second: 40 of 60 frames shown for 3 s, until the next nudge).
                         const bool nudging = t < phaseUntil;
@@ -5794,6 +5821,80 @@ static DWORD WINAPI PresenterThread(void *)
                             }
                         }
                         else coarseSecs = 0;
+                    }
+                    // Learned per game (LearnReflexStart, test): the alignments above find where frames should start each
+                    // time the limit comes on, and that takes a while (Jusant without frame generation: 1.5 minutes with
+                    // 3.5-5.6 frames missing a second while ReflexAlign moved 20 ms and widened its margin to 5 ms; Control
+                    // with frame generation: later and earlier steps undoing each other). The settled start (its place in
+                    // the strobe cycle) and margin are kept per game, refresh rate, frames per cycle and frame-generation
+                    // factor, and the limit starts there the next time. The alignments go on as usual from that start.
+                    {
+                        static bool rlWas = false, rlApplied = false, rlGaveUpSaved = false;
+                        static double rlOnT = 0.0, rlMoveT = 0.0, rlLastPh = -1.0;
+                        static int rlQuiet = 0;
+                        const int fgF = std::max(1, std::min(4, g_sleepFgFactor.load()));
+                        const bool rlFg = !fgPace && g_sleepLimitUs.load() > 0 && fgF > 1 && locked && g_sleepGrid.load() && !g_fgXess.load();
+                        const bool rlNoFg = atSleepNoFg && g_sleepGrid.load() != 0;
+                        const bool rlOn = s.learnPerGame && s.learnReflex && learnMine.frames > 0 && (rlFg || rlNoFg) && cyc > 0.0;
+                        const int phUs = g_sleepPhaseUs.load();
+                        const bool phOk = phUs >= 0 && t - g_sleepPhaseT.load() < 1.0;
+                        if (rlOn && !rlWas) { rlOnT = t; rlApplied = false; rlMoveT = t; rlLastPh = -1.0; rlQuiet = 0; }
+                        rlWas = rlOn;
+                        if (rlOn && phOk)
+                        {
+                            const double ph = phUs * 1e-6;
+                            if (!rlApplied && t - rlOnT >= 2.0)
+                            {
+                                rlApplied = true;
+                                if (learnMine.rfxGaveUp && s.reflexAlign && !g_alignHunted.exchange(true))
+                                {
+                                    rlGaveUpSaved = true;
+                                    LOGI("BFI Presenter: ReflexAlign off for this session: in an earlier session this game's frames didn't "
+                                         "follow it -- the limit keeps its place");
+                                }
+                                if (learnMine.rfxMs >= 0.0 && learnMine.rfxFg == fgF && learnMine.rfxMs < cyc * 1000.0)
+                                {
+                                    double d = learnMine.rfxMs * 0.001 - ph;
+                                    d = std::fmod(d + 1.5 * cyc, cyc) - 0.5 * cyc;        // the shorter way round the cycle
+                                    const int du = (int)(d * 1e6);
+                                    if (du) { shiftUs.fetch_add(du); alignShiftTot += d; }
+                                    if (rlNoFg && learnMine.rfxMarginMs > 0.0) alignTarget = std::max(alignTarget, std::min(0.008, learnMine.rfxMarginMs * 0.001));
+                                    if (rlFg && learnMine.rfxMarginMs > 0.0) g_coarseTargetS = std::max(g_coarseTargetS, std::min(0.008, learnMine.rfxMarginMs * 0.001));
+                                    rlMoveT = t; rlLastPh = learnMine.rfxMs * 0.001;
+                                    LOGI("BFI Presenter: frame limit at the game's Reflex sleep: start time learned for this game in an earlier "
+                                         "session (start +%.1f ms in the cycle, %.1f ms to spare; moved %+.1f ms)",
+                                         learnMine.rfxMs, learnMine.rfxMarginMs, d * 1000.0);
+                                }
+                            }
+                            // Settled: 30 s since the limit came on, 20 s since the start last moved, and 5 s in a row
+                            // holding the cap with at most 1 frame repeated or skipped.
+                            if (rlLastPh < 0.0 || fabs(std::fmod(ph - rlLastPh + 1.5 * cyc, cyc) - 0.5 * cyc) > 0.0003) { rlLastPh = ph; rlMoveT = t; }
+                            const double presCapL = hzL > 0.0 ? hzL / s.frames : 0.0;
+                            const bool holdsL = rlFg ? (presCapL > 0.0 && stNow.gameFps > 0.95 * presCapL && stNow.gameFps < 1.05 * presCapL) : holds;
+                            rlQuiet = (holdsL && !hitchPaused && p10 >= 0.0 && stNow.frameRepeats + stNow.frameSkips <= 1) ? rlQuiet + 1 : 0;
+                            if (rlApplied && t - rlOnT >= 30.0 && t - rlMoveT >= 20.0 && rlQuiet >= 5)
+                            {
+                                const double margin = rlNoFg && s.reflexAlign && !g_alignHunted.load() ? alignTarget : g_coarseTargetS;
+                                const bool changed = learnMine.rfxFg != fgF || learnMine.rfxMs < 0.0 ||
+                                                     fabs(std::fmod(ph * 1000.0 - learnMine.rfxMs + 1.5 * cyc * 1000.0, cyc * 1000.0) - 0.5 * cyc * 1000.0) > 0.75 ||
+                                                     fabs(margin * 1000.0 - learnMine.rfxMarginMs) > 0.75;
+                                if (changed)
+                                {
+                                    learnMine.rfxMs = ph * 1000.0; learnMine.rfxMarginMs = margin * 1000.0; learnMine.rfxFg = fgF;
+                                    LearnPost(learnMine);
+                                    LOGI("BFI Presenter: frame limit at the game's Reflex sleep: start time kept for this game (start +%.1f ms "
+                                         "in the cycle, %.1f ms to spare, frame generation %dx)", learnMine.rfxMs, learnMine.rfxMarginMs, fgF);
+                                }
+                            }
+                        }
+                        // The alignment gave up this session (it went round the strobe cycle): remembered, so the next
+                        // session doesn't try again.
+                        if (s.learnPerGame && s.learnReflex && learnMine.frames > 0 && g_alignHunted.load() && !rlGaveUpSaved && !learnMine.rfxGaveUp)
+                        {
+                            rlGaveUpSaved = true;
+                            learnMine.rfxGaveUp = 1;
+                            LearnPost(learnMine);
+                        }
                     }
                     EnterCriticalSection(&g_cfgLock);
                     g_status.alignSlackMs = p10 >= 0.0 ? p10 * 1000.0 : -1.0;
@@ -7132,6 +7233,8 @@ static int __cdecl hk_NvSleep(IUnknown *dev)
                 double ph = std::fmod(phase, cyc);
                 if (ph < 0.0) ph += cyc;
                 nextT = cycStart + ph + std::floor((nextT - cycStart - ph) / cyc + 0.5) * cyc;
+                g_sleepPhaseUs.store((int)(ph * 1e6));
+                g_sleepPhaseT.store(now);
             }
         }
         while (nextT - Now() > 0.015) SleepUntil(Now() + 0.015, timer);
