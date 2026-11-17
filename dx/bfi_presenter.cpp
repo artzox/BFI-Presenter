@@ -3313,6 +3313,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out);
 // How long the last ReflexTick took (its calls into NVIDIA's driver), for the reflex log. (1.0.43 tests also ran it on a
 // thread of its own: the calls took at most 0.6 ms either way, in Control, Jusant and Returnal, so nothing to move.)
 static std::atomic<double> g_rtMs{-1.0};
+static std::atomic<int> g_darkState{0};   // QueueDarkRefresh: 0 not yet, 1 running, 2 off for this session (the queued present waited)
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
 static double g_coarseTargetS = 0.005;        // the coarse alignment's margin (presenter thread only)
 static std::atomic<int> g_sleepPhaseUs{-1};   // where in the strobe cycle the sleep limit starts frames now (-1: not on the grid)
@@ -4693,6 +4694,7 @@ static DWORD WINAPI PresenterThread(void *)
                     if (pairBlocked * 2 > pairSeen)
                     {
                         pairOff = true;
+                        g_darkState.store(2);
                         LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
                              "pairs (the swap chain takes one pending present)", pairBlocked, pairSeen);
                     }
@@ -4708,6 +4710,7 @@ static DWORD WINAPI PresenterThread(void *)
             pairNext = true;
             pairVbT = tVb;
             pairLitPresS = tPres - tSub;
+            g_darkState.store(1);
             static bool pairLogged = false;
             if (!pairLogged)
             {
@@ -11810,6 +11813,38 @@ static void draw_overlay(reshade::api::effect_runtime *)
         bool qa = s.queueAhead != 0;
         if (ImGui::Checkbox("Queue one refresh ahead (needs 3 presenter buffers, Wait for vblank on)", &qa)) s.queueAhead = qa ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keeps exactly one extra present queued, so an occasional late slot is covered\nwithout a flash. +1 refresh (8 ms) of latency. Unlike Wait for vblank off, the\nqueue never grows, so the driver doesn't throttle the game.");
+        bool qd = s.queueDark != 0;
+        if (ImGui::Checkbox("Queue the dark refresh with the lit one (needs 3 presenter buffers, Wait for vblank on)", &qd)) s.queueDark = qd ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The dark refresh shows the same game frame, so it is drawn and presented right after the lit one\n"
+                                                      "instead of one refresh later. A stall while it is drawn then has two refreshes of room: fewer\n"
+                                                      "late refreshes, and the ones left are mostly dark flickers rather than bright flashes.\n"
+                                                      "No added latency. Turns itself off for the session if the swap chain can't take it. On by default.");
+        if (s.queueDark && s.enabled && s.frames >= 2)
+        {
+            // Why it isn't running: the settings that rule it out, then what the presenter found.
+            const int bufs = st.presBufs > 0 ? st.presBufs : s.presBuffers;
+            const char *why = !s.pacing ? "not in use: needs Wait for vblank on" :
+                              s.queueAhead ? "not in use while Queue one refresh ahead is on" :
+                              bufs < 3 ? (s.presBuffers >= 3 ? "not in use yet: 3 presenter buffers apply at the game's next resize"
+                                                             : "not in use: needs 3 presenter buffers") :
+                              GradualSaverOn(s) ? "not in use while an LCD saver is on" :
+                              g_darkState.load() == 2 ? "off for this session: the swap chain takes one pending present (see the log)" : nullptr;
+            if (why)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+                ImGui::TextWrapped("Dark refresh queue %s.", why);
+                ImGui::PopStyleColor(1);
+                if (!s.queueAhead && s.pacing && s.presBuffers < 3)
+                {
+                    if (ImGui::SmallButton("Use 3 presenter buffers")) { s.presBuffers = 3; IniWriteInt("PresenterBuffers", 3); }
+                }
+            }
+            else if (g_darkState.load() == 1)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(in use)");
+            }
+        }
         ImGui::SliderInt("Presenter buffers (applies at the game's next resize)", &s.presBuffers, 2, 4);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Real swap chain buffers behind the presenter. With 3 or 4 AND 'Wait for vblank' off,\nthe presenter queues frames ahead, so a late slot no longer holds a lit or dark frame\ntwice (a flash) -- at the cost of 1-2 refreshes (8-17 ms) of extra latency.");
         if (ImGui::Checkbox("Present on own queue (applies when the game next creates its swap chain)", &oq)) s.ownQueue = oq ? 1 : 0;
