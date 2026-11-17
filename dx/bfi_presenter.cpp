@@ -3283,13 +3283,22 @@ static int ScCompMode()
     if (!g_sc) return -1;
     OwnCall own;
     IDXGISwapChainMedia *m = nullptr;
-    if (FAILED(g_sc->QueryInterface(__uuidof(IDXGISwapChainMedia), (void **)&m)) || !m) return -1;
+    static int logged = 0;
+    const HRESULT qh = g_sc->QueryInterface(__uuidof(IDXGISwapChainMedia), (void **)&m);
+    if (FAILED(qh) || !m)
+    {
+        if (logged++ < 3) LOGI("BFI Presenter: swap chain presentation not readable: no IDXGISwapChainMedia (0x%08lx)", (unsigned long)qh);
+        return -1;
+    }
     DXGI_FRAME_STATISTICS_MEDIA fs = {};
+    fs.CompositionMode = (DXGI_FRAME_PRESENTATION_MODE)-1;
     const HRESULT hr = m->GetFrameStatisticsMedia(&fs);
     m->Release();
-    // DXGI_ERROR_FRAME_STATISTICS_DISJOINT just means no stats yet; the mode is still filled in.
-    if (FAILED(hr) && hr != DXGI_ERROR_FRAME_STATISTICS_DISJOINT) return -1;
-    return (int)fs.CompositionMode;
+    // DXGI_ERROR_FRAME_STATISTICS_DISJOINT just means no stats yet; the mode may still be filled in.
+    if (FAILED(hr) && logged++ < 3)
+        LOGI("BFI Presenter: swap chain presentation: GetFrameStatisticsMedia 0x%08lx (mode %d)", (unsigned long)hr, (int)fs.CompositionMode);
+    const int cm = (int)fs.CompositionMode;
+    return cm >= 0 && cm <= 3 ? cm : -1;
 }
 static const char *CompModeName(int m)
 {
