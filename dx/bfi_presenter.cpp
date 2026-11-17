@@ -154,7 +154,7 @@ struct Settings
     int   capReflex = 0;      // the game frame cap applied with Reflex's frame limit in games that use Reflex (opt-in)
     int   autoCapOwn = 0;     // AutoCapOwnWithoutFg: 0 = Reflex games step down with Reflex's limit; 1 = the presenter's own cap while frame generation is off
     int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
-    int   learnReflex = 0;       // LearnReflexStart (test): the Reflex frame limit starts where its alignment settled last time
+    int   learnReflex = 1;       // LearnReflexStart: the Reflex frame limit starts where its alignment settled last time
     int   threadBoost = 1;       // PresenterThreadBoost: the presenter thread registered with MMCSS (applies at the next start)
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap without Reflex holds the game before its next frame starts
     int   fgLimitNoReflex = 1; // FrameGenLimitWithoutReflex: frame generation without Reflex limited to one presented frame per strobe cycle
@@ -332,7 +332,7 @@ static void LoadSettings(Settings &s)
     s.fgLimitNoReflex = IniInt("FrameGenLimitWithoutReflex", 1) ? 1 : 0;
     s.autoCapFrameStart = IniInt("AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = IniInt("LearnPerGame", 1) ? 1 : 0;
-    s.learnReflex = IniInt("LearnReflexStart", 0) ? 1 : 0;
+    s.learnReflex = IniInt("LearnReflexStart", 1) ? 1 : 0;
     s.threadBoost = IniInt("PresenterThreadBoost", 1) ? 1 : 0;
     s.autoCapOwn = IniInt("AutoCapOwnWithoutFg", 0) ? 1 : 0;
     s.laterReleaseMs = IniFloat("LaterReleaseMarginMs", 1.5f);
