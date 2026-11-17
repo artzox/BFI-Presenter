@@ -3276,6 +3276,27 @@ static HRESULT ScStats(DXGI_FRAME_STATISTICS *st)
     if (g_dx11.load()) { OwnCall own; return SC_DIRECT(HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain *, DXGI_FRAME_STATISTICS *), 16)(g_sc, st); }
     return g_sc->GetFrameStatistics(st);
 }
+// How Windows shows the swap chain (DXGI_FRAME_PRESENTATION_MODE): 0 composed by DWM,
+// 1 overlay / independent flip, 2 none, 3 composition failure; -1 unknown.
+static int ScCompMode()
+{
+    if (!g_sc) return -1;
+    OwnCall own;
+    IDXGISwapChainMedia *m = nullptr;
+    if (FAILED(g_sc->QueryInterface(__uuidof(IDXGISwapChainMedia), (void **)&m)) || !m) return -1;
+    DXGI_FRAME_STATISTICS_MEDIA fs = {};
+    const HRESULT hr = m->GetFrameStatisticsMedia(&fs);
+    m->Release();
+    // DXGI_ERROR_FRAME_STATISTICS_DISJOINT just means no stats yet; the mode is still filled in.
+    if (FAILED(hr) && hr != DXGI_ERROR_FRAME_STATISTICS_DISJOINT) return -1;
+    return (int)fs.CompositionMode;
+}
+static const char *CompModeName(int m)
+{
+    return m == 0 ? "composed by Windows (DWM)" : m == 1 ? "independent flip (overlay)" : m == 2 ? "none" :
+           m == 3 ? "composition failure" : "unknown";
+}
+static std::atomic<int> g_compMode{-1};
 static HRESULT ScLPC(UINT *n)
 {
     if (g_dx11.load()) { OwnCall own; return SC_DIRECT(HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT *), 17)(g_sc, n); }
@@ -4723,6 +4744,7 @@ static DWORD WINAPI PresenterThread(void *)
                         for (int b = 0; b < 4; b++) heldN += (heldMask >> b) & 1;
                         const bool viaLimiter = !viaOverlays && heldN >= 2;
                         g_darkState.store(viaOverlays ? 3 : viaLimiter ? 4 : 2);
+                        LOGI("BFI Presenter: QueueDarkRefresh off: swap chain presentation is %s", CompModeName(g_compMode.load()));
                         if (viaLimiter)
                             LOGW("BFI Presenter: QueueDarkRefresh %s: the queued refresh's present waited in %d of %d "
                                  "pairs -- a frame limiter holds the presenter's presents (%.1f a second): RTSS's frame limit, Max Frame Rate "
@@ -4985,6 +5007,14 @@ static DWORD WINAPI PresenterThread(void *)
                 const bool heldSec = prate < 0.985 * hz && prate > 0.5 * hz && secLate < 3 && hz > 0.97 * peakHz;
                 limitSecs = heldSec ? limitSecs + 1 : 0;
                 g_presHeldMask.store(((g_presHeldMask.load() << 1) | (heldSec ? 1 : 0)) & 0xFF);
+                {
+                    const int cm = ScCompMode();
+                    if (cm != g_compMode.load())
+                    {
+                        LOGI("BFI Presenter: swap chain presentation: %s (was %s)", CompModeName(cm), CompModeName(g_compMode.load()));
+                        g_compMode.store(cm);
+                    }
+                }
                 if (heldSec) g_presHeldRate.store(prate);
                 if (limitSecs == 3 && !limitLogged)
                 {
