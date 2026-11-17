@@ -290,6 +290,7 @@ struct Settings
     int   threadBoost = 1;       // PresenterThreadBoost: the presenter thread registered with MMCSS (applies at the next start)
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap times the game's frame start with a search across the strobe cycle
     int   alignCoarse = 1;    // ReflexAlignCoarse: frames ready far ahead of the pick under the Reflex frame limit are moved closer once
+    int   reflexOwn = 0;      // ReflexOwnLimit (test): the game's own Reflex frame limit is applied at its Reflex sleep (it was only taken out of the driver)
     int   sleepGrid = 1;      // SleepLimitGrid: the frame limit at the game's Reflex sleep keeps its place in the strobe cycle
     int   fgDllCheck = 1;     // FrameGenDllCheck: a loaded frame generation DLL counts as frame generation (games without Reflex)
     int   gameCap  = 1;       // 0 off, 1 refresh rate, 2 half refresh, 3 quarter refresh,
@@ -404,6 +405,7 @@ static void LoadSettings(Settings &s)
     s.autoCap = KvInt(kv, "AutoFrameCap", 1) ? 1 : 0;
     s.fgDllCheck = KvInt(kv, "FrameGenDllCheck", 1) ? 1 : 0;
     s.sleepGrid = KvInt(kv, "SleepLimitGrid", 1) ? 1 : 0;
+    s.reflexOwn = KvInt(kv, "ReflexOwnLimit", 0) ? 1 : 0;
     s.alignCoarse = KvInt(kv, "ReflexAlignCoarse", 1) ? 1 : 0;
     s.autoCapFrameStart = KvInt(kv, "AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = KvInt(kv, "LearnPerGame", 1) ? 1 : 0;
@@ -458,7 +460,7 @@ static void LoadSettings(Settings &s)
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
     I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
-    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
+    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
@@ -627,6 +629,7 @@ static std::atomic<long> g_vkSleepSec{0};       // the game's Reflex sleep calls
 static std::atomic<double> g_vkSleepLastT{0.0};  // last Reflex sleep call
 static std::atomic<int>  g_vkSleepLimitUs{0};    // Reflex frame limit applied in the game's sleep call, per rendered frame (0 = off)
 static std::atomic<int>  g_vkFgFactor{1};        // presents per rendered frame, from Reflex sleep calls
+static std::atomic<int>  g_vkOwnLimit{0};        // ReflexOwnLimit (copied from the settings)
 static std::atomic<int>  g_vkSleepGrid{1};       // SleepLimitGrid (copied from the settings)
 static std::atomic<int>  g_vkSleepShiftUs{0};    // move the sleep limit's next wake-up by this much (+ later), taken once
 static std::atomic<bool> g_vkRfxBad{false};      // the game collapsed under the limit: off for the session
@@ -2328,6 +2331,7 @@ static void PresenterThread(Swapchain *sc)
         {
             sc->strobeFrames.store(s.frames);
             g_vkSleepGrid.store(s.sleepGrid);
+            g_vkOwnLimit.store(s.reflexOwn);
             sc->tickSlot.store((int)((presents - phaseShift) % (uint64_t)s.frames));
             sc->tickT.store(Now());
             sc->ticks.fetch_add(1);
@@ -5831,7 +5835,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_SetLatencySleepModeNV(VkDevice device,
     {
         loggedUs = us;
         LOGI("BFI Presenter: game Reflex (Vulkan): low latency %s%s, frame limit %d us%s", mode ? "on" : "off", boost ? " + Boost" : "", us,
-             us > 0 && g_active ? " -- taken out of the driver" : "");
+             us > 0 && g_active ? (g_vkOwnLimit.load() ? " -- applied at the game's Reflex sleep instead of in the driver" : " -- taken out of the driver") : "");
     }
     // The driver's limit counts the presenter's presents (it collapsed DX games to ~7 fps): taken out.
     if (info && info->minimumIntervalUs > 0 && g_active)
@@ -5851,7 +5855,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_LatencySleepNV(VkDevice device, VkSwap
     g_vkSleepLastT.store(Now());
     // Frame limit at the game's sleep, as in the DX add-on: one rendered frame per (limit), i.e. with frame
     // generation one presented frame per strobe cycle. The driver's own limit would count the presenter's presents.
-    const int us = g_vkSleepLimitUs.load();
+    int us = g_vkSleepLimitUs.load();
+    // ReflexOwnLimit (test): the game's own Reflex frame limit (an in-game frame cap that goes through Reflex) is taken
+    // out of the driver above, which would count the presenter's presents, and until 1.0.41 it was applied nowhere: the
+    // game ran up to the presenter's cap instead. As in the DX add-on it is applied here, at the game's sleep; not with
+    // frame generation (the automatic frame cap's limit paces that), and not after the game collapsed under a limit.
+    if (us <= 0 && g_active && g_vkOwnLimit.load() && g_vkFgFactor.load() <= 1 && !g_vkRfxBad.load())
+    {
+        const int own = g_vkLlMinUs.load();
+        if (own > 0) us = own;
+        static int ownWas = 0;
+        if ((own > 0) != (ownWas > 0) || (own > 0 && std::abs(own - ownWas) * 4 > std::max(ownWas, 1)))
+        {
+            ownWas = own;
+            if (own > 0) LOGI("BFI Presenter: game Reflex (Vulkan): the game's own frame limit (%d us, %.1f fps) is applied at its Reflex sleep", own, 1e6 / own);
+            else LOGI("BFI Presenter: game Reflex (Vulkan): the game's own frame limit is off");
+        }
+    }
     if (us > 0)
     {
         static double nextT = 0.0, phase = 0.0;
