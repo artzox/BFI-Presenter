@@ -3837,6 +3837,9 @@ static DWORD WINAPI PresenterThread(void *)
     bool pairOff = false;            // off now (the queued presents kept waiting)
     double pairRetryT = 0.0;         // when it tries again (0: off for the session)
     int pairRetries = 0;             // tries again after 1, 2, 4 and 8 minutes, then stays off
+    bool pairWaited = false;         // the last pair's queued present waited (a flip still pending behind it)
+    double pairDrainT = -10.0;       // when the presenter last skipped a vblank to empty the flip queue
+    int pairDrains = 0;
     double secStatsMs = 0.0, secVramMs = -1.0;   // the once-a-second block's calls into DXGI and the driver, timed for the reflex log
     bool vsyncOverridden = false;    // the driver is not honouring the presenter's VSync
     int  vsyncFastSecs = 0;          // seconds in a row with presents well above the refresh count
@@ -4054,6 +4057,21 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     tick(presents - 1, tw - perP);
                     tick(presents, tw);
+                    // The queued present waited for a flip (one missed refresh puts a flip one vblank late). Presenting
+                    // the lit refresh now would queue it behind a pending flip, and every pair after it too: the next
+                    // queued present waits again, this branch is taken again, and the extra refresh in the queue never
+                    // drains (Spider-Man 2, t11-t13: 8 ms queued presents and frame age +1 refresh after one missed
+                    // refresh, with Reflex on or off, borderless or exclusive). One more vblank empties it -- the dark
+                    // refresh shows one refresh longer, once. At most once in 2 s: a swap chain that really holds one
+                    // pending present waits every pair, and the safeguard below switches the dark queue off instead.
+                    if (pairWaited && tw - pairDrainT >= 2.0)
+                    {
+                        output->WaitForVBlank();
+                        pairDrainT = Now();
+                        if (++pairDrains <= 20)
+                            LOGI("BFI Presenter: QueueDarkRefresh: a flip was still pending after the pair -- skipped one vblank "
+                                 "to empty the queue (%d so far)", pairDrains);
+                    }
                 }
                 pairVbT = 0.0;
             }
@@ -4690,6 +4708,10 @@ static DWORD WINAPI PresenterThread(void *)
             // Not judged while the game starts up (Soul Reaver, OpenGL, t7: off after 115 waits of 120 in its first
             // 3 s, around a hitch pause, then 0.09 ms presents for the rest of the session), and a hitch pause starts
             // the window again.
+            {
+                const double wHz = modeHz > 1.0 ? modeHz : 120.0, wDur = tPres - tSub;
+                pairWaited = wDur > 0.5 / wHz && wDur - pairLitPresS > 0.25 / wHz;
+            }
             if (hitchPaused) pairSeen = pairBlocked = pairBadWins = 0;
             else if (!pairOff && tPres - pairStartT >= 5.0)
             {
