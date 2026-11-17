@@ -3826,6 +3826,7 @@ static DWORD WINAPI PresenterThread(void *)
     // pick doesn't move: no added latency. The next lit refresh is picked two vblanks after this one's.
     bool pairNext = false;           // this iteration: the refresh queued behind the lit one (no vblank wait)
     double pairVbT = 0.0;            // > 0: the vblank the lit refresh of the last pair was drawn at
+    double pairLitPresS = 0.0;       // how long the lit refresh's Present call took (overlays drawn in it: Cocoon 4.4 ms)
     int pairBlocked = 0, pairSeen = 0, pairLogs = 0;   // queued refreshes whose present blocked, and all of them, in the current window
     bool pairOff = false;            // ... three times: off for this session
     double secStatsMs = 0.0, secVramMs = -1.0;   // the once-a-second block's calls into DXGI and the driver, timed for the reflex log
@@ -4681,7 +4682,12 @@ static DWORD WINAPI PresenterThread(void *)
             if (!pairOff && !hitchPaused)
             {
                 pairSeen++;
-                if (tPres - tSub > 0.5 / (modeHz > 1.0 ? modeHz : 120.0)) pairBlocked++;
+                // Waited: the call took half a refresh, and a quarter of a refresh longer than the lit one's. Overlay
+                // hooks (ShowOverlays=1) draw inside every Present, the lit one too (Cocoon, t3: 4.4 ms each, judged
+                // as 120 waits of 120 and switched off), while a swap chain that holds one present makes only the
+                // queued one wait until the lit refresh's vblank.
+                const double prHz = modeHz > 1.0 ? modeHz : 120.0, prDur = tPres - tSub;
+                if (prDur > 0.5 / prHz && prDur - pairLitPresS > 0.25 / prHz) pairBlocked++;
                 if (pairSeen >= 120)
                 {
                     if (pairBlocked * 2 > pairSeen)
@@ -4701,11 +4707,25 @@ static DWORD WINAPI PresenterThread(void *)
         {
             pairNext = true;
             pairVbT = tVb;
+            pairLitPresS = tPres - tSub;
             static bool pairLogged = false;
             if (!pairLogged)
             {
                 pairLogged = true;
                 LOGI("BFI Presenter: QueueDarkRefresh on: the refresh after the lit one is queued with it");
+            }
+        }
+        // Why the dark queue isn't used, once per session (Cocoon, t3: PresenterBuffers=2 left in its ini, nothing in the log).
+        if (s.queueDark && s.enabled && s.frames >= 2 && !pairOff && !pairIter)
+        {
+            static bool pairWhyLogged = false;
+            const char *why = !s.pacing ? "Wait for vblank is off" : s.queueAhead ? "Queue one refresh ahead is on" :
+                              n < 3 ? "fewer than 3 presenter buffers (PresenterBuffers)" : GradualSaverOn(s) ? "an LCD saver is on" :
+                              vsyncOverridden ? "the driver is not honouring VSync" : nullptr;
+            if (why && !pairWhyLogged && presents > 600)
+            {
+                pairWhyLogged = true;
+                LOGI("BFI Presenter: QueueDarkRefresh not used: %s", why);
             }
         }
         if (s.pacing && s.queueAhead && n >= 3 && !vsyncOverridden)
