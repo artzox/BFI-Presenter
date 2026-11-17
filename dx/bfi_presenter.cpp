@@ -3313,6 +3313,7 @@ static void ReflexTick(int limitUs, ReflexSecond &out);
 // How long the last ReflexTick took (its calls into NVIDIA's driver), for the reflex log. (1.0.43 tests also ran it on a
 // thread of its own: the calls took at most 0.6 ms either way, in Control, Jusant and Returnal, so nothing to move.)
 static std::atomic<double> g_rtMs{-1.0};
+static int g_showOverlaysBoot = -1;            // ShowOverlays as read at start (-1 not yet); fixed for the session
 static std::atomic<int> g_darkState{0};   // QueueDarkRefresh: 0 not yet, 1 running, 2 off for this session (the queued present waited)
 static std::atomic<int> g_sleepShiftUs{0};    // ReflexAlign: move the next wake-up by this much (+ later), taken once
 static double g_coarseTargetS = 0.005;        // the coarse alignment's margin (presenter thread only)
@@ -4694,9 +4695,17 @@ static DWORD WINAPI PresenterThread(void *)
                     if (pairBlocked * 2 > pairSeen)
                     {
                         pairOff = true;
-                        g_darkState.store(2);
-                        LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
-                             "pairs (the swap chain takes one pending present)", pairBlocked, pairSeen);
+                        // Overlay hooks (ShowOverlays=1) make the queued present wait for the lit one's overlay drawing
+                        // (Cocoon, t6: off with ShowOverlays=1, 1 wait in 120 without).
+                        const bool viaOverlays = g_showOverlaysBoot == 1;
+                        g_darkState.store(viaOverlays ? 3 : 2);
+                        if (viaOverlays)
+                            LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
+                                 "pairs -- the overlays drawn in each present (ShowOverlays=1) hold it up; ShowOverlays=0 lets it run",
+                                 pairBlocked, pairSeen);
+                        else
+                            LOGW("BFI Presenter: QueueDarkRefresh off for this session: the queued refresh's present waited in %d of %d "
+                                 "pairs (the swap chain takes one pending present)", pairBlocked, pairSeen);
                     }
                     else if (pairBlocked > 0 && ++pairLogs <= 20)
                         LOGI("BFI Presenter: QueueDarkRefresh: the queued refresh's present waited in %d of the last %d pairs", pairBlocked, pairSeen);
@@ -7674,7 +7683,6 @@ static void PrepareDirectCalls()
 // ShowOverlays, as it was when the presenter first presented: overlays set themselves up on the first
 // present they see and remember things such as the queue (God of War Ragnarok crashed when that changed),
 // so the path is not switched while the game runs.
-static int g_showOverlaysBoot = -1;
 
 static HRESULT OwnPresent()
 {
@@ -11828,7 +11836,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
                               bufs < 3 ? (s.presBuffers >= 3 ? "not in use yet: 3 presenter buffers apply at the game's next resize"
                                                              : "not in use: needs 3 presenter buffers") :
                               GradualSaverOn(s) ? "not in use while an LCD saver is on" :
-                              g_darkState.load() == 2 ? "off for this session: the swap chain takes one pending present (see the log)" : nullptr;
+                              g_darkState.load() == 2 ? "off for this session: the swap chain takes one pending present (see the log)" :
+                              g_darkState.load() == 3 ? "off for this session: the overlays (Show overlays) hold up the queued present; "
+                                                        "turn Show overlays off to use it" : nullptr;
             if (why)
             {
                 ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
