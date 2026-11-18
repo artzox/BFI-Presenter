@@ -4670,7 +4670,7 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 static int hudLogs = 0;
                 if (hudLogs++ < 30) LOGI("BFI Presenter: frame warp check: the HUD mask covers %.1f%% of the picture", hudPct);
-                if (hudPct > 35.0) { if (++hudBigN >= 2) gmo::HudBad(hudPct); } else hudBigN = 0;
+                if (hudPct > 35.0) { gmo::HudBad(hudPct); hudBigN = 0; } else hudBigN = 0;
             }
             if (!(wsum[0] > 0.0 && wsum[1] > 0.0 && chkFrames > 0))
             {
@@ -8142,7 +8142,7 @@ struct Entry
     bool  depthRev = false, hasDepth = false, reset = false;
     UINT  gen = 0;                                        // bumped when the copies are made anew
 };
-struct GConsts { float outTexel[2], mvScale[2], mvMap[4], dMap[4], mvInvalid; uint32_t flags; float pad[2]; float hMap[4]; float hudThr; float pad2[3]; };
+struct GConsts { float outTexel[2], mvScale[2], mvMap[4], dMap[4], mvInvalid; uint32_t flags; float pad[2]; float hMap[4]; float hudThr; uint32_t hudMode; float pad2[2]; };
 static_assert(sizeof(GConsts) == 96, "PSWarpGame / PSWarpHud constants");
 
 static std::mutex lk;
@@ -8171,6 +8171,11 @@ static int  hudCur = 0;
 static bool hudMaskOk = false;                           // hudMask holds a mask from the last Presents
 static ID3D12PipelineState *psoHud = nullptr;
 static std::atomic<int> hudState{0};                     // 0 no HUD-less picture seen, 1 in use, -1 switched off (didn't match)
+// How the frame and the HUD-less picture are compared (PSWarpHud's gHudMode). 007 First Light's HUD-less picture is
+// linear (RGBA16F) against an HDR10 frame: compared as they are, the mask covered 99.9% (gm9). The modes are tried
+// in turn, from the likeliest for the two formats; the check (every 2 s) moves on when the mask covers too much.
+static int hudModes[3] = { 0, 1, 2 }; static int hudModeN = 3; static std::atomic<int> hudModeI{0};
+static bool hudModesSet = false;
 static char hudWhy[160] = "";
 static Consts consts = {}; static bool haveConsts = false;
 static bool depthFailed = false;                         // a copy texture of the game's depth format couldn't be made
@@ -8315,6 +8320,11 @@ static void Map(const Tag &t, UINT w, UINT h, float m[4])
     m[2] = e ? (float)t.ext.left : 0.0f;       m[3] = e ? (float)t.ext.top : 0.0f;
 }
 
+static const char *HudModeName(uint32_t m)
+{
+    return m == 1 ? "HDR10 frame against a linear scRGB picture" : m == 2 ? "sRGB frame against a linear picture" : "the same encoding";
+}
+
 static DXGI_FORMAT ColorView(DXGI_FORMAT f)
 {
     switch (f)
@@ -8426,7 +8436,7 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
         // A new device: the copies of the old one go (kept across swap chain resizes otherwise -- a copy the game has
         // recorded on a list it hasn't submitted yet must still exist when that list runs).
         for (int i = 0; i < kRing; i++) { SafeRelease(ring[i].mv); SafeRelease(ring[i].depth); ring[i] = Entry(); }
-        SafeRelease(hudCopy); hudW = hudH = 0; hudFmt = DXGI_FORMAT_UNKNOWN; hudLive = false;
+        SafeRelease(hudCopy); hudW = hudH = 0; hudFmt = DXGI_FORMAT_UNKNOWN; hudLive = false; hudModesSet = false;
         for (ID3D12Resource *r : retired) r->Release();
         retired.clear();
         pendN = 0; latest = -1; depthFailed = false;
@@ -8716,7 +8726,18 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     const bool linear = StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT;
     gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (linear ? 8u : 0u);
     memcpy(gc.hMap, hlMap, sizeof(gc.hMap));
-    gc.hudThr = linear ? 0.06f : 0.04f;
+    if (hl && !hudModesSet)
+    {
+        // the order to try: a float picture against a 10- or 8-bit frame is most likely HDR10 / sRGB against linear
+        const DXGI_FORMAT v = ColorView(hlFmt), f = StageFormat();
+        const bool hlFloat = v == DXGI_FORMAT_R16G16B16A16_FLOAT || v == DXGI_FORMAT_R32G32B32A32_FLOAT || v == DXGI_FORMAT_R11G11B10_FLOAT;
+        const bool fFloat = f == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (hlFloat && !fFloat) { hudModes[0] = f == DXGI_FORMAT_R10G10B10A2_UNORM ? 1 : 2; hudModes[1] = hudModes[0] == 1 ? 2 : 1; hudModes[2] = 0; }
+        else { hudModes[0] = 0; hudModes[1] = 1; hudModes[2] = 2; }
+        hudModeI = 0; hudModesSet = true;
+    }
+    gc.hudMode = (uint32_t)hudModes[std::min(hudModeI.load(), hudModeN - 1)];
+    gc.hudThr = (linear || gc.hudMode != 0) ? 0.08f : 0.04f;
 
     // 1. The HUD mask (when the game gives a HUD-less picture)
     if (hl)
@@ -8746,8 +8767,9 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         if (hudState.load() == 0)
         {
             hudState = 1;
-            LOGI("BFI Presenter: frame warp, the game's own motion: the HUD is kept still with the game's HUD-less picture (%ux%u, format %d, %s)",
-                 (unsigned)hlMap[0], (unsigned)hlMap[1], (int)hlFmt, hlLive ? "read at the Present" : "copied when tagged");
+            LOGI("BFI Presenter: frame warp, the game's own motion: the HUD is kept still with the game's HUD-less picture (%ux%u, format %d, "
+                 "the frame's %d, %s); compared as: %s", (unsigned)hlMap[0], (unsigned)hlMap[1], (int)hlFmt, (int)StageFormat(),
+                 hlLive ? "read at the Present" : "copied when tagged", HudModeName(gc.hudMode));
         }
         hl->Release();
     }
@@ -8802,13 +8824,23 @@ static UINT FlowGenNow() { return flowGen.load(); }
 static ID3D12Resource *FlowRes(int s) { return s >= 0 && s < (int)kStage ? flow[s] : nullptr; }
 static int StateNow(char *w, size_t n) { std::lock_guard<std::mutex> l(lk); snprintf(w, n, "%s", why); return state.load(); }
 static int HudNow() { return hudState.load(); }
-// The check found the mask covering much of the picture: the HUD-less picture doesn't match the frame shown (effects
-// drawn after it -- ReShade's included -- or another colour encoding). The mask is switched off for the session.
+// The check found the mask covering much of the picture: the HUD-less picture doesn't match the frame shown as it is
+// compared now. The next way of comparing is tried; after the last, the mask is switched off for the session (effects
+// drawn after the HUD-less picture -- ReShade's included -- or an encoding none of the modes undo).
 static void HudBad(double pct)
 {
-    if (hudState.exchange(-1) != -1)
-        LOGW("BFI Presenter: frame warp, the game's own motion: HUD protection off -- the game's HUD-less picture differs from the frame "
-             "shown over %.0f%% of it (effects drawn after it, ReShade's included, or another colour encoding)", pct);
+    if (hudState.load() < 0) return;
+    const int i = hudModeI.load();
+    if (i + 1 < hudModeN)
+    {
+        hudModeI = i + 1;
+        LOGI("BFI Presenter: frame warp, the game's own motion: the HUD mask covered %.0f%% compared as %s -- now trying: %s",
+             pct, HudModeName((uint32_t)hudModes[i]), HudModeName((uint32_t)hudModes[i + 1]));
+        return;
+    }
+    hudState = -1;
+    LOGW("BFI Presenter: frame warp, the game's own motion: HUD protection off -- the game's HUD-less picture differs from the frame "
+         "shown over %.0f%% of it in every way of comparing tried (effects drawn after it, ReShade's included?)", pct);
 }
 
 // With the frame resources (the swap chain resized or gone): the motion textures and the pass. The copies of the

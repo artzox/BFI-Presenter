@@ -200,8 +200,11 @@ cbuffer G : register(b1)
     uint   gFlags;        // 1 depth reversed (near = 1), 2 depth available, 4 the HUD mask (t7) is valid, 8 the frame is linear (scRGB)
     float2 gPad;
     float4 gHMap;         // screen uv -> the game's HUD-less picture's texel
-    float  gHudThr;       // HUD mask: a difference above this (in the frame's own values) is HUD
-    float3 gPad2;
+    float  gHudThr;       // HUD mask: a difference above this is HUD
+    uint   gHudMode;      // how the frame and the HUD-less picture are compared: 0 as they are (the same encoding);
+                          // 1 the frame is HDR10 (PQ, BT.2020) and the picture linear scRGB (BT.709); 2 the frame is
+                          // sRGB-encoded and the picture linear
+    float2 gPad2;
 };
 Texture2D<float2> gMv    : register(t5);
 Texture2D<float>  gDepth : register(t6);
@@ -255,9 +258,24 @@ HudOut PSWarpHud(float4 pos : SV_Position)
             int2 fq = clamp(int2(fu * float2(fw, fh)), int2(0, 0), int2(fw, fh) - 1);
             int2 lq = clamp(int2(fu * gHMap.xy + gHMap.zw), int2(0, 0), int2(lw, lh) - 1);
             float3 a = hFinal.Load(int3(fq, 0)).rgb, b = hLess.Load(int3(lq, 0)).rgb;
+            bool rel = (gFlags & 8) != 0;
+            if (gHudMode == 1)
+            {
+                // PQ -> nits -> scRGB (80-nit units), BT.2020 -> BT.709
+                float3 p = pow(saturate(a), 1.0 / 78.84375);
+                float3 n = pow(max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125) * (10000.0 / 80.0);
+                a = float3(dot(n, float3(1.6605, -0.5876, -0.0728)), dot(n, float3(-0.1246, 1.1329, -0.0083)), dot(n, float3(-0.0182, -0.1006, 1.1187)));
+                rel = true;
+            }
+            else if (gHudMode == 2)
+            {
+                a = saturate(a);
+                a = a <= 0.04045 ? a / 12.92 : pow((a + 0.055) / 1.055, 2.4);
+                rel = true;
+            }
             float3 e = abs(a - b);
             float m = max(max(e.r, e.g), e.b);
-            if ((gFlags & 8) != 0) m /= 0.2 + max(max(max(a.r, a.g), a.b), max(max(b.r, b.g), b.b));   // linear: relative
+            if (rel) m /= 0.2 + max(max(max(abs(a.r), abs(a.g)), abs(a.b)), max(max(abs(b.r), abs(b.g)), abs(b.b)));   // linear: relative
             d = max(d, m);
         }
     }
