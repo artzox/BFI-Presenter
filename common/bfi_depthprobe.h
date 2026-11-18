@@ -130,16 +130,18 @@ inline void on_end_pass(command_list *cmd)
     g.cur[cmd] = 0;
 }
 
-inline bool on_clear(command_list *cmd, resource_view dsv, const float *depth, const uint8_t *, uint32_t, const rect *)
+// Clears are matched to buffers by their view only, with no calls into ReShade's device: in South of Midnight
+// (DX11, dp1) looking up the resource of a cleared view crashed inside ReShade. Views seen while binding are
+// already mapped to their buffer; a clear of a view never bound for drawing isn't counted.
+inline bool on_clear(command_list *, resource_view dsv, const float *depth, const uint8_t *, uint32_t, const rect *)
 {
+    if (!dsv.handle || !depth) return false;
     std::lock_guard<std::mutex> l(g.lock);
-    const uint64_t r = ResOf(cmd, dsv);
-    if (r && depth)
-    {
-        Buf &b = g.bufs[r];
-        b.clears++;
-        if (*depth == 0.0f) b.clearsZero++; else if (*depth == 1.0f) b.clearsOne++; else b.clearsOther++;
-    }
+    auto it = g.viewRes.find(dsv.handle);
+    if (it == g.viewRes.end()) return false;
+    Buf &b = g.bufs[it->second];
+    b.clears++;
+    if (*depth == 0.0f) b.clearsZero++; else if (*depth == 1.0f) b.clearsOne++; else b.clearsOther++;
     return false;
 }
 
