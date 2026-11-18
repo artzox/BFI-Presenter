@@ -187,11 +187,9 @@ float4 PSWarpSmooth(float4 pos : SV_Position) : SV_Target
 }
 
 // ---- The game's own motion (test): where the game hands its upscaler motion vectors and depth (Streamline / DLSS),
-// they are turned into the same kind of motion texture at 1/4 of the game frame, at the game's Present, on the
+// they are turned into the same kind of motion texture (at the game's vector size, at most half the game frame), at the game's Present, on the
 // game's queue (dx/bfi_presenter.cpp, namespace gmo). xy = how far the picture at this point moved from the frame
 // before to this one (uv), z = 1 where the game's vector is valid, w = how near the point is (0 far .. 1 near).
-// Each texel takes the vector of the nearest of 9 taps over its footprint: along an edge the thing in front keeps
-// its own motion instead of a blend with what is behind it.
 cbuffer G : register(b1)
 {
     float2 gOutTexel;     // 1 / size of the motion texture written
@@ -206,36 +204,24 @@ Texture2D<float>  gDepth : register(t6);
 
 float4 PSWarpGame(float4 pos : SV_Position) : SV_Target
 {
+    // One vector per texel, from the game's vector at its centre (the texture is the size of the game's vectors, or
+    // half the frame: no spreading of one vector over its neighbours, which bent thin things).
     float2 uv = pos.xy * gOutTexel;
     uint mw, mh, dw, dh;
     gMv.GetDimensions(mw, mh);
     gDepth.GetDimensions(dw, dh);
-    float2 best = float2(0.0, 0.0);
-    float bestNear = -1.0;
-    bool found = false;
-    const bool useDepth = (gFlags & 2) != 0;
-    for (int y = -1; y <= 1; y++)
+    int2 mq = clamp(int2(uv * gMvMap.xy + gMvMap.zw), int2(0, 0), int2(mw, mh) - 1);
+    float2 m = gMv.Load(int3(mq, 0));
+    if (m.x == gMvInvalid || m.y == gMvInvalid || any(isnan(m))) return float4(0.0, 0.0, 0.0, 0.0);
+    float nearv = 0.0;
+    if ((gFlags & 2) != 0)
     {
-        for (int x = -1; x <= 1; x++)
-        {
-            if (!useDepth && (x != 0 || y != 0)) continue;     // without depth: the texel's centre only
-            float2 suv = uv + float2(x, y) * gOutTexel * 0.33;
-            int2 mq = clamp(int2(suv * gMvMap.xy + gMvMap.zw), int2(0, 0), int2(mw, mh) - 1);
-            float2 m = gMv.Load(int3(mq, 0));
-            if (m.x == gMvInvalid || m.y == gMvInvalid || any(isnan(m))) continue;
-            float nearv = 0.0;
-            if (useDepth)
-            {
-                int2 dq = clamp(int2(suv * gDepthMap.xy + gDepthMap.zw), int2(0, 0), int2(dw, dh) - 1);
-                float d = gDepth.Load(int3(dq, 0));
-                nearv = (gFlags & 1) != 0 ? d : 1.0 - d;
-            }
-            if (!found || nearv > bestNear) { best = m; bestNear = nearv; found = true; }
-        }
+        int2 dq = clamp(int2(uv * gDepthMap.xy + gDepthMap.zw), int2(0, 0), int2(dw, dh) - 1);
+        float d = gDepth.Load(int3(dq, 0));
+        nearv = (gFlags & 1) != 0 ? d : 1.0 - d;
     }
-    if (!found) return float4(0.0, 0.0, 0.0, 0.0);
     // Streamline: the pixel was at uv + m * mvecScale in the frame before, so it moved by the opposite.
-    return float4(-best * gMvScale, 1.0, saturate(bestNear));
+    return float4(-m * gMvScale, 1.0, saturate(nearv));
 }
 )HLSL";
 

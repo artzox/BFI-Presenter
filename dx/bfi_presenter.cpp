@@ -1664,7 +1664,7 @@ float4 GameFlow(float2 uv)
     int2 q = clamp(int2(uv * float2(w, h)), int2(0, 0), int2(w, h) - 1);
     return flowTex.Load(int3(q, 0));
 }
-// With the game's own motion (one vector per 4x4 pixels, per game frame, with how near each point is): the place
+// With the game's own motion (one vector per pixel of the game's vectors, per game frame, with how near each point is): the place
 // the output pixel comes from is found in up to three steps along the motion, and each step checked -- does the
 // point found really move onto this pixel? Of the steps that do, the nearest point wins: what is in front covers
 // what is behind it. Where none does, the area is being uncovered, and the background's motion (the farthest of
@@ -1672,7 +1672,8 @@ float4 GameFlow(float2 uv)
 float2 WarpShiftGame(float2 uv)
 {
     uint w, h;
-    flowTex.GetDimensions(w, h);
+    src.GetDimensions(w, h);
+    const float2 osz = float2(w, h);                      // the check below is to a pixel of the game frame
     float2 m[3];
     m[0] = GameFlow(uv).xy;
     m[1] = GameFlow(uv - m[0] * warp).xy;
@@ -1683,7 +1684,7 @@ float2 WarpShiftGame(float2 uv)
     {
         float4 g = GameFlow(uv - m[i] * warp);
         if (g.z < 0.5) continue;
-        if (length((g.xy - m[i]) * warp * float2(w, h)) < 1.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; }
+        if (length((g.xy - m[i]) * warp * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; }
         if (g.w < backNear) { backNear = g.w; back = m[i]; }
     }
     if (bestNear < 0.0) best = backNear <= 1.0 ? back : float2(0.0, 0.0);
@@ -7987,6 +7988,8 @@ static int  pend[kRing]; static int pendN = 0;            // filled entries not 
 static int  latest = -1;                                 // the newest filled entry (frame generation: every Present uses it)
 static int  evalsSec = 0, presSec = 0; static double secT = 0.0;
 static double perEval = 1.0;                             // Presents per upscaler call over the last seconds (2 or 3 with frame generation)
+static int  fgK = 0;                                     // frame generation: shown frames per rendered one, a whole number (0 = not settled)
+static int  fgKNext = 0, fgKSecs = 0;
 static uint64_t seq = 0;
 static UINT genNext = 1;
 static std::vector<ID3D12Resource *> retired;            // replaced copies, released with the frame resources
@@ -8244,7 +8247,7 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
     seq++;
     if (g_status.fgActive)
         SetState(e.hasDepth ? 1 : 2, "the game's motion vectors (%ux%u)%s are used, with frame generation: each shown frame moves by 1/%.0f of a rendered frame's motion",
-                 e.mvW, e.mvH, e.hasDepth ? " and depth" : "", perEval);
+                 e.mvW, e.mvH, e.hasDepth ? " and depth" : "", (double)(fgK >= 2 ? fgK : 2));
     else
         SetState(e.hasDepth ? 1 : 2, e.hasDepth ? "the game's motion vectors (%ux%u) and depth (%ux%u) are used" : "the game's motion vectors (%ux%u) are used, without depth",
                  e.mvW, e.mvH, e.dW, e.dH);
@@ -8312,11 +8315,14 @@ static bool EnsureGpu()
     return ok;
 }
 
-static bool EnsureFlow()
+// The motion textures: one vector per pixel of the game's own vectors, at most half the game frame's size (gm1-gm4
+// had one per 4x4 pixels of the frame, coarser than the game's vectors: thin things -- window frames, the edges of
+// columns -- broke into steps and bent).
+static bool EnsureFlow(UINT mvW, UINT mvH)
 {
     if (!g_stage[0]) return false;
     const D3D12_RESOURCE_DESC sd = g_stage[0]->GetDesc();
-    const UINT w = ((UINT)sd.Width + 3) / 4, h = (sd.Height + 3) / 4;
+    const UINT w = std::max(64u, std::min(mvW, ((UINT)sd.Width + 1) / 2)), h = std::max(64u, std::min(mvH, (sd.Height + 1) / 2));
     if (flow[0] && flowW == w && flowH == h) return true;
     for (UINT i = 0; i < kStage; i++) { SafeRelease(flow[i]); slotPend[i] = slotOk[i] = false; slotId[i] = 0; }
     D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -8358,7 +8364,15 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         const double tn = Now();
         if (tn - secT >= 1.0)
         {
-            if (evalsSec > 0 && presSec > 0) perEval = 0.5 * perEval + 0.5 * std::max(1.0, std::min(4.0, (double)presSec / evalsSec));
+            if (evalsSec > 0 && presSec > 0)
+            {
+                perEval = std::max(1.0, std::min(4.0, (double)presSec / evalsSec));
+                // A whole number, taken once two seconds in a row agree (gm4 used a running average, which started at
+                // 1 and wandered: with 1 against a real 2 a filled flash moved twice as far and snapped back).
+                const int kk = (int)std::floor(perEval + 0.5);
+                if (kk == fgKNext) { if (++fgKSecs >= 2) fgK = kk; }
+                else { fgKNext = kk; fgKSecs = 1; }
+            }
             evalsSec = presSec = 0; secT = tn;
         }
         if (g_status.fgActive)
@@ -8367,9 +8381,9 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
             // frame's motion. Every shown frame uses the newest vectors, for the share of that motion one shown frame
             // covers. (A generated frame sits between two rendered ones: its picture is a little off from the vectors'.)
             pendN = 0;
-            if (latest < 0) return;
+            if (latest < 0 || fgK < 2) return;            // not settled yet (or not really generating): the picture's motion
             k = latest;
-            scale = (float)(1.0 / std::max(1.0, perEval));
+            scale = 1.0f / (float)fgK;
         }
         else
         {
@@ -8380,7 +8394,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         }
         e = ring[k];
     }
-    if (!e.mv || !EnsureGpu() || !EnsureFlow()) return;
+    if (!e.mv || !EnsureGpu() || !EnsureFlow(e.mvW, e.mvH)) return;
     D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
     sh.ptr += (SIZE_T)(2 * k) * srvStride;
     if (descGen[k] != e.gen)
