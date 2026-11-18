@@ -146,6 +146,7 @@ struct Settings
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
     int   warpGame = 1;       // FrameWarpGameMotion: use the game's own motion vectors and depth where it hands them to
                               // its upscaler (Streamline / DLSS, D3D12, 64-bit); otherwise the motion measured from the picture
+    int   warpGameCheck = 1;  // FrameWarpGameMotionCheck (test, ini only): every 2 s the game's motion and the measured one in the log
     int   slHooks = 1;        // StreamlineHooks (test, ini only): 0 = Streamline is not hooked at all (no probe, frame warp
                               // with the picture's own motion only) -- to compare a game's frame rate with and without
     int   warpGameSign = 1;   // FrameWarpGameMotionSign (test, ini only): -1 turns the game's vectors round, in case a game's
@@ -319,6 +320,7 @@ static void LoadSettings(Settings &s)
     s.warpGame = IniInt("FrameWarpGameMotion", 1) != 0 ? 1 : 0;
     s.warpGameSign = IniInt("FrameWarpGameMotionSign", 1) < 0 ? -1 : 1;
     s.slHooks = IniInt("StreamlineHooks", 1) != 0 ? 1 : 0;
+    s.warpGameCheck = IniInt("FrameWarpGameMotionCheck", 1) != 0 ? 1 : 0;
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -1022,6 +1024,17 @@ static std::atomic<int> g_cs11{-1};                // colour space the game set 
 
 
 // ---------------------------------------------------------------- helpers
+// A 16-bit float (frame warp's check reads its motion textures back).
+static float HalfToFloat(uint16_t h)
+{
+    const uint32_t sgn = (uint32_t)(h & 0x8000) << 16, ex = (h >> 10) & 0x1F, man = h & 0x3FF;
+    uint32_t f;
+    if (ex == 0) { if (!man) f = sgn; else { float v = std::ldexp((float)man, -24); return sgn ? -v : v; } }
+    else if (ex == 31) f = sgn | 0x7F800000u | (man << 13);
+    else f = sgn | ((ex + 112) << 23) | (man << 13);
+    float out; memcpy(&out, &f, 4); return out;
+}
+
 static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
 {
     D3D12_RESOURCE_BARRIER br = {};
@@ -3537,6 +3550,15 @@ static DWORD WINAPI PresenterThread(void *)
     double secWarpSum = 0.0;
     int    secWarpGame[3] = {};             // cycles moved with: the picture's motion, the game's vectors and depth, its vectors only
     UINT   gameFlowGen = ~0u;               // the game's own motion textures the presenter's views were written for
+    // Frame warp check (test, FrameWarpGameMotionCheck): every 2 s, on a cycle moved with the game's motion, the motion
+    // measured from the picture for the same pair of frames as well; both read back and compared in the log.
+    ID3D12Resource *chkRb[2] = {};          // readback: the game's motion texture, the measured one
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT chkFp[2] = {};
+    UINT   chkW[2] = {}, chkH[2] = {};
+    UINT64 chkFence = 0, chkFrames = 0;
+    double chkT = 0.0;
+    bool   chkPending = false;
+    int    chkSrc = 0;
     const UINT kGameFlowSrv = kStage + 2 + WarpGpu::kSrvCount;   // their views in srvHeap
     bool   kwarp = false;
     UINT64 measFence = 0;
@@ -4586,6 +4608,52 @@ static DWORD WINAPI PresenterThread(void *)
         // ones); the motion from the frame before is measured only when the frame is shown moved, once per pair.
         const bool tsOn = tsHeap && logf;                // timed only while the timing log runs
         if (tsOn) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 0);
+        // Frame warp check: the two motions read back (a cycle or more later), averaged and logged.
+        if (chkPending && g_presFence->GetCompletedValue() >= chkFence)
+        {
+            chkPending = false;
+            double sum[2][2] = {}, wsum[2] = {}, mag[2] = {};
+            const D3D12_RESOURCE_DESC fd = g_stage[0]->GetDesc();
+            const double W = (double)fd.Width, H = (double)fd.Height;
+            for (int q = 0; q < 2; q++)
+            {
+                void *mp = nullptr;
+                D3D12_RANGE rr = { 0, (SIZE_T)(chkFp[q].Footprint.RowPitch * chkH[q]) };
+                if (FAILED(chkRb[q]->Map(0, &rr, &mp)) || !mp) continue;
+                const int step = q == 0 ? 4 : 1;                 // the game's texture is large: every 4th texel
+                for (UINT y = 0; y < chkH[q]; y += step)
+                {
+                    const uint16_t *row = (const uint16_t *)((const uint8_t *)mp + chkFp[q].Offset + (size_t)y * chkFp[q].Footprint.RowPitch);
+                    for (UINT x = 0; x < chkW[q]; x += step)
+                    {
+                        const float fx = HalfToFloat(row[4 * x]), fy = HalfToFloat(row[4 * x + 1]);
+                        const float fz = HalfToFloat(row[4 * x + 2]), fw = HalfToFloat(row[4 * x + 3]);
+                        // the game's: z = 1 where its vector is valid; the measured (evened out): w = 1 where measured
+                        const float wgt = q == 0 ? (fz > 0.5f ? 1.0f : 0.0f) : (fw > 0.5f ? fz : 0.0f);
+                        if (wgt <= 0.0f || !std::isfinite(fx) || !std::isfinite(fy)) continue;
+                        sum[q][0] += fx * wgt; sum[q][1] += fy * wgt; wsum[q] += wgt;
+                        mag[q] += std::sqrt((double)fx * W * fx * W + (double)fy * H * fy * H) * wgt;   // pixels
+                    }
+                }
+                D3D12_RANGE wr = { 0, 0 };
+                chkRb[q]->Unmap(0, &wr);
+            }
+            if (wsum[0] > 0.0 && wsum[1] > 0.0 && chkFrames > 0)
+            {
+                // per shown frame, in pixels of the game frame
+                const double gx = sum[0][0] / wsum[0] * W, gy = sum[0][1] / wsum[0] * H;
+                const double mx = sum[1][0] / wsum[1] * W / (double)chkFrames, my = sum[1][1] / wsum[1] * H / (double)chkFrames;
+                const double gl = std::sqrt(gx * gx + gy * gy), ml = std::sqrt(mx * mx + my * my);
+                const double ang = (gl > 0.05 && ml > 0.05) ? std::acos(std::max(-1.0, std::min(1.0, (gx * mx + gy * my) / (gl * ml)))) * 57.29578 : -1.0;
+                static int chkLogs = 0;
+                if (chkLogs++ < 150)
+                    LOGI("BFI Presenter: frame warp check: per shown frame, the game's motion %.1f, %.1f px (%.1f px; points moving %.1f px on average), "
+                         "measured from the picture %.1f, %.1f px (%.1f px), game / measured %.2f, %s%.0f deg apart (%llu frame%s between the pair, %s)",
+                         gx, gy, gl, mag[0] / wsum[0], mx, my, ml, ml > 0.05 ? gl / ml : 0.0,
+                         ang < 0.0 ? "direction n/a " : "", ang < 0.0 ? 0.0 : ang, (unsigned long long)chkFrames, chkFrames == 1 ? "" : "s",
+                         chkSrc == 1 ? "vectors and depth" : "vectors only");
+            }
+        }
         bool warpTouched = false;
         if (s.frameWarp && warp.ok)
         {
@@ -4596,6 +4664,48 @@ static DWORD WINAPI PresenterThread(void *)
                 touched = true;
             }
             if (c.warp != 0.0f && c.warpSrc == 0 && (warp.flowNew != pickId || warp.flowOld != warpOld)) { warp.RecordFlow(list); touched = true; }
+            // The check: the measured motion for this pair too, and both textures copied for reading back.
+            if (s.warpGameCheck && c.warpSrc != 0 && cycleStart && !chkPending && Now() - chkT >= 2.0 && gmo::FlowRes(pick))
+            {
+                if (warp.flowNew != pickId || warp.flowOld != warpOld) { warp.RecordFlow(list); touched = true; }
+                ID3D12Resource *srcR[2] = { gmo::FlowRes(pick), warp.flowOut[WarpGpu::Out()] };
+                bool okRb = true;
+                for (int q = 0; q < 2 && okRb; q++)
+                {
+                    const D3D12_RESOURCE_DESC dsc = srcR[q]->GetDesc();
+                    if (!chkRb[q] || chkW[q] != (UINT)dsc.Width || chkH[q] != dsc.Height)
+                    {
+                        SafeRelease(chkRb[q]);
+                        UINT64 total = 0;
+                        g_device->GetCopyableFootprints(&dsc, 0, 1, 0, &chkFp[q], nullptr, nullptr, &total);
+                        D3D12_HEAP_PROPERTIES rh = {}; rh.Type = D3D12_HEAP_TYPE_READBACK;
+                        D3D12_RESOURCE_DESC bd = {};
+                        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1;
+                        bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                        okRb = SUCCEEDED(g_device->CreateCommittedResource(&rh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                                           nullptr, IID_PPV_ARGS(&chkRb[q])));
+                        chkW[q] = (UINT)dsc.Width; chkH[q] = dsc.Height;
+                    }
+                }
+                if (okRb)
+                {
+                    // both in PIXEL_SHADER_RESOURCE here (the game's moved there at the start of this list)
+                    D3D12_RESOURCE_BARRIER cb[2] = { Transition(srcR[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                                     Transition(srcR[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE) };
+                    list->ResourceBarrier(2, cb);
+                    for (int q = 0; q < 2; q++)
+                    {
+                        D3D12_TEXTURE_COPY_LOCATION dl = {}, sl = {};
+                        dl.pResource = chkRb[q]; dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dl.PlacedFootprint = chkFp[q];
+                        sl.pResource = srcR[q]; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
+                        list->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+                    }
+                    cb[0] = Transition(srcR[0], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    cb[1] = Transition(srcR[1], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    list->ResourceBarrier(2, cb);
+                    chkPending = true; chkFence = reserve; chkFrames = pickId - warpOld; chkT = Now(); chkSrc = (int)c.warpSrc;
+                }
+            }
             warpTouched = touched;
             if (touched)
             {
@@ -6297,6 +6407,7 @@ static DWORD WINAPI PresenterThread(void *)
     SafeRelease(psAplC);
     SafeRelease(psAplR);
     warp.Release();
+    SafeRelease(chkRb[0]); SafeRelease(chkRb[1]);
     for (int i = 0; i < kWarpShN; i++) SafeRelease(psWarp[i]);
     SafeRelease(rootSig);
     SafeRelease(rsBlob);
