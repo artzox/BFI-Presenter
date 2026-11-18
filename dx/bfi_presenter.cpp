@@ -4613,13 +4613,15 @@ static DWORD WINAPI PresenterThread(void *)
         {
             chkPending = false;
             double sum[2][2] = {}, wsum[2] = {}, mag[2] = {};
+            int nAll[2] = {}, nOk[2] = {}; HRESULT mapHr[2] = { E_FAIL, E_FAIL };
             const D3D12_RESOURCE_DESC fd = g_stage[0]->GetDesc();
             const double W = (double)fd.Width, H = (double)fd.Height;
             for (int q = 0; q < 2; q++)
             {
                 void *mp = nullptr;
                 D3D12_RANGE rr = { 0, (SIZE_T)(chkFp[q].Footprint.RowPitch * chkH[q]) };
-                if (FAILED(chkRb[q]->Map(0, &rr, &mp)) || !mp) continue;
+                mapHr[q] = chkRb[q]->Map(0, &rr, &mp);
+                if (FAILED(mapHr[q]) || !mp) continue;
                 const int step = q == 0 ? 4 : 1;                 // the game's texture is large: every 4th texel
                 for (UINT y = 0; y < chkH[q]; y += step)
                 {
@@ -4630,7 +4632,9 @@ static DWORD WINAPI PresenterThread(void *)
                         const float fz = HalfToFloat(row[4 * x + 2]), fw = HalfToFloat(row[4 * x + 3]);
                         // the game's: z = 1 where its vector is valid; the measured (evened out): w = 1 where measured
                         const float wgt = q == 0 ? (fz > 0.5f ? 1.0f : 0.0f) : (fw > 0.5f ? fz : 0.0f);
+                        nAll[q]++;
                         if (wgt <= 0.0f || !std::isfinite(fx) || !std::isfinite(fy)) continue;
+                        nOk[q]++;
                         sum[q][0] += fx * wgt; sum[q][1] += fy * wgt; wsum[q] += wgt;
                         mag[q] += std::sqrt((double)fx * W * fx * W + (double)fy * H * fy * H) * wgt;   // pixels
                     }
@@ -4638,7 +4642,15 @@ static DWORD WINAPI PresenterThread(void *)
                 D3D12_RANGE wr = { 0, 0 };
                 chkRb[q]->Unmap(0, &wr);
             }
-            if (wsum[0] > 0.0 && wsum[1] > 0.0 && chkFrames > 0)
+            if (!(wsum[0] > 0.0 && wsum[1] > 0.0 && chkFrames > 0))
+            {
+                static int nLog = 0;
+                if (nLog++ < 10)
+                    LOGI("BFI Presenter: frame warp check: nothing to compare (the game's motion: map 0x%08lX, %d of %d points valid, %ux%u; "
+                         "measured: map 0x%08lX, %d of %d points measured, %ux%u; %llu frames between)", (unsigned long)mapHr[0], nOk[0], nAll[0],
+                         chkW[0], chkH[0], (unsigned long)mapHr[1], nOk[1], nAll[1], chkW[1], chkH[1], (unsigned long long)chkFrames);
+            }
+            else
             {
                 // per shown frame, in pixels of the game frame
                 const double gx = sum[0][0] / wsum[0] * W, gy = sum[0][1] / wsum[0] * H;
@@ -4687,6 +4699,12 @@ static DWORD WINAPI PresenterThread(void *)
                         chkW[q] = (UINT)dsc.Width; chkH[q] = dsc.Height;
                     }
                 }
+                if (!okRb)
+                {
+                    static bool once = false;
+                    if (!once) { once = true; LOGW("BFI Presenter: frame warp check: its readback buffers could not be made"); }
+                    chkT = Now();
+                }
                 if (okRb)
                 {
                     // both in PIXEL_SHADER_RESOURCE here (the game's moved there at the start of this list)
@@ -4704,6 +4722,8 @@ static DWORD WINAPI PresenterThread(void *)
                     cb[1] = Transition(srcR[1], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                     list->ResourceBarrier(2, cb);
                     chkPending = true; chkFence = reserve; chkFrames = pickId - warpOld; chkT = Now(); chkSrc = (int)c.warpSrc;
+                    static int nRec = 0;
+                    if (nRec++ < 3) LOGI("BFI Presenter: frame warp check: both motions copied for reading back (fence %llu)", (unsigned long long)reserve);
                 }
             }
             warpTouched = touched;
