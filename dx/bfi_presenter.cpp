@@ -7497,7 +7497,8 @@ struct Base { void *next; uint8_t type[16]; size_t version; };                  
 struct Res  { Base b; uint32_t type; uint32_t pad; void *native; void *mem; void *view; uint32_t state;
               uint32_t width, height, nativeFormat, mips, layers; };              // sl::Resource (start)
 struct Ext  { uint32_t top, left, width, height; };                               // sl::Extent
-struct Tag  { Base b; Res *res; uint32_t bufType; uint32_t lifecycle; const Ext *ext; };   // sl::ResourceTag
+struct Tag  { Base b; Res *res; uint32_t bufType; uint32_t lifecycle; Ext ext; };   // sl::ResourceTag (2.4: the extent by value)
+static_assert(sizeof(Tag) == 64, "sl::ResourceTag layout");
 struct Consts                                                                     // sl::Constants (start)
 {
     Base b;
@@ -7560,7 +7561,7 @@ static void NoteTags(const Tag *tags, uint32_t n)
         if (tags[i].b.version > 64 || tags[i].bufType > 255) { g_badTags++; continue; }
         TagStat &s = g_tags[tags[i].bufType];
         s.calls++;
-        if (tags[i].ext && Readable(tags[i].ext, sizeof(Ext))) { s.extW = tags[i].ext->width; s.extH = tags[i].ext->height; }
+        if (tags[i].ext.width) { s.extW = tags[i].ext.width; s.extH = tags[i].ext.height; }
         Res *r = tags[i].res;
         if (!r || !Readable(r, sizeof(Res)) || !r->native) { s.null = true; continue; }
         if (s.w) continue;                             // size looked up once per buffer type
