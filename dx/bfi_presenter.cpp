@@ -5988,7 +5988,8 @@ static DWORD WINAPI PresenterThread(void *)
                     static int swIdx = -1, swN = 0, swSecs = 0, swBad = 0, swShown = 0, swRelN = 0, swRep = 0;
                     static double swPhase = 0.0, swStart = 0.0, swDoneT = -1.0, swBestMs = 0.0, swRel = 0.0, swScore[16] = {}, swRelMs[16] = {},
                                   swSlack = 1.0, swSlackK[16] = {};
-                    static int swTight = 0;
+                    static unsigned swTightHist = 0;     // the last 5 seconds: frames repeated with little to spare (one bit each)
+                    static double swBackMs = 0.0;        // moved earlier since the start time was found (more to spare)
                     static int swShownK[16] = {};
                     static bool swWasOn = false;
                     // The automatic frame cap at the frame start keeps the start time it found while the cap goes up to
@@ -6068,6 +6069,7 @@ static DWORD WINAPI PresenterThread(void *)
                         {
                             swN = std::max(4, std::min(16, (int)(cyc / 0.002 + 0.5)));
                             swIdx = 0; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swBad = 0;
+                            swTightHist = 0; swBackMs = 0.0;
                             swStart = base;
                             moveTo(swStart);
                             LOGI("BFI Presenter: %s: trying %d start times across the strobe cycle (%.0f s)",
@@ -6125,16 +6127,25 @@ static DWORD WINAPI PresenterThread(void *)
                         // slower than the start time found.
                         else
                         {
-                            swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + 6.0))) ? swBad + 1 : 0;
-                            // Held, frames repeating close to their flash (the GPU work grew): 2 ms earlier, once per 3 s.
-                            swTight = (!fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.0015) ? swTight + 1 : 0;
-                            if (swTight >= 3)
+                            swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + swBackMs + 6.0))) ? swBad + 1 : 0;   // the steps back below
+                            // don't count as slower
+                            // Held, frames repeating with little to spare before their flash (the GPU work grew): 2 ms
+                            // earlier when 3 of the last 5 seconds had 2 or more repeats with under 3 ms to spare, at most
+                            // 8 ms earlier than the start time found. Stray: the search took the quickest start time
+                            // (4.4 ms to spare), then 2-7 frames a second repeated at 0.5-3.5 ms to spare -- never under
+                            // the 1.5 ms (3 s in a row) this needed before, so it stayed there; 2 ms earlier had 8.5 ms.
+                            // Only where the game holds the cap, so a scene too heavy for it moves nothing.
+                            const bool tight = !fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.003;
+                            swTightHist = ((swTightHist << 1) | (tight ? 1u : 0u)) & 0x1Fu;
+                            int nTight = 0; for (int k = 0; k < 5; k++) nTight += (swTightHist >> k) & 1u;
+                            if (nTight >= 3 && swBackMs < 7.9)
                             {
-                                swTight = 0;
+                                swTightHist = 0;
+                                swBackMs += 2.0;
                                 moveTo(swPhase - 0.002);
                                 learnSw();
-                                LOGI("BFI Presenter: %s: frames repeated close to their flash -- 2 ms earlier",
-                                     swName);
+                                LOGI("BFI Presenter: %s: frames repeated with %.1f ms to spare before their flash -- 2 ms earlier "
+                                     "(%.0f ms earlier than the start time found)", swName, p10 * 1000.0, swBackMs);
                             }
                         }
                     }
