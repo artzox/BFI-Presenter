@@ -270,7 +270,7 @@ HudOut PSWarpHud(float4 pos : SV_Position)
             else if (gHudMode == 2)
             {
                 a = saturate(a);
-                a = a <= 0.04045 ? a / 12.92 : pow((a + 0.055) / 1.055, 2.4);
+                a = lerp(a / 12.92, pow((a + 0.055) / 1.055, 2.4), step(0.04045, a));
                 rel = true;
             }
             float3 e = abs(a - b);
