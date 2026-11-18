@@ -320,6 +320,11 @@ The dark refresh after a lit one shows the same game frame, so BFI Presenter dra
 After a missed refresh it skips one vblank to empty the queue, so it keeps running through hitches (Spider-Man 2, Ratchet & Clank: Rift Apart, Returnal). It turns itself off when the second refresh keeps waiting for the first: overlays drawn into every flash (**Show overlays** on, e.g. the RivaTuner or Steam overlay) or a frame limiter on the presenter's presents (RTSS's frame limit, or NVIDIA's Max Frame Rate); BFI then works as before, and it tries again after 1, 2, 4 and 8 minutes. Not used with **Queue one refresh ahead** or the LCD savers, or with fewer than 3 presenter buffers: the settings window says why when it isn't in use, with a button for 3 presenter buffers, and the log says so too.\
 *When to change it:* leave on. If it says it is off because of the overlays, turn Show overlays off to use it.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/dark-queue-dark.png">
+  <img src="img/dark-queue-light.png" alt="Ten refreshes at 120 Hz, with the moment each picture is handed to the screen above them. One at a time: a brief stall delays the dark picture, so the lit picture is shown twice, a bright flash. Queue one refresh ahead: the stall is covered, but everything is shown one refresh later. Dark refresh queued with the lit one: both are handed over together, the stall falls where nothing is due, nothing is late and there is no added delay. If a stall hits the lit picture instead, the dark picture is shown twice, a brief dark flicker." width="760">
+</picture>
+
 **Multimedia scheduler for the presenter thread** · `PresenterThreadBoost` · default: on\
 Registers the presenter's thread with Windows' multimedia scheduler, the one audio and the desktop compositor use, so it runs ahead of the game's own threads: a late flash flickers, a late game frame is only a stutter. Windows' power throttling (which can slow threads down on laptops and in the Balanced power plan) is turned off for the thread either way. The log says whether it took effect. Applies at the next game start (v1.0.28).\
 *When to change it:* leave on.
