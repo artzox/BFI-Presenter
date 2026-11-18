@@ -19,6 +19,10 @@ namespace dp
 using namespace reshade::api;
 
 inline void (*g_log)(const char *msg) = nullptr;
+// Set by the DX add-on: true while it runs a DX11, DX9 or OpenGL game, where the probe stays out (crashes in
+// South of Midnight, dp1-dp4).
+inline bool (*g_skip)() = nullptr;
+#define DP_SKIP if (g_skip && g_skip()) return
 
 struct Buf
 {
@@ -103,12 +107,14 @@ inline uint64_t ResOf(command_list *cmd, resource_view v)
 
 inline void on_bind(command_list *cmd, uint32_t, const resource_view *, resource_view dsv)
 {
+    DP_SKIP;
     std::lock_guard<std::mutex> l(g.lock);
     g.cur[cmd] = ResOf(cmd, dsv);
 }
 
 inline void on_begin_pass(command_list *cmd, uint32_t, const render_pass_render_target_desc *, const render_pass_depth_stencil_desc *ds)
 {
+    DP_SKIP;
     std::lock_guard<std::mutex> l(g.lock);
     const uint64_t r = ds ? ResOf(cmd, ds->view) : 0;
     g.cur[cmd] = r;
@@ -126,6 +132,7 @@ inline void on_begin_pass(command_list *cmd, uint32_t, const render_pass_render_
 
 inline void on_end_pass(command_list *cmd)
 {
+    DP_SKIP;
     std::lock_guard<std::mutex> l(g.lock);
     g.cur[cmd] = 0;
 }
@@ -136,6 +143,7 @@ inline void on_end_pass(command_list *cmd)
 inline bool on_clear(command_list *, resource_view dsv, const float *depth, const uint8_t *, uint32_t, const rect *)
 {
     if (!dsv.handle || !depth) return false;
+    DP_SKIP false;
     std::lock_guard<std::mutex> l(g.lock);
     auto it = g.viewRes.find(dsv.handle);
     if (it == g.viewRes.end()) return false;
@@ -147,6 +155,7 @@ inline bool on_clear(command_list *, resource_view dsv, const float *depth, cons
 
 inline void Count(command_list *cmd, uint32_t n)
 {
+    DP_SKIP;
     std::lock_guard<std::mutex> l(g.lock);
     auto it = g.cur.find(cmd);
     const uint64_t r = it != g.cur.end() ? it->second : 0;
@@ -164,6 +173,7 @@ inline bool on_draw_indirect(command_list *cmd, indirect_command type, resource,
 }
 inline void on_reset(command_list *cmd)
 {
+    DP_SKIP;
     std::lock_guard<std::mutex> l(g.lock);
     g.cur[cmd] = 0;
 }
@@ -174,6 +184,7 @@ inline void on_present(command_queue *, swapchain *sc, const rect *, const rect 
     // crashed inside ReShade. The back buffer's size is the window's client area instead.
     std::lock_guard<std::mutex> l(g.lock);
     (void)sc;
+    if (g_skip && g_skip()) return;
     if (!g.bbW)
     {
         if (HWND w = GetForegroundWindow())

@@ -59,6 +59,7 @@
 #include "../common/bfi_warpclock.h"
 #include "../common/bfi_depthprobe.h"
 static void DepthProbeReg(bool on);
+static bool DepthProbeSkip();
 
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d12.lib")
@@ -10815,7 +10816,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     // the DX11/DX9/OpenGL path presents through the presenter's own swap chain.
     {
         static bool dpOn = false;
-        if (!dpOn && swapchain->get_device()->get_api() == reshade::api::device_api::d3d12) { dpOn = true; DepthProbeReg(true); }
+        if (!dpOn && !DepthProbeSkip() && swapchain->get_device()->get_api() == reshade::api::device_api::d3d12) { dpOn = true; DepthProbeReg(true); }
     }
     if (g_sc) return;                                            // resizes of ours are handled in the hook
     // Direct3D 9 is handled above; 11 and 12 below. In an OpenGL or Vulkan game the native
@@ -12096,12 +12097,14 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE)
 // (Grip, v0.64).
 // Depth probe (test build): logs which depth buffer the game draws into (common/bfi_depthprobe.h).
 static void DepthProbeLog(const char *m) { reshade::log::message(reshade::log::level::info, m); }
+static bool DepthProbeSkip() { return g_dx11.load() || g_dx9.load() || g_glActive.load(); }
 static void DepthProbeReg(bool on)
 {
     HMODULE rs = reshade::internal::get_reshade_module_handle();
     auto f = (void (*)(reshade::addon_event, void *))(void *)GetProcAddress(rs, on ? "ReShadeRegisterEvent" : "ReShadeUnregisterEvent");
     if (!f) return;
     dp::g_log = DepthProbeLog;
+    dp::g_skip = DepthProbeSkip;
     dp::Register(f);
     if (on) LOGI("BFI Presenter: depth probe on (test build, DX12 games): the depth buffers the game draws into are logged every 10 s");
 }
