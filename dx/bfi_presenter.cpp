@@ -7984,6 +7984,9 @@ static_assert(sizeof(GConsts) == 56, "PSWarpGame constants");
 static std::mutex lk;
 static Entry ring[kRing];
 static int  pend[kRing]; static int pendN = 0;            // filled entries not yet taken by a Present, oldest first
+static int  latest = -1;                                 // the newest filled entry (frame generation: every Present uses it)
+static int  evalsSec = 0, presSec = 0; static double secT = 0.0;
+static double perEval = 1.0;                             // Presents per upscaler call over the last seconds (2 or 3 with frame generation)
 static uint64_t seq = 0;
 static UINT genNext = 1;
 static std::vector<ID3D12Resource *> retired;            // replaced copies, released with the frame resources
@@ -8147,8 +8150,6 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
     for (int k = 0; k < 2; k++) if (!tg[k] && haveSet[k]) tg[k] = &setTag[k];
     // slSetTag's tags valid only when tagged (life-cycle 0): for this upscaler call only
     struct Forget { ~Forget() { for (int k = 0; k < 2; k++) if (haveSet[k] && setTag[k].lifecycle == 0) haveSet[k] = false; } } forget;
-    if (g_status.fgActive)
-    { SetState(-1, "frame generation is on: the game's motion vectors belong to its rendered frames only -- the picture's own motion is used"); return; }
     if (!tg[1]) { SetState(-1, "the game hands its upscaler no motion vectors that last to the upscaler call -- the picture's own motion is used"); return; }
     if (!haveConsts) { SetState(-1, "no camera constants from the game -- the picture's own motion is used"); return; }
     if (consts.cameraMotionIncluded != 1)
@@ -8186,7 +8187,7 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
         for (int i = 0; i < kRing; i++) { SafeRelease(ring[i].mv); SafeRelease(ring[i].depth); ring[i] = Entry(); }
         for (ID3D12Resource *r : retired) r->Release();
         retired.clear();
-        pendN = 0; depthFailed = false;
+        pendN = 0; latest = -1; depthFailed = false;
         ringDev = g_device;
     }
     const int k = (int)(seq % kRing);
@@ -8238,9 +8239,15 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
     mv->Release(); if (dp) dp->Release();
     if (pendN >= 2) { pend[0] = pend[1]; pendN = 1; }      // a Present that never came: the older copy is dropped
     pend[pendN++] = k;
+    latest = k;
+    evalsSec++;
     seq++;
-    SetState(e.hasDepth ? 1 : 2, e.hasDepth ? "the game's motion vectors (%ux%u) and depth (%ux%u) are used" : "the game's motion vectors (%ux%u) are used, without depth",
-             e.mvW, e.mvH, e.dW, e.dH);
+    if (g_status.fgActive)
+        SetState(e.hasDepth ? 1 : 2, "the game's motion vectors (%ux%u)%s are used, with frame generation: each shown frame moves by 1/%.0f of a rendered frame's motion",
+                 e.mvW, e.mvH, e.hasDepth ? " and depth" : "", perEval);
+    else
+        SetState(e.hasDepth ? 1 : 2, e.hasDepth ? "the game's motion vectors (%ux%u) and depth (%ux%u) are used" : "the game's motion vectors (%ux%u) are used, without depth",
+                 e.mvW, e.mvH, e.dW, e.dH);
 }
 
 static bool EnsureGpu()
@@ -8341,15 +8348,36 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
 {
     if (s >= kStage) return;
     slotId[s] = 0; slotPend[s] = slotOk[s] = false;
-    if (!On() || g_status.fgActive) { std::lock_guard<std::mutex> l(lk); pendN = 0; return; }
+    if (!On()) { std::lock_guard<std::mutex> l(lk); pendN = 0; latest = -1; return; }
     Entry e;
     int k;
+    float scale = 1.0f;
     {
         std::lock_guard<std::mutex> l(lk);
-        if (pendN == 0) return;                           // no upscaler call since the last Present (a menu, DLSS off)
-        k = pend[0];
-        for (int i = 1; i < pendN; i++) pend[i - 1] = pend[i];
-        pendN--;
+        presSec++;
+        const double tn = Now();
+        if (tn - secT >= 1.0)
+        {
+            if (evalsSec > 0 && presSec > 0) perEval = 0.5 * perEval + 0.5 * std::max(1.0, std::min(4.0, (double)presSec / evalsSec));
+            evalsSec = presSec = 0; secT = tn;
+        }
+        if (g_status.fgActive)
+        {
+            // Frame generation: two or three frames are shown per rendered one, and the game's vectors are a rendered
+            // frame's motion. Every shown frame uses the newest vectors, for the share of that motion one shown frame
+            // covers. (A generated frame sits between two rendered ones: its picture is a little off from the vectors'.)
+            pendN = 0;
+            if (latest < 0) return;
+            k = latest;
+            scale = (float)(1.0 / std::max(1.0, perEval));
+        }
+        else
+        {
+            if (pendN == 0) return;                       // no upscaler call since the last Present (a menu, DLSS off)
+            k = pend[0];
+            for (int i = 1; i < pendN; i++) pend[i - 1] = pend[i];
+            pendN--;
+        }
         e = ring[k];
     }
     if (!e.mv || !EnsureGpu() || !EnsureFlow()) return;
@@ -8380,7 +8408,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     list->SetPipelineState(pso);
     GConsts gc = {};
     gc.outTexel[0] = 1.0f / (float)flowW; gc.outTexel[1] = 1.0f / (float)flowH;
-    gc.mvScale[0] = e.mvScale[0] * (float)g_shared.warpGameSign; gc.mvScale[1] = e.mvScale[1] * (float)g_shared.warpGameSign;
+    gc.mvScale[0] = e.mvScale[0] * (float)g_shared.warpGameSign * scale; gc.mvScale[1] = e.mvScale[1] * (float)g_shared.warpGameSign * scale;
     memcpy(gc.mvMap, e.mvMap, sizeof(gc.mvMap)); memcpy(gc.dMap, e.dMap, sizeof(gc.dMap));
     gc.mvInvalid = e.mvInvalid;
     gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u);
@@ -8441,7 +8469,7 @@ static void Release()
     flowW = flowH = 0;
     flowGen++;
     for (int i = 0; i < kRing; i++) descGen[i] = 0;
-    pendN = 0; haveSet[0] = haveSet[1] = false;
+    pendN = 0; latest = -1; haveSet[0] = haveSet[1] = false;
     SafeRelease(pso); SafeRelease(rs); SafeRelease(srvHeap); SafeRelease(rtvHeap);
 }
 } // namespace gmo
