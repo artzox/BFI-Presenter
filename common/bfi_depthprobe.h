@@ -170,13 +170,17 @@ inline void on_reset(command_list *cmd)
 
 inline void on_present(command_queue *, swapchain *sc, const rect *, const rect *, uint32_t, const rect *)
 {
+    // No calls into ReShade here: in South of Midnight (DX11, dp2) asking the swap chain for its back buffer
+    // crashed inside ReShade. The back buffer's size is the window's client area instead.
     std::lock_guard<std::mutex> l(g.lock);
-    if (sc)
+    (void)sc;
+    if (!g.bbW)
     {
-        if (device *d = sc->get_device())
+        if (HWND w = GetForegroundWindow())
         {
-            const resource bb = sc->get_current_back_buffer();
-            if (bb.handle) { const resource_desc rd = d->get_resource_desc(bb); g.bbW = rd.texture.width; g.bbH = rd.texture.height; }
+            RECT rc = {};
+            DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
+            if (pid == GetCurrentProcessId() && GetClientRect(w, &rc)) { g.bbW = (uint32_t)rc.right; g.bbH = (uint32_t)rc.bottom; }
         }
     }
     g.frames++;
