@@ -69,6 +69,8 @@ static ID3D12Resource *FlowRes(int s);
 static void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride);
 static UINT FlowGenNow();
 static int  StateNow(char *why, size_t n);
+static int  HudNow();
+static void HudBad(double pct);
 static void Release();
 }
 #else
@@ -81,6 +83,8 @@ static inline ID3D12Resource *FlowRes(int) { return nullptr; }
 static inline void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE, UINT) {}
 static inline UINT FlowGenNow() { return 0; }
 static inline int  StateNow(char *why, size_t n) { if (n) why[0] = 0; return 0; }
+static inline int  HudNow() { return 0; }
+static inline void HudBad(double) {}
 static inline void Release() {}
 }
 #endif
@@ -146,6 +150,9 @@ struct Settings
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
     int   warpGame = 1;       // FrameWarpGameMotion: use the game's own motion vectors and depth where it hands them to
                               // its upscaler (Streamline / DLSS, D3D12, 64-bit); otherwise the motion measured from the picture
+    int   warpGameHud = 1;    // FrameWarpGameHud: keep the HUD still with the game's HUD-less picture, where it gives one
+    float warpMaxGameFg = 0.25f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
+                              // many shown frames ahead (it overshot visibly from about 0.5 in 007 First Light)
     int   warpGameCheck = 1;  // FrameWarpGameMotionCheck (test, ini only): every 2 s the game's motion and the measured one in the log
     int   slHooks = 1;        // StreamlineHooks (test, ini only): 0 = Streamline is not hooked at all (no probe, frame warp
                               // with the picture's own motion only) -- to compare a game's frame rate with and without
@@ -321,6 +328,8 @@ static void LoadSettings(Settings &s)
     s.warpGameSign = IniInt("FrameWarpGameMotionSign", 1) < 0 ? -1 : 1;
     s.slHooks = IniInt("StreamlineHooks", 1) != 0 ? 1 : 0;
     s.warpGameCheck = IniInt("FrameWarpGameMotionCheck", 1) != 0 ? 1 : 0;
+    s.warpGameHud = IniInt("FrameWarpGameHud", 1) != 0 ? 1 : 0;
+    s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.25f)));
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -551,6 +560,8 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("FrameWarpMaxAhead", s.warpMax);
     IniWriteInt("FrameWarpMinRate", s.warpMinRate);
     IniWriteInt("FrameWarpGameMotion", s.warpGame);
+    IniWriteInt("FrameWarpGameHud", s.warpGameHud);
+    IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -676,6 +687,7 @@ struct Status
                                                 // motion vectors and depth, 2 its motion vectors only
     int    warpGameState = 0;                   // the game's own motion: 0 nothing seen, 1 vectors and depth, 2 vectors only, -1 not usable
     char   warpGameWhy[160] = "";
+    int    warpHud = 0;                         // the game's HUD mask: 0 none, 1 in use, -1 switched off
     int    reused = 0;                          // per second: refreshes that reused an already-drawn buffer   // per second: strobe cycles with no new game frame / frames never shown
     int    deviceLost = 0;
     int    flashHint = 0;                       // missed refreshes keep coming back (3 of the last 10 s; off after 30 s without)
@@ -1765,6 +1777,8 @@ bool FetchWarped(float2 pos, out float3 c)
     if (dot(d, d) < 0.0004) return false;                 // under 1/50 pixel
     if (Still(int2(cp), size)) return false;
     float2 p = clamp(cp - d, float2(0.5, 0.5), size - 0.5);
+    // the game's HUD mask (w = -1): a HUD pixel is never moved, and no moved pixel is taken from the HUD
+    if (warpSrc != 0 && (GameFlow(cp * inv).w < -0.5 || GameFlow(p * inv).w < -0.5)) return false;
     if (Still(int2(p), size)) return false;
     if (srcPerOut.x > 1.0001 || srcPerOut.y > 1.0001)
     {
@@ -2499,10 +2513,11 @@ static void Trace(const char *fmt, ...)
 // they are usually ready), and kept on disk in BFIPresenter_shaders.bin next to the ini, keyed to the exact source and
 // compile flags: from the second start of a version there is no compile at all.
 static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce",
-                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame" };   // the last five: kWarpShader (dx/bfi_warp.h)
-static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
-static const int kShN = 10;
+                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud" };   // the last six: kWarpShader (dx/bfi_warp.h)
+static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
+static const int kShN = 11;
 static const int kShWarpGame = 9;                // frame warp from the game's own motion vectors and depth
+static const int kShWarpHud = 10;                // and its HUD mask from the game's HUD-less picture
 static const int kShWarp = 5;                    // first of the frame warp shaders
 static ID3DBlob *g_shBlob[kShN] = {};
 static HANDLE volatile g_shThread = nullptr;
@@ -4517,7 +4532,9 @@ static DWORD WINAPI PresenterThread(void *)
             }
             if (gsrc && gmo::FlowRes(pick))
             {
-                c.warp = (float)(floor(warpAhead * 256.0 + 0.5) / 256.0);
+                // with frame generation, a limit of its own (the game's motion overshoots visibly further out)
+                const double ahead = g_status.fgActive ? std::min(warpAhead, (double)s.warpMaxGameFg) : warpAhead;
+                c.warp = (float)(floor(ahead * 256.0 + 0.5) / 256.0);
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = (uint32_t)gsrc;
             }
@@ -4614,9 +4631,10 @@ static DWORD WINAPI PresenterThread(void *)
         {
             chkPending = false;
             double sum[2][2] = {}, wsum[2] = {}, mag[2] = {};
-            int nAll[2] = {}, nOk[2] = {}; HRESULT mapHr[2] = { E_FAIL, E_FAIL };
+            int nAll[2] = {}, nOk[2] = {}, nHud = 0; HRESULT mapHr[2] = { E_FAIL, E_FAIL };
             const D3D12_RESOURCE_DESC fd = g_stage[0]->GetDesc();
             const double W = (double)fd.Width, H = (double)fd.Height;
+            static int hudBigN = 0;
             for (int q = 0; q < 2; q++)
             {
                 void *mp = nullptr;
@@ -4636,6 +4654,7 @@ static DWORD WINAPI PresenterThread(void *)
                         // the game's: z = 1 where its vector is valid; the measured (evened out): w = 1 where measured
                         const float wgt = q == 0 ? (fz > 0.5f ? 1.0f : 0.0f) : (fw > 0.5f ? fz : 0.0f);
                         nAll[q]++;
+                        if (q == 0 && fw < -0.5f) nHud++;
                         if (wgt <= 0.0f || !std::isfinite(fx) || !std::isfinite(fy)) continue;
                         nOk[q]++;
                         sum[q][0] += fx * wgt; sum[q][1] += fy * wgt; wsum[q] += wgt;
@@ -4644,6 +4663,14 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 D3D12_RANGE wr = { 0, 0 };
                 chkRb[q]->Unmap(0, &wr);
+            }
+            // the HUD mask: how much of the picture it covers (much more than any HUD: it doesn't match -- switched off)
+            const double hudPct = nAll[0] ? 100.0 * nHud / nAll[0] : 0.0;
+            if (gmo::HudNow() > 0)
+            {
+                static int hudLogs = 0;
+                if (hudLogs++ < 30) LOGI("BFI Presenter: frame warp check: the HUD mask covers %.1f%% of the picture", hudPct);
+                if (hudPct > 35.0) { if (++hudBigN >= 2) gmo::HudBad(hudPct); } else hudBigN = 0;
             }
             if (!(wsum[0] > 0.0 && wsum[1] > 0.0 && chkFrames > 0))
             {
@@ -5311,6 +5338,7 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.warpRate     = warpClock.rate;
             g_status.warpSrc      = secWarpGame[1] ? 1 : secWarpGame[2] ? 2 : 0;
             g_status.warpGameState = gmo::StateNow(g_status.warpGameWhy, sizeof(g_status.warpGameWhy));
+            g_status.warpHud = gmo::HudNow();
             {
                 // the log says which motion frame warp uses, when it changes (at most every 5 s)
                 static int srcWas = -1;
@@ -7913,14 +7941,14 @@ static void NoteInputs(const Base **in, uint32_t n)
 } // namespace slp
 namespace gmo
 {
-static void NoteSetTags(const slp::Tag *tags, uint32_t n);
+static void NoteSetTags(const slp::Tag *tags, uint32_t n, void *cmd);
 static void NoteConsts(const slp::Consts &c);
 static void OnEvaluate(const slp::Base **in, uint32_t n, void *cmd);
 }
 namespace slp
 {
-static int hk_SetTag(const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); gmo::NoteSetTags(tags, n); return o_SetTag(vp, tags, n, cmd); }
-static int hk_SetTagForFrame(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); gmo::NoteSetTags(tags, n); return o_SetTagForFrame(frame, vp, tags, n, cmd); }
+static int hk_SetTag(const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); gmo::NoteSetTags(tags, n, cmd); return o_SetTag(vp, tags, n, cmd); }
+static int hk_SetTagForFrame(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); gmo::NoteSetTags(tags, n, cmd); return o_SetTagForFrame(frame, vp, tags, n, cmd); }
 static int hk_SetConstants(const Consts &c, const void *frame, const void *vp)
 {
     {
@@ -8114,8 +8142,8 @@ struct Entry
     bool  depthRev = false, hasDepth = false, reset = false;
     UINT  gen = 0;                                        // bumped when the copies are made anew
 };
-struct GConsts { float outTexel[2], mvScale[2], mvMap[4], dMap[4], mvInvalid; uint32_t flags; };
-static_assert(sizeof(GConsts) == 56, "PSWarpGame constants");
+struct GConsts { float outTexel[2], mvScale[2], mvMap[4], dMap[4], mvInvalid; uint32_t flags; float pad[2]; float hMap[4]; float hudThr; float pad2[3]; };
+static_assert(sizeof(GConsts) == 96, "PSWarpGame / PSWarpHud constants");
 
 static std::mutex lk;
 static Entry ring[kRing];
@@ -8129,6 +8157,21 @@ static uint64_t seq = 0;
 static UINT genNext = 1;
 static std::vector<ID3D12Resource *> retired;            // replaced copies, released with the frame resources
 static Tag setTag[2]; static Res setRes[2]; static bool haveSet[2] = {};   // the last depth / vectors given to slSetTag
+
+// HUD mask: the game's HUD-less picture (Streamline buffer type 2), copied when the game tags it with a command list
+// (at its slSetTag or upscaler call), else used where it is at the Present when it stays valid until then.
+static ID3D12Resource *hudCopy = nullptr;                // the copy (ours), in COPY_DEST between uses
+static DXGI_FORMAT hudFmt = DXGI_FORMAT_UNKNOWN;
+static UINT  hudW = 0, hudH = 0;
+static float hudMap[4] = {};
+static double hudCopyT = -10.0;                          // when it was last copied
+static Tag   hudLiveTag; static Res hudLiveRes; static bool hudLive = false;   // valid until the Present (no copy)
+static ID3D12Resource *hudRaw[2] = {}, *hudMask = nullptr;   // the motion texture's size, R8; in PIXEL_SHADER_RESOURCE between uses
+static int  hudCur = 0;
+static bool hudMaskOk = false;                           // hudMask holds a mask from the last Presents
+static ID3D12PipelineState *psoHud = nullptr;
+static std::atomic<int> hudState{0};                     // 0 no HUD-less picture seen, 1 in use, -1 switched off (didn't match)
+static char hudWhy[160] = "";
 static Consts consts = {}; static bool haveConsts = false;
 static bool depthFailed = false;                         // a copy texture of the game's depth format couldn't be made
 static ID3D12Device *ringDev = nullptr;                  // the device the copies belong to (not owned)
@@ -8138,7 +8181,6 @@ static ID3D12RootSignature *rs = nullptr;
 static ID3D12PipelineState *pso = nullptr;
 static ID3D12DescriptorHeap *srvHeap = nullptr, *rtvHeap = nullptr;
 static UINT srvStride = 0, rtvStride = 0;
-static UINT descGen[kRing] = {};
 static ID3D12Resource *flow[kStage] = {};
 static UINT flowW = 0, flowH = 0;
 static std::atomic<UINT> flowGen{0};                     // bumped when the motion textures are made anew
@@ -8202,13 +8244,15 @@ static bool On() { return g_shared.frameWarp != 0 && g_shared.warpGame != 0 && !
 
 // slSetTag: the last depth and motion vectors a game tagged with a resource (games that pass them here rather than to
 // slEvaluateFeature). Only tags that stay valid up to the upscaler call are kept.
-static void NoteSetTags(const Tag *tags, uint32_t n)
+static void CopyHud(const Tag &t, void *cmd);
+static void NoteSetTags(const Tag *tags, uint32_t n, void *cmd)
 {
     if (!On() || !tags || n == 0 || n > 64 || !Plaus(tags)) return;
     std::lock_guard<std::mutex> l(lk);
     for (uint32_t i = 0; i < n; i++)
     {
         const Tag &t = tags[i];
+        if (t.bufType == 2) { if (g_shared.warpGameHud && t.res && Plaus(t.res) && t.res->native) CopyHud(t, cmd); continue; }
         if (t.bufType > 1) continue;
         const int k = (int)t.bufType;
         // Any life-cycle: 007 First Light tags its depth here and hands only the vectors to the upscaler call that
@@ -8271,20 +8315,79 @@ static void Map(const Tag &t, UINT w, UINT h, float m[4])
     m[2] = e ? (float)t.ext.left : 0.0f;       m[3] = e ? (float)t.ext.top : 0.0f;
 }
 
+static DXGI_FORMAT ColorView(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        return f;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+// The HUD-less picture: copied now on the game's list when there is one (lk held). Without a list, kept to be read at
+// the Present if it stays valid until then.
+static void CopyHud(const Tag &t, void *cmd)
+{
+    if (hudState.load() < 0 || !g_device) return;
+    if (!cmd)
+    {
+        if (t.lifecycle == 1) { hudLiveTag = t; hudLiveRes = *t.res; hudLiveTag.res = &hudLiveRes; hudLive = true; }
+        return;
+    }
+    D3D12_RESOURCE_DESC hd = {};
+    ID3D12Resource *src = Native(t.res, &hd);
+    if (!src) return;
+    ID3D12GraphicsCommandList *cl = nullptr;
+    const uint32_t st = t.res->state;
+    if (st == UINT_MAX || ColorView(hd.Format) == DXGI_FORMAT_UNKNOWN ||
+        FAILED(((IUnknown *)cmd)->QueryInterface(__uuidof(ID3D12GraphicsCommandList), (void **)&cl)) || !cl)
+    { src->Release(); return; }
+    if (!hudCopy || hudW != (UINT)hd.Width || hudH != hd.Height || hudFmt != hd.Format)
+    {
+        if (hudCopy) retired.push_back(hudCopy);
+        hudCopy = MakeCopy(hd, L"BFI frame warp: the game's HUD-less picture");
+        hudW = (UINT)hd.Width; hudH = hd.Height; hudFmt = hd.Format;
+    }
+    if (hudCopy)
+    {
+        D3D12_RESOURCE_BARRIER b0, b1;
+        const bool tr = !(st & D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (tr) { b0 = Transition(src, (D3D12_RESOURCE_STATES)st, D3D12_RESOURCE_STATE_COPY_SOURCE); cl->ResourceBarrier(1, &b0); }
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, sl = {};
+        dst.Type = sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource = hudCopy; sl.pResource = src;
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &sl, nullptr);
+        if (tr) { b1 = Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, (D3D12_RESOURCE_STATES)st); cl->ResourceBarrier(1, &b1); }
+        Map(t, hudW, hudH, hudMap);
+        hudCopyT = Now();
+        hudLive = false;
+    }
+    cl->Release();
+    src->Release();
+}
+
 // Step 1, from the slEvaluateFeature hook (DLSS), before the call goes on.
 static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
 {
     if (!On() || !g_device || !cmd) return;
-    const Tag *tg[2] = {};
+    const Tag *tg[2] = {}, *hl = nullptr;
     if (in && n && n <= 64 && Plaus(in))
         for (uint32_t i = 0; i < n; i++)
             for (const Base *b = in[i]; b && Plaus(b); b = (const Base *)b->next)
                 if (memcmp(b->type, slp::kTagGuid, 16) == 0)
                 {
                     const Tag *t = (const Tag *)b;
-                    if (t->bufType <= 1 && t->res) tg[t->bufType] = t;
+                    if (t->bufType <= 2 && t->res) { if (t->bufType == 2) hl = t; else tg[t->bufType] = t; }
                 }
     std::lock_guard<std::mutex> l(lk);
+    if (hl && g_shared.warpGameHud && Plaus(hl->res) && hl->res->native) CopyHud(*hl, cmd);
     for (int k = 0; k < 2; k++) if (!tg[k] && haveSet[k]) tg[k] = &setTag[k];
     // slSetTag's tags valid only when tagged (life-cycle 0): for this upscaler call only
     struct Forget { ~Forget() { for (int k = 0; k < 2; k++) if (haveSet[k] && setTag[k].lifecycle == 0) haveSet[k] = false; } } forget;
@@ -8323,6 +8426,7 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
         // A new device: the copies of the old one go (kept across swap chain resizes otherwise -- a copy the game has
         // recorded on a list it hasn't submitted yet must still exist when that list runs).
         for (int i = 0; i < kRing; i++) { SafeRelease(ring[i].mv); SafeRelease(ring[i].depth); ring[i] = Entry(); }
+        SafeRelease(hudCopy); hudW = hudH = 0; hudFmt = DXGI_FORMAT_UNKNOWN; hudLive = false;
         for (ID3D12Resource *r : retired) r->Release();
         retired.clear();
         pendN = 0; latest = -1; depthFailed = false;
@@ -8396,8 +8500,8 @@ static bool EnsureGpu()
     if (failed) return false;
     D3D12_DESCRIPTOR_RANGE range = {};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 2;
-    range.BaseShaderRegister = 5;                          // t5 the vectors, t6 the depth
+    range.NumDescriptors = 6;
+    range.BaseShaderRegister = 5;                          // t5 the vectors, t6 the depth, t7 the HUD mask, t8-t10 its pass's inputs
     D3D12_ROOT_PARAMETER p[2] = {};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     p[0].Constants.ShaderRegister = 1;                     // b1
@@ -8429,22 +8533,31 @@ static bool EnsureGpu()
         pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         pd.SampleDesc.Count = 1;
         ok = SUCCEEDED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+        if (ok && g_shBlob[kShWarpHud])
+        {
+            pd.PS = { g_shBlob[kShWarpHud]->GetBufferPointer(), g_shBlob[kShWarpHud]->GetBufferSize() };
+            pd.NumRenderTargets = 2;
+            pd.RTVFormats[0] = pd.RTVFormats[1] = DXGI_FORMAT_R8_UNORM;
+            pd.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            if (FAILED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoHud)))) psoHud = nullptr;   // optional
+        }
     }
     if (ok)
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 2 * kRing; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        // one block of 6 views per staging slot, written at that slot's Present (its previous use is finished then:
+        // the game's side waits for the slot's last copy list before reusing it)
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 6 * kStage; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ok = SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = kStage; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = kStage + 3; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
         srvStride = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         rtvStride = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        for (int i = 0; i < kRing; i++) descGen[i] = 0;
     }
     if (!ok)
     {
         failed = true;
-        SafeRelease(pso); SafeRelease(rs); SafeRelease(srvHeap); SafeRelease(rtvHeap);
+        SafeRelease(psoHud); SafeRelease(pso); SafeRelease(rs); SafeRelease(srvHeap); SafeRelease(rtvHeap);
         LOGW("BFI Presenter: frame warp, the game's own motion: its pass could not be created -- the picture's own motion is used");
     }
     return ok;
@@ -8460,6 +8573,7 @@ static bool EnsureFlow(UINT mvW, UINT mvH)
     const UINT w = std::max(64u, std::min(mvW, ((UINT)sd.Width + 1) / 2)), h = std::max(64u, std::min(mvH, (sd.Height + 1) / 2));
     if (flow[0] && flowW == w && flowH == h) return true;
     for (UINT i = 0; i < kStage; i++) { SafeRelease(flow[i]); slotPend[i] = slotOk[i] = false; slotId[i] = 0; }
+    SafeRelease(hudRaw[0]); SafeRelease(hudRaw[1]); SafeRelease(hudMask); hudMaskOk = false;
     D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -8478,6 +8592,18 @@ static bool EnsureFlow(UINT mvW, UINT mvH)
         D3D12_CPU_DESCRIPTOR_HANDLE rh = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         rh.ptr += (SIZE_T)i * rtvStride;
         g_device->CreateRenderTargetView(flow[i], nullptr, rh);
+    }
+    // the HUD mask's textures (optional)
+    rd.Format = DXGI_FORMAT_R8_UNORM;
+    ID3D12Resource **hr[3] = { &hudRaw[0], &hudRaw[1], &hudMask };
+    for (int i = 0; i < 3; i++)
+    {
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(hr[i]))))
+        { SafeRelease(hudRaw[0]); SafeRelease(hudRaw[1]); SafeRelease(hudMask); break; }
+        (*hr[i])->SetName(L"BFI frame warp: HUD mask");
+        D3D12_CPU_DESCRIPTOR_HANDLE rh = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rh.ptr += (SIZE_T)(kStage + i) * rtvStride;
+        g_device->CreateRenderTargetView(*hr[i], nullptr, rh);
     }
     flowW = w; flowH = h;
     flowGen++;
@@ -8530,46 +8656,113 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         e = ring[k];
     }
     if (!e.mv || !EnsureGpu() || !EnsureFlow(e.mvW, e.mvH)) return;
+    // The HUD-less picture for the mask: a copy made this frame (or a few frames ago), or the game's own buffer when it
+    // stays valid until the Present.
+    ID3D12Resource *hl = nullptr; uint32_t hlState = 0; DXGI_FORMAT hlFmt = DXGI_FORMAT_UNKNOWN; float hlMap[4] = {};
+    bool hlLive = false;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        if (g_shared.warpGameHud && hudState.load() >= 0 && psoHud && hudMask)
+        {
+            if (hudCopy && Now() - hudCopyT < 0.25) { hl = hudCopy; hl->AddRef(); hlState = D3D12_RESOURCE_STATE_COPY_DEST; hlFmt = hudFmt; memcpy(hlMap, hudMap, sizeof(hlMap)); }
+            else if (hudLive)
+            {
+                D3D12_RESOURCE_DESC d = {};
+                if ((hl = Native(hudLiveTag.res, &d)) != nullptr)
+                {
+                    hlState = hudLiveRes.state; hlFmt = d.Format; hlLive = true; Map(hudLiveTag, (UINT)d.Width, d.Height, hlMap);
+                    if (hlState == UINT_MAX || ColorView(hlFmt) == DXGI_FORMAT_UNKNOWN) { hl->Release(); hl = nullptr; }
+                }
+            }
+        }
+    }
+    // the views for this slot: t5 vectors, t6 depth, t7 HUD mask, t8 the frame, t9 the HUD-less picture, t10 the raw mask before
     D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
-    sh.ptr += (SIZE_T)(2 * k) * srvStride;
-    if (descGen[k] != e.gen)
+    sh.ptr += (SIZE_T)(6 * s) * srvStride;
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sv.Texture2D.MipLevels = 1;
+        auto at = [&](int i) { D3D12_CPU_DESCRIPTOR_HANDLE h = sh; h.ptr += (SIZE_T)i * srvStride; return h; };
         sv.Format = MvView(e.mvFmt);
-        g_device->CreateShaderResourceView(e.mv, &sv, sh);
-        D3D12_CPU_DESCRIPTOR_HANDLE sh2 = sh; sh2.ptr += srvStride;
+        g_device->CreateShaderResourceView(e.mv, &sv, at(0));
         sv.Format = e.hasDepth ? DepthView(e.dFmt) : DXGI_FORMAT_R32_FLOAT;
-        sv.Texture2D.PlaneSlice = 0;
-        g_device->CreateShaderResourceView(e.hasDepth ? e.depth : nullptr, &sv, sh2);
-        descGen[k] = e.gen;
+        g_device->CreateShaderResourceView(e.hasDepth ? e.depth : nullptr, &sv, at(1));
+        sv.Format = DXGI_FORMAT_R8_UNORM;
+        g_device->CreateShaderResourceView(hudMask, &sv, at(2));
+        sv.Format = StageFormat();
+        g_device->CreateShaderResourceView(g_stage[s], &sv, at(3));
+        sv.Format = hl ? ColorView(hlFmt) : DXGI_FORMAT_R8G8B8A8_UNORM;
+        g_device->CreateShaderResourceView(hl, &sv, at(4));
+        sv.Format = DXGI_FORMAT_R8_UNORM;
+        g_device->CreateShaderResourceView(hudRaw[1 - hudCur], &sv, at(5));
     }
-    D3D12_RESOURCE_BARRIER b[3] = {
-        Transition(flow[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
-        Transition(e.mv, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-        e.hasDepth ? Transition(e.depth, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) : D3D12_RESOURCE_BARRIER{} };
-    const UINT nb = e.hasDepth ? 3 : 2;
-    list->ResourceBarrier(nb, b);
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = srvHeap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += (UINT64)(6 * s) * srvStride;
     list->SetDescriptorHeaps(1, &srvHeap);
     list->SetGraphicsRootSignature(rs);
-    list->SetPipelineState(pso);
-    GConsts gc = {};
-    gc.outTexel[0] = 1.0f / (float)flowW; gc.outTexel[1] = 1.0f / (float)flowH;
-    gc.mvScale[0] = e.mvScale[0] * (float)g_shared.warpGameSign * scale; gc.mvScale[1] = e.mvScale[1] * (float)g_shared.warpGameSign * scale;
-    memcpy(gc.mvMap, e.mvMap, sizeof(gc.mvMap)); memcpy(gc.dMap, e.dMap, sizeof(gc.dMap));
-    gc.mvInvalid = e.mvInvalid;
-    gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u);
-    list->SetGraphicsRoot32BitConstants(0, sizeof(GConsts) / 4, &gc, 0);
-    D3D12_GPU_DESCRIPTOR_HANDLE gh = srvHeap->GetGPUDescriptorHandleForHeapStart();
-    gh.ptr += (UINT64)(2 * k) * srvStride;
     list->SetGraphicsRootDescriptorTable(1, gh);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)flowW, (float)flowH, 0.0f, 1.0f };
     D3D12_RECT sc = { 0, 0, (LONG)flowW, (LONG)flowH };
     list->RSSetViewports(1, &vp);
     list->RSSetScissorRects(1, &sc);
+    GConsts gc = {};
+    gc.outTexel[0] = 1.0f / (float)flowW; gc.outTexel[1] = 1.0f / (float)flowH;
+    gc.mvScale[0] = e.mvScale[0] * (float)g_shared.warpGameSign * scale; gc.mvScale[1] = e.mvScale[1] * (float)g_shared.warpGameSign * scale;
+    memcpy(gc.mvMap, e.mvMap, sizeof(gc.mvMap)); memcpy(gc.dMap, e.dMap, sizeof(gc.dMap));
+    gc.mvInvalid = e.mvInvalid;
+    const bool linear = StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (linear ? 8u : 0u);
+    memcpy(gc.hMap, hlMap, sizeof(gc.hMap));
+    gc.hudThr = linear ? 0.06f : 0.04f;
+
+    // 1. The HUD mask (when the game gives a HUD-less picture)
+    if (hl)
+    {
+        D3D12_RESOURCE_BARRIER hb[4]; UINT nh = 0;
+        hb[nh++] = Transition(g_stage[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        const bool hlTr = !(hlState & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (hlTr) hb[nh++] = Transition(hl, (D3D12_RESOURCE_STATES)hlState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        hb[nh++] = Transition(hudRaw[hudCur], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        hb[nh++] = Transition(hudMask, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(nh, hb);
+        list->SetPipelineState(psoHud);
+        list->SetGraphicsRoot32BitConstants(0, sizeof(GConsts) / 4, &gc, 0);
+        D3D12_CPU_DESCRIPTOR_HANDLE rt[2] = { rtvHeap->GetCPUDescriptorHandleForHeapStart(), rtvHeap->GetCPUDescriptorHandleForHeapStart() };
+        rt[0].ptr += (SIZE_T)(kStage + hudCur) * rtvStride;
+        rt[1].ptr += (SIZE_T)(kStage + 2) * rtvStride;
+        list->OMSetRenderTargets(2, rt, FALSE, nullptr);
+        list->DrawInstanced(3, 1, 0, 0);
+        nh = 0;
+        hb[nh++] = Transition(g_stage[s], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        if (hlTr) hb[nh++] = Transition(hl, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, (D3D12_RESOURCE_STATES)hlState);
+        hb[nh++] = Transition(hudRaw[hudCur], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        hb[nh++] = Transition(hudMask, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(nh, hb);
+        hudCur = 1 - hudCur;
+        hudMaskOk = true;
+        if (hudState.load() == 0)
+        {
+            hudState = 1;
+            LOGI("BFI Presenter: frame warp, the game's own motion: the HUD is kept still with the game's HUD-less picture (%ux%u, format %d, %s)",
+                 (unsigned)hlMap[0], (unsigned)hlMap[1], (int)hlFmt, hlLive ? "read at the Present" : "copied when tagged");
+        }
+        hl->Release();
+    }
+    else hudMaskOk = false;
+    if (hudMaskOk) gc.flags |= 4u;
+
+    // 2. The motion texture
+    D3D12_RESOURCE_BARRIER b[3] = {
+        Transition(flow[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+        Transition(e.mv, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        e.hasDepth ? Transition(e.depth, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) : D3D12_RESOURCE_BARRIER{} };
+    const UINT nb = e.hasDepth ? 3 : 2;
+    list->ResourceBarrier(nb, b);
+    list->SetPipelineState(pso);
+    list->SetGraphicsRoot32BitConstants(0, sizeof(GConsts) / 4, &gc, 0);
     D3D12_CPU_DESCRIPTOR_HANDLE rh = rtvHeap->GetCPUDescriptorHandleForHeapStart();
     rh.ptr += (SIZE_T)s * rtvStride;
     list->OMSetRenderTargets(1, &rh, FALSE, nullptr);
@@ -8608,6 +8801,15 @@ static void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride)
 static UINT FlowGenNow() { return flowGen.load(); }
 static ID3D12Resource *FlowRes(int s) { return s >= 0 && s < (int)kStage ? flow[s] : nullptr; }
 static int StateNow(char *w, size_t n) { std::lock_guard<std::mutex> l(lk); snprintf(w, n, "%s", why); return state.load(); }
+static int HudNow() { return hudState.load(); }
+// The check found the mask covering much of the picture: the HUD-less picture doesn't match the frame shown (effects
+// drawn after it -- ReShade's included -- or another colour encoding). The mask is switched off for the session.
+static void HudBad(double pct)
+{
+    if (hudState.exchange(-1) != -1)
+        LOGW("BFI Presenter: frame warp, the game's own motion: HUD protection off -- the game's HUD-less picture differs from the frame "
+             "shown over %.0f%% of it (effects drawn after it, ReShade's included, or another colour encoding)", pct);
+}
 
 // With the frame resources (the swap chain resized or gone): the motion textures and the pass. The copies of the
 // game's buffers stay (see OnEvaluate) until the device changes.
@@ -8617,9 +8819,9 @@ static void Release()
     for (UINT i = 0; i < kStage; i++) { SafeRelease(flow[i]); slotPend[i] = slotOk[i] = false; slotId[i] = 0; }
     flowW = flowH = 0;
     flowGen++;
-    for (int i = 0; i < kRing; i++) descGen[i] = 0;
-    pendN = 0; latest = -1; haveSet[0] = haveSet[1] = false;
-    SafeRelease(pso); SafeRelease(rs); SafeRelease(srvHeap); SafeRelease(rtvHeap);
+    SafeRelease(hudRaw[0]); SafeRelease(hudRaw[1]); SafeRelease(hudMask); hudMaskOk = false;
+    pendN = 0; latest = -1; haveSet[0] = haveSet[1] = false; hudLive = false;
+    SafeRelease(psoHud); SafeRelease(pso); SafeRelease(rs); SafeRelease(srvHeap); SafeRelease(rtvHeap);
 }
 } // namespace gmo
 
@@ -12956,6 +13158,20 @@ static void draw_overlay(reshade::api::effect_runtime *)
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", st.warpGameWhy); }
                 else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
                     ImGui::SetTooltip("This game hasn't handed an upscaler any motion data (no Streamline / DLSS seen).");
+            }
+            if (s.warpGame)
+            {
+                ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
+                                                              "further ahead than this (shown frames). Further out it overshoots and snaps back.");
+                bool hud = s.warpGameHud != 0;
+                if (ImGui::Checkbox("Keep the HUD still (the game's HUD-less picture)", &hud)) s.warpGameHud = hud ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands its upscaler a picture without the HUD (e.g. 007 First Light),\n"
+                                                              "whatever differs from it is HUD and is never moved. Switches itself off if the\n"
+                                                              "two don't match (effects drawn after it, ReShade's included).");
+                if (s.warpGameHud)
+                    ImGui::TextDisabled(st.warpHud > 0 ? "HUD mask: in use" : st.warpHud < 0 ? "HUD mask: off (the HUD-less picture doesn't match the frame)"
+                                                       : "HUD mask: the game gives no HUD-less picture");
             }
             ImGui::Unindent(16.0f);
         }

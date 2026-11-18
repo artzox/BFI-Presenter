@@ -197,16 +197,26 @@ cbuffer G : register(b1)
     float4 gMvMap;        // screen uv -> motion-vector texel: xy scale, zw offset (texels)
     float4 gDepthMap;     // screen uv -> depth texel
     float  gMvInvalid;    // the value the game writes where a vector is not valid
-    uint   gFlags;        // 1 depth reversed (near = 1), 2 depth available
+    uint   gFlags;        // 1 depth reversed (near = 1), 2 depth available, 4 the HUD mask (t7) is valid, 8 the frame is linear (scRGB)
+    float2 gPad;
+    float4 gHMap;         // screen uv -> the game's HUD-less picture's texel
+    float  gHudThr;       // HUD mask: a difference above this (in the frame's own values) is HUD
+    float3 gPad2;
 };
 Texture2D<float2> gMv    : register(t5);
 Texture2D<float>  gDepth : register(t6);
+Texture2D<float>  gHud   : register(t7);   // HUD mask (1 = HUD), the size of the motion texture
+Texture2D<float4> hFinal : register(t8);   // HUD mask pass: the game's finished frame
+Texture2D<float4> hLess  : register(t9);   // and its HUD-less picture
+Texture2D<float>  hPrev  : register(t10);  // and the raw difference found at the Present before
 
 float4 PSWarpGame(float4 pos : SV_Position) : SV_Target
 {
     // One vector per texel, from the game's vector at its centre (the texture is the size of the game's vectors, or
     // half the frame: no spreading of one vector over its neighbours, which bent thin things).
     float2 uv = pos.xy * gOutTexel;
+    // HUD: no motion, and marked (w = -1) so the presenter neither moves it nor takes a moved pixel from it
+    if ((gFlags & 4) != 0 && gHud.Load(int3(int2(pos.xy), 0)) > 0.5) return float4(0.0, 0.0, 0.0, -1.0);
     uint mw, mh, dw, dh;
     gMv.GetDimensions(mw, mh);
     gDepth.GetDimensions(dw, dh);
@@ -223,10 +233,43 @@ float4 PSWarpGame(float4 pos : SV_Position) : SV_Target
     // Streamline: the pixel was at uv + m * mvecScale in the frame before, so it moved by the opposite.
     return float4(-m * gMvScale, 1.0, saturate(nearv));
 }
+
+// HUD mask (where the game hands its upscaler a HUD-less picture of the frame, e.g. 007 First Light): what differs
+// between the finished frame and the HUD-less picture is HUD. Nine taps over each texel's footprint. Only what
+// differed at this Present and the one before counts (raw AND previous raw): with frame generation every other shown
+// frame is generated, and a generated frame differs from the rendered frame's HUD-less picture wherever things move
+// -- the rendered frame next to it doesn't, so the AND keeps only the HUD.
+struct HudOut { float raw : SV_Target0; float hud : SV_Target1; };
+HudOut PSWarpHud(float4 pos : SV_Position)
+{
+    float2 uv = pos.xy * gOutTexel;
+    uint fw, fh, lw, lh;
+    hFinal.GetDimensions(fw, fh);
+    hLess.GetDimensions(lw, lh);
+    float d = 0.0;
+    [unroll] for (int y = 0; y < 3; y++)
+    {
+        [unroll] for (int x = 0; x < 3; x++)
+        {
+            float2 fu = uv + ((float2(x, y) + 0.5) / 3.0 - 0.5) * gOutTexel;
+            int2 fq = clamp(int2(fu * float2(fw, fh)), int2(0, 0), int2(fw, fh) - 1);
+            int2 lq = clamp(int2(fu * gHMap.xy + gHMap.zw), int2(0, 0), int2(lw, lh) - 1);
+            float3 a = hFinal.Load(int3(fq, 0)).rgb, b = hLess.Load(int3(lq, 0)).rgb;
+            float3 e = abs(a - b);
+            float m = max(max(e.r, e.g), e.b);
+            if ((gFlags & 8) != 0) m /= 0.2 + max(max(max(a.r, a.g), a.b), max(max(b.r, b.g), b.b));   // linear: relative
+            d = max(d, m);
+        }
+    }
+    HudOut o;
+    o.raw = d > gHudThr ? 1.0 : 0.0;
+    o.hud = (o.raw > 0.5 && hPrev.Load(int3(int2(pos.xy), 0)) > 0.5) ? 1.0 : 0.0;
+    return o;
+}
 )HLSL";
 
-static const char *const kWarpEntry[] = { "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame" };
-static const int kWarpShN = 5;
+static const char *const kWarpEntry[] = { "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud" };
+static const int kWarpShN = 6;
 
 struct WarpConstants
 {
