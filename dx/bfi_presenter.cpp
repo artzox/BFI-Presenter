@@ -3555,6 +3555,7 @@ static DWORD WINAPI PresenterThread(void *)
     ID3D12Resource *chkRb[2] = {};          // readback: the game's motion texture, the measured one
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT chkFp[2] = {};
     UINT   chkW[2] = {}, chkH[2] = {};
+    UINT64 chkBytes[2] = {};
     UINT64 chkFence = 0, chkFrames = 0;
     double chkT = 0.0;
     bool   chkPending = false;
@@ -4619,7 +4620,9 @@ static DWORD WINAPI PresenterThread(void *)
             for (int q = 0; q < 2; q++)
             {
                 void *mp = nullptr;
-                D3D12_RANGE rr = { 0, (SIZE_T)(chkFp[q].Footprint.RowPitch * chkH[q]) };
+                // the whole buffer (gm7 asked for rows x row pitch, which is past its end when the last row isn't padded:
+                // E_INVALIDARG for the measured motion's 120-texel rows)
+                D3D12_RANGE rr = { 0, (SIZE_T)chkBytes[q] };
                 mapHr[q] = chkRb[q]->Map(0, &rr, &mp);
                 if (FAILED(mapHr[q]) || !mp) continue;
                 const int step = q == 0 ? 4 : 1;                 // the game's texture is large: every 4th texel
@@ -4690,6 +4693,7 @@ static DWORD WINAPI PresenterThread(void *)
                         SafeRelease(chkRb[q]);
                         UINT64 total = 0;
                         g_device->GetCopyableFootprints(&dsc, 0, 1, 0, &chkFp[q], nullptr, nullptr, &total);
+                        chkBytes[q] = total;
                         D3D12_HEAP_PROPERTIES rh = {}; rh.Type = D3D12_HEAP_TYPE_READBACK;
                         D3D12_RESOURCE_DESC bd = {};
                         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1;
