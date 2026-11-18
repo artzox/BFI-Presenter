@@ -21,6 +21,8 @@ struct OsdData
     int    warpOn = 0;         // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
     int    warped = 0;         // per second: strobe cycles shown moved ahead
     double warpAhead = 0.0;    // and how far on average, in game frames
+    int    warpSrc = -1;       // the motion it moves the picture with: 0 measured from the picture, 1 the game's motion
+                               // vectors and depth, 2 its motion vectors only; -1 = not reported (the picture's own)
     double now = 0.0;          // Now() seconds, for the totals' time
 };
 
@@ -149,6 +151,9 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
     if (d.warpOn == 2) ImGui::TextColored(kGood, "frame warp: %d of %.0f cycles moved (%.2f frames ahead)", d.warped, cycles, d.warpAhead);
     else if (d.warpOn == 1) ImGui::TextDisabled("frame warp: waiting (frame rate outside its range)");
     else if (d.warpOn < 0) ImGui::TextColored(kBad, "frame warp: not available");
+    if (d.warpOn > 0 && d.warpSrc >= 0)
+        ImGui::TextDisabled("  motion: %s", d.warpSrc == 1 ? "the game's motion vectors + depth" : d.warpSrc == 2 ? "the game's motion vectors"
+                                                                                              : "measured from the picture");
     {
         const double since = g_totSince.load();
         const int el = since > 0.0 && d.now > since ? (int)(d.now - since) : 0;

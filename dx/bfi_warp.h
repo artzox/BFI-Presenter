@@ -22,7 +22,8 @@
 //      (HUD, text, crosshair) and is shown as rendered.
 //
 // No game data is needed (no motion vectors, depth or camera): it works on the finished picture, HUD and ReShade
-// effects included -- and has their limits: see docs/settings-guide.md, "Frame warp".
+// effects included -- and has their limits: see docs/settings-guide.md, "Frame warp". Where the game hands its
+// upscaler its motion vectors and depth (Streamline), PSWarpGame below makes the motion texture from those instead.
 //
 // Uses the presenter's root signature (b0 constants, t0-t4 one SRV each, s0 linear clamp) and its vertex shader.
 // ============================================================================
@@ -184,10 +185,62 @@ float4 PSWarpSmooth(float4 pos : SV_Position) : SV_Target
     }
     return wsum2 > 1e-4 ? float4(sum2 / wsum2, 1.0, 1.0) : float4(m, 1.0, 1.0);
 }
+
+// ---- The game's own motion (test): where the game hands its upscaler motion vectors and depth (Streamline / DLSS),
+// they are turned into the same kind of motion texture at 1/4 of the game frame, at the game's Present, on the
+// game's queue (dx/bfi_presenter.cpp, namespace gmo). xy = how far the picture at this point moved from the frame
+// before to this one (uv), z = 1 where the game's vector is valid, w = how near the point is (0 far .. 1 near).
+// Each texel takes the vector of the nearest of 9 taps over its footprint: along an edge the thing in front keeps
+// its own motion instead of a blend with what is behind it.
+cbuffer G : register(b1)
+{
+    float2 gOutTexel;     // 1 / size of the motion texture written
+    float2 gMvScale;      // the game's motion-vector scale (Streamline's mvecScale: to uv)
+    float4 gMvMap;        // screen uv -> motion-vector texel: xy scale, zw offset (texels)
+    float4 gDepthMap;     // screen uv -> depth texel
+    float  gMvInvalid;    // the value the game writes where a vector is not valid
+    uint   gFlags;        // 1 depth reversed (near = 1), 2 depth available
+};
+Texture2D<float2> gMv    : register(t5);
+Texture2D<float>  gDepth : register(t6);
+
+float4 PSWarpGame(float4 pos : SV_Position) : SV_Target
+{
+    float2 uv = pos.xy * gOutTexel;
+    uint mw, mh, dw, dh;
+    gMv.GetDimensions(mw, mh);
+    gDepth.GetDimensions(dw, dh);
+    float2 best = float2(0.0, 0.0);
+    float bestNear = -1.0;
+    bool found = false;
+    const bool useDepth = (gFlags & 2) != 0;
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            if (!useDepth && (x != 0 || y != 0)) continue;     // without depth: the texel's centre only
+            float2 suv = uv + float2(x, y) * gOutTexel * 0.33;
+            int2 mq = clamp(int2(suv * gMvMap.xy + gMvMap.zw), int2(0, 0), int2(mw, mh) - 1);
+            float2 m = gMv.Load(int3(mq, 0));
+            if (m.x == gMvInvalid || m.y == gMvInvalid || any(isnan(m))) continue;
+            float nearv = 0.0;
+            if (useDepth)
+            {
+                int2 dq = clamp(int2(suv * gDepthMap.xy + gDepthMap.zw), int2(0, 0), int2(dw, dh) - 1);
+                float d = gDepth.Load(int3(dq, 0));
+                nearv = (gFlags & 1) != 0 ? d : 1.0 - d;
+            }
+            if (!found || nearv > bestNear) { best = m; bestNear = nearv; found = true; }
+        }
+    }
+    if (!found) return float4(0.0, 0.0, 0.0, 0.0);
+    // Streamline: the pixel was at uv + m * mvecScale in the frame before, so it moved by the opposite.
+    return float4(-best * gMvScale, 1.0, saturate(bestNear));
+}
 )HLSL";
 
-static const char *const kWarpEntry[] = { "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth" };
-static const int kWarpShN = 4;
+static const char *const kWarpEntry[] = { "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame" };
+static const int kWarpShN = 5;
 
 struct WarpConstants
 {

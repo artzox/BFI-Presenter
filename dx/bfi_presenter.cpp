@@ -60,6 +60,29 @@
 #include "../common/bfi_warpclock.h"
 #ifdef _WIN64
 namespace slp { static void Tick(double t); }   // Streamline probe (test), defined after InlineHook64
+namespace gmo                                    // frame warp from the game's own motion (test), defined after slp
+{
+static void AtPresent(ID3D12GraphicsCommandList *list, UINT s);
+static void Published(UINT s, UINT64 id);
+static int  SlotFor(int s, UINT64 id);
+static ID3D12Resource *FlowRes(int s);
+static void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride);
+static UINT FlowGenNow();
+static int  StateNow(char *why, size_t n);
+static void Release();
+}
+#else
+namespace gmo                                    // 32-bit games: no Streamline, the picture's own motion only
+{
+static inline void AtPresent(ID3D12GraphicsCommandList *, UINT) {}
+static inline void Published(UINT, UINT64) {}
+static inline int  SlotFor(int, UINT64) { return 0; }
+static inline ID3D12Resource *FlowRes(int) { return nullptr; }
+static inline void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE, UINT) {}
+static inline UINT FlowGenNow() { return 0; }
+static inline int  StateNow(char *why, size_t n) { if (n) why[0] = 0; return 0; }
+static inline void Release() {}
+}
 #endif
 
 #ifdef _MSC_VER
@@ -121,6 +144,10 @@ struct Settings
                               // along the camera's motion instead of lit again (no frame is held back: no added latency)
     float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
+    int   warpGame = 1;       // FrameWarpGameMotion: use the game's own motion vectors and depth where it hands them to
+                              // its upscaler (Streamline / DLSS, D3D12, 64-bit); otherwise the motion measured from the picture
+    int   warpGameSign = 1;   // FrameWarpGameMotionSign (test, ini only): -1 turns the game's vectors round, in case a game's
+                              // scale has the other sign
     int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
     int   osdCorner = 1;      // OsdCorner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
     int   osdGraph = 1;       // OsdGraph: frame-time graph
@@ -287,6 +314,8 @@ static void LoadSettings(Settings &s)
     s.frameWarp = IniInt("FrameWarp", 0) != 0 ? 1 : 0;      // 2 (even pacing, test builds t1-t2) is gone: fill
     s.warpMax = std::max(0.25f, std::min(1.5f, IniFloat("FrameWarpMaxAhead", 1.0f)));
     s.warpMinRate = std::max(40, std::min(95, IniInt("FrameWarpMinRate", 75)));
+    s.warpGame = IniInt("FrameWarpGameMotion", 1) != 0 ? 1 : 0;
+    s.warpGameSign = IniInt("FrameWarpGameMotionSign", 1) < 0 ? -1 : 1;
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -516,6 +545,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarp", s.frameWarp);
     IniWriteFloat("FrameWarpMaxAhead", s.warpMax);
     IniWriteInt("FrameWarpMinRate", s.warpMinRate);
+    IniWriteInt("FrameWarpGameMotion", s.warpGame);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -637,6 +667,10 @@ struct Status
     int    warpCycles = 0;                      // per second: strobe cycles shown moved ahead
     double warpRate = 0.0;                      // the game's frames per strobe cycle, as frame warp measures it
     double warpAvg = 0.0;                       // average distance ahead of those cycles, in game frames
+    int    warpSrc = 0;                         // what those cycles were moved with: 0 the picture's own motion, 1 the game's
+                                                // motion vectors and depth, 2 its motion vectors only
+    int    warpGameState = 0;                   // the game's own motion: 0 nothing seen, 1 vectors and depth, 2 vectors only, -1 not usable
+    char   warpGameWhy[160] = "";
     int    reused = 0;                          // per second: refreshes that reused an already-drawn buffer   // per second: strobe cycles with no new game frame / frames never shown
     int    deviceLost = 0;
     int    flashHint = 0;                       // missed refreshes keep coming back (3 of the last 10 s; off after 30 s without)
@@ -1378,6 +1412,7 @@ static void ReleaseFrameResources()
 {
     for (UINT i = 0; i < kMaxBuf; i++) SafeRelease(g_virt[i]);
     for (UINT s = 0; s < kStage; s++) SafeRelease(g_stage[s]);
+    gmo::Release();
     g_bufCount = 0;
 }
 
@@ -1604,7 +1639,10 @@ cbuffer C : register(b0)
     float rfxRamp;    // SDR to HDR, RenoFX HDR Boost (flags & 256): Ramp Intensity
     float rfxColor;   // its colour blend, 0..1 (0 = brightness only)
     float rfxApl;     // its APL Limiter: 1 = on (the scene average is in aplTex, measured from this frame)
-    float warp;       // frame warp: the frame is shown this share of its measured motion further on (0 = as rendered)
+    float warp;       // frame warp: the frame is shown this share of its measured motion further on (0 = as rendered);
+                      // with the game's own motion (warpSrc != 0): this many game frames further on
+    float warpPrevN;  // the game's own motion: game frames between this frame and the one shown before (t4)
+    uint  warpSrc;    // 0 motion measured from the picture; 1 the game's motion vectors and depth; 2 its motion vectors only
 };
 Texture2D<float4> src : register(t0);
 Texture2D<float> aplTex : register(t1);
@@ -1616,8 +1654,42 @@ SamplerState linClamp : register(s0);
 // Frame warp (dx/bfi_warp.h): how far back along its motion the picture shown at uv is taken from, in uv. The vector
 // is read where the picture comes from (second step), so a moving area's own motion is used rather than what it
 // moves across; at most 8% of the screen.
+float4 GameFlow(float2 uv)
+{
+    uint w, h;
+    flowTex.GetDimensions(w, h);
+    int2 q = clamp(int2(uv * float2(w, h)), int2(0, 0), int2(w, h) - 1);
+    return flowTex.Load(int3(q, 0));
+}
+// With the game's own motion (one vector per 4x4 pixels, per game frame, with how near each point is): the place
+// the output pixel comes from is found in up to three steps along the motion, and each step checked -- does the
+// point found really move onto this pixel? Of the steps that do, the nearest point wins: what is in front covers
+// what is behind it. Where none does, the area is being uncovered, and the background's motion (the farthest of
+// the points found) fills it.
+float2 WarpShiftGame(float2 uv)
+{
+    uint w, h;
+    flowTex.GetDimensions(w, h);
+    float2 m[3];
+    m[0] = GameFlow(uv).xy;
+    m[1] = GameFlow(uv - m[0] * warp).xy;
+    m[2] = GameFlow(uv - m[1] * warp).xy;
+    float2 best = float2(0.0, 0.0), back = float2(0.0, 0.0);
+    float bestNear = -1.0, backNear = 2.0;
+    [unroll] for (int i = 0; i < 3; i++)
+    {
+        float4 g = GameFlow(uv - m[i] * warp);
+        if (g.z < 0.5) continue;
+        if (length((g.xy - m[i]) * warp * float2(w, h)) < 1.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; }
+        if (g.w < backNear) { backNear = g.w; back = m[i]; }
+    }
+    if (bestNear < 0.0) best = backNear <= 1.0 ? back : float2(0.0, 0.0);
+    return clamp(best * warp, -0.08, 0.08);
+}
+
 float2 WarpShift(float2 uv)
 {
+    if (warpSrc != 0) return WarpShiftGame(uv);
     float4 f = flowTex.SampleLevel(linClamp, uv, 0);
     float2 d = f.xy * (f.z * warp);
     f = flowTex.SampleLevel(linClamp, uv - d, 0);
@@ -1650,7 +1722,7 @@ bool Still(int2 q, float2 size)
     if (n < 1) return false;
     float2 c = float2(q) + 0.5;
     float4 f = flowTex.SampleLevel(linClamp, c / size, 0);
-    float2 step = f.xy * f.z * size;                       // this part of the scene's motion since the frame before, pixels
+    float2 step = f.xy * f.z * size * (warpSrc != 0 ? warpPrevN : 1.0);   // this part of the scene's motion since the frame before, pixels
     if (dot(step, step) < 2.25) return true;               // under a pixel and a half: nothing to tell apart
     float3 a = src.Load(int3(q, 0)).rgb;
     float3 d = abs(a - srcPrev.SampleLevel(linClamp, (c - step) / size, 0).rgb);
@@ -2243,6 +2315,8 @@ struct Constants
     float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
     float    rfxApl;                    // its APL Limiter: 1 = on (GPU-measured from the frame being shown)
     float    warp;                      // frame warp: share of the measured motion the frame is moved ahead (0 = off)
+    float    warpPrevN;                 // frame warp with the game's own motion: game frames back to the frame shown before
+    uint32_t warpSrc;                   // 0 motion from the picture, 1 the game's motion vectors and depth, 2 its vectors only
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -2408,9 +2482,10 @@ static void Trace(const char *fmt, ...)
 // they are usually ready), and kept on disk in BFIPresenter_shaders.bin next to the ini, keyed to the exact source and
 // compile flags: from the second start of a version there is no compile at all.
 static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce",
-                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth" };   // the last four: kWarpShader (dx/bfi_warp.h)
-static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
-static const int kShN = 9;
+                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame" };   // the last five: kWarpShader (dx/bfi_warp.h)
+static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
+static const int kShN = 10;
+static const int kShWarpGame = 9;                // frame warp from the game's own motion vectors and depth
 static const int kShWarp = 5;                    // first of the frame warp shaders
 static ID3DBlob *g_shBlob[kShN] = {};
 static HANDLE volatile g_shThread = nullptr;
@@ -3456,6 +3531,9 @@ static DWORD WINAPI PresenterThread(void *)
     UINT64 warpPrevId = 0;
     int    secWarpCycles = 0;
     double secWarpSum = 0.0;
+    int    secWarpGame[3] = {};             // cycles moved with: the picture's motion, the game's vectors and depth, its vectors only
+    UINT   gameFlowGen = ~0u;               // the game's own motion textures the presenter's views were written for
+    const UINT kGameFlowSrv = kStage + 2 + WarpGpu::kSrvCount;   // their views in srvHeap
     bool   kwarp = false;
     UINT64 measFence = 0;
     IDXGIOutput *output = nullptr;
@@ -3482,7 +3560,8 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount;   // the stage frames, the APL Limiter's cells and its 1x1 average, frame warp's textures
+    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
+                                                                       // frame warp's textures, the game's own motion per stage slot
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
 
@@ -4394,8 +4473,30 @@ static DWORD WINAPI PresenterThread(void *)
         if (StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT) c.flags |= 1024u;
         if (warpAhead > 0.0 && s.frameWarp && warp.ok && (warpOld = warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrev >= 0 && warpPrev != pick && warpPrevId == warpOld && g_stageId[warpPrev] == warpOld && g_stageFence[warpPrev] <= done)
-            c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
-        if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; }
+        {
+            // The game's own motion (where it hands its upscaler motion vectors and depth): one game frame's motion,
+            // warpAhead frames on. Otherwise the motion measured between this frame and the one shown before.
+            const int gsrc = s.warpGame ? gmo::SlotFor(pick, pickId) : 0;
+            if (gsrc)
+            {
+                const UINT fg = gmo::FlowGenNow();
+                if (fg != gameFlowGen)
+                {
+                    D3D12_CPU_DESCRIPTOR_HANDLE gh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                    gh.ptr += (SIZE_T)kGameFlowSrv * srvStride;
+                    gmo::WriteFlowSrvs(gh, srvStride);
+                    gameFlowGen = fg;
+                }
+            }
+            if (gsrc && gmo::FlowRes(pick))
+            {
+                c.warp = (float)(floor(warpAhead * 256.0 + 0.5) / 256.0);
+                c.warpPrevN = (float)(pickId - warpOld);
+                c.warpSrc = (uint32_t)gsrc;
+            }
+            else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
+        }
+        if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame[c.warpSrc <= 2 ? c.warpSrc : 0]++; }
 
         if (pickNew2 < 0) pickNew2 = pick;                       // picked later (the wait above): the same frame
         const UINT64 pickId2 = pickNew2 >= 0 ? g_stageId[pickNew2] : 0;
@@ -4456,6 +4557,11 @@ static DWORD WINAPI PresenterThread(void *)
         {
             D3D12_RESOURCE_BARRIER b3 = Transition(g_stage[warpPrev], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &b3);
+            if (c.warpSrc != 0)
+            {
+                D3D12_RESOURCE_BARRIER b4 = Transition(gmo::FlowRes(pick), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                list->ResourceBarrier(1, &b4);
+            }
         }
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         rtv.ptr += (SIZE_T)bi * rtvStride;
@@ -4485,7 +4591,7 @@ static DWORD WINAPI PresenterThread(void *)
                 warp.RecordLuma(list, srv, pickId, pickTime, StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT);
                 touched = true;
             }
-            if (c.warp != 0.0f && (warp.flowNew != pickId || warp.flowOld != warpOld)) { warp.RecordFlow(list); touched = true; }
+            if (c.warp != 0.0f && c.warpSrc == 0 && (warp.flowNew != pickId || warp.flowOld != warpOld)) { warp.RecordFlow(list); touched = true; }
             warpTouched = touched;
             if (touched)
             {
@@ -4495,7 +4601,13 @@ static DWORD WINAPI PresenterThread(void *)
             }
         }
         if (tsOn) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 1);
-        list->SetGraphicsRootDescriptorTable(4, warp.ok ? warp.FlowSrv() : srv);   // t3 (read only while a frame is shown moved)
+        if (c.warpSrc != 0)
+        {
+            D3D12_GPU_DESCRIPTOR_HANDLE gs = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            gs.ptr += (UINT64)(kGameFlowSrv + (UINT)pick) * srvStride;
+            list->SetGraphicsRootDescriptorTable(4, gs);                           // t3: the game's own motion for this frame
+        }
+        else list->SetGraphicsRootDescriptorTable(4, warp.ok ? warp.FlowSrv() : srv);   // t3 (read only while a frame is shown moved)
         {
             D3D12_GPU_DESCRIPTOR_HANDLE psrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
             psrv.ptr += (UINT64)(c.warp != 0.0f ? warpPrev : pick) * srvStride;
@@ -4603,6 +4715,11 @@ static DWORD WINAPI PresenterThread(void *)
         {
             D3D12_RESOURCE_BARRIER b3 = Transition(g_stage[warpPrev], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             list->ResourceBarrier(1, &b3);
+            if (c.warpSrc != 0)
+            {
+                D3D12_RESOURCE_BARRIER b4 = Transition(gmo::FlowRes(pick), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                list->ResourceBarrier(1, &b4);
+            }
         }
         if (FAILED(list->Close())) LOGE("BFI Presenter: presenter draw list failed to record (Close) -- see BFIPresenter_debug.txt with Diagnostics=2");
 
@@ -5054,6 +5171,22 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.warpCycles   = secWarpCycles;
             g_status.warpAvg      = secWarpCycles ? secWarpSum / secWarpCycles : 0.0;
             g_status.warpRate     = warpClock.rate;
+            g_status.warpSrc      = secWarpGame[1] ? 1 : secWarpGame[2] ? 2 : 0;
+            g_status.warpGameState = gmo::StateNow(g_status.warpGameWhy, sizeof(g_status.warpGameWhy));
+            {
+                // the log says which motion frame warp uses, when it changes (at most every 5 s)
+                static int srcWas = -1;
+                static double srcLogT = -10.0;
+                const int src = secWarpCycles ? g_status.warpSrc : -1;
+                if (src >= 0 && src != srcWas && t - srcLogT > 5.0)
+                {
+                    LOGI("BFI Presenter: frame warp moves the picture with %s (%d of %d cycles in the last second)",
+                         src == 1 ? "the game's own motion vectors and depth" : src == 2 ? "the game's own motion vectors (no depth)"
+                                  : "the motion measured from the picture", src ? secWarpGame[src] : secWarpGame[0], secWarpCycles);
+                    srcWas = src; srcLogT = t;
+                }
+            }
+            secWarpGame[0] = secWarpGame[1] = secWarpGame[2] = 0;
             {
                 // the log says when frame warp starts and stops working (at most every 5 s)
                 static int warpWas = 0;
@@ -6545,6 +6678,7 @@ static HRESULT SubmitGameFrameLocked()
     br[0] = Transition(g_virt[g_cur], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
     br[1] = Transition(g_stage[s], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     g_copyList->ResourceBarrier(2, br);
+    gmo::AtPresent(g_copyList, s);            // frame warp: this frame's motion from the game's own vectors and depth
     {
         const HRESULT ch = g_copyList->Close();
         static bool once = false;
@@ -6565,6 +6699,7 @@ static HRESULT SubmitGameFrameLocked()
     EnterCriticalSection(&g_lock);            // publish: selectable from here on
     g_stageFence[s] = g_gameFenceVal;
     g_stageId[s]    = ++g_frameId;
+    gmo::Published(s, g_frameId);
     g_recentFence[g_frameId % 8] = g_gameFenceVal;
     g_stageTime[s]  = Now();
     LeaveCriticalSection(&g_lock);
@@ -7636,8 +7771,17 @@ static void NoteInputs(const Base **in, uint32_t n)
     const double d = Now() - t0; g_probeS += d; g_probeCalls++; if (d > g_probeMaxS) g_probeMaxS = d;
 }
 
-static int hk_SetTag(const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); return o_SetTag(vp, tags, n, cmd); }
-static int hk_SetTagForFrame(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); return o_SetTagForFrame(frame, vp, tags, n, cmd); }
+} // namespace slp
+namespace gmo
+{
+static void NoteSetTags(const slp::Tag *tags, uint32_t n);
+static void NoteConsts(const slp::Consts &c);
+static void OnEvaluate(const slp::Base **in, uint32_t n, void *cmd);
+}
+namespace slp
+{
+static int hk_SetTag(const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); gmo::NoteSetTags(tags, n); return o_SetTag(vp, tags, n, cmd); }
+static int hk_SetTagForFrame(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); gmo::NoteSetTags(tags, n); return o_SetTagForFrame(frame, vp, tags, n, cmd); }
 static int hk_SetConstants(const Consts &c, const void *frame, const void *vp)
 {
     {
@@ -7660,12 +7804,14 @@ static int hk_SetConstants(const Consts &c, const void *frame, const void *vp)
             g_last = c; g_haveLast = true;
         }
     }
+    if (Plaus(&c)) gmo::NoteConsts(c);
     return o_SetConstants(c, frame, vp);
 }
 static int hk_Evaluate(uint32_t feature, const void *frame, const Base **inputs, uint32_t n, void *cmd)
 {
     { std::lock_guard<std::mutex> l(g_lk); g_evals[feature]++; }
     NoteInputs(inputs, n);
+    if (feature == 0) gmo::OnEvaluate(inputs, n, cmd);   // DLSS: the game's motion vectors and depth for frame warp
     return o_Evaluate(feature, frame, inputs, n, cmd);
 }
 
@@ -7791,6 +7937,481 @@ static void Tick(double t)
     else LOGI("BFI Presenter: Streamline probe: no camera constants in the last %.0f s (%u calls, %u implausible)", secs, consts, constsBad);
 }
 } // namespace slp
+
+// ---------------------------------------------------------------------------------------------------------
+// Frame warp from the game's own motion (test): where a D3D12 game hands its upscaler its motion vectors and depth
+// through Streamline (DLSS), frame warp moves each part of the picture by the game's own vector for it instead of
+// the motion it measures from the finished picture, and where things overlap the nearer one wins.
+//
+//   1. At the upscaler call (slEvaluateFeature, the game's render thread): the game's motion vectors and depth are
+//      copied on the game's own command list -- copies only, so nothing the game has set on its list is changed --
+//      into one of three pairs of textures, with the camera constants of that frame (motion-vector scale, reversed
+//      depth, a camera cut).
+//   2. At the game's Present (its Present thread): the oldest copy not yet taken becomes that frame's motion
+//      texture (PSWarpGame, dx/bfi_warp.h), 1/4 of the game frame, made on the presenter's copy list on the game's
+//      queue right after the frame is copied into its staging slot. One per staging slot.
+//   3. The presenter (per refresh) reads that slot's motion texture when it shows the frame moved ahead.
+//
+// Nothing of this runs while frame warp is off. Games without Streamline, DX11 games and games whose motion vectors
+// leave out the camera's motion keep the motion measured from the picture; the overlay says which is used.
+namespace gmo
+{
+using slp::Tag; using slp::Res; using slp::Consts; using slp::Base; using slp::Plaus;
+
+static const int kRing = 3;
+struct Entry
+{
+    ID3D12Resource *mv = nullptr, *depth = nullptr;       // the copies (ours)
+    DXGI_FORMAT mvFmt = DXGI_FORMAT_UNKNOWN, dFmt = DXGI_FORMAT_UNKNOWN;   // the game's formats
+    UINT mvW = 0, mvH = 0, dW = 0, dH = 0;
+    float mvMap[4] = {}, dMap[4] = {};                    // screen uv -> texel: xy scale, zw offset
+    float mvScale[2] = {}, mvInvalid = 0.0f;
+    bool  depthRev = false, hasDepth = false, reset = false;
+    UINT  gen = 0;                                        // bumped when the copies are made anew
+};
+struct GConsts { float outTexel[2], mvScale[2], mvMap[4], dMap[4], mvInvalid; uint32_t flags; };
+static_assert(sizeof(GConsts) == 56, "PSWarpGame constants");
+
+static std::mutex lk;
+static Entry ring[kRing];
+static int  pend[kRing]; static int pendN = 0;            // filled entries not yet taken by a Present, oldest first
+static uint64_t seq = 0;
+static UINT genNext = 1;
+static std::vector<ID3D12Resource *> retired;            // replaced copies, released with the frame resources
+static Tag setTag[2]; static Res setRes[2]; static bool haveSet[2] = {};   // the last depth / vectors given to slSetTag
+static Consts consts = {}; static bool haveConsts = false;
+static bool depthFailed = false;                         // a copy texture of the game's depth format couldn't be made
+static ID3D12Device *ringDev = nullptr;                  // the device the copies belong to (not owned)
+
+// GPU objects for step 2 (Present thread)
+static ID3D12RootSignature *rs = nullptr;
+static ID3D12PipelineState *pso = nullptr;
+static ID3D12DescriptorHeap *srvHeap = nullptr, *rtvHeap = nullptr;
+static UINT srvStride = 0, rtvStride = 0;
+static UINT descGen[kRing] = {};
+static ID3D12Resource *flow[kStage] = {};
+static UINT flowW = 0, flowH = 0;
+static std::atomic<UINT> flowGen{0};                     // bumped when the motion textures are made anew
+static bool slotPend[kStage] = {}, slotOk[kStage] = {}, slotDepth[kStage] = {};
+static std::atomic<UINT64> slotId[kStage];
+
+// What the game hands over, for the overlay and the log.
+static std::atomic<int> state{0};                        // 0 nothing seen yet, 1 vectors and depth, 2 vectors only, -1 not usable
+static char why[160] = "";
+static int  whyLogged = 0;
+
+static void SetState(int st, const char *fmt, ...)
+{
+    char b[160];
+    va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof(b), fmt, ap); va_end(ap);
+    state = st;
+    if (strcmp(b, why) != 0)
+    {
+        snprintf(why, sizeof(why), "%s", b);
+        if (whyLogged++ < 20) LOGI("BFI Presenter: frame warp, the game's own motion: %s", b);
+    }
+}
+
+static DXGI_FORMAT CopyFormat(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32G8X24_TYPELESS;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24G8_TYPELESS;
+    case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_TYPELESS;
+    default: return f;
+    }
+}
+static DXGI_FORMAT DepthView(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+static DXGI_FORMAT MvView(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+static bool On() { return g_shared.frameWarp != 0 && g_shared.warpGame != 0 && !g_dx11.load(); }
+
+// slSetTag: the last depth and motion vectors a game tagged with a resource (games that pass them here rather than to
+// slEvaluateFeature). Only tags that stay valid up to the upscaler call are kept.
+static void NoteSetTags(const Tag *tags, uint32_t n)
+{
+    if (!On() || !tags || n == 0 || n > 64 || !Plaus(tags)) return;
+    std::lock_guard<std::mutex> l(lk);
+    for (uint32_t i = 0; i < n; i++)
+    {
+        const Tag &t = tags[i];
+        if (t.bufType > 1) continue;
+        const int k = (int)t.bufType;
+        if (!t.res || !Plaus(t.res) || !t.res->native || t.lifecycle == 0) { haveSet[k] = false; continue; }
+        setTag[k] = t; setRes[k] = *t.res; setTag[k].res = &setRes[k]; haveSet[k] = true;
+    }
+}
+
+static void NoteConsts(const Consts &c) { std::lock_guard<std::mutex> l(lk); consts = c; haveConsts = true; }
+
+static ID3D12Resource *Native(const Res *r, D3D12_RESOURCE_DESC *d)
+{
+    if (!r || !Plaus(r) || !r->native || !Plaus(r->native)) return nullptr;
+    ID3D12Resource *n = nullptr;
+    if (FAILED(((IUnknown *)r->native)->QueryInterface(__uuidof(ID3D12Resource), (void **)&n)) || !n) return nullptr;
+    ID3D12Device *dev = nullptr;
+    const bool same = SUCCEEDED(n->GetDevice(IID_PPV_ARGS(&dev))) && dev == g_device;
+    if (dev) dev->Release();
+    if (!same) { n->Release(); return nullptr; }
+    *d = n->GetDesc();
+    if (d->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d->SampleDesc.Count != 1) { n->Release(); return nullptr; }
+    return n;                                             // AddRef'd: the caller releases
+}
+
+static ID3D12Resource *MakeCopy(const D3D12_RESOURCE_DESC &src, const wchar_t *name)
+{
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = src.Width; rd.Height = src.Height; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = CopyFormat(src.Format);
+    rd.SampleDesc.Count = 1;
+    ID3D12Resource *r = nullptr;
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&r))))
+        return nullptr;
+    r->SetName(name);
+    return r;
+}
+
+static void Map(const Tag &t, UINT w, UINT h, float m[4])
+{
+    const bool e = t.ext.width && t.ext.height;
+    m[0] = e ? (float)t.ext.width : (float)w;  m[1] = e ? (float)t.ext.height : (float)h;
+    m[2] = e ? (float)t.ext.left : 0.0f;       m[3] = e ? (float)t.ext.top : 0.0f;
+}
+
+// Step 1, from the slEvaluateFeature hook (DLSS), before the call goes on.
+static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
+{
+    if (!On() || !g_device || !cmd) return;
+    const Tag *tg[2] = {};
+    if (in && n && n <= 64 && Plaus(in))
+        for (uint32_t i = 0; i < n; i++)
+            for (const Base *b = in[i]; b && Plaus(b); b = (const Base *)b->next)
+                if (memcmp(b->type, slp::kTagGuid, 16) == 0)
+                {
+                    const Tag *t = (const Tag *)b;
+                    if (t->bufType <= 1 && t->res) tg[t->bufType] = t;
+                }
+    std::lock_guard<std::mutex> l(lk);
+    for (int k = 0; k < 2; k++) if (!tg[k] && haveSet[k]) tg[k] = &setTag[k];
+    if (!tg[1]) { SetState(-1, "the game hands its upscaler no motion vectors that last to the upscaler call -- the picture's own motion is used"); return; }
+    if (!haveConsts) { SetState(-1, "no camera constants from the game -- the picture's own motion is used"); return; }
+    if (consts.cameraMotionIncluded != 1)
+    { SetState(-1, "the game's motion vectors leave out the camera's motion (not supported in this test) -- the picture's own motion is used"); return; }
+    ID3D12GraphicsCommandList *cl = nullptr;
+    if (FAILED(((IUnknown *)cmd)->QueryInterface(__uuidof(ID3D12GraphicsCommandList), (void **)&cl)) || !cl)
+    { SetState(-1, "the upscaler call has no D3D12 command list -- the picture's own motion is used"); return; }
+    D3D12_RESOURCE_DESC md = {}, dd = {};
+    ID3D12Resource *mv = Native(tg[1]->res, &md);
+    ID3D12Resource *dp = (tg[0] && !depthFailed) ? Native(tg[0]->res, &dd) : nullptr;
+    if (dp && DepthView(dd.Format) == DXGI_FORMAT_UNKNOWN) { dp->Release(); dp = nullptr; }
+    if (!mv || MvView(md.Format) == DXGI_FORMAT_UNKNOWN)
+    {
+        SetState(-1, mv ? "the game's motion vectors are in a format not supported (%d) -- the picture's own motion is used"
+                        : "the game's motion vectors are not a D3D12 texture of this device -- the picture's own motion is used", (int)md.Format);
+        if (mv) mv->Release();
+        if (dp) dp->Release();
+        cl->Release();
+        return;
+    }
+    const uint32_t mvState = tg[1]->res->state, dState = dp ? tg[0]->res->state : 0;
+    if (mvState == UINT_MAX || (dp && dState == UINT_MAX))
+    {
+        SetState(-1, "the game didn't give its buffers' states -- the picture's own motion is used");
+        mv->Release(); if (dp) dp->Release(); cl->Release();
+        return;
+    }
+    if (ringDev != g_device)
+    {
+        // A new device: the copies of the old one go (kept across swap chain resizes otherwise -- a copy the game has
+        // recorded on a list it hasn't submitted yet must still exist when that list runs).
+        for (int i = 0; i < kRing; i++) { SafeRelease(ring[i].mv); SafeRelease(ring[i].depth); ring[i] = Entry(); }
+        for (ID3D12Resource *r : retired) r->Release();
+        retired.clear();
+        pendN = 0; depthFailed = false;
+        ringDev = g_device;
+    }
+    const int k = (int)(seq % kRing);
+    Entry &e = ring[k];
+    if (!e.mv || e.mvW != (UINT)md.Width || e.mvH != md.Height || e.mvFmt != md.Format)
+    {
+        if (e.mv) retired.push_back(e.mv);
+        e.mv = MakeCopy(md, L"BFI frame warp: game motion vectors");
+        e.mvW = (UINT)md.Width; e.mvH = md.Height; e.mvFmt = md.Format; e.gen = genNext++;
+    }
+    if (dp && (!e.depth || e.dW != (UINT)dd.Width || e.dH != dd.Height || e.dFmt != dd.Format))
+    {
+        if (e.depth) retired.push_back(e.depth);
+        e.depth = MakeCopy(dd, L"BFI frame warp: game depth");
+        e.dW = (UINT)dd.Width; e.dH = dd.Height; e.dFmt = dd.Format; e.gen = genNext++;
+        if (!e.depth)
+        {
+            depthFailed = true;
+            LOGW("BFI Presenter: frame warp, the game's own motion: no copy of the game's depth (format %d) -- motion vectors only", (int)dd.Format);
+        }
+    }
+    if (!e.mv) { SetState(-1, "no copy of the game's motion vectors could be made"); mv->Release(); if (dp) dp->Release(); cl->Release(); return; }
+    if (dp && !e.depth) { dp->Release(); dp = nullptr; }
+
+    // The copies, on the game's list. A buffer not in a state it can be copied from is moved there and back.
+    D3D12_RESOURCE_BARRIER pre[2], post[2]; UINT nb = 0;
+    if (!(mvState & D3D12_RESOURCE_STATE_COPY_SOURCE))
+    { pre[nb] = Transition(mv, (D3D12_RESOURCE_STATES)mvState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      post[nb] = Transition(mv, D3D12_RESOURCE_STATE_COPY_SOURCE, (D3D12_RESOURCE_STATES)mvState); nb++; }
+    if (dp && !(dState & D3D12_RESOURCE_STATE_COPY_SOURCE))
+    { pre[nb] = Transition(dp, (D3D12_RESOURCE_STATES)dState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      post[nb] = Transition(dp, D3D12_RESOURCE_STATE_COPY_SOURCE, (D3D12_RESOURCE_STATES)dState); nb++; }
+    if (nb) cl->ResourceBarrier(nb, pre);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.Type = src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = e.mv; src.pResource = mv;
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    if (dp) { dst.pResource = e.depth; src.pResource = dp; cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr); }   // subresource 0: the depth plane
+    if (nb) cl->ResourceBarrier(nb, post);
+    cl->Release();
+
+    Map(*tg[1], e.mvW, e.mvH, e.mvMap);
+    if (dp) Map(*tg[0], e.dW, e.dH, e.dMap);
+    e.mvScale[0] = consts.mvecScale[0]; e.mvScale[1] = consts.mvecScale[1];
+    e.mvInvalid = consts.mvInvalid;
+    e.depthRev = consts.depthInverted == 1;
+    e.hasDepth = dp != nullptr;
+    e.reset = consts.reset == 1;
+    mv->Release(); if (dp) dp->Release();
+    if (pendN >= 2) { pend[0] = pend[1]; pendN = 1; }      // a Present that never came: the older copy is dropped
+    pend[pendN++] = k;
+    seq++;
+    SetState(e.hasDepth ? 1 : 2, e.hasDepth ? "the game's motion vectors (%ux%u) and depth (%ux%u) are used" : "the game's motion vectors (%ux%u) are used, without depth",
+             e.mvW, e.mvH, e.dW, e.dH);
+}
+
+static bool EnsureGpu()
+{
+    if (pso) return true;
+    if (!g_shDone || !g_shBlob[0] || !g_shBlob[kShWarpGame] || !g_device) return false;
+    static bool failed = false;
+    if (failed) return false;
+    D3D12_DESCRIPTOR_RANGE range = {};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 2;
+    range.BaseShaderRegister = 5;                          // t5 the vectors, t6 the depth
+    D3D12_ROOT_PARAMETER p[2] = {};
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    p[0].Constants.ShaderRegister = 1;                     // b1
+    p[0].Constants.Num32BitValues = sizeof(GConsts) / 4;
+    p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[1].DescriptorTable.NumDescriptorRanges = 1;
+    p[1].DescriptorTable.pDescriptorRanges = &range;
+    p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.NumParameters = 2; rsd.pParameters = p;
+    ID3DBlob *blob = nullptr, *err = nullptr;
+    bool ok = SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) &&
+              SUCCEEDED(g_device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs)));
+    SafeRelease(blob); SafeRelease(err);
+    if (ok)
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { g_shBlob[0]->GetBufferPointer(), g_shBlob[0]->GetBufferSize() };
+        pd.PS = { g_shBlob[kShWarpGame]->GetBufferPointer(), g_shBlob[kShWarpGame]->GetBufferSize() };
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        pd.SampleDesc.Count = 1;
+        ok = SUCCEEDED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+    }
+    if (ok)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 2 * kRing; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ok = SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = kStage; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
+        srvStride = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        rtvStride = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        for (int i = 0; i < kRing; i++) descGen[i] = 0;
+    }
+    if (!ok)
+    {
+        failed = true;
+        SafeRelease(pso); SafeRelease(rs); SafeRelease(srvHeap); SafeRelease(rtvHeap);
+        LOGW("BFI Presenter: frame warp, the game's own motion: its pass could not be created -- the picture's own motion is used");
+    }
+    return ok;
+}
+
+static bool EnsureFlow()
+{
+    if (!g_stage[0]) return false;
+    const D3D12_RESOURCE_DESC sd = g_stage[0]->GetDesc();
+    const UINT w = ((UINT)sd.Width + 3) / 4, h = (sd.Height + 3) / 4;
+    if (flow[0] && flowW == w && flowH == h) return true;
+    for (UINT i = 0; i < kStage; i++) { SafeRelease(flow[i]); slotPend[i] = slotOk[i] = false; slotId[i] = 0; }
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    for (UINT i = 0; i < kStage; i++)
+    {
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&flow[i]))))
+        {
+            for (UINT j = 0; j < kStage; j++) SafeRelease(flow[j]);
+            return false;
+        }
+        flow[i]->SetName(L"BFI frame warp: the game's motion");
+        D3D12_CPU_DESCRIPTOR_HANDLE rh = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rh.ptr += (SIZE_T)i * rtvStride;
+        g_device->CreateRenderTargetView(flow[i], nullptr, rh);
+    }
+    flowW = w; flowH = h;
+    flowGen++;
+    return true;
+}
+
+// Step 2, on the copy list that has just copied the game's frame into staging slot s (before it is closed).
+static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
+{
+    if (s >= kStage) return;
+    slotId[s] = 0; slotPend[s] = slotOk[s] = false;
+    if (!On()) { std::lock_guard<std::mutex> l(lk); pendN = 0; return; }
+    Entry e;
+    int k;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        if (pendN == 0) return;                           // no upscaler call since the last Present (a menu, DLSS off)
+        k = pend[0];
+        for (int i = 1; i < pendN; i++) pend[i - 1] = pend[i];
+        pendN--;
+        e = ring[k];
+    }
+    if (!e.mv || !EnsureGpu() || !EnsureFlow()) return;
+    D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+    sh.ptr += (SIZE_T)(2 * k) * srvStride;
+    if (descGen[k] != e.gen)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        sv.Format = MvView(e.mvFmt);
+        g_device->CreateShaderResourceView(e.mv, &sv, sh);
+        D3D12_CPU_DESCRIPTOR_HANDLE sh2 = sh; sh2.ptr += srvStride;
+        sv.Format = e.hasDepth ? DepthView(e.dFmt) : DXGI_FORMAT_R32_FLOAT;
+        sv.Texture2D.PlaneSlice = 0;
+        g_device->CreateShaderResourceView(e.hasDepth ? e.depth : nullptr, &sv, sh2);
+        descGen[k] = e.gen;
+    }
+    D3D12_RESOURCE_BARRIER b[3] = {
+        Transition(flow[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+        Transition(e.mv, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        e.hasDepth ? Transition(e.depth, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) : D3D12_RESOURCE_BARRIER{} };
+    const UINT nb = e.hasDepth ? 3 : 2;
+    list->ResourceBarrier(nb, b);
+    list->SetDescriptorHeaps(1, &srvHeap);
+    list->SetGraphicsRootSignature(rs);
+    list->SetPipelineState(pso);
+    GConsts gc = {};
+    gc.outTexel[0] = 1.0f / (float)flowW; gc.outTexel[1] = 1.0f / (float)flowH;
+    gc.mvScale[0] = e.mvScale[0] * (float)g_shared.warpGameSign; gc.mvScale[1] = e.mvScale[1] * (float)g_shared.warpGameSign;
+    memcpy(gc.mvMap, e.mvMap, sizeof(gc.mvMap)); memcpy(gc.dMap, e.dMap, sizeof(gc.dMap));
+    gc.mvInvalid = e.mvInvalid;
+    gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u);
+    list->SetGraphicsRoot32BitConstants(0, sizeof(GConsts) / 4, &gc, 0);
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = srvHeap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += (UINT64)(2 * k) * srvStride;
+    list->SetGraphicsRootDescriptorTable(1, gh);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)flowW, (float)flowH, 0.0f, 1.0f };
+    D3D12_RECT sc = { 0, 0, (LONG)flowW, (LONG)flowH };
+    list->RSSetViewports(1, &vp);
+    list->RSSetScissorRects(1, &sc);
+    D3D12_CPU_DESCRIPTOR_HANDLE rh = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rh.ptr += (SIZE_T)s * rtvStride;
+    list->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+    list->DrawInstanced(3, 1, 0, 0);
+    b[0] = Transition(flow[s], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+    b[1] = Transition(e.mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (e.hasDepth) b[2] = Transition(e.depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->ResourceBarrier(nb, b);
+    slotPend[s] = true; slotOk[s] = !e.reset; slotDepth[s] = e.hasDepth;
+}
+
+// After the frame in slot s is published as game frame id.
+static void Published(UINT s, UINT64 id) { if (s < kStage && slotPend[s]) slotId[s] = id; }
+
+// The presenter: is frame `id` in slot s warped with the game's motion? 0 no, 1 vectors and depth, 2 vectors only.
+static int SlotFor(int s, UINT64 id)
+{
+    if (s < 0 || s >= (int)kStage || !id || slotId[s].load() != id || !slotOk[s]) return 0;
+    return slotDepth[s] ? 1 : 2;
+}
+
+// The presenter: shader-resource views of the motion textures, into its own heap (when they were made anew).
+static void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+    sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    for (UINT i = 0; i < kStage; i++)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)i * stride;
+        g_device->CreateShaderResourceView(flow[i], &sv, h);   // a null view while there is none
+    }
+}
+static UINT FlowGenNow() { return flowGen.load(); }
+static ID3D12Resource *FlowRes(int s) { return s >= 0 && s < (int)kStage ? flow[s] : nullptr; }
+static int StateNow(char *w, size_t n) { std::lock_guard<std::mutex> l(lk); snprintf(w, n, "%s", why); return state.load(); }
+
+// With the frame resources (the swap chain resized or gone): the motion textures and the pass. The copies of the
+// game's buffers stay (see OnEvaluate) until the device changes.
+static void Release()
+{
+    std::lock_guard<std::mutex> l(lk);
+    for (UINT i = 0; i < kStage; i++) { SafeRelease(flow[i]); slotPend[i] = slotOk[i] = false; slotId[i] = 0; }
+    flowW = flowH = 0;
+    flowGen++;
+    for (int i = 0; i < kRing; i++) descGen[i] = 0;
+    pendN = 0; haveSet[0] = haveSet[1] = false;
+    SafeRelease(pso); SafeRelease(rs); SafeRelease(srvHeap); SafeRelease(rtvHeap);
+}
+} // namespace gmo
 
 // NvAPI functions, once nvapi64.dll is in the game (it isn't loaded by the presenter).
 static bool ReflexApi()
@@ -11510,6 +12131,9 @@ static void on_osd(reshade::api::effect_runtime *rt)
     d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
     d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
     d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
+    // which motion: what the last second's moved cycles used, or (none moved) what the game hands over
+    d.warpSrc = g_status.warpCycles ? g_status.warpSrc
+              : (g_shared.warpGame && g_status.warpGameState > 0 ? g_status.warpGameState : 0);
     LeaveCriticalSection(&g_cfgLock);
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
 }
@@ -12107,6 +12731,22 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
             else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else ImGui::Text("Waiting for the game's frame rate.");
+            bool gm = s.warpGame != 0;
+            if (ImGui::Checkbox("Use the game's own motion vectors and depth (test)", &gm)) s.warpGame = gm ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands its upscaler (DLSS through Streamline, DX12) its motion vectors and\n"
+                                                          "depth, frame warp moves each part of the picture by the game's own motion for it, and\n"
+                                                          "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
+                                                          "from the finished picture, which can only follow the camera. Other games keep the\n"
+                                                          "measured motion. The line below says which one is in use.");
+            {
+                const int src = st.warpCycles ? st.warpSrc : (s.warpGame && st.warpGameState > 0 ? st.warpGameState : 0);
+                ImGui::Text("Motion used: %s", src == 1 ? "the game's motion vectors and depth" : src == 2 ? "the game's motion vectors (no depth)"
+                                                     : "measured from the picture");
+                if (s.warpGame && st.warpGameWhy[0]) { ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", st.warpGameWhy); }
+                else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("This game hasn't handed an upscaler any motion data (no Streamline / DLSS seen).");
+            }
             ImGui::Unindent(16.0f);
         }
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
