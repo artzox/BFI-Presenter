@@ -7542,6 +7542,14 @@ static bool Readable(const void *p, size_t n)
     if (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
     return (const BYTE *)p + n <= (const BYTE *)mi.BaseAddress + mi.RegionSize;
 }
+// Cheap check without a system call: Rift Apart slowed to 13 fps with VirtualQuery on every tag (sl4) --
+// it takes the process's address-space lock, which the game's streaming threads hold for long stretches.
+// So VirtualQuery runs only on one sampled call a second; every other call just checks the pointer's range.
+static inline bool Plaus(const void *p) { const uintptr_t u = (uintptr_t)p; return u >= 0x10000 && u < 0x7FFFFFFF0000ull && !(u & 7); }
+static std::atomic<bool> g_deepDue{true};
+static bool g_deep = false;                          // this call is the sampled one (set under g_lk)
+static inline bool Chk(const void *p, size_t n) { return g_deep ? Readable(p, n) : Plaus(p); }
+static double g_probeS = 0.0, g_probeMaxS = 0.0; static uint32_t g_probeCalls = 0;   // time in the probe's own code
 static uint32_t g_badTags = 0;
 static char g_slVer[48] = "unknown";
 static int g_slMajor = 0;
@@ -7563,8 +7571,8 @@ static void NoteOne(const Tag &tg, std::map<uint32_t, TagStat> &into, const char
     s.calls++;
     if (tg.ext.width) { s.extW = tg.ext.width; s.extH = tg.ext.height; }
     Res *r = tg.res;
-    const bool rOk = r && Readable(r, sizeof(Res));
-    if (g_rawLeft > 0)
+    const bool rOk = r && Chk(r, sizeof(Res));
+    if (g_rawLeft > 0 && g_deep)
     {
         g_rawLeft--;
         LOGI("BFI Presenter: Streamline probe: raw tag (%s): type %u, lifecycle %u, extent %u,%u %ux%u, resource %p%s native %p, res size %ux%u fmt %u, state 0x%x",
@@ -7575,6 +7583,7 @@ static void NoteOne(const Tag &tg, std::map<uint32_t, TagStat> &into, const char
     if (!rOk) { s.badRes++; return; }
     if (r->width) { s.resW = r->width; s.resH = r->height; }
     if (!r->native) { s.noNative++; return; }
+    if (!g_deep) { if (Plaus(r->native)) s.ok++; else s.badNative++; return; }   // the texture is looked up only on the sampled call
     if (!Readable(r->native, 8) || !Readable(*(void **)r->native, 24)) { s.badNative++; return; }
     if (s.w) { s.ok++; return; }                         // size looked up once per buffer type and window
     IUnknown *u = (IUnknown *)r->native;
@@ -7596,27 +7605,35 @@ static void NoteOne(const Tag &tg, std::map<uint32_t, TagStat> &into, const char
 
 static void NoteTags(const Tag *tags, uint32_t n)
 {
+    const double t0 = Now();
     std::lock_guard<std::mutex> l(g_lk);
-    if (n == 0 || n > 64 || !Readable(tags, n * sizeof(Tag))) { g_badTags++; return; }
-    for (uint32_t i = 0; i < n; i++) NoteOne(tags[i], g_tags, "slSetTag");
+    g_deep = g_deepDue.exchange(false);
+    if (n != 0 && n <= 64 && Chk(tags, n * sizeof(Tag))) { for (uint32_t i = 0; i < n; i++) NoteOne(tags[i], g_tags, "slSetTag"); }
+    else g_badTags++;
+    const double d = Now() - t0; g_probeS += d; g_probeCalls++; if (d > g_probeMaxS) g_probeMaxS = d;
 }
 
 // slEvaluateFeature can carry the tags itself, as inputs (each a chain of structures through 'next').
 static void NoteInputs(const Base **in, uint32_t n)
 {
+    const double t0 = Now();
     std::lock_guard<std::mutex> l(g_lk);
-    if (!in || n == 0 || n > 64 || !Readable(in, n * sizeof(void *))) return;
-    for (uint32_t i = 0; i < n; i++)
+    g_deep = g_deepDue.exchange(false);
+    if (in && n != 0 && n <= 64 && Chk(in, n * sizeof(void *)))
     {
-        const Base *b = in[i];
-        for (int depth = 0; b && depth < 8; depth++)
+        for (uint32_t i = 0; i < n; i++)
         {
-            if (!Readable(b, sizeof(Base))) { g_badTags++; break; }
-            if (memcmp(b->type, kTagGuid, 16) == 0) { if (Readable(b, sizeof(Tag))) NoteOne(*(const Tag *)b, g_tagsEval, "slEvaluateFeature"); }
-            else { uint32_t g; memcpy(&g, b->type, 4); g_evalIn[g]++; }
-            b = (const Base *)b->next;
+            const Base *b = in[i];
+            for (int depth = 0; b && depth < 8; depth++)
+            {
+                if (!Chk(b, sizeof(Base))) { g_badTags++; break; }
+                if (memcmp(b->type, kTagGuid, 16) == 0) { if (Chk(b, sizeof(Tag))) NoteOne(*(const Tag *)b, g_tagsEval, "slEvaluateFeature"); }
+                else { uint32_t g; memcpy(&g, b->type, 4); g_evalIn[g]++; }
+                b = (const Base *)b->next;
+            }
         }
     }
+    const double d = Now() - t0; g_probeS += d; g_probeCalls++; if (d > g_probeMaxS) g_probeMaxS = d;
 }
 
 static int hk_SetTag(const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); return o_SetTag(vp, tags, n, cmd); }
@@ -7626,7 +7643,7 @@ static int hk_SetConstants(const Consts &c, const void *frame, const void *vp)
     {
         std::lock_guard<std::mutex> l(g_lk);
         g_consts++;
-        if (!Readable(&c, sizeof(Consts))) { g_constsBad++; return o_SetConstants(c, frame, vp); }
+        if (!Plaus(&c)) { g_constsBad++; return o_SetConstants(c, frame, vp); }
         const bool sane = c.fov > 0.05f && c.fov < 3.2f && c.zNear > 0.0f && c.zFar != c.zNear;
         if (!sane) g_constsBad++;
         else
@@ -7708,9 +7725,22 @@ static void Tick(double t)
         g_winT = t;
         return;
     }
-    if (!g_hooked || g_reports >= 60 || t - g_winT < 10.0) return;
-    std::lock_guard<std::mutex> l(g_lk);
+    if (!g_hooked) return;
+    g_deepDue = true;                                  // one sampled (fully checked) call a second
+    if (g_reports >= 60 || t - g_winT < 10.0) return;
+    // Take the window's numbers under the lock, then log without it (the game's render thread waits on the lock).
+    std::map<uint32_t, TagStat> tagsSet, tagsEv; std::map<uint32_t, uint32_t> evalIn, evals;
+    uint32_t badTags, consts, constsBad, resets, probeCalls; double moved, turned, probeS, probeMaxS; Consts last; bool haveLast;
+    {
+        std::lock_guard<std::mutex> l(g_lk);
+        tagsSet.swap(g_tags); tagsEv.swap(g_tagsEval); evalIn.swap(g_evalIn); evals.swap(g_evals);
+        badTags = g_badTags; consts = g_consts; constsBad = g_constsBad; resets = g_resets; moved = g_moved; turned = g_turned;
+        last = g_last; haveLast = g_haveLast; probeCalls = g_probeCalls; probeS = g_probeS; probeMaxS = g_probeMaxS;
+        g_badTags = 0; g_consts = g_constsBad = g_resets = 0; g_moved = g_turned = 0.0; g_haveLast = false;
+        g_probeCalls = 0; g_probeS = g_probeMaxS = 0.0;
+    }
     const double secs = t - g_winT;
+    g_winT = t;
     g_reports++;
     // One line per buffer type (the log line is capped at 512 characters).
     auto list = [&](std::map<uint32_t, TagStat> &m, const char *from) {
@@ -7727,37 +7757,38 @@ static void Tick(double t)
                  s.d3d12 ? " D3D12" : s.d3d11 ? " D3D11" : "", extra, s.ok, s.noRes, s.badRes, s.noNative, s.badNative, s.noQI);
         }
     };
-    list(g_tags, "slSetTag");
-    list(g_tagsEval, "slEvaluateFeature");
+    list(tagsSet, "slSetTag");
+    list(tagsEv, "slEvaluateFeature");
     char other[300] = "";
-    for (auto &kv : g_evalIn)
+    for (auto &kv : evalIn)
     {
         char one[48]; snprintf(one, sizeof(one), "%s%08x %.0f/s", other[0] ? ", " : "", kv.first, kv.second / secs);
         strncat(other, one, sizeof(other) - strlen(other) - 1);
     }
     char ev[300] = "";
-    for (auto &kv : g_evals)
+    for (auto &kv : evals)
     {
         char one[80]; const char *nm = FeatureName(kv.first);
         snprintf(one, sizeof(one), "%s%s%s %.0f/s", ev[0] ? ", " : "", nm ? nm : "feature ", nm ? "" : std::to_string(kv.first).c_str(), kv.second / secs);
         strncat(ev, one, sizeof(ev) - strlen(ev) - 1);
     }
     LOGI("BFI Presenter: Streamline probe: last %.0f s: %u slSetTag buffer types, %u inside slEvaluateFeature, unreadable tag calls %u | evaluated: %s | "
-         "other evaluate inputs: %s", secs, (unsigned)g_tags.size(), (unsigned)g_tagsEval.size(), g_badTags, ev[0] ? ev : "none", other[0] ? other : "none");
-    if (g_haveLast)
+         "other evaluate inputs: %s", secs, (unsigned)tagsSet.size(), (unsigned)tagsEv.size(), badTags, ev[0] ? ev : "none", other[0] ? other : "none");
+    LOGI("BFI Presenter: Streamline probe: its own time in the game's calls: %u calls, %.1f us on average, %.0f us at most", probeCalls,
+         probeCalls ? probeS * 1e6 / probeCalls : 0.0, probeMaxS * 1e6);
+    if (haveLast)
     {
-        const Consts &c = g_last;
+        const Consts &c = last;
         bool mat = false;
         for (int i = 0; i < 16; i++) if (c.viewToClip[i] != 0.0f) mat = true;
         LOGI("BFI Presenter: Streamline probe: camera constants %.0f/s (%u implausible), FOV %.1f deg, aspect %.2f, near %.3g, far %.3g, depth %s, "
              "motion vectors scale %.3g x %.3g%s%s%s, view-to-clip matrix %s, camera moved %.1f units and turned %.0f deg in %.0f s, %u resets",
-             g_consts / secs, g_constsBad, c.fov * 57.29578, c.aspect, c.zNear, c.zFar,
+             consts / secs, constsBad, c.fov * 57.29578, c.aspect, c.zNear, c.zFar,
              c.depthInverted == 1 ? "reversed" : c.depthInverted == 0 ? "standard" : "not stated", c.mvecScale[0], c.mvecScale[1],
              c.cameraMotionIncluded == 1 ? ", include camera motion" : "", c.mvJittered == 1 ? ", jittered" : "", c.mv3D == 1 ? ", 3D" : "",
-             mat ? "set" : "all zero", g_moved, g_turned, secs, g_resets);
+             mat ? "set" : "all zero", moved, turned, secs, resets);
     }
-    else LOGI("BFI Presenter: Streamline probe: no camera constants in the last %.0f s (%u calls, %u implausible)", secs, g_consts, g_constsBad);
-    g_tags.clear(); g_tagsEval.clear(); g_evalIn.clear(); g_evals.clear(); g_badTags = 0; g_consts = g_constsBad = g_resets = 0; g_moved = g_turned = 0.0; g_haveLast = false; g_winT = t;
+    else LOGI("BFI Presenter: Streamline probe: no camera constants in the last %.0f s (%u calls, %u implausible)", secs, consts, constsBad);
 }
 } // namespace slp
 
