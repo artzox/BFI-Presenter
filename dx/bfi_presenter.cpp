@@ -7516,12 +7516,16 @@ typedef int (*PFN_SetConstants)(const Consts &c, const void *frame, const void *
 typedef int (*PFN_Evaluate)(uint32_t feature, const void *frame, const Base **inputs, uint32_t n, void *cmd);
 static PFN_SetTag o_SetTag; static PFN_SetTagForFrame o_SetTagForFrame; static PFN_SetConstants o_SetConstants; static PFN_Evaluate o_Evaluate;
 
-struct TagStat { uint32_t calls = 0, w = 0, h = 0, fmt = 0, extW = 0, extH = 0; bool d3d12 = false, d3d11 = false, null = false; };
+struct TagStat { uint32_t calls = 0, w = 0, h = 0, fmt = 0, extW = 0, extH = 0, resW = 0, resH = 0;
+                 uint32_t noRes = 0, badRes = 0, noNative = 0, badNative = 0, noQI = 0, ok = 0; bool d3d12 = false, d3d11 = false; };
 static std::mutex g_lk;
 static bool g_tried = false, g_hooked = false;
 static double g_winT = 0.0;
 static int g_reports = 0;
-static std::map<uint32_t, TagStat> g_tags;
+static std::map<uint32_t, TagStat> g_tags, g_tagsEval;   // from slSetTag / from slEvaluateFeature's inputs
+static std::map<uint32_t, uint32_t> g_evalIn;               // other structures in slEvaluateFeature's inputs, by GUID's first word
+static int g_rawLeft = 8;                                   // raw tag dumps left (sl4)
+static const uint8_t kTagGuid[16] = { 0xad,0x5a,0x6a,0x4c, 0x45,0xb4, 0x6c,0x49, 0x87,0xff,0x1a,0xf3,0x84,0x5b,0xe6,0x53 };
 static std::map<uint32_t, uint32_t> g_evals;
 static uint32_t g_consts = 0, g_constsBad = 0, g_resets = 0;
 static Consts g_last = {}; static bool g_haveLast = false;
@@ -7552,33 +7556,65 @@ static const char *TagName(uint32_t t)
     }
 }
 
+static void NoteOne(const Tag &tg, std::map<uint32_t, TagStat> &into, const char *from)
+{
+    if (tg.b.version > 64 || tg.bufType > 255) { g_badTags++; return; }
+    TagStat &s = into[tg.bufType];
+    s.calls++;
+    if (tg.ext.width) { s.extW = tg.ext.width; s.extH = tg.ext.height; }
+    Res *r = tg.res;
+    const bool rOk = r && Readable(r, sizeof(Res));
+    if (g_rawLeft > 0)
+    {
+        g_rawLeft--;
+        LOGI("BFI Presenter: Streamline probe: raw tag (%s): type %u, lifecycle %u, extent %u,%u %ux%u, resource %p%s native %p, res size %ux%u fmt %u, state 0x%x",
+             from, tg.bufType, tg.lifecycle, tg.ext.left, tg.ext.top, tg.ext.width, tg.ext.height, (void *)r, rOk ? "" : " (unreadable)",
+             rOk ? r->native : nullptr, rOk ? r->width : 0, rOk ? r->height : 0, rOk ? r->nativeFormat : 0, rOk ? r->state : 0);
+    }
+    if (!r) { s.noRes++; return; }
+    if (!rOk) { s.badRes++; return; }
+    if (r->width) { s.resW = r->width; s.resH = r->height; }
+    if (!r->native) { s.noNative++; return; }
+    if (!Readable(r->native, 8) || !Readable(*(void **)r->native, 24)) { s.badNative++; return; }
+    if (s.w) { s.ok++; return; }                         // size looked up once per buffer type and window
+    IUnknown *u = (IUnknown *)r->native;
+    ID3D12Resource *r12 = nullptr; ID3D11Texture2D *t11 = nullptr;
+    if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D12Resource), (void **)&r12)) && r12)
+    {
+        const D3D12_RESOURCE_DESC d = r12->GetDesc();
+        s.w = (uint32_t)d.Width; s.h = d.Height; s.fmt = (uint32_t)d.Format; s.d3d12 = true; s.ok++;
+        r12->Release();
+    }
+    else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&t11)) && t11)
+    {
+        D3D11_TEXTURE2D_DESC d = {}; t11->GetDesc(&d);
+        s.w = d.Width; s.h = d.Height; s.fmt = (uint32_t)d.Format; s.d3d11 = true; s.ok++;
+        t11->Release();
+    }
+    else s.noQI++;
+}
+
 static void NoteTags(const Tag *tags, uint32_t n)
 {
     std::lock_guard<std::mutex> l(g_lk);
     if (n == 0 || n > 64 || !Readable(tags, n * sizeof(Tag))) { g_badTags++; return; }
+    for (uint32_t i = 0; i < n; i++) NoteOne(tags[i], g_tags, "slSetTag");
+}
+
+// slEvaluateFeature can carry the tags itself, as inputs (each a chain of structures through 'next').
+static void NoteInputs(const Base **in, uint32_t n)
+{
+    std::lock_guard<std::mutex> l(g_lk);
+    if (!in || n == 0 || n > 64 || !Readable(in, n * sizeof(void *))) return;
     for (uint32_t i = 0; i < n; i++)
     {
-        if (tags[i].b.version > 64 || tags[i].bufType > 255) { g_badTags++; continue; }
-        TagStat &s = g_tags[tags[i].bufType];
-        s.calls++;
-        if (tags[i].ext.width) { s.extW = tags[i].ext.width; s.extH = tags[i].ext.height; }
-        Res *r = tags[i].res;
-        if (!r || !Readable(r, sizeof(Res)) || !r->native) { s.null = true; continue; }
-        if (s.w) continue;                             // size looked up once per buffer type
-        if (!Readable(r->native, 8) || !Readable(*(void **)r->native, 24)) { s.null = true; continue; }
-        IUnknown *u = (IUnknown *)r->native;
-        ID3D12Resource *r12 = nullptr; ID3D11Texture2D *t11 = nullptr;
-        if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D12Resource), (void **)&r12)) && r12)
+        const Base *b = in[i];
+        for (int depth = 0; b && depth < 8; depth++)
         {
-            const D3D12_RESOURCE_DESC d = r12->GetDesc();
-            s.w = (uint32_t)d.Width; s.h = d.Height; s.fmt = (uint32_t)d.Format; s.d3d12 = true;
-            r12->Release();
-        }
-        else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&t11)) && t11)
-        {
-            D3D11_TEXTURE2D_DESC d = {}; t11->GetDesc(&d);
-            s.w = d.Width; s.h = d.Height; s.fmt = (uint32_t)d.Format; s.d3d11 = true;
-            t11->Release();
+            if (!Readable(b, sizeof(Base))) { g_badTags++; break; }
+            if (memcmp(b->type, kTagGuid, 16) == 0) { if (Readable(b, sizeof(Tag))) NoteOne(*(const Tag *)b, g_tagsEval, "slEvaluateFeature"); }
+            else { uint32_t g; memcpy(&g, b->type, 4); g_evalIn[g]++; }
+            b = (const Base *)b->next;
         }
     }
 }
@@ -7612,6 +7648,7 @@ static int hk_SetConstants(const Consts &c, const void *frame, const void *vp)
 static int hk_Evaluate(uint32_t feature, const void *frame, const Base **inputs, uint32_t n, void *cmd)
 {
     { std::lock_guard<std::mutex> l(g_lk); g_evals[feature]++; }
+    NoteInputs(inputs, n);
     return o_Evaluate(feature, frame, inputs, n, cmd);
 }
 
@@ -7675,17 +7712,28 @@ static void Tick(double t)
     std::lock_guard<std::mutex> l(g_lk);
     const double secs = t - g_winT;
     g_reports++;
-    char tags[700] = "";
-    for (auto &kv : g_tags)
+    // One line per buffer type (the log line is capped at 512 characters).
+    auto list = [&](std::map<uint32_t, TagStat> &m, const char *from) {
+        for (auto &kv : m)
+        {
+            const TagStat &s = kv.second;
+            const char *nm = TagName(kv.first);
+            char nb[24]; snprintf(nb, sizeof(nb), "type %u", kv.first);
+            char extra[80] = "";
+            if (s.resW) snprintf(extra, sizeof(extra), ", stated %ux%u", s.resW, s.resH);
+            if (s.extW) { char e[40]; snprintf(e, sizeof(e), ", used %ux%u", s.extW, s.extH); strncat(extra, e, sizeof(extra) - strlen(extra) - 1); }
+            LOGI("BFI Presenter: Streamline probe: %s tag %s %.0f/s: %ux%u fmt %u%s%s [ok %u, no resource %u, resource unreadable %u, no native %u, "
+                 "native unreadable %u, not a texture %u]", from, nm ? nm : nb, s.calls / secs, s.w, s.h, s.fmt,
+                 s.d3d12 ? " D3D12" : s.d3d11 ? " D3D11" : "", extra, s.ok, s.noRes, s.badRes, s.noNative, s.badNative, s.noQI);
+        }
+    };
+    list(g_tags, "slSetTag");
+    list(g_tagsEval, "slEvaluateFeature");
+    char other[300] = "";
+    for (auto &kv : g_evalIn)
     {
-        const TagStat &s = kv.second;
-        char one[200];
-        const char *nm = TagName(kv.first);
-        char nb[24]; snprintf(nb, sizeof(nb), "type %u", kv.first);
-        snprintf(one, sizeof(one), "%s%s %.0f/s %ux%u fmt %u%s%s", tags[0] ? "; " : "", nm ? nm : nb, s.calls / secs, s.w, s.h, s.fmt,
-                 s.d3d12 ? " (D3D12)" : s.d3d11 ? " (D3D11)" : "", s.null ? " (some without a resource)" : "");
-        if (s.extW) { char e[48]; snprintf(e, sizeof(e), ", used %ux%u", s.extW, s.extH); strncat(one, e, sizeof(one) - strlen(one) - 1); }
-        strncat(tags, one, sizeof(tags) - strlen(tags) - 1);
+        char one[48]; snprintf(one, sizeof(one), "%s%08x %.0f/s", other[0] ? ", " : "", kv.first, kv.second / secs);
+        strncat(other, one, sizeof(other) - strlen(other) - 1);
     }
     char ev[300] = "";
     for (auto &kv : g_evals)
@@ -7694,8 +7742,8 @@ static void Tick(double t)
         snprintf(one, sizeof(one), "%s%s%s %.0f/s", ev[0] ? ", " : "", nm ? nm : "feature ", nm ? "" : std::to_string(kv.first).c_str(), kv.second / secs);
         strncat(ev, one, sizeof(ev) - strlen(ev) - 1);
     }
-    LOGI("BFI Presenter: Streamline probe: tags in the last %.0f s: %s | evaluated: %s | unreadable tag calls: %u", secs, tags[0] ? tags : "none",
-         ev[0] ? ev : "none", g_badTags);
+    LOGI("BFI Presenter: Streamline probe: last %.0f s: %u slSetTag buffer types, %u inside slEvaluateFeature, unreadable tag calls %u | evaluated: %s | "
+         "other evaluate inputs: %s", secs, (unsigned)g_tags.size(), (unsigned)g_tagsEval.size(), g_badTags, ev[0] ? ev : "none", other[0] ? other : "none");
     if (g_haveLast)
     {
         const Consts &c = g_last;
@@ -7709,7 +7757,7 @@ static void Tick(double t)
              mat ? "set" : "all zero", g_moved, g_turned, secs, g_resets);
     }
     else LOGI("BFI Presenter: Streamline probe: no camera constants in the last %.0f s (%u calls, %u implausible)", secs, g_consts, g_constsBad);
-    g_tags.clear(); g_evals.clear(); g_badTags = 0; g_consts = g_constsBad = g_resets = 0; g_moved = g_turned = 0.0; g_haveLast = false; g_winT = t;
+    g_tags.clear(); g_tagsEval.clear(); g_evalIn.clear(); g_evals.clear(); g_badTags = 0; g_consts = g_constsBad = g_resets = 0; g_moved = g_turned = 0.0; g_haveLast = false; g_winT = t;
 }
 } // namespace slp
 
