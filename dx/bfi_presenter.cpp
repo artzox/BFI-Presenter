@@ -7814,7 +7814,8 @@ static int hk_Evaluate(uint32_t feature, const void *frame, const Base **inputs,
 {
     { std::lock_guard<std::mutex> l(g_lk); g_evals[feature]++; }
     NoteInputs(inputs, n);
-    if (feature == 0) gmo::OnEvaluate(inputs, n, cmd);   // DLSS: the game's motion vectors and depth for frame warp
+    if (feature == 0 || feature == 1001) gmo::OnEvaluate(inputs, n, cmd);   // DLSS / DLSS ray reconstruction: the game's motion
+                                                                              // vectors and depth for frame warp
     return o_Evaluate(feature, frame, inputs, n, cmd);
 }
 
@@ -8069,7 +8070,9 @@ static void NoteSetTags(const Tag *tags, uint32_t n)
         const Tag &t = tags[i];
         if (t.bufType > 1) continue;
         const int k = (int)t.bufType;
-        if (!t.res || !Plaus(t.res) || !t.res->native || t.lifecycle == 0) { haveSet[k] = false; continue; }
+        // Any life-cycle: 007 First Light tags its depth here and hands only the vectors to the upscaler call that
+        // follows on the same frame. One valid only when tagged is forgotten at that upscaler call (OnEvaluate).
+        if (!t.res || !Plaus(t.res) || !t.res->native) { haveSet[k] = false; continue; }
         setTag[k] = t; setRes[k] = *t.res; setTag[k].res = &setRes[k]; haveSet[k] = true;
     }
 }
@@ -8142,6 +8145,10 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
                 }
     std::lock_guard<std::mutex> l(lk);
     for (int k = 0; k < 2; k++) if (!tg[k] && haveSet[k]) tg[k] = &setTag[k];
+    // slSetTag's tags valid only when tagged (life-cycle 0): for this upscaler call only
+    struct Forget { ~Forget() { for (int k = 0; k < 2; k++) if (haveSet[k] && setTag[k].lifecycle == 0) haveSet[k] = false; } } forget;
+    if (g_status.fgActive)
+    { SetState(-1, "frame generation is on: the game's motion vectors belong to its rendered frames only -- the picture's own motion is used"); return; }
     if (!tg[1]) { SetState(-1, "the game hands its upscaler no motion vectors that last to the upscaler call -- the picture's own motion is used"); return; }
     if (!haveConsts) { SetState(-1, "no camera constants from the game -- the picture's own motion is used"); return; }
     if (consts.cameraMotionIncluded != 1)
@@ -8155,6 +8162,9 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
     if (dp && DepthView(dd.Format) == DXGI_FORMAT_UNKNOWN) { dp->Release(); dp = nullptr; }
     if (!mv || MvView(md.Format) == DXGI_FORMAT_UNKNOWN)
     {
+        // A second, occasional upscaler call with 8-bit "vectors" (Rift Apart, Spider-Man 2): skipped quietly while
+        // the main one works.
+        if (mv && state.load() > 0) { mv->Release(); if (dp) dp->Release(); cl->Release(); return; }
         SetState(-1, mv ? "the game's motion vectors are in a format not supported (%d) -- the picture's own motion is used"
                         : "the game's motion vectors are not a D3D12 texture on the presenter's GPU -- the picture's own motion is used", (int)md.Format);
         if (mv) mv->Release();
@@ -8331,7 +8341,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
 {
     if (s >= kStage) return;
     slotId[s] = 0; slotPend[s] = slotOk[s] = false;
-    if (!On()) { std::lock_guard<std::mutex> l(lk); pendN = 0; return; }
+    if (!On() || g_status.fgActive) { std::lock_guard<std::mutex> l(lk); pendN = 0; return; }
     Entry e;
     int k;
     {
