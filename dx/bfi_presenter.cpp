@@ -44,6 +44,7 @@
 #include <atomic>
 #include <vector>
 #include <string>
+#include <map>
 #include <cstdarg>
 #include <cmath>
 #include <cstdint>
@@ -57,6 +58,9 @@
 #include "../common/bfi_osd.h"
 #include "../common/bfi_clockdrift.h"
 #include "../common/bfi_warpclock.h"
+#ifdef _WIN64
+namespace slp { static void Tick(double t); }   // Streamline probe (test), defined after InlineHook64
+#endif
 
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d12.lib")
@@ -4952,6 +4956,9 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 g_status.fgLimitUs = want;
             }
+#ifdef _WIN64
+            slp::Tick(t);
+#endif
             DXGI_FRAME_STATISTICS st = {};
             const double tSt0 = Now();
             const bool sok = SUCCEEDED(ScStats(&st));
@@ -7476,6 +7483,198 @@ static void *InlineHook64(void *target, void *hook, char *why, size_t whyLen)
     FlushInstructionCache(GetCurrentProcess(), code, len);
     return tramp;
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Streamline probe (test build sl1): what a game hands DLSS through Streamline each frame -- the tagged
+// buffers (depth, motion vectors) and the camera constants -- logged every 10 s. Only sl.interposer.dll's
+// slSetTag, slSetTagForFrame, slSetConstants and slEvaluateFeature are hooked: a few calls a frame, no
+// draw events (the depth probe through ReShade's draw events crashed South of Midnight). Nothing is changed.
+// Layouts follow the Streamline SDK 2.x headers (sl_struct.h, sl.h, sl_consts.h); values are checked for
+// sanity before they are logged.
+namespace slp
+{
+struct Base { void *next; uint8_t type[16]; size_t version; };                   // sl::BaseStructure, 32 bytes
+struct Res  { Base b; uint32_t type; uint32_t pad; void *native; void *mem; void *view; uint32_t state;
+              uint32_t width, height, nativeFormat, mips, layers; };              // sl::Resource (start)
+struct Ext  { uint32_t top, left, width, height; };                               // sl::Extent
+struct Tag  { Base b; Res *res; uint32_t bufType; uint32_t lifecycle; const Ext *ext; };   // sl::ResourceTag
+struct Consts                                                                     // sl::Constants (start)
+{
+    Base b;
+    float viewToClip[16], clipToView[16], clipToLensClip[16], clipToPrevClip[16], prevClipToClip[16];
+    float jitter[2], mvecScale[2], pinhole[2];
+    float pos[3], up[3], right[3], fwd[3];
+    float zNear, zFar, fov, aspect, mvInvalid;
+    uint8_t depthInverted, cameraMotionIncluded, mv3D, reset, ortho, mvDilated, mvJittered;
+};
+static_assert(offsetof(Consts, zNear) == 424 && offsetof(Consts, depthInverted) == 444, "sl::Constants layout");
+
+typedef int (*PFN_SetTag)(const void *vp, const Tag *tags, uint32_t n, void *cmd);
+typedef int (*PFN_SetTagForFrame)(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd);
+typedef int (*PFN_SetConstants)(const Consts &c, const void *frame, const void *vp);
+typedef int (*PFN_Evaluate)(uint32_t feature, const void *frame, const Base **inputs, uint32_t n, void *cmd);
+static PFN_SetTag o_SetTag; static PFN_SetTagForFrame o_SetTagForFrame; static PFN_SetConstants o_SetConstants; static PFN_Evaluate o_Evaluate;
+
+struct TagStat { uint32_t calls = 0, w = 0, h = 0, fmt = 0, extW = 0, extH = 0; bool d3d12 = false, d3d11 = false, null = false; };
+static std::mutex g_lk;
+static bool g_tried = false, g_hooked = false;
+static double g_winT = 0.0;
+static int g_reports = 0;
+static std::map<uint32_t, TagStat> g_tags;
+static std::map<uint32_t, uint32_t> g_evals;
+static uint32_t g_consts = 0, g_constsBad = 0, g_resets = 0;
+static Consts g_last = {}; static bool g_haveLast = false;
+static double g_moved = 0.0, g_turned = 0.0;      // camera travel and turning over the window (from pos and fwd)
+static float g_prevPos[3], g_prevFwd[3]; static bool g_havePrev = false;
+
+static const char *TagName(uint32_t t)
+{
+    switch (t)
+    {
+    case 0: return "depth"; case 1: return "motion vectors"; case 2: return "HUD-less colour"; case 3: return "upscaler input colour";
+    case 4: return "upscaler output colour"; case 5: return "normals"; case 6: return "roughness"; case 7: return "albedo";
+    default: return nullptr;
+    }
+}
+
+static void NoteTags(const Tag *tags, uint32_t n)
+{
+    if (!tags || n > 64) return;
+    std::lock_guard<std::mutex> l(g_lk);
+    for (uint32_t i = 0; i < n; i++)
+    {
+        TagStat &s = g_tags[tags[i].bufType];
+        s.calls++;
+        if (tags[i].ext) { s.extW = tags[i].ext->width; s.extH = tags[i].ext->height; }
+        Res *r = tags[i].res;
+        if (!r || !r->native) { s.null = true; continue; }
+        if (s.w) continue;                             // size looked up once per buffer type
+        IUnknown *u = (IUnknown *)r->native;
+        ID3D12Resource *r12 = nullptr; ID3D11Texture2D *t11 = nullptr;
+        if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D12Resource), (void **)&r12)) && r12)
+        {
+            const D3D12_RESOURCE_DESC d = r12->GetDesc();
+            s.w = (uint32_t)d.Width; s.h = d.Height; s.fmt = (uint32_t)d.Format; s.d3d12 = true;
+            r12->Release();
+        }
+        else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&t11)) && t11)
+        {
+            D3D11_TEXTURE2D_DESC d = {}; t11->GetDesc(&d);
+            s.w = d.Width; s.h = d.Height; s.fmt = (uint32_t)d.Format; s.d3d11 = true;
+            t11->Release();
+        }
+    }
+}
+
+static int hk_SetTag(const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); return o_SetTag(vp, tags, n, cmd); }
+static int hk_SetTagForFrame(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); return o_SetTagForFrame(frame, vp, tags, n, cmd); }
+static int hk_SetConstants(const Consts &c, const void *frame, const void *vp)
+{
+    {
+        std::lock_guard<std::mutex> l(g_lk);
+        g_consts++;
+        const bool sane = c.fov > 0.05f && c.fov < 3.2f && c.zNear > 0.0f && c.zFar != c.zNear;
+        if (!sane) g_constsBad++;
+        else
+        {
+            if (c.reset == 1) g_resets++;
+            if (g_havePrev)
+            {
+                const double dx = c.pos[0] - g_prevPos[0], dy = c.pos[1] - g_prevPos[1], dz = c.pos[2] - g_prevPos[2];
+                g_moved += std::sqrt(dx * dx + dy * dy + dz * dz);
+                const double dot = c.fwd[0] * g_prevFwd[0] + c.fwd[1] * g_prevFwd[1] + c.fwd[2] * g_prevFwd[2];
+                g_turned += std::acos(std::max(-1.0, std::min(1.0, dot))) * 57.29578;
+            }
+            memcpy(g_prevPos, c.pos, sizeof(g_prevPos)); memcpy(g_prevFwd, c.fwd, sizeof(g_prevFwd)); g_havePrev = true;
+            g_last = c; g_haveLast = true;
+        }
+    }
+    return o_SetConstants(c, frame, vp);
+}
+static int hk_Evaluate(uint32_t feature, const void *frame, const Base **inputs, uint32_t n, void *cmd)
+{
+    { std::lock_guard<std::mutex> l(g_lk); g_evals[feature]++; }
+    return o_Evaluate(feature, frame, inputs, n, cmd);
+}
+
+static const char *FeatureName(uint32_t f)
+{
+    switch (f)
+    {
+    case 0: return "DLSS"; case 1: return "NRD"; case 2: return "NIS"; case 3: return "Reflex"; case 4: return "PCL";
+    case 1000: return "DLSS frame generation"; case 1001: return "DLSS ray reconstruction"; default: return nullptr;
+    }
+}
+
+// Once a second from the presenter: hooks Streamline when it is loaded, and reports every 10 s.
+static void Tick(double t)
+{
+    if (!g_tried)
+    {
+        HMODULE sl = GetModuleHandleA("sl.interposer.dll");
+        if (!sl) return;
+        g_tried = true;
+        struct { const char *name; void *hook; void **orig; } fns[] = {
+            { "slSetTag", (void *)&hk_SetTag, (void **)&o_SetTag },
+            { "slSetTagForFrame", (void *)&hk_SetTagForFrame, (void **)&o_SetTagForFrame },
+            { "slSetConstants", (void *)&hk_SetConstants, (void **)&o_SetConstants },
+            { "slEvaluateFeature", (void *)&hk_Evaluate, (void **)&o_Evaluate },
+        };
+        char list[400] = "";
+        for (auto &f : fns)
+        {
+            void *p = (void *)GetProcAddress(sl, f.name);
+            char why[96] = "not exported";
+            void *orig = p ? InlineHook64(p, f.hook, why, sizeof(why)) : nullptr;
+            if (orig) { *f.orig = orig; g_hooked = true; }
+            char one[160];
+            snprintf(one, sizeof(one), "%s%s %s%s%s", list[0] ? "; " : "", f.name, orig ? "hooked" : "not hooked", orig ? "" : " -- ", orig ? "" : why);
+            strncat(list, one, sizeof(list) - strlen(list) - 1);
+        }
+        LOGI("BFI Presenter: Streamline probe (test build): %s", list);
+        g_winT = t;
+        return;
+    }
+    if (!g_hooked || g_reports >= 60 || t - g_winT < 10.0) return;
+    std::lock_guard<std::mutex> l(g_lk);
+    const double secs = t - g_winT;
+    g_reports++;
+    char tags[700] = "";
+    for (auto &kv : g_tags)
+    {
+        const TagStat &s = kv.second;
+        char one[200];
+        const char *nm = TagName(kv.first);
+        char nb[24]; snprintf(nb, sizeof(nb), "type %u", kv.first);
+        snprintf(one, sizeof(one), "%s%s %.0f/s %ux%u fmt %u%s%s", tags[0] ? "; " : "", nm ? nm : nb, s.calls / secs, s.w, s.h, s.fmt,
+                 s.d3d12 ? " (D3D12)" : s.d3d11 ? " (D3D11)" : "", s.null ? " (some without a resource)" : "");
+        if (s.extW) { char e[48]; snprintf(e, sizeof(e), ", used %ux%u", s.extW, s.extH); strncat(one, e, sizeof(one) - strlen(one) - 1); }
+        strncat(tags, one, sizeof(tags) - strlen(tags) - 1);
+    }
+    char ev[300] = "";
+    for (auto &kv : g_evals)
+    {
+        char one[80]; const char *nm = FeatureName(kv.first);
+        snprintf(one, sizeof(one), "%s%s%s %.0f/s", ev[0] ? ", " : "", nm ? nm : "feature ", nm ? "" : std::to_string(kv.first).c_str(), kv.second / secs);
+        strncat(ev, one, sizeof(ev) - strlen(ev) - 1);
+    }
+    LOGI("BFI Presenter: Streamline probe: tags in the last %.0f s: %s | evaluated: %s", secs, tags[0] ? tags : "none", ev[0] ? ev : "none");
+    if (g_haveLast)
+    {
+        const Consts &c = g_last;
+        bool mat = false;
+        for (int i = 0; i < 16; i++) if (c.viewToClip[i] != 0.0f) mat = true;
+        LOGI("BFI Presenter: Streamline probe: camera constants %.0f/s (%u implausible), FOV %.1f deg, aspect %.2f, near %.3g, far %.3g, depth %s, "
+             "motion vectors scale %.3g x %.3g%s%s%s, view-to-clip matrix %s, camera moved %.1f units and turned %.0f deg in %.0f s, %u resets",
+             g_consts / secs, g_constsBad, c.fov * 57.29578, c.aspect, c.zNear, c.zFar,
+             c.depthInverted == 1 ? "reversed" : c.depthInverted == 0 ? "standard" : "not stated", c.mvecScale[0], c.mvecScale[1],
+             c.cameraMotionIncluded == 1 ? ", include camera motion" : "", c.mvJittered == 1 ? ", jittered" : "", c.mv3D == 1 ? ", 3D" : "",
+             mat ? "set" : "all zero", g_moved, g_turned, secs, g_resets);
+    }
+    else LOGI("BFI Presenter: Streamline probe: no camera constants in the last %.0f s (%u calls, %u implausible)", secs, g_consts, g_constsBad);
+    g_tags.clear(); g_evals.clear(); g_consts = g_constsBad = g_resets = 0; g_moved = g_turned = 0.0; g_haveLast = false; g_winT = t;
+}
+} // namespace slp
 
 // NvAPI functions, once nvapi64.dll is in the game (it isn't loaded by the presenter).
 static bool ReflexApi()
