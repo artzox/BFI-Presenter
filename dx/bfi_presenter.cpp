@@ -146,6 +146,8 @@ struct Settings
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
     int   warpGame = 1;       // FrameWarpGameMotion: use the game's own motion vectors and depth where it hands them to
                               // its upscaler (Streamline / DLSS, D3D12, 64-bit); otherwise the motion measured from the picture
+    int   slHooks = 1;        // StreamlineHooks (test, ini only): 0 = Streamline is not hooked at all (no probe, frame warp
+                              // with the picture's own motion only) -- to compare a game's frame rate with and without
     int   warpGameSign = 1;   // FrameWarpGameMotionSign (test, ini only): -1 turns the game's vectors round, in case a game's
                               // scale has the other sign
     int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
@@ -316,6 +318,7 @@ static void LoadSettings(Settings &s)
     s.warpMinRate = std::max(40, std::min(95, IniInt("FrameWarpMinRate", 75)));
     s.warpGame = IniInt("FrameWarpGameMotion", 1) != 0 ? 1 : 0;
     s.warpGameSign = IniInt("FrameWarpGameMotionSign", 1) < 0 ? -1 : 1;
+    s.slHooks = IniInt("StreamlineHooks", 1) != 0 ? 1 : 0;
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -7832,6 +7835,11 @@ static void Tick(double t)
         HMODULE sl = GetModuleHandleA("sl.interposer.dll");
         if (!sl) return;
         g_tried = true;
+        if (!g_shared.slHooks)
+        {
+            LOGI("BFI Presenter: Streamline found, not hooked (StreamlineHooks=0): frame warp uses the picture's own motion");
+            return;
+        }
         {
             char path[MAX_PATH] = "";
             GetModuleFileNameA(sl, path, MAX_PATH);
@@ -8073,9 +8081,24 @@ static ID3D12Resource *Native(const Res *r, D3D12_RESOURCE_DESC *d)
     if (!r || !Plaus(r) || !r->native || !Plaus(r->native)) return nullptr;
     ID3D12Resource *n = nullptr;
     if (FAILED(((IUnknown *)r->native)->QueryInterface(__uuidof(ID3D12Resource), (void **)&n)) || !n) return nullptr;
+    // The same GPU as the presenter's device? Compared by adapter, not by pointer: ReShade and Streamline each put a
+    // device of their own in front of the driver's (gm1: the pointers differed for the same device). D3D12 makes one
+    // device per adapter, so the same adapter is the same device.
     ID3D12Device *dev = nullptr;
-    const bool same = SUCCEEDED(n->GetDevice(IID_PPV_ARGS(&dev))) && dev == g_device;
-    if (dev) dev->Release();
+    bool same = false;
+    if (SUCCEEDED(n->GetDevice(IID_PPV_ARGS(&dev))) && dev)
+    {
+        const LUID a = dev->GetAdapterLuid(), b = g_device->GetAdapterLuid();
+        same = a.LowPart == b.LowPart && a.HighPart == b.HighPart;
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            LOGI("BFI Presenter: frame warp, the game's own motion: the game's buffers are on device %p, the presenter's is %p (%s adapter)",
+                 (void *)dev, (void *)g_device, same ? "the same" : "another");
+        }
+        dev->Release();
+    }
     if (!same) { n->Release(); return nullptr; }
     *d = n->GetDesc();
     if (d->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d->SampleDesc.Count != 1) { n->Release(); return nullptr; }
@@ -8133,7 +8156,7 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
     if (!mv || MvView(md.Format) == DXGI_FORMAT_UNKNOWN)
     {
         SetState(-1, mv ? "the game's motion vectors are in a format not supported (%d) -- the picture's own motion is used"
-                        : "the game's motion vectors are not a D3D12 texture of this device -- the picture's own motion is used", (int)md.Format);
+                        : "the game's motion vectors are not a D3D12 texture on the presenter's GPU -- the picture's own motion is used", (int)md.Format);
         if (mv) mv->Release();
         if (dp) dp->Release();
         cl->Release();
