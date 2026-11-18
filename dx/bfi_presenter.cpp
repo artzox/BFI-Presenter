@@ -154,6 +154,8 @@ struct Settings
     int   warpGame = 1;       // FrameWarpGameMotion: use the game's own motion vectors and depth where it hands them to
                               // its upscaler (Streamline / DLSS, D3D12, 64-bit); otherwise the motion measured from the picture
     int   warpGameHud = 1;    // FrameWarpGameHud: keep the HUD still with the game's HUD-less picture, where it gives one
+    float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many
+                              // pixels of the game frame (0 = off) -- a CRT shader's scanlines and mask stay in place
     float warpMaxGameFg = 0.25f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
                               // many shown frames ahead (it overshot visibly from about 0.5 in 007 First Light)
     int   warpGameCheck = 1;  // FrameWarpGameMotionCheck (test, ini only): every 2 s the game's motion and the measured one in the log
@@ -338,6 +340,8 @@ static void LoadSettings(Settings &s)
     s.warpGameCheck = IniInt("FrameWarpGameMotionCheck", 1) != 0 ? 1 : 0;
     s.warpGameHud = IniInt("FrameWarpGameHud", 1) != 0 ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.25f)));
+    s.warpSnapX = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapX", 0.0f)));
+    s.warpSnapY = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapY", 0.0f)));
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -570,6 +574,8 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarpGameMotion", s.warpGame);
     IniWriteInt("FrameWarpGameHud", s.warpGameHud);
     IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
+    IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
+    IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -1680,6 +1686,8 @@ cbuffer C : register(b0)
                       // with the game's own motion (warpSrc != 0): this many game frames further on
     float warpPrevN;  // the game's own motion: game frames between this frame and the one shown before (t4)
     uint  warpSrc;    // 0 motion measured from the picture; 1 the game's motion vectors and depth; 2 its motion vectors only
+    float warpSnapX, warpSnapY;  // moves rounded to whole steps of this many game-frame pixels (0 = off): a CRT shader's scanlines
+                      // and mask stay where they are instead of breaking up where parts of the picture move differently
 };
 Texture2D<float4> src : register(t0);
 Texture2D<float> aplTex : register(t1);
@@ -1783,6 +1791,8 @@ bool FetchWarped(float2 pos, out float3 c)
     float2 inv = 1.0 / size;
     float2 cp = pos * srcPerOut;
     float2 d = WarpShift(cp * inv) * size;
+    if (warpSnapX > 0.0) d.x = round(d.x / warpSnapX) * warpSnapX;
+    if (warpSnapY > 0.0) d.y = round(d.y / warpSnapY) * warpSnapY;
     if (dot(d, d) < 0.0004) return false;                 // under 1/50 pixel
     if (Still(int2(cp), size)) return false;
     float2 p = clamp(cp - d, float2(0.5, 0.5), size - 0.5);
@@ -2357,6 +2367,7 @@ struct Constants
     float    warp;                      // frame warp: share of the measured motion the frame is moved ahead (0 = off)
     float    warpPrevN;                 // frame warp with the game's own motion: game frames back to the frame shown before
     uint32_t warpSrc;                   // 0 motion from the picture, 1 the game's motion vectors and depth, 2 its vectors only
+    float    warpSnapX, warpSnapY;      // frame warp: moves rounded to whole steps of this many game-frame pixels (0 = off)
 };
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -4548,6 +4559,7 @@ static DWORD WINAPI PresenterThread(void *)
                 c.warpSrc = (uint32_t)gsrc;
             }
             else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
+            c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
         }
         if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame[c.warpSrc <= 2 ? c.warpSrc : 0]++; }
 
@@ -13493,6 +13505,13 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
                     ImGui::SetTooltip("This game hasn't handed DLSS any motion data (no Streamline or DLSS call seen).");
             }
+            ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader (e.g.\n"
+                                                          "CRT-Standalone), set it to the mask's width so the mask stays in place. 0 = off.");
+            ImGui::SliderFloat("Snap moves up and down (px)", &s.warpSnapY, 0.0f, 16.0f, s.warpSnapY > 0.0f ? "%.2f" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader,\n"
+                                                          "set it to the scanline width (e.g. CRT-Standalone's Scanline Width) so the scanlines\n"
+                                                          "don't break up where parts of the picture move by different amounts. 0 = off.");
             if (s.warpGame)
             {
                 ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
