@@ -5977,6 +5977,8 @@ BFI_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BFI_vkGetDeviceProcAddr(VkDe
 #ifdef _WIN32
 #include <imgui.h>
 #include <reshade.hpp>
+#include "../common/bfi_depthprobe.h"
+static void DepthProbeLog(const char *m) { LOGI("%s", m); }
 #include "../common/bfi_osd.h"
 
 extern "C" __declspec(dllexport) const char *NAME;
@@ -6763,7 +6765,13 @@ static void TryRegisterReShade()
     ov("BFI Presenter (Vulkan)", draw_overlay);
     // the in-game OSD: ReShade's overlay event, every frame
     if (auto ev = (void (*)(reshade::addon_event, void *))(void *)GetProcAddress(rs, "ReShadeRegisterEvent"))
+    {
         ev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
+        // Depth probe (test build): the depth buffers the game draws into, logged every 10 s (common/bfi_depthprobe.h).
+        dp::g_log = DepthProbeLog;
+        dp::Register(ev);
+        LOGI("BFI Presenter: depth probe on (test build): the depth buffers the game draws into are logged every 10 s");
+    }
     static bool pinned = false;
     if (!pinned)
     {
@@ -6785,7 +6793,10 @@ static void UnregisterReShade()
     auto ureg = (void (*)(HMODULE))(void *)GetProcAddress(g_rsModule, "ReShadeUnregisterAddon");
     if (uov) uov("BFI Presenter (Vulkan)", draw_overlay);
     if (auto uev = (void (*)(reshade::addon_event, void *))(void *)GetProcAddress(g_rsModule, "ReShadeUnregisterEvent"))
+    {
         uev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
+        dp::Register(uev);
+    }
     if (ureg) ureg(g_module);
     g_rsModule = nullptr;
 }

@@ -57,6 +57,8 @@
 #include "../common/bfi_osd.h"
 #include "../common/bfi_clockdrift.h"
 #include "../common/bfi_warpclock.h"
+#include "../common/bfi_depthprobe.h"
+static void DepthProbeReg(bool on);
 
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d12.lib")
@@ -12073,6 +12075,7 @@ static void UnregisterAll(HMODULE hModule)
     RegisterDx9Events(false);
     reshade::unregister_overlay("BFI Presenter", draw_overlay);
     reshade::unregister_event<reshade::addon_event::reshade_overlay>(on_osd);
+    DepthProbeReg(false);
     RemoveHooks();
     reshade::unregister_addon(hModule);
 }
@@ -12085,6 +12088,18 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE)
 // The module is pinned, so a reload does not run DllMain again: register
 // again here, or ReShade reports "No add-on was registered" and drops it
 // (Grip, v0.64).
+// Depth probe (test build): logs which depth buffer the game draws into (common/bfi_depthprobe.h).
+static void DepthProbeLog(const char *m) { reshade::log::message(reshade::log::level::info, m); }
+static void DepthProbeReg(bool on)
+{
+    HMODULE rs = reshade::internal::get_reshade_module_handle();
+    auto f = (void (*)(reshade::addon_event, void *))(void *)GetProcAddress(rs, on ? "ReShadeRegisterEvent" : "ReShadeUnregisterEvent");
+    if (!f) return;
+    dp::g_log = DepthProbeLog;
+    dp::Register(f);
+    if (on) LOGI("BFI Presenter: depth probe on (test build): the depth buffers the game draws into are logged every 10 s");
+}
+
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
 {
     if (!g_unregistered) return true;                  // first load: DllMain registered already
@@ -12098,6 +12113,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     RegisterDx9Events(true);
     reshade::register_overlay("BFI Presenter", draw_overlay);
     reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
+    DepthProbeReg(true);
     if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
     return true;
 }
@@ -12155,6 +12171,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         RegisterDx9Events(true);
         reshade::register_overlay("BFI Presenter", draw_overlay);
         reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
+        DepthProbeReg(true);
         ShaderPrepare();                                // compiled (or loaded) while the game starts up
         // DRED must be switched on before the game creates its device; a
         // thread avoids calling into D3D12 under the loader lock.
