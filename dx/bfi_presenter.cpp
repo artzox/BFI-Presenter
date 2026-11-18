@@ -10811,6 +10811,12 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             if (g_dx11.load() || g_sc) return;                   // the presenter couldn't be stopped: stay off
         }
     }
+    // Depth probe (test): DX12 games only. In South of Midnight (DX11, dp1-dp3) it crashed in three places;
+    // the DX11/DX9/OpenGL path presents through the presenter's own swap chain.
+    {
+        static bool dpOn = false;
+        if (!dpOn && swapchain->get_device()->get_api() == reshade::api::device_api::d3d12) { dpOn = true; DepthProbeReg(true); }
+    }
     if (g_sc) return;                                            // resizes of ours are handled in the hook
     // Direct3D 9 is handled above; 11 and 12 below. In an OpenGL or Vulkan game the native
     // handle is not a DXGI swap chain (Heretic II, OpenGL: crashed reading
@@ -12097,7 +12103,7 @@ static void DepthProbeReg(bool on)
     if (!f) return;
     dp::g_log = DepthProbeLog;
     dp::Register(f);
-    if (on) LOGI("BFI Presenter: depth probe on (test build): the depth buffers the game draws into are logged every 10 s");
+    if (on) LOGI("BFI Presenter: depth probe on (test build, DX12 games): the depth buffers the game draws into are logged every 10 s");
 }
 
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
@@ -12113,7 +12119,6 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     RegisterDx9Events(true);
     reshade::register_overlay("BFI Presenter", draw_overlay);
     reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
-    DepthProbeReg(true);
     if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
     return true;
 }
@@ -12171,7 +12176,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         RegisterDx9Events(true);
         reshade::register_overlay("BFI Presenter", draw_overlay);
         reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
-        DepthProbeReg(true);
         ShaderPrepare();                                // compiled (or loaded) while the game starts up
         // DRED must be switched on before the game creates its device; a
         // thread avoids calling into D3D12 under the loader lock.
