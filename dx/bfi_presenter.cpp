@@ -7527,6 +7527,20 @@ static Consts g_last = {}; static bool g_haveLast = false;
 static double g_moved = 0.0, g_turned = 0.0;      // camera travel and turning over the window (from pos and fwd)
 static float g_prevPos[3], g_prevFwd[3]; static bool g_havePrev = false;
 
+// Every pointer from the game is checked before it is read: Rift Apart (sl1) crashed reading a tag's extent
+// at 0x100000008 -- a Streamline older than the 2.x layout assumed here, or a different one.
+static bool Readable(const void *p, size_t n)
+{
+    if (!p || (uintptr_t)p < 0x10000) return false;
+    MEMORY_BASIC_INFORMATION mi = {};
+    if (!VirtualQuery(p, &mi, sizeof(mi)) || mi.State != MEM_COMMIT) return false;
+    if (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    return (const BYTE *)p + n <= (const BYTE *)mi.BaseAddress + mi.RegionSize;
+}
+static uint32_t g_badTags = 0;
+static char g_slVer[48] = "unknown";
+static int g_slMajor = 0;
+
 static const char *TagName(uint32_t t)
 {
     switch (t)
@@ -7539,16 +7553,18 @@ static const char *TagName(uint32_t t)
 
 static void NoteTags(const Tag *tags, uint32_t n)
 {
-    if (!tags || n > 64) return;
     std::lock_guard<std::mutex> l(g_lk);
+    if (n == 0 || n > 64 || !Readable(tags, n * sizeof(Tag))) { g_badTags++; return; }
     for (uint32_t i = 0; i < n; i++)
     {
+        if (tags[i].b.version > 64 || tags[i].bufType > 255) { g_badTags++; continue; }
         TagStat &s = g_tags[tags[i].bufType];
         s.calls++;
-        if (tags[i].ext) { s.extW = tags[i].ext->width; s.extH = tags[i].ext->height; }
+        if (tags[i].ext && Readable(tags[i].ext, sizeof(Ext))) { s.extW = tags[i].ext->width; s.extH = tags[i].ext->height; }
         Res *r = tags[i].res;
-        if (!r || !r->native) { s.null = true; continue; }
+        if (!r || !Readable(r, sizeof(Res)) || !r->native) { s.null = true; continue; }
         if (s.w) continue;                             // size looked up once per buffer type
+        if (!Readable(r->native, 8) || !Readable(*(void **)r->native, 24)) { s.null = true; continue; }
         IUnknown *u = (IUnknown *)r->native;
         ID3D12Resource *r12 = nullptr; ID3D11Texture2D *t11 = nullptr;
         if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D12Resource), (void **)&r12)) && r12)
@@ -7573,6 +7589,7 @@ static int hk_SetConstants(const Consts &c, const void *frame, const void *vp)
     {
         std::lock_guard<std::mutex> l(g_lk);
         g_consts++;
+        if (!Readable(&c, sizeof(Consts))) { g_constsBad++; return o_SetConstants(c, frame, vp); }
         const bool sane = c.fov > 0.05f && c.fov < 3.2f && c.zNear > 0.0f && c.zFar != c.zNear;
         if (!sane) g_constsBad++;
         else
@@ -7614,6 +7631,24 @@ static void Tick(double t)
         HMODULE sl = GetModuleHandleA("sl.interposer.dll");
         if (!sl) return;
         g_tried = true;
+        {
+            char path[MAX_PATH] = "";
+            GetModuleFileNameA(sl, path, MAX_PATH);
+            DWORD h = 0, n = GetFileVersionInfoSizeA(path, &h);
+            std::vector<BYTE> vb(n ? n : 1);
+            VS_FIXEDFILEINFO *fi = nullptr; UINT fl = 0;
+            if (n && GetFileVersionInfoA(path, 0, n, vb.data()) && VerQueryValueA(vb.data(), "\\", (void **)&fi, &fl) && fi)
+            {
+                g_slMajor = HIWORD(fi->dwFileVersionMS);
+                snprintf(g_slVer, sizeof(g_slVer), "%u.%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS),
+                         HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+            }
+        }
+        if (g_slMajor < 2)
+        {
+            LOGI("BFI Presenter: Streamline probe (test build): sl.interposer.dll version %s -- not 2.x, left alone", g_slVer);
+            return;
+        }
         struct { const char *name; void *hook; void **orig; } fns[] = {
             { "slSetTag", (void *)&hk_SetTag, (void **)&o_SetTag },
             { "slSetTagForFrame", (void *)&hk_SetTagForFrame, (void **)&o_SetTagForFrame },
@@ -7631,7 +7666,7 @@ static void Tick(double t)
             snprintf(one, sizeof(one), "%s%s %s%s%s", list[0] ? "; " : "", f.name, orig ? "hooked" : "not hooked", orig ? "" : " -- ", orig ? "" : why);
             strncat(list, one, sizeof(list) - strlen(list) - 1);
         }
-        LOGI("BFI Presenter: Streamline probe (test build): %s", list);
+        LOGI("BFI Presenter: Streamline probe (test build): sl.interposer.dll %s: %s", g_slVer, list);
         g_winT = t;
         return;
     }
@@ -7658,7 +7693,8 @@ static void Tick(double t)
         snprintf(one, sizeof(one), "%s%s%s %.0f/s", ev[0] ? ", " : "", nm ? nm : "feature ", nm ? "" : std::to_string(kv.first).c_str(), kv.second / secs);
         strncat(ev, one, sizeof(ev) - strlen(ev) - 1);
     }
-    LOGI("BFI Presenter: Streamline probe: tags in the last %.0f s: %s | evaluated: %s", secs, tags[0] ? tags : "none", ev[0] ? ev : "none");
+    LOGI("BFI Presenter: Streamline probe: tags in the last %.0f s: %s | evaluated: %s | unreadable tag calls: %u", secs, tags[0] ? tags : "none",
+         ev[0] ? ev : "none", g_badTags);
     if (g_haveLast)
     {
         const Consts &c = g_last;
@@ -7672,7 +7708,7 @@ static void Tick(double t)
              mat ? "set" : "all zero", g_moved, g_turned, secs, g_resets);
     }
     else LOGI("BFI Presenter: Streamline probe: no camera constants in the last %.0f s (%u calls, %u implausible)", secs, g_consts, g_constsBad);
-    g_tags.clear(); g_evals.clear(); g_consts = g_constsBad = g_resets = 0; g_moved = g_turned = 0.0; g_haveLast = false; g_winT = t;
+    g_tags.clear(); g_evals.clear(); g_badTags = 0; g_consts = g_constsBad = g_resets = 0; g_moved = g_turned = 0.0; g_haveLast = false; g_winT = t;
 }
 } // namespace slp
 
