@@ -8921,7 +8921,9 @@ enum { kSR = 1, kRR = 13 };                            // NVSDK_NGX_Feature_Supe
 enum { kMVLowRes = 1 << 1, kDepthInverted = 1 << 3 };  // NVSDK_NGX_DLSS_Feature_Flags
 struct Feat { int feature; int flags; unsigned w, h; };
 static std::mutex lk;
-static std::map<unsigned, Feat> feats;                 // by handle id, from CreateFeature
+static std::map<uintptr_t, Feat> feats;                // by handle, from CreateFeature: the handle's address, not its id -- DLSS
+                                                       // frame generation numbers its handles on its own (Directive 8020: super
+                                                       // resolution and frame generation both handle 1)
 static bool tried[2] = {};                             // "nvngx.dll", "_nvngx.dll"
 static bool hooked = false;
 static thread_local int inside = 0;                    // nested NGX call (OptiScaler calling the driver's DLSS)
@@ -8997,7 +8999,7 @@ static void OnCreate(int feature, const void *params, Handle *h)
     if (GetU(params, "DLSS.Feature.Create.Flags", fl)) f.flags = (int)fl;
     GetU(params, "Width", f.w); GetU(params, "Height", f.h);
     std::lock_guard<std::mutex> l(lk);
-    feats[h->id] = f;
+    feats[(uintptr_t)h] = f;
     static int logged = 0;
     if (logged++ < 8)
         LOGI("BFI Presenter: DLSS feature %d created (handle %u): render size %ux%u, flags 0x%x%s", feature, h->id, f.w, f.h, (unsigned)fl,
@@ -9013,7 +9015,7 @@ static void OnEval(void *cmd, const Handle *h, const void *params)
         std::lock_guard<std::mutex> l(lk);
         nEval++;
         if (slp::g_slDepth > 0) { nSl++; return; }          // Streamline's own DLSS call: the Streamline hook has it
-        auto it = feats.find(h->id);
+        auto it = feats.find((uintptr_t)h);
         known = it != feats.end();
         if (known) f = it->second;
         nFeat[known ? f.feature : -1]++;
