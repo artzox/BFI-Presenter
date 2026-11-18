@@ -23,6 +23,7 @@ struct OsdData
     double warpAhead = 0.0;    // and how far on average, in game frames
     int    warpSrc = -1;       // the motion it moves the picture with: 0 measured from the picture, 1 the game's motion
                                // vectors and depth, 2 its motion vectors only; -1 = not reported (the picture's own)
+    int    warpVia = 0;        // the game's motion came through 0 Streamline, 1 DLSS directly (NGX)
     double now = 0.0;          // Now() seconds, for the totals' time
 };
 
@@ -152,8 +153,9 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
     else if (d.warpOn == 1) ImGui::TextDisabled("frame warp: waiting (frame rate outside its range)");
     else if (d.warpOn < 0) ImGui::TextColored(kBad, "frame warp: not available");
     if (d.warpOn > 0 && d.warpSrc >= 0)
-        ImGui::TextDisabled("  motion: %s", d.warpSrc == 1 ? "the game's motion vectors + depth" : d.warpSrc == 2 ? "the game's motion vectors"
-                                                                                              : "measured from the picture");
+        ImGui::TextDisabled("  motion: %s%s", d.warpSrc == 1 ? "the game's motion vectors + depth" : d.warpSrc == 2 ? "the game's motion vectors"
+                                                                                                : "measured from the picture",
+                            d.warpSrc <= 0 ? "" : d.warpVia == 1 ? " (DLSS)" : " (Streamline)");
     {
         const double since = g_totSince.load();
         const int el = since > 0.0 && d.now > since ? (int)(d.now - since) : 0;

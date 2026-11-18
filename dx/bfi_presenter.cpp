@@ -60,6 +60,7 @@
 #include "../common/bfi_warpclock.h"
 #ifdef _WIN64
 namespace slp { static void Tick(double t); }   // Streamline probe (test), defined after InlineHook64
+namespace ngx { static void Tick(double t); }   // DLSS called directly (NGX, test), defined after gmo
 namespace gmo                                    // frame warp from the game's own motion (test), defined after slp
 {
 static void AtPresent(ID3D12GraphicsCommandList *list, UINT s);
@@ -69,6 +70,7 @@ static ID3D12Resource *FlowRes(int s);
 static void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride);
 static UINT FlowGenNow();
 static int  StateNow(char *why, size_t n);
+static int  ViaNow();
 static int  HudNow();
 static void HudBad(double pct);
 static void Release();
@@ -83,6 +85,7 @@ static inline ID3D12Resource *FlowRes(int) { return nullptr; }
 static inline void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE, UINT) {}
 static inline UINT FlowGenNow() { return 0; }
 static inline int  StateNow(char *why, size_t n) { if (n) why[0] = 0; return 0; }
+static inline int  ViaNow() { return 0; }
 static inline int  HudNow() { return 0; }
 static inline void HudBad(double) {}
 static inline void Release() {}
@@ -156,6 +159,9 @@ struct Settings
     int   warpGameCheck = 1;  // FrameWarpGameMotionCheck (test, ini only): every 2 s the game's motion and the measured one in the log
     int   slHooks = 1;        // StreamlineHooks (test, ini only): 0 = Streamline is not hooked at all (no probe, frame warp
                               // with the picture's own motion only) -- to compare a game's frame rate with and without
+    int   dlssHooks = 1;      // DlssHooks (test, ini only): 0 = DLSS called directly (NGX) is not hooked
+    int   dlssInState = 64;   // DlssInputState (test, ini only): the state DLSS's inputs are in at its call (64 = non-pixel
+                              // shader resource, as DLSS asks; 192 = all shader resource)
     int   warpGameSign = 1;   // FrameWarpGameMotionSign (test, ini only): -1 turns the game's vectors round, in case a game's
                               // scale has the other sign
     int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
@@ -327,6 +333,8 @@ static void LoadSettings(Settings &s)
     s.warpGame = IniInt("FrameWarpGameMotion", 1) != 0 ? 1 : 0;
     s.warpGameSign = IniInt("FrameWarpGameMotionSign", 1) < 0 ? -1 : 1;
     s.slHooks = IniInt("StreamlineHooks", 1) != 0 ? 1 : 0;
+    s.dlssHooks = IniInt("DlssHooks", 1) != 0 ? 1 : 0;
+    s.dlssInState = IniInt("DlssInputState", 64);
     s.warpGameCheck = IniInt("FrameWarpGameMotionCheck", 1) != 0 ? 1 : 0;
     s.warpGameHud = IniInt("FrameWarpGameHud", 1) != 0 ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.25f)));
@@ -687,6 +695,7 @@ struct Status
                                                 // motion vectors and depth, 2 its motion vectors only
     int    warpGameState = 0;                   // the game's own motion: 0 nothing seen, 1 vectors and depth, 2 vectors only, -1 not usable
     char   warpGameWhy[160] = "";
+    int    warpGameVia = 0;                     // through 0 Streamline, 1 DLSS directly (NGX)
     int    warpHud = 0;                         // the game's HUD mask: 0 none, 1 in use, -1 switched off
     int    reused = 0;                          // per second: refreshes that reused an already-drawn buffer   // per second: strobe cycles with no new game frame / frames never shown
     int    deviceLost = 0;
@@ -5240,6 +5249,7 @@ static DWORD WINAPI PresenterThread(void *)
             }
 #ifdef _WIN64
             slp::Tick(t);
+            ngx::Tick(t);
 #endif
             DXGI_FRAME_STATISTICS st = {};
             const double tSt0 = Now();
@@ -5338,6 +5348,7 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.warpRate     = warpClock.rate;
             g_status.warpSrc      = secWarpGame[1] ? 1 : secWarpGame[2] ? 2 : 0;
             g_status.warpGameState = gmo::StateNow(g_status.warpGameWhy, sizeof(g_status.warpGameWhy));
+            g_status.warpGameVia = gmo::ViaNow();
             g_status.warpHud = gmo::HudNow();
             {
                 // the log says which motion frame warp uses, when it changes (at most every 5 s)
@@ -7854,6 +7865,7 @@ static inline bool Chk(const void *p, size_t n) { return g_deep ? Readable(p, n)
 static double g_probeS = 0.0, g_probeMaxS = 0.0; static uint32_t g_probeCalls = 0;   // time in the probe's own code
 static uint32_t g_badTags = 0;
 static char g_slVer[48] = "unknown";
+static thread_local int g_slDepth = 0;               // inside slEvaluateFeature on this thread (its own DLSS call is left to this hook)
 static int g_slMajor = 0;
 
 static const char *TagName(uint32_t t)
@@ -7980,7 +7992,10 @@ static int hk_Evaluate(uint32_t feature, const void *frame, const Base **inputs,
     NoteInputs(inputs, n);
     if (feature == 0 || feature == 1001) gmo::OnEvaluate(inputs, n, cmd);   // DLSS / DLSS ray reconstruction: the game's motion
                                                                               // vectors and depth for frame warp
-    return o_Evaluate(feature, frame, inputs, n, cmd);
+    g_slDepth++;
+    const int r = o_Evaluate(feature, frame, inputs, n, cmd);
+    g_slDepth--;
+    return r;
 }
 
 static const char *FeatureName(uint32_t f)
@@ -8383,6 +8398,9 @@ static void CopyHud(const Tag &t, void *cmd)
     src->Release();
 }
 
+static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int from);
+static std::atomic<int> via{0};                          // where the game's motion comes from: 0 Streamline, 1 DLSS (NGX)
+
 // Step 1, from the slEvaluateFeature hook (DLSS), before the call goes on.
 static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
 {
@@ -8405,6 +8423,13 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
     if (!haveConsts) { SetState(-1, "no camera constants from the game -- the picture's own motion is used"); return; }
     if (consts.cameraMotionIncluded != 1)
     { SetState(-1, "the game's motion vectors leave out the camera's motion (not supported in this test) -- the picture's own motion is used"); return; }
+    Feed(tg, consts, cmd, 0);
+}
+
+// The copies and the ring entry, from either source (lk held): Streamline's tags, or the parameters of a direct DLSS
+// call (NGX) put into the same shape. via: 0 Streamline, 1 DLSS (NGX).
+static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int from)
+{
     ID3D12GraphicsCommandList *cl = nullptr;
     if (FAILED(((IUnknown *)cmd)->QueryInterface(__uuidof(ID3D12GraphicsCommandList), (void **)&cl)) || !cl)
     { SetState(-1, "the upscaler call has no D3D12 command list -- the picture's own motion is used"); return; }
@@ -8494,12 +8519,15 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
     latest = k;
     evalsSec++;
     seq++;
+    via = from;
+    const char *srcName = from == 1 ? "DLSS (NGX)" : "Streamline";
     if (g_status.fgActive)
-        SetState(e.hasDepth ? 1 : 2, "the game's motion vectors (%ux%u)%s are used, with frame generation: each shown frame moves by 1/%.0f of a rendered frame's motion",
-                 e.mvW, e.mvH, e.hasDepth ? " and depth" : "", (double)(fgK >= 2 ? fgK : 2));
+        SetState(e.hasDepth ? 1 : 2, "the game's motion vectors (%ux%u)%s from %s are used, with frame generation: each shown frame moves by 1/%.0f of a rendered frame's motion",
+                 e.mvW, e.mvH, e.hasDepth ? " and depth" : "", srcName, (double)(fgK >= 2 ? fgK : 2));
+    else if (e.hasDepth)
+        SetState(1, "the game's motion vectors (%ux%u) and depth (%ux%u) from %s are used", e.mvW, e.mvH, e.dW, e.dH, srcName);
     else
-        SetState(e.hasDepth ? 1 : 2, e.hasDepth ? "the game's motion vectors (%ux%u) and depth (%ux%u) are used" : "the game's motion vectors (%ux%u) are used, without depth",
-                 e.mvW, e.mvH, e.dW, e.dH);
+        SetState(2, "the game's motion vectors (%ux%u) from %s are used, without depth", e.mvW, e.mvH, srcName);
 }
 
 static bool EnsureGpu()
@@ -8824,6 +8852,7 @@ static UINT FlowGenNow() { return flowGen.load(); }
 static ID3D12Resource *FlowRes(int s) { return s >= 0 && s < (int)kStage ? flow[s] : nullptr; }
 static int StateNow(char *w, size_t n) { std::lock_guard<std::mutex> l(lk); snprintf(w, n, "%s", why); return state.load(); }
 static int HudNow() { return hudState.load(); }
+static int ViaNow() { return via.load(); }
 // The check found the mask covering much of the picture: the HUD-less picture doesn't match the frame shown as it is
 // compared now. The next way of comparing is tried; after the last, the mask is switched off for the session (effects
 // drawn after the HUD-less picture -- ReShade's included -- or an encoding none of the modes undo).
@@ -8856,6 +8885,277 @@ static void Release()
     SafeRelease(psoHud); SafeRelease(pso); SafeRelease(rs); SafeRelease(srvHeap); SafeRelease(rtvHeap);
 }
 } // namespace gmo
+
+// ---------------------------------------------------------------------------------------------------------
+// The game's own motion from DLSS called directly (NGX, test): games that call DLSS without Streamline (most Unreal
+// Engine games, Townfall) hand it their motion vectors and depth in an NGX parameter object at
+// NVSDK_NGX_D3D12_EvaluateFeature. Those exports of the driver's _nvngx.dll (or a nvngx.dll in the game's folder) are
+// hooked; at each DLSS call (super resolution or ray reconstruction) the parameters are read and put into the shape
+// Streamline's tags have, and gmo::Feed copies the buffers as for Streamline. A DLSS call made by Streamline itself is
+// left to the Streamline hook. Layouts and names follow the DLSS SDK headers (nvsdk_ngx.h, nvsdk_ngx_defs.h,
+// nvsdk_ngx_params.h).
+namespace ngx
+{
+using slp::Plaus; using slp::Readable;
+struct Handle { unsigned int id; };
+typedef int (*PFN_Create)(void *cl, int feature, void *params, Handle **out);
+typedef int (*PFN_Eval)(void *cl, const Handle *h, const void *params, void *cb);
+typedef int (*PFN_Get)(const void *self, const char *name, void *out);
+// hooked in up to two modules: a nvngx.dll in the game's folder (OptiScaler) and the driver's _nvngx.dll
+static PFN_Create o_Creates[2] = {};
+static PFN_Eval o_Eval[2] = {}, o_EvalC[2] = {};
+static const int kSuccess = 1;                         // NVSDK_NGX_Result_Success
+enum { kSR = 1, kRR = 13 };                            // NVSDK_NGX_Feature_SuperSampling, _RayReconstruction
+enum { kMVLowRes = 1 << 1, kDepthInverted = 1 << 3 };  // NVSDK_NGX_DLSS_Feature_Flags
+struct Feat { int feature; int flags; unsigned w, h; };
+static std::mutex lk;
+static std::map<unsigned, Feat> feats;                 // by handle id, from CreateFeature
+static bool tried[2] = {};                             // "nvngx.dll", "_nvngx.dll"
+static bool hooked = false;
+static thread_local int inside = 0;                    // nested NGX call (OptiScaler calling the driver's DLSS)
+// The parameter object is a C++ interface: 8 Set overloads, then 8 Get overloads, then Reset. MSVC puts overloads
+// of one name in reverse order, so Get(ID3D12Resource**) is slot 9 there and slot 14 in declaration order. Which one
+// is found once, from the first DLSS call, by asking for "MotionVectors" and checking that what comes back is a D3D12
+// texture. Int and unsigned int getters are slots 11 and 12 either way round (both read a 4-byte value).
+static int slotRes = 0, slotF = 0;                     // 0 = not found yet, -1 = not recognised (NGX left alone)
+static uint32_t nEval = 0, nUsed = 0, nOther = 0, nUnknown = 0, nNoMv = 0, nSl = 0;
+static std::map<int, uint32_t> nFeat;
+static double winT = 0.0; static int reports = 0;
+
+static int Get(const void *p, int slot, const char *name, void *out) { return ((PFN_Get)(*(void ***)p)[slot])(p, name, out); }
+static bool GetU(const void *p, const char *name, unsigned &v)
+{
+    uint64_t x = 0;                                        // int or unsigned int: slot 11 or 12 in either order
+    if (Get(p, 11, name, &x) != kSuccess && Get(p, 12, name, &x) != kSuccess) return false;
+    v = (unsigned)x; return true;
+}
+
+// A D3D12 texture? Only for the one-time layout check: the pointer, its vtable and the vtable's first function are
+// checked (the function must be in a loaded module) before anything is called.
+static bool LooksLikeD3D12(void *p)
+{
+    if (!Plaus(p) || !Readable(p, 8)) return false;
+    void **vt = *(void ***)p;
+    if (!Plaus(vt) || !Readable(vt, 24)) return false;
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)vt[0], &m) || !m) return false;
+    ID3D12Resource *r = nullptr;
+    if (FAILED(((IUnknown *)p)->QueryInterface(__uuidof(ID3D12Resource), (void **)&r)) || !r) return false;
+    r->Release();
+    return true;
+}
+
+static void *GetRes(const void *p, const char *name, const char *enc)
+{
+    uint64_t v = 0;
+    if (Get(p, slotRes, name, &v) == kSuccess && v) return (void *)(uintptr_t)v;
+    v = 0;
+    if (enc && Get(p, slotRes, enc, &v) == kSuccess && v) return (void *)(uintptr_t)v;
+    return nullptr;
+}
+
+static bool Layout(const void *p)
+{
+    if (slotRes) return slotRes > 0;
+    const int tryRes[2] = { 9, 14 };
+    for (int i = 0; i < 2 && !slotRes; i++)
+    {
+        for (const char *nm : { "MotionVectors", "#\x27" })
+        {
+            uint64_t v = 0;                                // 8 bytes: in the other order the slot is Get(float*)
+            if (Get(p, tryRes[i], nm, &v) == kSuccess && v && LooksLikeD3D12((void *)(uintptr_t)v))
+            { slotRes = tryRes[i]; slotF = tryRes[i] == 9 ? 14 : 9; break; }
+        }
+    }
+    if (!slotRes)
+    {
+        slotRes = -1;
+        LOGW("BFI Presenter: frame warp, the game's own motion: DLSS's parameter object isn't laid out as expected -- direct DLSS calls are left alone");
+        return false;
+    }
+    LOGI("BFI Presenter: frame warp, the game's own motion: DLSS parameters read in %s order", slotRes == 9 ? "MSVC's" : "declaration");
+    return true;
+}
+
+static void OnCreate(int feature, const void *params, Handle *h)
+{
+    if (!h || !Plaus(h) || !params || !Plaus(params)) return;
+    Feat f = { feature, -1, 0, 0 };
+    unsigned fl = 0;
+    if (GetU(params, "DLSS.Feature.Create.Flags", fl)) f.flags = (int)fl;
+    GetU(params, "Width", f.w); GetU(params, "Height", f.h);
+    std::lock_guard<std::mutex> l(lk);
+    feats[h->id] = f;
+    static int logged = 0;
+    if (logged++ < 8)
+        LOGI("BFI Presenter: DLSS feature %d created (handle %u): render size %ux%u, flags 0x%x%s", feature, h->id, f.w, f.h, (unsigned)fl,
+             f.flags < 0 ? " (not stated)" : "");
+}
+
+static void OnEval(void *cmd, const Handle *h, const void *params)
+{
+    if (!gmo::On() || !g_device || !cmd || !params || !Plaus(params) || !h || !Plaus(h)) return;
+    Feat f = { 0, -1, 0, 0 };
+    bool known;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        nEval++;
+        if (slp::g_slDepth > 0) { nSl++; return; }          // Streamline's own DLSS call: the Streamline hook has it
+        auto it = feats.find(h->id);
+        known = it != feats.end();
+        if (known) f = it->second;
+        nFeat[known ? f.feature : -1]++;
+        if (known && f.feature != kSR && f.feature != kRR) { nOther++; return; }
+        if (!known) nUnknown++;
+        if (!Layout(params)) return;
+    }
+    void *mv = GetRes(params, "MotionVectors", "#\x27");
+    if (!mv) { std::lock_guard<std::mutex> l(lk); nNoMv++; return; }   // not an upscaler call (frame generation has names of its own)
+    void *dp = GetRes(params, "Depth", "#\x3d");
+    float sx = 1.0f, sy = 1.0f;
+    if (Get(params, slotF, "MV.Scale.X", &sx) != kSuccess) Get(params, slotF, "#\x2c", &sx);
+    if (Get(params, slotF, "MV.Scale.Y", &sy) != kSuccess) Get(params, slotF, "#\x2d", &sy);
+    unsigned reset = 0, rw = 0, rh = 0, flags = 0, mvX = 0, mvY = 0, dX = 0, dY = 0, cw = 0, ch = 0;
+    GetU(params, "Reset", reset);
+    GetU(params, "DLSS.Render.Subrect.Dimensions.Width", rw); GetU(params, "DLSS.Render.Subrect.Dimensions.Height", rh);
+    GetU(params, "DLSS.Input.MV.Subrect.Base.X", mvX); GetU(params, "DLSS.Input.MV.Subrect.Base.Y", mvY);
+    GetU(params, "DLSS.Input.Depth.Subrect.Base.X", dX); GetU(params, "DLSS.Input.Depth.Subrect.Base.Y", dY);
+    if (!rw || !rh) { rw = f.w; rh = f.h; }
+    if ((!rw || !rh) && GetU(params, "Width", cw) && GetU(params, "Height", ch)) { rw = cw; rh = ch; }
+    bool flagsGiven = f.flags >= 0;
+    if (flagsGiven) flags = (unsigned)f.flags;
+    else if (GetU(params, "DLSS.Feature.Create.Flags", flags)) flagsGiven = true;
+    else flags = kMVLowRes | kDepthInverted;               // not stated: as most current engines (Unreal's included)
+
+    // The vectors' texture size, for vectors at the output size (no MVLowRes) and for a missing render size.
+    UINT mvW = 0, mvH = 0;
+    {
+        ID3D12Resource *r = nullptr;
+        if (Plaus(mv) && SUCCEEDED(((IUnknown *)mv)->QueryInterface(__uuidof(ID3D12Resource), (void **)&r)) && r)
+        { const D3D12_RESOURCE_DESC d = r->GetDesc(); mvW = (UINT)d.Width; mvH = d.Height; r->Release(); }
+    }
+    if (!mvW) return;
+    const bool low = (flags & kMVLowRes) != 0;
+    if (!rw || !rh) { rw = mvW; rh = mvH; }
+
+    // Into Streamline's shape: the extents in use, the vector scale to screen uv (DLSS's scale goes to pixels of the
+    // vectors' own size), reversed depth, a camera cut. DLSS's vectors always include the camera's motion.
+    slp::Res res[2] = {}; slp::Tag tag[2] = {};
+    res[1].native = mv; res[1].state = (uint32_t)g_shared.dlssInState;
+    tag[1].res = &res[1]; tag[1].bufType = 1;
+    if (low) tag[1].ext = { mvY, mvX, rw, rh };            // top, left, width, height
+    if (dp) { res[0].native = dp; res[0].state = (uint32_t)g_shared.dlssInState; tag[0].res = &res[0]; tag[0].bufType = 0; tag[0].ext = { dY, dX, rw, rh }; }
+    slp::Consts c = {};
+    c.mvecScale[0] = sx / (float)(low ? rw : mvW);
+    c.mvecScale[1] = sy / (float)(low ? rh : mvH);
+    c.depthInverted = (flags & kDepthInverted) ? 1 : 0;
+    c.cameraMotionIncluded = 1;
+    c.reset = reset ? 1 : 0;
+    c.mvInvalid = 3.402823466e38f;                         // DLSS has no marker for a missing vector
+    static int logged = 0;
+    if (logged < 4)
+    {
+        logged++;
+        LOGI("BFI Presenter: DLSS call (feature %d%s): vectors %ux%u%s, scale %.3g x %.3g, render %ux%u, depth %s, flags 0x%x%s",
+             known ? f.feature : -1, known ? "" : ", created before the hook", mvW, mvH, low ? " (render size)" : " (output size)", sx, sy, rw, rh,
+             dp ? ((flags & kDepthInverted) ? "reversed" : "standard") : "none", flags, flagsGiven ? "" : " (assumed: not stated)");
+    }
+    const slp::Tag *tg[2] = { dp ? &tag[0] : nullptr, &tag[1] };
+    {
+        std::lock_guard<std::mutex> l(gmo::lk);
+        gmo::Feed(tg, c, cmd, 1);
+    }
+    std::lock_guard<std::mutex> l(lk);
+    nUsed++;
+}
+
+template <int I> static int hk_Create(void *cl, int feature, void *params, Handle **out)
+{
+    inside++;
+    const int r = o_Creates[I](cl, feature, params, out);
+    inside--;
+    if (r == kSuccess && out && Plaus(out) && inside == 0) OnCreate(feature, params, *out);
+    return r;
+}
+template <int I> static int hk_Eval(void *cl, const Handle *h, const void *params, void *cb)
+{
+    if (inside == 0) OnEval(cl, h, params);
+    inside++;
+    const int r = o_Eval[I](cl, h, params, cb);
+    inside--;
+    return r;
+}
+template <int I> static int hk_EvalC(void *cl, const Handle *h, const void *params, void *cb)
+{
+    if (inside == 0) OnEval(cl, h, params);
+    inside++;
+    const int r = o_EvalC[I](cl, h, params, cb);
+    inside--;
+    return r;
+}
+
+// Once a second from the presenter: hooks DLSS's exports once a module with them is loaded; reports every 10 s.
+static void Tick(double t)
+{
+    static const char *mods[2] = { "nvngx.dll", "_nvngx.dll" };
+    for (int i = 0; i < 2; i++)
+    {
+        if (tried[i]) continue;
+        HMODULE m = GetModuleHandleA(mods[i]);
+        if (!m) continue;
+        tried[i] = true;
+        if (!g_shared.dlssHooks)
+        {
+            LOGI("BFI Presenter: %s found, not hooked (DlssHooks=0)", mods[i]);
+            continue;
+        }
+        void *fC = (void *)GetProcAddress(m, "NVSDK_NGX_D3D12_CreateFeature");
+        void *fE = (void *)GetProcAddress(m, "NVSDK_NGX_D3D12_EvaluateFeature");
+        void *fEC = (void *)GetProcAddress(m, "NVSDK_NGX_D3D12_EvaluateFeature_C");
+        if (!fE && !fEC) { LOGI("BFI Presenter: %s has no D3D12 DLSS calls -- not hooked", mods[i]); continue; }
+        struct { const char *name; void *fn; void *hook; void **orig; } fns[3] = {
+            { "CreateFeature", fC, i ? (void *)&hk_Create<1> : (void *)&hk_Create<0>, (void **)&o_Creates[i] },
+            { "EvaluateFeature", fE, i ? (void *)&hk_Eval<1> : (void *)&hk_Eval<0>, (void **)&o_Eval[i] },
+            { "EvaluateFeature_C", fEC, i ? (void *)&hk_EvalC<1> : (void *)&hk_EvalC<0>, (void **)&o_EvalC[i] },
+        };
+        char list[400] = "";
+        for (auto &f : fns)
+        {
+            char why[96] = "not exported";
+            void *orig = f.fn ? InlineHook64(f.fn, f.hook, why, sizeof(why)) : nullptr;
+            if (orig) { *f.orig = orig; hooked = true; }
+            char one[160];
+            snprintf(one, sizeof(one), "%s%s %s%s%s", list[0] ? "; " : "", f.name, orig ? "hooked" : "not hooked", orig ? "" : " -- ", orig ? "" : why);
+            strncat(list, one, sizeof(list) - strlen(list) - 1);
+        }
+        char path[MAX_PATH] = "";
+        GetModuleFileNameA(m, path, MAX_PATH);
+        LOGI("BFI Presenter: DLSS (NGX, test build): %s: %s", path, list);
+        if (!winT) winT = t;
+    }
+    if (!hooked || reports >= 30 || t - winT < 10.0) return;
+    uint32_t e, u, o, un, nm, sl; std::map<int, uint32_t> fs;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        e = nEval; u = nUsed; o = nOther; un = nUnknown; nm = nNoMv; sl = nSl; fs.swap(nFeat);
+        nEval = nUsed = nOther = nUnknown = nNoMv = nSl = 0;
+    }
+    const double secs = t - winT;
+    winT = t;
+    if (!e) return;
+    reports++;
+    char fl[200] = "";
+    for (auto &kv : fs)
+    {
+        char one[64];
+        if (kv.first < 0) snprintf(one, sizeof(one), "%sa feature created before the hook %.0f/s", fl[0] ? ", " : "", kv.second / secs);
+        else snprintf(one, sizeof(one), "%sfeature %d %.0f/s", fl[0] ? ", " : "", kv.first, kv.second / secs);
+        strncat(fl, one, sizeof(fl) - strlen(fl) - 1);
+    }
+    LOGI("BFI Presenter: DLSS (NGX): last %.0f s: %.0f calls/s (%s), used %.0f/s, from Streamline %.0f/s, other features %.0f/s, created before the hook %.0f/s, "
+         "without vectors %.0f/s", secs, e / secs, fl[0] ? fl : "none", u / secs, sl / secs, o / secs, un / secs, nm / secs);
+}
+} // namespace ngx
 
 // NvAPI functions, once nvapi64.dll is in the game (it isn't loaded by the presenter).
 static bool ReflexApi()
@@ -12578,6 +12878,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
     // which motion: what the last second's moved cycles used, or (none moved) what the game hands over
     d.warpSrc = g_status.warpCycles ? g_status.warpSrc
               : (g_shared.warpGame && g_status.warpGameState > 0 ? g_status.warpGameState : 0);
+    d.warpVia = g_status.warpGameVia;
     LeaveCriticalSection(&g_cfgLock);
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
 }
@@ -13177,19 +13478,20 @@ static void draw_overlay(reshade::api::effect_runtime *)
             else ImGui::Text("Waiting for the game's frame rate.");
             bool gm = s.warpGame != 0;
             if (ImGui::Checkbox("Use the game's own motion vectors and depth (test)", &gm)) s.warpGame = gm ? 1 : 0;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands its upscaler (DLSS through Streamline, DX12) its motion vectors and\n"
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (through Streamline or directly, DX12) its motion vectors and\n"
                                                           "depth, frame warp moves each part of the picture by the game's own motion for it, and\n"
                                                           "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
                                                           "from the finished picture, which can only follow the camera. Other games keep the\n"
                                                           "measured motion. The line below says which one is in use.");
             {
                 const int src = st.warpCycles ? st.warpSrc : (s.warpGame && st.warpGameState > 0 ? st.warpGameState : 0);
-                ImGui::Text("Motion used: %s", src == 1 ? "the game's motion vectors and depth" : src == 2 ? "the game's motion vectors (no depth)"
-                                                     : "measured from the picture");
+                ImGui::Text("Motion used: %s%s", src == 1 ? "the game's motion vectors and depth" : src == 2 ? "the game's motion vectors (no depth)"
+                                                       : "measured from the picture",
+                            src <= 0 ? "" : st.warpGameVia == 1 ? ", from DLSS" : ", from Streamline");
                 if (s.warpGame && st.warpGameWhy[0]) { ImGui::SameLine(); ImGui::TextDisabled("(?)");
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", st.warpGameWhy); }
                 else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
-                    ImGui::SetTooltip("This game hasn't handed an upscaler any motion data (no Streamline / DLSS seen).");
+                    ImGui::SetTooltip("This game hasn't handed DLSS any motion data (no Streamline or DLSS call seen).");
             }
             if (s.warpGame)
             {
