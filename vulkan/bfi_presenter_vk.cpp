@@ -642,7 +642,20 @@ static std::atomic<bool> g_vkAlignHunted{false};  // the Reflex limit's alignmen
 static std::atomic<int>  g_vkSleepPhaseUs{-1};   // where in the strobe cycle the sleep limit starts frames now (-1: not on the grid)
 static std::atomic<double> g_vkSleepPhaseT{0.0};
 static std::atomic<int>  g_vkSleepShiftUs{0};    // move the sleep limit's next wake-up by this much (+ later), taken once
-static std::atomic<bool> g_vkRfxBad{false};      // the game collapsed under the limit: off for the session
+static std::atomic<bool> g_vkRfxBad{false};
+// vp3: the hitch guard's pauses (the last 8), for the limit at the game's Reflex sleep to back off and for "gave up" to be
+// remembered only from a steady session.
+static std::atomic<double> g_vkPauseT[8];
+static std::atomic<int> g_vkPauseN{0};
+static std::atomic<bool> g_vkAtSleepBad{false};   // the limit at the game's Reflex sleep led to missed refreshes: off for the session
+static std::atomic<bool> g_vkHuntSteady{true};    // presentation was steady when the alignment went round the strobe cycle
+static int VkPausesSince(double since)
+{
+    int n = 0;
+    const int k = g_vkPauseN.load();
+    for (int i = 0; i < 8 && i < k; i++) if (g_vkPauseT[i].load() >= since) n++;
+    return n;
+}      // the game collapsed under the limit: off for the session
 static bool g_active = false;      // BFIPresenter.ini found: the layer manages swap chains in this process
 static std::atomic<bool> g_surfCaps2Ext{false};    // VK_KHR_get_surface_capabilities2 enabled (needed by full_screen_exclusive)
 static std::atomic<bool> g_colorspaceExt{false};   // VK_EXT_swapchain_colorspace enabled (HDR10 presentation possible)
@@ -3113,6 +3126,7 @@ static void PresenterThread(Swapchain *sc)
             if (now != hitchPaused)
             {
                 hitchPaused = now;
+                if (now) { const int k = g_vkPauseN.fetch_add(1); g_vkPauseT[k % 8].store(Now()); }
                 LOGI("BFI Presenter: hitch guard: BFI %s (%s)", now ? "paused" : "resumed",
                      now ? (stalled ? "game stalled" : "missed refreshes") : "steady again");
             }
@@ -3445,10 +3459,32 @@ static void PresenterThread(Swapchain *sc)
                     // before it reads input for the next frame, instead of being held in its present with the finished frame
                     // waiting. Not while the cap tries Refresh rate, and not for a game that presents each frame twice (RPCS3:
                     // one sleep per emulated frame).
-                    else if (f == 1 && sleeping && s.reflexAtSleep && s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 &&
+                    else if (f == 1 && sleeping && s.reflexAtSleep && !g_vkAtSleepBad.load() && s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 &&
                              !g_vkRfxBad.load() && sc->autoCapDown.load() && !capProbe && !dupPresents)
                         want = (int)(1e6 * s.frames / hzA + 0.5);
                     static double onT = 0.0, fpsOn = 0.0; static int badSecs = 0;
+                    // Back-off (vp3): without frame generation, a game that leaves the GPU no room (Indiana Jones at 60 of
+                    // about 65 fps) has its frames lined up to finish just before the flash -- right when the presenter draws.
+                    // The presenter's refreshes then came late: 25 hitch-guard pauses in 100 s, against 1 with the presenter's
+                    // own cap. 3 pauses within 60 s while the limit is on switch it off for the session.
+                    {
+                        static double atSleepOnT = 0.0;
+                        const bool atSleepNow = f == 1 && g_vkSleepLimitUs.load() > 0;
+                        static bool atSleepWas = false;
+                        if (atSleepNow && !atSleepWas) atSleepOnT = Now();
+                        atSleepWas = atSleepNow;
+                        if (atSleepNow && want > 0)
+                        {
+                            const int np = VkPausesSince(std::max(atSleepOnT + 2.0, Now() - 60.0));
+                            if (np >= 3 && !g_vkAtSleepBad.exchange(true))
+                            {
+                                want = 0;
+                                LOGW("BFI Presenter: frame limit at the game's Reflex sleep: BFI paused %d times in the last 60 s while it was on "
+                                     "(missed refreshes: the GPU leaves the presenter too little room at the flash) -- off for this session; "
+                                     "the presenter's frame cap paces the game", np);
+                            }
+                        }
+                    }
                     const int was = g_vkSleepLimitUs.exchange(want);
                     if ((was > 0) != (want > 0))
                     {
@@ -3552,7 +3588,8 @@ static void PresenterThread(Swapchain *sc)
                                 hT[hN % 96] = t; hS[hN % 96] = alignTot; hN++;
                                 double span = 0.0;
                                 for (int k = 0; k < 96 && k < hN; k++) if (t - hT[k] <= 90.0) span = std::max(span, fabs(alignTot - hS[k]));
-                                if (cycA > 0.0 && span >= 1.5 * cycA && !g_vkAlignHunted.exchange(true))
+                                if (cycA > 0.0 && span >= 1.5 * cycA && !g_vkAlignHunted.exchange(true) &&
+                                    (g_vkHuntSteady.store(VkPausesSince(Now() - 90.0) <= 1), true))
                                     LOGI("BFI Presenter: Reflex frame limit alignment went round the strobe cycle (%.0f ms within 90 s): "
                                          "the game's frames don't follow its frame start -- alignment off for this session", span * 1000.0);
                             }
@@ -3657,7 +3694,16 @@ static void PresenterThread(Swapchain *sc)
                                         }
                                     }
                                 }
-                                if (s.learnPerGame && s.learnReflex && learnMine.frames > 0 && g_vkAlignHunted.load() && !rlGaveUpSaved && !learnMine.rfxGaveUp)
+                                if (s.learnPerGame && s.learnReflex && learnMine.frames > 0 && g_vkAlignHunted.load() && !rlGaveUpSaved && !learnMine.rfxGaveUp &&
+                                    !g_vkHuntSteady.load())
+                                {
+                                    // Not from a session with missed refreshes: the frames went round because the presenter's
+                                    // refreshes were late, not because the game ignores its frame start (vp3, Indiana Jones).
+                                    rlGaveUpSaved = true;
+                                    LOGI("BFI Presenter: the alignment's give-up is not remembered for this game: BFI was paused for "
+                                         "missed refreshes meanwhile");
+                                }
+                                else if (s.learnPerGame && s.learnReflex && learnMine.frames > 0 && g_vkAlignHunted.load() && !rlGaveUpSaved && !learnMine.rfxGaveUp)
                                 {
                                     rlGaveUpSaved = true;
                                     learnMine.rfxGaveUp = 1;
