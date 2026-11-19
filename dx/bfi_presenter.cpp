@@ -176,6 +176,8 @@ struct Settings
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (test, ini only): with the game's motion and frame generation, its
                               // vectors read where each point is in the rendered frame: 1 = generated frames come before
                               // the rendered one (DLSS frame generation), -1 = after it, 0 = off (read where shown, ep7)
+    int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
+                              // they are for a while (30 s, then longer)
     int   warpEase = 1;       // FrameWarpGameMotionEase (test, ini only): with the game's motion and frame generation, the
                               // part of a move past the rendered frame eases off as the game's motion slows (1 = on)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
@@ -364,6 +366,7 @@ static void LoadSettings(Settings &s)
     s.warpGameFg = IniInt("FrameWarpGameMotionWithFG", 0) ? 1 : 0;
     s.warpFgLag = std::max(-1, std::min(1, IniInt("FrameWarpGameMotionFGLag", 1)));
     s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
+    s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
     s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
     s.warpPauseLb = IniInt("FrameWarpPauseCutscenes", 1) ? 1 : 0;
@@ -3163,6 +3166,8 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
 // held start time don't count lost frames then or for 10 s after (Obduction: streaming stalls set off two searches in a
 // minute, both finding the start time already in use).
 static std::atomic<double> g_windowHungT{-1e9};
+// New frames shown, and how many came more than a third of a cycle late (the frame-start search: uneven frame times)
+static std::atomic<int> g_gameIvN{0}, g_gameIvLate{0};
 
 // PresenterResize: BFI (and DX12 SDR to HDR) start inside the game's first resize of its swap chain. Most games do one
 // at start-up; some never do on their own (Hades II, Wreckfest 2), and messages to their window don't make them (tried:
@@ -3628,7 +3633,16 @@ static DWORD WINAPI PresenterThread(void *)
     UINT64 warpPrevId = 0;
     int    secWarpCycles = 0;
     int    secWarpPaused = 0;   // cycles not filled: a camera cut or a letterboxed cutscene
-    int    winWarpPaused = 0, winCuts = 0; double winPauseT = 0.0;
+    // Warp guard (ep10): a repeated cycle shown as it is reuses the picture already drawn; filled, it is drawn anew, and
+    // that submission can wait in the driver behind the game's own late frame (South of Midnight: about 6 ms, 214 of 296
+    // repeats then missed their refresh and the hitch guard switched BFI off). If filled repeats keep making their
+    // refresh late, repeats are shown as they are for a while.
+    bool   cycRepeat = false;          // this strobe cycle repeats the frame shown before
+    uint8_t warpRepHist = 0;           // the last 8 filled repeats: bit set = drawn too late for its refresh
+    int    warpRepHistN = 0;
+    double warpRepHoldT = -1.0, warpRepHoldS = 30.0;
+    int    secWarpHeld = 0;
+    int    winWarpPaused = 0, winCuts = 0, winWarpHeld = 0; double winPauseT = 0.0;
     double secWarpSum = 0.0;
     int    secWarpGame[3] = {};             // cycles moved with: the picture's motion, the game's vectors and depth, its vectors only
     UINT   gameFlowGen = ~0u;               // the game's own motion textures the presenter's views were written for
@@ -3929,6 +3943,7 @@ static DWORD WINAPI PresenterThread(void *)
     LeaveCriticalSection(&g_cfgLock);
 
     uint64_t presents = 0, lastShownId = 0;
+    double pickNew0T = 0.0;                    // the staging time of the last new frame shown (the frame-start search)
     // LCD phase swap: refreshes held back from the strobe count. Each one repeats the cycle's last (dark)
     // refresh once, so with an even cycle the lit refresh moves to the panel's other drive polarity.
     uint64_t phaseShift = 0;
@@ -4416,6 +4431,15 @@ static DWORD WINAPI PresenterThread(void *)
         }
         if (cycleStart)
         {
+            cycRepeat = lastShownId && pickId == lastShownId;
+            if (pickNew0T > 0.0 && pickId != lastShownId && g_stageTime[pick] > pickNew0T)
+            {
+                // the game's frame times, for the frame-start search: a frame more than a third of a cycle late
+                g_gameIvN.fetch_add(1);
+                if (g_stageTime[pick] - pickNew0T > 1.35 * (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0) * (double)(pickId - lastShownId))
+                    g_gameIvLate.fetch_add(1);
+            }
+            if (pickId != lastShownId) pickNew0T = g_stageTime[pick];
             if (pickId == lastShownId) secFrameRepeats++;
             else if (lastShownId && pickId > lastShownId + 1) secFrameSkips += (int)(pickId - lastShownId - 1);
         }
@@ -4618,6 +4642,12 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 c.warp = 0.0f; c.warpSrc = 0; gFlow = nullptr;
                 if (cycleStart) secWarpPaused++;
+            }
+            // The warp guard: repeats shown as they are while it holds.
+            if (c.warp != 0.0f && cycRepeat && s.warpGuard && Now() < warpRepHoldT)
+            {
+                c.warp = 0.0f; c.warpSrc = 0; gFlow = nullptr;
+                if (cycleStart) secWarpHeld++;
             }
         }
         if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame[c.warpSrc <= 2 ? c.warpSrc : 0]++; }
@@ -4985,6 +5015,22 @@ static DWORD WINAPI PresenterThread(void *)
             while (g_holdPresents.load() > 0 && g_running.load() && Now() - th < 2.0) Sleep(1);
         }
         const double tSub = Now();
+        if (cycleStart && cycRepeat && c.warp != 0.0f && s.warpGuard)
+        {
+            const bool late = tSub - tFence > 0.4 / (modeHz > 0.0 ? modeHz : 120.0);
+            warpRepHist = (uint8_t)((warpRepHist << 1) | (late ? 1 : 0));
+            if (warpRepHistN < 8) warpRepHistN++;
+            int n = 0; for (int b = 0; b < 8; b++) n += (warpRepHist >> b) & 1;
+            if (warpRepHistN >= 5 && n >= 3)
+            {
+                warpRepHoldT = tSub + warpRepHoldS;
+                LOGI("BFI Presenter: frame warp guard: %d of the last %d filled repeats were drawn too late for their refresh (drawing one took "
+                     "%.1f ms; the game's own late frame was being sent to the GPU at the same time) -- repeats are shown as they are for %.0f s",
+                     n, warpRepHistN, (tSub - tFence) * 1000.0, warpRepHoldS);
+                warpRepHoldS = std::min(300.0, warpRepHoldS * 2.0);
+                warpRepHist = 0; warpRepHistN = 0;
+            }
+        }
         PresStage(ST_PRESENT);
         HRESULT hr;
         hr = OwnPresent();
@@ -5451,16 +5497,16 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 else if (g_status.warpOn != 2 && warpWas != 2) warpWas = g_status.warpOn;
             }
-            winWarpPaused += secWarpPaused; winCuts += gmo::CutsTake();
+            winWarpPaused += secWarpPaused; winCuts += gmo::CutsTake(); winWarpHeld += secWarpHeld;
             if (t - winPauseT >= 10.0)
             {
                 static int pauseLogs = 0;
-                if ((winWarpPaused || winCuts) && pauseLogs++ < 60)
+                if ((winWarpPaused || winCuts || winWarpHeld) && pauseLogs++ < 60)
                     LOGI("BFI Presenter: frame warp, last %.0f s: %d camera cuts flagged by the game, %d strobe cycles not filled (camera cuts, "
-                         "letterboxed cutscenes)", t - winPauseT, winCuts, winWarpPaused);
-                winWarpPaused = winCuts = 0; winPauseT = t;
+                         "letterboxed cutscenes), %d repeats shown as they are (the warp guard)", t - winPauseT, winCuts, winWarpPaused, winWarpHeld);
+                winWarpPaused = winCuts = winWarpHeld = 0; winPauseT = t;
             }
-            secWarpPaused = 0;
+            secWarpPaused = 0; secWarpHeld = 0;
             secWarpCycles = 0; secWarpSum = 0.0;
             g_status.unevenRep    = secRepU;
             g_status.unevenSkip   = secSkipU;
@@ -6057,6 +6103,7 @@ static DWORD WINAPI PresenterThread(void *)
                     static int swIdx = -1, swN = 0, swSecs = 0, swBad = 0, swShown = 0, swRelN = 0, swRep = 0;
                     static double swPhase = 0.0, swStart = 0.0, swDoneT = -1.0, swBestMs = 0.0, swRel = 0.0, swScore[16] = {}, swRelMs[16] = {},
                                   swSlack = 1.0, swSlackK[16] = {};
+                    static int swIvN = 0, swIvLate = 0;     // the search: new frames shown, and those over a third of a cycle late
                     static unsigned swTightHist = 0;     // the last 5 seconds: frames repeated with little to spare (one bit each)
                     static double swBackMs = 0.0;        // moved earlier since the start time was found (more to spare)
                     static int swShownK[16] = {};
@@ -6127,6 +6174,7 @@ static DWORD WINAPI PresenterThread(void *)
                         // The automatic frame cap at the frame start: only while the game holds the cap. Below it (a scene
                         // too heavy for 60) every start time loses frames and a search only shows its bad ones (Days Gone:
                         // four searches in four minutes, each started in a scene at 55-59 fps).
+                        const int ivNSec = g_gameIvN.exchange(0), ivLateSec = g_gameIvLate.exchange(0);
                         const bool ok = holds && !hitchPaused && (g_fgPaceKind.load() != 2 || stNow.gameFps >= 0.98 * capFps) &&
                                         t - g_windowHungT.load() > 10.0;
                         const double base = swPhase - std::fmod(swPhase, cyc);   // stay within the same cycle's worth of moves
@@ -6139,6 +6187,7 @@ static DWORD WINAPI PresenterThread(void *)
                             swN = std::max(4, std::min(16, (int)(cyc / 0.002 + 0.5)));
                             swIdx = 0; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swBad = 0;
                             swTightHist = 0; swBackMs = 0.0;
+                            swIvN = swIvLate = 0;
                             swStart = base;
                             moveTo(swStart);
                             LOGI("BFI Presenter: %s: trying %d start times across the strobe cycle (%.0f s)",
@@ -6150,6 +6199,7 @@ static DWORD WINAPI PresenterThread(void *)
                             if (!ok) { swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swSlack = 1.0; }
                             else if (++swSecs >= settle)
                             {
+                                swIvN += ivNSec; swIvLate += ivLateSec;
                                 swShown += relN; swRel += relSum; swRelN += relN; swRep += stNow.frameRepeats;
                                 if (p10 >= 0.0) swSlack = std::min(swSlack, p10);
                                 // The automatic frame cap at the frame start: a start time that loses frames in its first
@@ -6175,8 +6225,21 @@ static DWORD WINAPI PresenterThread(void *)
                                     if (swIdx < swN) moveTo(start + swIdx * cyc / swN);
                                     else
                                     {
+                                        // Uneven frame times (ep10): over 2% of the game's frames came more than a third of a cycle
+                                        // late during the search -- the quickest start with 3-5 ms to spare missed one cycle in 10
+                                        // (South of Midnight: +14.6 ms with 4.6 ms to spare, 296 repeats in 52 s). There, 6 ms to
+                                        // spare first, then 3 ms, then any start time that showed every frame.
+                                        const int ivN = swIvN, ivLate = swIvLate;
+                                        const bool uneven = !fsr && ivN >= 200 && ivLate * 50 > ivN;
+                                        if (uneven)
+                                            for (int k = 0; k < swN; k++)
+                                                if (swScore[k] < 1e3)
+                                                    swScore[k] = swSlackK[k] >= 0.006 ? swRelMs[k] : swSlackK[k] >= 0.003 ? 50.0 + swRelMs[k] : 100.0 + swRelMs[k];
                                         int best = 0;
                                         for (int k = 1; k < swN; k++) if (swScore[k] < swScore[best]) best = k;
+                                        if (uneven)
+                                            LOGI("BFI Presenter: %s: the game's frame times are uneven (%d of %d frames over a third of a cycle late) -- "
+                                                 "a start time with more to spare is preferred", swName, ivLate, ivN);
                                         moveTo(start + best * cyc / swN);
                                         swIdx = -1; swDoneT = t; swBestMs = swRelMs[best];
                                         learnSw();
