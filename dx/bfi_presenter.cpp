@@ -176,6 +176,8 @@ struct Settings
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (test, ini only): with the game's motion and frame generation, its
                               // vectors read where each point is in the rendered frame: 1 = generated frames come before
                               // the rendered one (DLSS frame generation), -1 = after it, 0 = off (read where shown, ep7)
+    int   warpEase = 1;       // FrameWarpGameMotionEase (test, ini only): with the game's motion and frame generation, the
+                              // part of a move past the rendered frame eases off as the game's motion slows (1 = on)
     float warpMaxGameFg = 0.25f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
                               // many shown frames ahead (it overshot visibly from about 0.5 in 007 First Light)
     int   warpGameCheck = 1;  // FrameWarpGameMotionCheck (test, ini only): every 2 s the game's motion and the measured one in the log
@@ -361,6 +363,7 @@ static void LoadSettings(Settings &s)
     s.warpGameHud = IniInt("FrameWarpGameHud", 1) != 0 ? 1 : 0;
     s.warpGameFg = IniInt("FrameWarpGameMotionWithFG", 0) ? 1 : 0;
     s.warpFgLag = std::max(-1, std::min(1, IniInt("FrameWarpGameMotionFGLag", 1)));
+    s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.25f)));
     s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
     s.warpPauseLb = IniInt("FrameWarpPauseCutscenes", 1) ? 1 : 0;
@@ -1717,6 +1720,8 @@ cbuffer C : register(b0)
                       // and mask stay where they are instead of breaking up where parts of the picture move differently
     float warpLag;    // the game's motion with frame generation: shown frames this frame is behind the rendered frame its
                       // motion vectors are for (a generated frame sits between two rendered ones; 0 = the rendered frame)
+    float warpEase;   // the game's motion: 1 = the part of a move past the rendered frame is scaled by how much the motion
+                      // kept up from the frame before (z - 1 of the motion texture): no overshoot when the camera slows down
 };
 Texture2D<float4> src : register(t0);
 Texture2D<float> aplTex : register(t1);
@@ -1754,16 +1759,20 @@ float2 WarpShiftGame(float2 uv)
     m[1] = GameFlow(uv - m[0] * L).xy;
     m[2] = GameFlow(uv - m[1] * L).xy;
     float2 best = float2(0.0, 0.0), back = float2(0.0, 0.0);
-    float bestNear = -1.0, backNear = 2.0;
+    float bestNear = -1.0, backNear = 2.0, bestK = 1.0, backK = 1.0;
     [unroll] for (int i = 0; i < 3; i++)
     {
         float4 g = GameFlow(uv - m[i] * L);
         if (g.z < 0.5) continue;
-        if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; }
-        if (g.w < backNear) { backNear = g.w; back = m[i]; }
+        if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; bestK = saturate(g.z - 1.0); }
+        if (g.w < backNear) { backNear = g.w; back = m[i]; backK = saturate(g.z - 1.0); }
     }
-    if (bestNear < 0.0) best = backNear <= 1.0 ? back : float2(0.0, 0.0);
-    return clamp(best * warp, -0.08, 0.08);
+    if (bestNear < 0.0) { best = backNear <= 1.0 ? back : float2(0.0, 0.0); bestK = backK; }
+    // Up to the rendered frame the motion is known (a generated frame); past it, it's a guess that it carries on: that part
+    // eases off as the motion slows, so a camera coming to a stop isn't pushed past where it stops and snapped back (ep9).
+    const float known = clamp(warpLag, 0.0, warp);
+    const float k = warpEase > 0.5 ? bestK : 1.0;
+    return clamp(best * (known + (warp - known) * k), -0.08, 0.08);
 }
 
 float2 WarpShift(float2 uv)
@@ -1801,7 +1810,7 @@ bool Still(int2 q, float2 size)
     if (n < 1) return false;
     float2 c = float2(q) + 0.5;
     float4 f = flowTex.SampleLevel(linClamp, c / size, 0);
-    float2 step = f.xy * f.z * size * (warpSrc != 0 ? warpPrevN : 1.0);   // this part of the scene's motion since the frame before, pixels
+    float2 step = f.xy * size * (warpSrc != 0 ? min(f.z, 1.0) * warpPrevN : f.z);   // this part of the scene's motion since the frame before, pixels
     if (dot(step, step) < 2.25) return true;               // under a pixel and a half: nothing to tell apart
     float3 a = src.Load(int3(q, 0)).rgb;
     float3 d = abs(a - srcPrev.SampleLevel(linClamp, (c - step) / size, 0).rgb);
@@ -2402,6 +2411,7 @@ struct Constants
     uint32_t warpSrc;                   // 0 motion from the picture, 1 the game's motion vectors and depth, 2 its vectors only
     float    warpSnapX, warpSnapY;      // frame warp: moves rounded to whole steps of this many game-frame pixels (0 = off)
     float    warpLag;                   // the game's motion with frame generation: shown frames behind its vectors' frame
+    float    warpEase;                  // the game's motion: 1 = moves past the rendered frame ease off as the motion slows
 };
 static_assert(sizeof(Constants) / 4 <= 63, "root constants: at most 64 DWORDs in the root signature");
 
@@ -4596,6 +4606,7 @@ static DWORD WINAPI PresenterThread(void *)
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = (uint32_t)gsrc;
                 c.warpLag = g_status.fgActive ? gmo::SlotLag(pick) : 0.0f;
+                c.warpEase = (g_status.fgActive && s.warpEase) ? 1.0f : 0.0f;
             }
             // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
             else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
@@ -8677,8 +8688,9 @@ static bool EnsureGpu()
     if (failed) return false;
     D3D12_DESCRIPTOR_RANGE range = {};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 6;
-    range.BaseShaderRegister = 5;                          // t5 the vectors, t6 the depth, t7 the HUD mask, t8-t10 its pass's inputs
+    range.NumDescriptors = 7;
+    range.BaseShaderRegister = 5;                          // t5 the vectors, t6 the depth, t7 the HUD mask, t8-t10 its pass's inputs,
+                                                           // t11 the vectors of the rendered frame before
     D3D12_ROOT_PARAMETER p[2] = {};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     p[0].Constants.ShaderRegister = 1;                     // b1
@@ -8724,7 +8736,7 @@ static bool EnsureGpu()
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
         // one block of 6 views per staging slot, written at that slot's Present (its previous use is finished then:
         // the game's side waits for the slot's last copy list before reusing it)
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 6 * kStage; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 7 * kStage; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ok = SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = kStage + 3; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
@@ -8820,7 +8832,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     if (s >= kStage) return;
     slotId[s] = 0; slotPend[s] = slotOk[s] = false;
     if (!On()) { std::lock_guard<std::mutex> l(lk); pendN = 0; latest = -1; return; }
-    Entry e;
+    Entry e, ep;
     int k;
     float scale = 1.0f, lag = 0.0f;
     {
@@ -8864,8 +8876,11 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
             pendN--;
         }
         e = ring[k];
+        ep = ring[(k + kRing - 1) % kRing];
     }
     if (!e.mv || !EnsureGpu() || !EnsureFlow(e.mvW, e.mvH)) return;
+    // the rendered frame before's vectors (how much the motion kept up), where they are the same kind
+    const bool prevOk = ep.mv && ep.mv != e.mv && ep.mvW == e.mvW && ep.mvH == e.mvH && ep.mvFmt == e.mvFmt && !e.reset;
     // The HUD-less picture for the mask: a copy made this frame (or a few frames ago), or the game's own buffer when it
     // stays valid until the Present.
     ID3D12Resource *hl = nullptr; uint32_t hlState = 0; DXGI_FORMAT hlFmt = DXGI_FORMAT_UNKNOWN; float hlMap[4] = {};
@@ -8888,7 +8903,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     }
     // the views for this slot: t5 vectors, t6 depth, t7 HUD mask, t8 the frame, t9 the HUD-less picture, t10 the raw mask before
     D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
-    sh.ptr += (SIZE_T)(6 * s) * srvStride;
+    sh.ptr += (SIZE_T)(7 * s) * srvStride;
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -8897,6 +8912,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         auto at = [&](int i) { D3D12_CPU_DESCRIPTOR_HANDLE h = sh; h.ptr += (SIZE_T)i * srvStride; return h; };
         sv.Format = MvView(e.mvFmt);
         g_device->CreateShaderResourceView(e.mv, &sv, at(0));
+        g_device->CreateShaderResourceView(prevOk ? ep.mv : nullptr, &sv, at(6));
         sv.Format = e.hasDepth ? DepthView(e.dFmt) : DXGI_FORMAT_R32_FLOAT;
         g_device->CreateShaderResourceView(e.hasDepth ? e.depth : nullptr, &sv, at(1));
         sv.Format = DXGI_FORMAT_R8_UNORM;
@@ -8909,7 +8925,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         g_device->CreateShaderResourceView(hudRaw[1 - hudCur], &sv, at(5));
     }
     D3D12_GPU_DESCRIPTOR_HANDLE gh = srvHeap->GetGPUDescriptorHandleForHeapStart();
-    gh.ptr += (UINT64)(6 * s) * srvStride;
+    gh.ptr += (UINT64)(7 * s) * srvStride;
     list->SetDescriptorHeaps(1, &srvHeap);
     list->SetGraphicsRootSignature(rs);
     list->SetGraphicsRootDescriptorTable(1, gh);
@@ -8923,6 +8939,8 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     gc.mvScale[0] = e.mvScale[0] * (float)g_shared.warpGameSign * scale; gc.mvScale[1] = e.mvScale[1] * (float)g_shared.warpGameSign * scale;
     memcpy(gc.mvMap, e.mvMap, sizeof(gc.mvMap)); memcpy(gc.dMap, e.dMap, sizeof(gc.dMap));
     gc.mvInvalid = e.mvInvalid;
+    gc.pad[0] = scale > 0.0f ? 1.0f / scale : 1.0f;        // shown frames per rendered one: back to a whole rendered frame's motion
+    gc.pad[1] = prevOk ? 1.0f : 0.0f;
     const bool linear = StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT;
     gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (linear ? 8u : 0u);
     memcpy(gc.hMap, hlMap, sizeof(gc.hMap));
@@ -8977,11 +8995,12 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     if (hudMaskOk) gc.flags |= 4u;
 
     // 2. The motion texture
-    D3D12_RESOURCE_BARRIER b[3] = {
+    D3D12_RESOURCE_BARRIER b[4] = {
         Transition(flow[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
-        Transition(e.mv, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-        e.hasDepth ? Transition(e.depth, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) : D3D12_RESOURCE_BARRIER{} };
-    const UINT nb = e.hasDepth ? 3 : 2;
+        Transition(e.mv, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) };
+    UINT nb = 2;
+    if (e.hasDepth) b[nb++] = Transition(e.depth, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (prevOk) b[nb++] = Transition(ep.mv, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     list->ResourceBarrier(nb, b);
     list->SetPipelineState(pso);
     list->SetGraphicsRoot32BitConstants(0, sizeof(GConsts) / 4, &gc, 0);
@@ -8989,9 +9008,11 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     rh.ptr += (SIZE_T)s * rtvStride;
     list->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     list->DrawInstanced(3, 1, 0, 0);
-    b[0] = Transition(flow[s], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
-    b[1] = Transition(e.mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (e.hasDepth) b[2] = Transition(e.depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    nb = 0;
+    b[nb++] = Transition(flow[s], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+    b[nb++] = Transition(e.mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (e.hasDepth) b[nb++] = Transition(e.depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (prevOk) b[nb++] = Transition(ep.mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     list->ResourceBarrier(nb, b);
     slotPend[s] = true; slotOk[s] = !e.reset; slotDepth[s] = e.hasDepth; slotCut[s] = e.reset; slotLag[s] = lag;
 }

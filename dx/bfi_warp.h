@@ -198,7 +198,8 @@ cbuffer G : register(b1)
     float4 gDepthMap;     // screen uv -> depth texel
     float  gMvInvalid;    // the value the game writes where a vector is not valid
     uint   gFlags;        // 1 depth reversed (near = 1), 2 depth available, 4 the HUD mask (t7) is valid, 8 the frame is linear (scRGB)
-    float2 gPad;
+    float  gPerRendered;  // shown frames per rendered one (frame generation; 1 without): gMvScale * this = a rendered frame's motion
+    float  gPrevOk;       // 1 = t11 holds the vectors of the rendered frame before
     float4 gHMap;         // screen uv -> the game's HUD-less picture's texel
     float  gHudThr;       // HUD mask: a difference above this is HUD
     uint   gHudMode;      // how the frame and the HUD-less picture are compared: 0 as they are (the same encoding);
@@ -212,6 +213,7 @@ Texture2D<float>  gHud   : register(t7);   // HUD mask (1 = HUD), the size of th
 Texture2D<float4> hFinal : register(t8);   // HUD mask pass: the game's finished frame
 Texture2D<float4> hLess  : register(t9);   // and its HUD-less picture
 Texture2D<float>  hPrev  : register(t10);  // and the raw difference found at the Present before
+Texture2D<float2> gMvPrev : register(t11); // the vectors of the rendered frame before (same size and format)
 
 float4 PSWarpGame(float4 pos : SV_Position) : SV_Target
 {
@@ -233,8 +235,24 @@ float4 PSWarpGame(float4 pos : SV_Position) : SV_Target
         float d = gDepth.Load(int3(dq, 0));
         nearv = (gFlags & 1) != 0 ? d : 1.0 - d;
     }
+    // How much the motion kept up (z = 1 + k): this point's motion against its motion one rendered frame before, where it
+    // was then; slower now -> k < 1, and a move past the rendered frame is scaled by it (WarpShiftGame). Both under half
+    // a pixel: still, k = 1.
+    float k = 1.0;
+    if (gPrevOk > 0.5)
+    {
+        const float2 cur = m * gMvScale * gPerRendered;   // uv, a whole rendered frame
+        int2 pq = clamp(int2((uv + cur) * gMvMap.xy + gMvMap.zw), int2(0, 0), int2(mw, mh) - 1);
+        float2 mp = gMvPrev.Load(int3(pq, 0));
+        if (!(mp.x == gMvInvalid || mp.y == gMvInvalid || any(isnan(mp))))
+        {
+            const float2 px = 1.0 / gOutTexel;
+            const float a = length(cur * px), b = length(mp * gMvScale * gPerRendered * px);
+            if (b > 0.5) k = saturate(a / b);
+        }
+    }
     // Streamline: the pixel was at uv + m * mvecScale in the frame before, so it moved by the opposite.
-    return float4(-m * gMvScale, 1.0, saturate(nearv));
+    return float4(-m * gMvScale, 1.0 + k, saturate(nearv));
 }
 
 // HUD mask (where the game hands its upscaler a HUD-less picture of the frame, e.g. 007 First Light): what differs
