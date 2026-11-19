@@ -6130,12 +6130,14 @@ static DWORD WINAPI PresenterThread(void *)
                             swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + swBackMs + 6.0))) ? swBad + 1 : 0;   // the steps back below
                             // don't count as slower
                             // Held, frames repeating with little to spare before their flash (the GPU work grew): 2 ms
-                            // earlier when 3 of the last 5 seconds had 2 or more repeats with under 3 ms to spare, at most
-                            // 8 ms earlier than the start time found. Stray: the search took the quickest start time
-                            // (4.4 ms to spare), then 2-7 frames a second repeated at 0.5-3.5 ms to spare -- never under
-                            // the 1.5 ms (3 s in a row) this needed before, so it stayed there; 2 ms earlier had 8.5 ms.
+                            // earlier when 3 of the last 5 seconds had 2 or more repeats with under 6 ms to spare (the 10th
+                            // percentile: the few frames that miss are below it), at most 8 ms earlier than the start time
+                            // found. Stray: the search took the quickest start time (4.4 ms to spare), then 2-7 frames a
+                            // second repeated at 0.5-3.5 ms to spare -- never under the 1.5 ms (3 s in a row) this needed
+                            // before, so it stayed there; 2 ms earlier had 8.5 ms. Kena (gm14, under 3 ms): 1-5 repeats a
+                            // second at 2.5-5 ms to spare, never moved.
                             // Only where the game holds the cap, so a scene too heavy for it moves nothing.
-                            const bool tight = !fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.003;
+                            const bool tight = !fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.006;
                             swTightHist = ((swTightHist << 1) | (tight ? 1u : 0u)) & 0x1Fu;
                             int nTight = 0; for (int k = 0; k < 5; k++) nTight += (swTightHist >> k) & 1u;
                             if (nTight >= 3 && swBackMs < 7.9)
@@ -13471,6 +13473,28 @@ static void draw_overlay(reshade::api::effect_runtime *)
         // ---------------------------------------------------------- every cap
         ImGui::Spacing();
         ImGui::SeparatorText("Every cap");
+        ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest latency shows the newest frame -- best at the Refresh cap, and needed by the hold at\nthe frame start. Smooth holds up to one finished frame in reserve (about one refresh more latency)\nso every frame is lit once and in order -- it only helps at the Half or Quarter cap.");
+        if (s.pacingMode == 0)
+        {
+            ImGui::Indent(16.0f);
+            bool cu = s.smoothCatchUp != 0;
+            if (ImGui::Checkbox("Catch up after a hitch", &cu)) s.smoothCatchUp = cu ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off (default): after a game hitch the presenter stays one frame behind (about one cycle\n"
+                                                          "more latency) and shows every frame once, in order.\n"
+                                                          "On: when two finished frames keep waiting, one is skipped to get back to the lowest\n"
+                                                          "latency -- a second stutter shortly after the first.");
+            ImGui::Unindent(16.0f);
+        }
+        bool aa = s.autoAhead != 0;
+        if (ImGui::Checkbox("Automatic frames ahead (1, or 2 while the game misses cycles)", &aa)) s.autoAhead = aa ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many frames the game may queue on the GPU ahead of the screen.\n1 = lowest input lag (like a low-latency mode); 2 if the frame rate drops.");
+        ImGui::Indent(16.0f);
+        if (!s.autoAhead) ImGui::SliderInt("Max frames ahead (0 = off)", &s.maxAhead, 0, 3);
+        else ImGui::TextDisabled("Frames ahead in use: %d", st.aheadInUse);
+        ImGui::Unindent(16.0f);
+        ImGui::TextDisabled("Fine-tuning (later release at Refresh rate, the just-in-time margin, lining Reflex's limit up): Advanced.");
+        ImGui::Spacing();
         bool fw = s.frameWarp != 0;
         if (ImGui::Checkbox("Frame warp: fill missing frames (test, Ctrl+Shift+W)", &fw)) s.frameWarp = fw ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("For games that run just under the strobe rate (50-59 fps against a 60 Hz strobe). A strobe\n"
@@ -13541,27 +13565,6 @@ static void draw_overlay(reshade::api::effect_runtime *)
             }
             ImGui::Unindent(16.0f);
         }
-        ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest latency shows the newest frame -- best at the Refresh cap, and needed by the hold at\nthe frame start. Smooth holds up to one finished frame in reserve (about one refresh more latency)\nso every frame is lit once and in order -- it only helps at the Half or Quarter cap.");
-        if (s.pacingMode == 0)
-        {
-            ImGui::Indent(16.0f);
-            bool cu = s.smoothCatchUp != 0;
-            if (ImGui::Checkbox("Catch up after a hitch", &cu)) s.smoothCatchUp = cu ? 1 : 0;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off (default): after a game hitch the presenter stays one frame behind (about one cycle\n"
-                                                          "more latency) and shows every frame once, in order.\n"
-                                                          "On: when two finished frames keep waiting, one is skipped to get back to the lowest\n"
-                                                          "latency -- a second stutter shortly after the first.");
-            ImGui::Unindent(16.0f);
-        }
-        bool aa = s.autoAhead != 0;
-        if (ImGui::Checkbox("Automatic frames ahead (1, or 2 while the game misses cycles)", &aa)) s.autoAhead = aa ? 1 : 0;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many frames the game may queue on the GPU ahead of the screen.\n1 = lowest input lag (like a low-latency mode); 2 if the frame rate drops.");
-        ImGui::Indent(16.0f);
-        if (!s.autoAhead) ImGui::SliderInt("Max frames ahead (0 = off)", &s.maxAhead, 0, 3);
-        else ImGui::TextDisabled("Frames ahead in use: %d", st.aheadInUse);
-        ImGui::Unindent(16.0f);
-        ImGui::TextDisabled("Fine-tuning (later release at Refresh rate, the just-in-time margin, lining Reflex's limit up): Advanced.");
     }
 
     // ================================================================ 4. status
