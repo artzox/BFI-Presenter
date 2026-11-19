@@ -67,7 +67,8 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s);
 static void Published(UINT s, UINT64 id);
 static int  SlotFor(int s, UINT64 id);
 static ID3D12Resource *FlowRes(int s);
-static void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride);
+static UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride);
+static ID3D12Resource *FlowFor(int s, UINT gen);
 static UINT FlowGenNow();
 static int  StateNow(char *why, size_t n);
 static int  StateFast();
@@ -83,7 +84,8 @@ static inline void AtPresent(ID3D12GraphicsCommandList *, UINT) {}
 static inline void Published(UINT, UINT64) {}
 static inline int  SlotFor(int, UINT64) { return 0; }
 static inline ID3D12Resource *FlowRes(int) { return nullptr; }
-static inline void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE, UINT) {}
+static inline UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE, UINT) { return 0; }
+static inline ID3D12Resource *FlowFor(int, UINT) { return nullptr; }
 static inline UINT FlowGenNow() { return 0; }
 static inline int  StateNow(char *why, size_t n) { if (n) why[0] = 0; return 0; }
 static inline int  StateFast() { return 0; }
@@ -4538,6 +4540,7 @@ static DWORD WINAPI PresenterThread(void *)
         // frame older (frames never shown): the share of that motion for warpAhead game frames. In steps of 1/256, so
         // the cycle's refreshes compare equal and drawn buffers can still be reused.
         UINT64 warpOld = 0;
+        ID3D12Resource *gFlow = nullptr;                // this refresh's motion texture from the game's motion
         if (StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT) c.flags |= 1024u;
         if (warpAhead > 0.0 && s.frameWarp && warp.ok && (warpOld = warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrev >= 0 && warpPrev != pick && warpPrevId == warpOld && g_stageId[warpPrev] == warpOld && g_stageFence[warpPrev] <= done)
@@ -4552,11 +4555,11 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     D3D12_CPU_DESCRIPTOR_HANDLE gh = srvHeap->GetCPUDescriptorHandleForHeapStart();
                     gh.ptr += (SIZE_T)kGameFlowSrv * srvStride;
-                    gmo::WriteFlowSrvs(gh, srvStride);
-                    gameFlowGen = fg;
+                    gameFlowGen = gmo::WriteFlowSrvs(gh, srvStride);
                 }
+                gFlow = gmo::FlowFor(pick, gameFlowGen);   // one texture for the whole refresh (both barriers, the check)
             }
-            if (gsrc && gmo::FlowRes(pick))
+            if (gsrc && gFlow)
             {
                 // with frame generation, a limit of its own (the game's motion overshoots visibly further out)
                 const double ahead = g_status.fgActive ? std::min(warpAhead, (double)s.warpMaxGameFg) : warpAhead;
@@ -4632,7 +4635,7 @@ static DWORD WINAPI PresenterThread(void *)
             list->ResourceBarrier(1, &b3);
             if (c.warpSrc != 0)
             {
-                D3D12_RESOURCE_BARRIER b4 = Transition(gmo::FlowRes(pick), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                D3D12_RESOURCE_BARRIER b4 = Transition(gFlow, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 list->ResourceBarrier(1, &b4);
             }
         }
@@ -4736,10 +4739,10 @@ static DWORD WINAPI PresenterThread(void *)
             }
             if (c.warp != 0.0f && c.warpSrc == 0 && (warp.flowNew != pickId || warp.flowOld != warpOld)) { warp.RecordFlow(list); touched = true; }
             // The check: the measured motion for this pair too, and both textures copied for reading back.
-            if (s.warpGameCheck && c.warpSrc != 0 && cycleStart && !chkPending && Now() - chkT >= 2.0 && gmo::FlowRes(pick))
+            if (s.warpGameCheck && c.warpSrc != 0 && cycleStart && !chkPending && Now() - chkT >= 2.0 && gFlow)
             {
                 if (warp.flowNew != pickId || warp.flowOld != warpOld) { warp.RecordFlow(list); touched = true; }
-                ID3D12Resource *srcR[2] = { gmo::FlowRes(pick), warp.flowOut[WarpGpu::Out()] };
+                ID3D12Resource *srcR[2] = { gFlow, warp.flowOut[WarpGpu::Out()] };
                 bool okRb = true;
                 for (int q = 0; q < 2 && okRb; q++)
                 {
@@ -4911,7 +4914,7 @@ static DWORD WINAPI PresenterThread(void *)
             list->ResourceBarrier(1, &b3);
             if (c.warpSrc != 0)
             {
-                D3D12_RESOURCE_BARRIER b4 = Transition(gmo::FlowRes(pick), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                D3D12_RESOURCE_BARRIER b4 = Transition(gFlow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 list->ResourceBarrier(1, &b4);
             }
         }
@@ -8203,7 +8206,9 @@ static int  fgK = 0;                                     // frame generation: sh
 static int  fgKNext = 0, fgKSecs = 0;
 static uint64_t seq = 0;
 static UINT genNext = 1;
-static std::vector<ID3D12Resource *> retired;            // replaced copies, released with the frame resources
+static std::vector<std::pair<ID3D12Resource *, double>> retired;   // replaced copies, released 5 s on (a game list that
+                                                         // copied into one has run by then; they used to stay until the
+                                                         // device changed: ~100 MB more each time Townfall letterboxed)
 static Tag setTag[2]; static Res setRes[2]; static bool haveSet[2] = {};   // the last depth / vectors given to slSetTag
 
 // HUD mask: the game's HUD-less picture (Streamline buffer type 2), copied when the game tags it with a command list
@@ -8235,6 +8240,14 @@ static ID3D12PipelineState *pso = nullptr;
 static ID3D12DescriptorHeap *srvHeap = nullptr, *rtvHeap = nullptr;
 static UINT srvStride = 0, rtvStride = 0;
 static ID3D12Resource *flow[kStage] = {};
+// The motion textures are made anew when the game's vector size changes (Townfall: its cutscenes switch between 2258x1271
+// and a letterboxed 2258x961, twice within 2 s before the GPU hung in 1.0.44-ep1). The old ones were released at once,
+// while the presenter's queue could still be reading one and its command list had a barrier on one and the matching
+// barrier back on the new one. Now they are swapped under flowLk, kept for 3 s before release, and the presenter takes
+// one texture per refresh, with the generation its views were written for.
+static std::mutex flowLk;
+struct RetiredRes { ID3D12Resource *r; double t; };
+static std::vector<RetiredRes> flowRetired;
 static UINT flowW = 0, flowH = 0;
 static std::atomic<UINT> flowGen{0};                     // bumped when the motion textures are made anew
 static bool slotPend[kStage] = {}, slotOk[kStage] = {}, slotDepth[kStage] = {};
@@ -8409,7 +8422,7 @@ static void CopyHud(const Tag &t, void *cmd)
     { src->Release(); return; }
     if (!hudCopy || hudW != (UINT)hd.Width || hudH != hd.Height || hudFmt != hd.Format)
     {
-        if (hudCopy) retired.push_back(hudCopy);
+        if (hudCopy) retired.push_back({ hudCopy, Now() });
         hudCopy = MakeCopy(hd, L"BFI frame warp: the game's HUD-less picture");
         hudW = (UINT)hd.Width; hudH = hd.Height; hudFmt = hd.Format;
     }
@@ -8463,6 +8476,13 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
 // call (NGX) put into the same shape. via: 0 Streamline, 1 DLSS (NGX).
 static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int from)
 {
+    if (!retired.empty())
+    {
+        const double tn = Now();
+        for (size_t i = 0; i < retired.size();)
+            if (tn - retired[i].second > 5.0) { retired[i].first->Release(); retired[i] = retired.back(); retired.pop_back(); }
+            else i++;
+    }
     ID3D12GraphicsCommandList *cl = nullptr;
     if (FAILED(((IUnknown *)cmd)->QueryInterface(__uuidof(ID3D12GraphicsCommandList), (void **)&cl)) || !cl)
     { SetState(-1, "the upscaler call has no D3D12 command list -- the picture's own motion is used"); return; }
@@ -8495,7 +8515,7 @@ static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int fr
         // recorded on a list it hasn't submitted yet must still exist when that list runs).
         for (int i = 0; i < kRing; i++) { SafeRelease(ring[i].mv); SafeRelease(ring[i].depth); ring[i] = Entry(); }
         SafeRelease(hudCopy); hudW = hudH = 0; hudFmt = DXGI_FORMAT_UNKNOWN; hudLive = false; hudModesSet = false;
-        for (ID3D12Resource *r : retired) r->Release();
+        for (auto &r : retired) r.first->Release();
         retired.clear();
         pendN = 0; latest = -1; depthFailed = false;
         ringDev = g_device;
@@ -8504,13 +8524,13 @@ static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int fr
     Entry &e = ring[k];
     if (!e.mv || e.mvW != (UINT)md.Width || e.mvH != md.Height || e.mvFmt != md.Format)
     {
-        if (e.mv) retired.push_back(e.mv);
+        if (e.mv) retired.push_back({ e.mv, Now() });
         e.mv = MakeCopy(md, L"BFI frame warp: game motion vectors");
         e.mvW = (UINT)md.Width; e.mvH = md.Height; e.mvFmt = md.Format; e.gen = genNext++;
     }
     if (dp && (!e.depth || e.dW != (UINT)dd.Width || e.dH != dd.Height || e.dFmt != dd.Format))
     {
-        if (e.depth) retired.push_back(e.depth);
+        if (e.depth) retired.push_back({ e.depth, Now() });
         e.depth = MakeCopy(dd, L"BFI frame warp: game depth");
         e.dW = (UINT)dd.Width; e.dH = dd.Height; e.dFmt = dd.Format; e.gen = genNext++;
         if (!e.depth)
@@ -8642,9 +8662,28 @@ static bool EnsureFlow(UINT mvW, UINT mvH)
     if (!g_stage[0]) return false;
     const D3D12_RESOURCE_DESC sd = g_stage[0]->GetDesc();
     const UINT w = std::max(64u, std::min(mvW, ((UINT)sd.Width + 1) / 2)), h = std::max(64u, std::min(mvH, (sd.Height + 1) / 2));
+    {
+        // Retired textures released 3 s on: no queue reads them by then.
+        std::lock_guard<std::mutex> l(flowLk);
+        const double tn = Now();
+        for (size_t i = 0; i < flowRetired.size();)
+            if (tn - flowRetired[i].t > 3.0) { flowRetired[i].r->Release(); flowRetired[i] = flowRetired.back(); flowRetired.pop_back(); }
+            else i++;
+    }
     if (flow[0] && flowW == w && flowH == h) return true;
-    for (UINT i = 0; i < kStage; i++) { SafeRelease(flow[i]); slotPend[i] = slotOk[i] = false; slotId[i] = 0; }
-    SafeRelease(hudRaw[0]); SafeRelease(hudRaw[1]); SafeRelease(hudMask); hudMaskOk = false;
+    {
+        std::lock_guard<std::mutex> l(flowLk);
+        const double tn = Now();
+        for (UINT i = 0; i < kStage; i++)
+        {
+            if (flow[i]) flowRetired.push_back({ flow[i], tn });
+            flow[i] = nullptr; slotPend[i] = slotOk[i] = false; slotId[i] = 0;
+        }
+        ID3D12Resource **hr0[3] = { &hudRaw[0], &hudRaw[1], &hudMask };
+        for (auto r : hr0) { if (*r) flowRetired.push_back({ *r, tn }); *r = nullptr; }
+        hudMaskOk = false;
+        flowGen++;                                        // the presenter's views of the old ones are out of date
+    }
     D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -8652,17 +8691,22 @@ static bool EnsureFlow(UINT mvW, UINT mvH)
     rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *nf[kStage] = {};
     for (UINT i = 0; i < kStage; i++)
     {
-        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&flow[i]))))
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&nf[i]))))
         {
-            for (UINT j = 0; j < kStage; j++) SafeRelease(flow[j]);
+            for (UINT j = 0; j < kStage; j++) SafeRelease(nf[j]);
             return false;
         }
-        flow[i]->SetName(L"BFI frame warp: the game's motion");
+        nf[i]->SetName(L"BFI frame warp: the game's motion");
         D3D12_CPU_DESCRIPTOR_HANDLE rh = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         rh.ptr += (SIZE_T)i * rtvStride;
-        g_device->CreateRenderTargetView(flow[i], nullptr, rh);
+        g_device->CreateRenderTargetView(nf[i], nullptr, rh);
+    }
+    {
+        std::lock_guard<std::mutex> l(flowLk);
+        for (UINT i = 0; i < kStage; i++) flow[i] = nf[i];
     }
     // the HUD mask's textures (optional)
     rd.Format = DXGI_FORMAT_R8_UNORM;
@@ -8676,8 +8720,11 @@ static bool EnsureFlow(UINT mvW, UINT mvH)
         rh.ptr += (SIZE_T)(kStage + i) * rtvStride;
         g_device->CreateRenderTargetView(*hr[i], nullptr, rh);
     }
-    flowW = w; flowH = h;
-    flowGen++;
+    {
+        std::lock_guard<std::mutex> l(flowLk);
+        flowW = w; flowH = h;
+        flowGen++;
+    }
     return true;
 }
 
@@ -8868,8 +8915,9 @@ static int SlotFor(int s, UINT64 id)
 }
 
 // The presenter: shader-resource views of the motion textures, into its own heap (when they were made anew).
-static void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride)
+static UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride)
 {
+    std::lock_guard<std::mutex> l(flowLk);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
     sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -8880,6 +8928,13 @@ static void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride)
         D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)i * stride;
         g_device->CreateShaderResourceView(flow[i], &sv, h);   // a null view while there is none
     }
+    return flowGen.load();
+}
+// The slot's motion texture if the views the presenter wrote (generation gen) are still for it; else none this refresh.
+static ID3D12Resource *FlowFor(int s, UINT gen)
+{
+    std::lock_guard<std::mutex> l(flowLk);
+    return s >= 0 && s < (int)kStage && flowGen.load() == gen ? flow[s] : nullptr;
 }
 static UINT FlowGenNow() { return flowGen.load(); }
 static ID3D12Resource *FlowRes(int s) { return s >= 0 && s < (int)kStage ? flow[s] : nullptr; }
@@ -8911,7 +8966,12 @@ static void HudBad(double pct)
 static void Release()
 {
     std::lock_guard<std::mutex> l(lk);
-    for (UINT i = 0; i < kStage; i++) { SafeRelease(flow[i]); slotPend[i] = slotOk[i] = false; slotId[i] = 0; }
+    {
+        std::lock_guard<std::mutex> l2(flowLk);
+        for (UINT i = 0; i < kStage; i++) { SafeRelease(flow[i]); slotPend[i] = slotOk[i] = false; slotId[i] = 0; }
+        for (auto &r : flowRetired) r.r->Release();
+        flowRetired.clear();
+    }
     flowW = flowH = 0;
     flowGen++;
     SafeRelease(hudRaw[0]); SafeRelease(hudRaw[1]); SafeRelease(hudMask); hudMaskOk = false;
