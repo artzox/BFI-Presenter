@@ -101,19 +101,9 @@ struct WarpClock
         const bool locked = rate > 0.9 && std::fabs(rate - std::floor(rate + 0.5)) < 0.012;
         if (mode == 2)
         {
-            // Within 3% of a whole multiple counts as holding it here: a lost frame now and then (Jusant at 60 of 60 with
-            // one missing every second or two) reads as 0.983 and drained slowly, as below the strobe rate.
-            const bool held = rate > 0.9 && std::fabs(rate - std::floor(rate + 0.5)) < 0.03;
-            const bool locked = held;
             const double r = locked ? std::floor(rate + 0.5) : rate;
             double a = ahead + r - step;
-            // Settles back toward the frames as rendered: slowly below the strobe rate (measuring errors), quickly at it --
-            // a repeat not taken back by a skip is otherwise drained over many flashes, each moved a little, and every
-            // moved flash can show errors at high-contrast edges (Jusant, ep5: 14.6 cycles a second moved for 0.8 repeats).
-            // At the strobe rate the repeat itself keeps its move (0.9); the flashes after it settle in two or three.
-            if (!locked) a *= 0.99;
-            else if (!isNew) a *= 0.9;
-            else { a *= 0.4; if (a < 0.08) a = 0.0; }
+            a *= locked ? 0.9 : 0.99;                      // settles back toward the frames as rendered (measuring errors)
             if (a < 0.0) a = 0.0;
             if (a > maxAhead) a = maxAhead;
             if (!isNew && a < ahead) a = ahead;            // no step backward on a cycle without a new frame
