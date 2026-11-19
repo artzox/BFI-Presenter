@@ -648,6 +648,19 @@ static std::atomic<bool> g_vkRfxBad{false};
 static std::atomic<double> g_vkPauseT[8];
 static std::atomic<int> g_vkPauseN{0};
 static std::atomic<bool> g_vkAtSleepBad{false};   // the limit at the game's Reflex sleep led to missed refreshes: off for the session
+// The pauses while the limit at the game's Reflex sleep was on without frame generation (from 2 s after it came on), kept
+// across swap chain rebuilds (vp4: the third pause came 0.6 s before an automatic rebuild, which switched the limit off
+// and on again and started the count over).
+static std::atomic<double> g_vkAtSleepPauseT[8];
+static std::atomic<int> g_vkAtSleepPauseN{0};
+static std::atomic<double> g_vkAtSleepOnT{0.0};
+static int VkAtSleepPausesSince(double since)
+{
+    int n = 0;
+    const int k = g_vkAtSleepPauseN.load();
+    for (int i = 0; i < 8 && i < k; i++) if (g_vkAtSleepPauseT[i].load() >= since) n++;
+    return n;
+}
 static std::atomic<bool> g_vkHuntSteady{true};    // presentation was steady when the alignment went round the strobe cycle
 static int VkPausesSince(double since)
 {
@@ -3126,7 +3139,12 @@ static void PresenterThread(Swapchain *sc)
             if (now != hitchPaused)
             {
                 hitchPaused = now;
-                if (now) { const int k = g_vkPauseN.fetch_add(1); g_vkPauseT[k % 8].store(Now()); }
+                if (now)
+                {
+                    const int k = g_vkPauseN.fetch_add(1); g_vkPauseT[k % 8].store(Now());
+                    if (g_vkSleepLimitUs.load() > 0 && g_vkFgFactor.load() <= 1 && Now() - g_vkAtSleepOnT.load() >= 2.0)
+                    { const int j = g_vkAtSleepPauseN.fetch_add(1); g_vkAtSleepPauseT[j % 8].store(Now()); }
+                }
                 LOGI("BFI Presenter: hitch guard: BFI %s (%s)", now ? "paused" : "resumed",
                      now ? (stalled ? "game stalled" : "missed refreshes") : "steady again");
             }
@@ -3463,29 +3481,23 @@ static void PresenterThread(Swapchain *sc)
                              !g_vkRfxBad.load() && sc->autoCapDown.load() && !capProbe && !dupPresents)
                         want = (int)(1e6 * s.frames / hzA + 0.5);
                     static double onT = 0.0, fpsOn = 0.0; static int badSecs = 0;
-                    // Back-off (vp3): without frame generation, a game that leaves the GPU no room (Indiana Jones at 60 of
-                    // about 65 fps) has its frames lined up to finish just before the flash -- right when the presenter draws.
-                    // The presenter's refreshes then came late: 25 hitch-guard pauses in 100 s, against 1 with the presenter's
-                    // own cap. 3 pauses within 60 s while the limit is on switch it off for the session.
+                    // Back-off (vp3, vp4): without frame generation, a game that leaves the GPU no room (Indiana Jones at 60
+                    // of about 65 fps) has its frames lined up to finish just before the flash -- right when the presenter
+                    // draws. The presenter's refreshes then came late: 25 hitch-guard pauses in 100 s, against 1 with the
+                    // presenter's own cap. 3 pauses within 60 s while the limit was on switch it off for the session.
+                    if (f == 1 && want > 0 && !g_vkAtSleepBad.load())
                     {
-                        static double atSleepOnT = 0.0;
-                        const bool atSleepNow = f == 1 && g_vkSleepLimitUs.load() > 0;
-                        static bool atSleepWas = false;
-                        if (atSleepNow && !atSleepWas) atSleepOnT = Now();
-                        atSleepWas = atSleepNow;
-                        if (atSleepNow && want > 0)
+                        const int np = VkAtSleepPausesSince(Now() - 60.0);
+                        if (np >= 3 && !g_vkAtSleepBad.exchange(true))
                         {
-                            const int np = VkPausesSince(std::max(atSleepOnT + 2.0, Now() - 60.0));
-                            if (np >= 3 && !g_vkAtSleepBad.exchange(true))
-                            {
-                                want = 0;
-                                LOGW("BFI Presenter: frame limit at the game's Reflex sleep: BFI paused %d times in the last 60 s while it was on "
-                                     "(missed refreshes: the GPU leaves the presenter too little room at the flash) -- off for this session; "
-                                     "the presenter's frame cap paces the game", np);
-                            }
+                            want = 0;
+                            LOGW("BFI Presenter: frame limit at the game's Reflex sleep: BFI paused %d times in the last 60 s while it was on "
+                                 "(missed refreshes: the GPU leaves the presenter too little room at the flash) -- off for this session; "
+                                 "the presenter's frame cap paces the game", np);
                         }
                     }
                     const int was = g_vkSleepLimitUs.exchange(want);
+                    if (was <= 0 && want > 0) g_vkAtSleepOnT.store(Now());
                     if ((was > 0) != (want > 0))
                     {
                         LOGI("BFI Presenter: frame limit at the game's Reflex sleep %s (%d us per rendered frame, frame generation %dx)",
