@@ -5386,9 +5386,165 @@ template <int I> static int hk_EvalC(VkCommandBuffer cb, const void *h, const vo
 }
 
 // Once a second from the presenter: hooks DLSS's Vulkan exports once a module with them is loaded; reports every 10 s.
+// Streamline probe (Vulkan, test): what a game tags for Streamline each frame -- above all whether it hands over a
+// picture without its HUD (buffer type 2), which DX uses to keep the HUD still (FrameWarpGameHud). Only
+// sl.interposer.dll's slSetTag, slSetTagForFrame and slEvaluateFeature are hooked; nothing is changed. Layouts as the
+// DX probe (Streamline SDK 2.x); for Vulkan the resource's native is a VkImage, state its VkImageLayout and
+// nativeFormat its VkFormat. Every pointer is checked before it is read.
+namespace sl
+{
+struct Base { void *next; uint8_t type[16]; size_t version; };
+struct Res  { Base b; uint32_t type; uint32_t pad; void *native; void *mem; void *view; uint32_t state;
+              uint32_t width, height, nativeFormat, mips, layers; };
+struct Ext  { uint32_t top, left, width, height; };
+struct Tag  { Base b; Res *res; uint32_t bufType; uint32_t lifecycle; Ext ext; };
+static_assert(sizeof(Tag) == 64, "sl::ResourceTag layout");
+typedef int (*PFN_SetTag)(const void *vp, const Tag *tags, uint32_t n, void *cmd);
+typedef int (*PFN_SetTagForFrame)(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd);
+typedef int (*PFN_Evaluate)(uint32_t feature, const void *frame, const Base **inputs, uint32_t n, void *cmd);
+static PFN_SetTag o_SetTag; static PFN_SetTagForFrame o_SetTagForFrame; static PFN_Evaluate o_Evaluate;
+static const uint8_t kTagGuid[16] = { 0xad,0x5a,0x6a,0x4c, 0x45,0xb4, 0x6c,0x49, 0x87,0xff,0x1a,0xf3,0x84,0x5b,0xe6,0x53 };
+struct Stat { uint32_t calls = 0, w = 0, h = 0, fmt = 0, layout = 0, extW = 0, extH = 0, life = 0, noRes = 0, bad = 0; };
+static std::mutex lk;
+static std::map<uint32_t, Stat> tagsSet, tagsEval;
+static std::map<uint32_t, uint32_t> evals;
+static uint32_t badCalls = 0;
+static bool tried = false, hooked = false;
+static double winT = 0.0; static int reports = 0;
+
+static const char *TagName(uint32_t t)
+{
+    switch (t)
+    {
+    case 0: return "depth"; case 1: return "motion vectors"; case 2: return "HUD-less colour"; case 3: return "upscaler input colour";
+    case 4: return "upscaler output colour"; case 5: return "normals"; case 6: return "roughness"; case 7: return "albedo";
+    case 9: return "UI colour and alpha"; case 15: return "backbuffer"; default: return nullptr;
+    }
+}
+static const char *FeatureName(uint32_t f)
+{
+    switch (f)
+    {
+    case 0: return "DLSS"; case 1: return "NRD"; case 2: return "NIS"; case 3: return "Reflex"; case 4: return "PCL";
+    case 1000: return "DLSS frame generation"; case 1001: return "DLSS ray reconstruction"; default: return nullptr;
+    }
+}
+static void NoteOne(const Tag &tg, std::map<uint32_t, Stat> &into)
+{
+    if (tg.b.version > 64 || tg.bufType > 255) { badCalls++; return; }
+    Stat &st = into[tg.bufType];
+    st.calls++;
+    st.life = tg.lifecycle;
+    if (tg.ext.width) { st.extW = tg.ext.width; st.extH = tg.ext.height; }
+    const Res *r = tg.res;
+    if (!r) { st.noRes++; return; }
+    if (!Plaus(r)) { st.bad++; return; }
+    if (r->width && r->width < 32768 && r->height < 32768) { st.w = r->width; st.h = r->height; st.fmt = r->nativeFormat; st.layout = r->state; }
+}
+static void NoteTags(const Tag *tags, uint32_t n)
+{
+    std::lock_guard<std::mutex> l(lk);
+    if (n == 0 || n > 64 || !Plaus(tags)) { badCalls++; return; }
+    for (uint32_t i = 0; i < n; i++) NoteOne(tags[i], tagsSet);
+}
+static void NoteInputs(const Base **in, uint32_t n)
+{
+    std::lock_guard<std::mutex> l(lk);
+    if (!in || n == 0 || n > 64 || !Plaus(in)) return;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        const Base *b = in[i];
+        for (int depth = 0; b && depth < 8; depth++)
+        {
+            if (!Plaus(b)) { badCalls++; break; }
+            if (memcmp(b->type, kTagGuid, 16) == 0) NoteOne(*(const Tag *)b, tagsEval);
+            b = (const Base *)b->next;
+        }
+    }
+}
+static int hk_SetTag(const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); return o_SetTag(vp, tags, n, cmd); }
+static int hk_SetTagForFrame(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd)
+{ NoteTags(tags, n); return o_SetTagForFrame(frame, vp, tags, n, cmd); }
+static int hk_Evaluate(uint32_t feature, const void *frame, const Base **inputs, uint32_t n, void *cmd)
+{
+    { std::lock_guard<std::mutex> l(lk); evals[feature]++; }
+    NoteInputs(inputs, n);
+    return o_Evaluate(feature, frame, inputs, n, cmd);
+}
+// Once a second (from gvk::Tick): hooks Streamline when it is loaded, and reports every 10 s (the first minute).
+static void Tick(double t)
+{
+    if (!tried)
+    {
+        HMODULE m = GetModuleHandleA("sl.interposer.dll");
+        if (!m) return;
+        tried = true;
+        char path[MAX_PATH] = "";
+        GetModuleFileNameA(m, path, MAX_PATH);
+        if (!GetProcAddress(m, "slSetTagForFrame"))
+        {
+            LOGI("BFI Presenter: Streamline (Vulkan): %s has no slSetTagForFrame -- not 2.x, left alone", path);
+            return;
+        }
+        struct { const char *name; void *hook; void **orig; } fns[] = {
+            { "slSetTag", (void *)&hk_SetTag, (void **)&o_SetTag },
+            { "slSetTagForFrame", (void *)&hk_SetTagForFrame, (void **)&o_SetTagForFrame },
+            { "slEvaluateFeature", (void *)&hk_Evaluate, (void **)&o_Evaluate },
+        };
+        char list[400] = "";
+        for (auto &f : fns)
+        {
+            void *p = (void *)GetProcAddress(m, f.name);
+            char why[96] = "not exported";
+            void *orig = p ? InlineHook64(p, f.hook, why, sizeof(why)) : nullptr;
+            if (orig) { *f.orig = orig; hooked = true; }
+            char one[160];
+            snprintf(one, sizeof(one), "%s%s %s%s%s", list[0] ? "; " : "", f.name, orig ? "hooked" : "not hooked", orig ? "" : " -- ", orig ? "" : why);
+            strncat(list, one, sizeof(list) - strlen(list) - 1);
+        }
+        LOGI("BFI Presenter: Streamline probe (Vulkan, test): %s: %s", path, list);
+        winT = t;
+        return;
+    }
+    if (!hooked || reports >= 6 || t - winT < 10.0) return;
+    std::map<uint32_t, Stat> ts, te; std::map<uint32_t, uint32_t> ev; uint32_t bad;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        ts.swap(tagsSet); te.swap(tagsEval); ev.swap(evals); bad = badCalls; badCalls = 0;
+    }
+    const double secs = t - winT;
+    winT = t;
+    reports++;
+    bool hudLess = false;
+    auto list = [&](std::map<uint32_t, Stat> &m, const char *from) {
+        for (auto &kv : m)
+        {
+            const Stat &st = kv.second;
+            if (kv.first == 2) hudLess = true;
+            const char *nm = TagName(kv.first);
+            char nb[24]; snprintf(nb, sizeof(nb), "type %u", kv.first);
+            LOGI("BFI Presenter: Streamline probe: %s tag %s %.0f/s: %ux%u format %u layout %u, used %ux%u, lifecycle %u [no resource %u, unreadable %u]",
+                 from, nm ? nm : nb, st.calls / secs, st.w, st.h, st.fmt, st.layout, st.extW, st.extH, st.life, st.noRes, st.bad);
+        }
+    };
+    list(ts, "slSetTag");
+    list(te, "slEvaluateFeature");
+    char evs[300] = "";
+    for (auto &kv : ev)
+    {
+        char one[80]; const char *nm = FeatureName(kv.first);
+        snprintf(one, sizeof(one), "%s%s%s %.0f/s", evs[0] ? ", " : "", nm ? nm : "feature ", nm ? "" : std::to_string(kv.first).c_str(), kv.second / secs);
+        strncat(evs, one, sizeof(evs) - strlen(evs) - 1);
+    }
+    LOGI("BFI Presenter: Streamline probe: last %.0f s: %u buffer types tagged, %u in evaluate calls, %u unreadable | evaluated: %s | HUD-less picture: %s",
+         secs, (unsigned)ts.size(), (unsigned)te.size(), bad, evs[0] ? evs : "none", hudLess ? "yes" : "no");
+}
+} // namespace sl
+
 static void Tick(double t)
 {
     if (!g_shared.frameWarp || !g_shared.warpGame) return;      // nothing hooked until frame warp with the game's motion is on
+    sl::Tick(t);      // nothing hooked until frame warp with the game's motion is on
     static const char *mods[2] = { "nvngx.dll", "_nvngx.dll" };
     for (int i = 0; i < 2; i++)
     {
