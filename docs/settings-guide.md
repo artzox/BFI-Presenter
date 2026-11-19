@@ -282,6 +282,14 @@ With frame generation, each shown frame moves by its share of a rendered frame's
 **Snap moves** (`FrameWarpSnapX`, `FrameWarpSnapY`, default off): moves are rounded to whole steps of this many pixels. With a CRT shader whose scanlines or mask break up on filled flashes (parts of the picture now move by different amounts), set up and down to the scanline width (e.g. CRT-Standalone's Scanline Width) and across to the mask's width.\
 *When to change it:* leave on. If a game looks worse with it (errors at the edges of things in front), turn it off for that game.
 
+**Even pacing** · `FrameWarpEvenPacing` · default: off · with the game's own motion (v1.0.44)\
+Fill-only frame warp moves only the flashes without a new frame. With even pacing, every flash shows the picture where the game's motion is at that moment, so each step on screen is the same: at 57 fps on a 60 Hz strobe, about 0.95 of a game frame every flash instead of 1, 1, 1 and then a stall. In camera pans this looks like a game at the full strobe rate. The cost: frames are moved a little all the time, so any error of the game's motion (edges where something uncovers the background, a HUD that changes every frame) shows on every flash, not one in twenty. The further below the strobe rate the game runs, the further frames are moved; it works best just under it (e.g. 55–59 fps on a 60 Hz strobe). Only where the settings window says the game's motion is used; elsewhere, and in a game that holds the strobe rate, missing frames are filled as usual.\
+*When to change it:* try it in a game that runs a few fps under the strobe rate with the game's motion; leave it off in games that often drop well below.
+
+**Camera cuts and letterboxed cutscenes** · `FrameWarpPauseCutscenes` · default: on · with the game's own motion (v1.0.44)\
+A quick cut to another camera angle has no motion to follow, so a filled flash there can only be wrong. When the game tells DLSS about a cut (Townfall does, in Streamline games and in direct DLSS calls), that frame and the next two are never filled, whatever this setting says. With this setting on, a cutscene that the game letterboxes through DLSS (its output a wide strip smaller than the screen, e.g. Townfall's 3840×1634 of 3840×2160) pauses frame warp until it returns to full screen. It only counts once the game has shown full-screen output in that session, and not once a letterbox has lasted 10 minutes in a row, so a game letterboxed by design keeps frame warp.\
+*When to change it:* leave on; turn it off for a game whose play goes in and out of letterbox.
+
 **Frame pacing** · `FramePacing` · default: Lowest latency (new ini files)
 - **Lowest latency** always shows the newest image: quickest response.
 - **Smooth** holds one finished image in reserve so every image is shown once, in order, even if one arrives a little late: about one refresh more delay.

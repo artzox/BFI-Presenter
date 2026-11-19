@@ -69,8 +69,11 @@ static int  SlotFor(int s, UINT64 id);
 static ID3D12Resource *FlowRes(int s);
 static UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride);
 static ID3D12Resource *FlowFor(int s, UINT gen);
+static bool PauseNow(UINT64 id, bool letterbox, const char **why);
+static int  CutsTake();
 static UINT FlowGenNow();
 static int  StateNow(char *why, size_t n);
+static int  StateFast();
 static int  ViaNow();
 static int  HudNow();
 static void HudBad(double pct);
@@ -85,8 +88,11 @@ static inline int  SlotFor(int, UINT64) { return 0; }
 static inline ID3D12Resource *FlowRes(int) { return nullptr; }
 static inline UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE, UINT) { return 0; }
 static inline ID3D12Resource *FlowFor(int, UINT) { return nullptr; }
+static inline bool PauseNow(UINT64, bool, const char **) { return false; }
+static inline int  CutsTake() { return 0; }
 static inline UINT FlowGenNow() { return 0; }
 static inline int  StateNow(char *why, size_t n) { if (n) why[0] = 0; return 0; }
+static inline int  StateFast() { return 0; }
 static inline int  ViaNow() { return 0; }
 static inline int  HudNow() { return 0; }
 static inline void HudBad(double) {}
@@ -156,6 +162,10 @@ struct Settings
     int   warpGame = 1;       // FrameWarpGameMotion: use the game's own motion vectors and depth where it hands them to
                               // its upscaler (Streamline / DLSS, D3D12, 64-bit); otherwise the motion measured from the picture
     int   warpGameHud = 1;    // FrameWarpGameHud: keep the HUD still with the game's HUD-less picture, where it gives one
+    int   warpPauseLb = 1;    // FrameWarpPauseCutscenes: no frame warp while a cutscene is letterboxed through DLSS (its output
+                              // smaller than the screen, e.g. Townfall)
+    int   warpEven = 0;       // FrameWarpEvenPacing: every strobe cycle moved to where the game's motion is, where the game's
+                              // own motion is used; elsewhere missing frames are filled as usual
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many
                               // pixels of the game frame (0 = off) -- a CRT shader's scanlines and mask stay in place
     float warpMaxGameFg = 0.25f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
@@ -342,6 +352,8 @@ static void LoadSettings(Settings &s)
     s.warpGameCheck = IniInt("FrameWarpGameMotionCheck", 1) != 0 ? 1 : 0;
     s.warpGameHud = IniInt("FrameWarpGameHud", 1) != 0 ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.25f)));
+    s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
+    s.warpPauseLb = IniInt("FrameWarpPauseCutscenes", 1) ? 1 : 0;
     s.warpSnapX = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapX", 0.0f)));
     s.warpSnapY = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapY", 0.0f)));
     s.osd = IniInt("Osd", 0) ? 1 : 0;
@@ -576,6 +588,8 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarpGameMotion", s.warpGame);
     IniWriteInt("FrameWarpGameHud", s.warpGameHud);
     IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
+    IniWriteInt("FrameWarpEvenPacing", s.warpEven);
+    IniWriteInt("FrameWarpPauseCutscenes", s.warpPauseLb);
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
     IniWriteInt("Osd", s.osd);
@@ -3584,6 +3598,8 @@ static DWORD WINAPI PresenterThread(void *)
     int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
     UINT64 warpPrevId = 0;
     int    secWarpCycles = 0;
+    int    secWarpPaused = 0;   // cycles not filled: a camera cut or a letterboxed cutscene
+    int    winWarpPaused = 0, winCuts = 0; double winPauseT = 0.0;
     double secWarpSum = 0.0;
     int    secWarpGame[3] = {};             // cycles moved with: the picture's motion, the game's vectors and depth, its vectors only
     UINT   gameFlowGen = ~0u;               // the game's own motion textures the presenter's views were written for
@@ -4383,7 +4399,7 @@ static DWORD WINAPI PresenterThread(void *)
             warpAhead = 0.0;
         }
         else if (cycleStart)
-            warpAhead = warpClock.Cycle(s.frameWarp, pickId, pickTime, tVb, (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0),
+            warpAhead = warpClock.Cycle((s.warpEven && s.warpGame && gmo::StateFast() > 0) ? 2 : 1, pickId, pickTime, tVb, (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0),
                                         (double)s.warpMax, (double)s.warpMinRate / 100.0);
         pickNew = cycleStart && pickId != lastShownId;
         pickRelT = (pickNew && g_relId[pickId % kRel] == pickId) ? g_relT[pickId % kRel] : 0.0;
@@ -4561,8 +4577,17 @@ static DWORD WINAPI PresenterThread(void *)
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = (uint32_t)gsrc;
             }
+            // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
+            else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
             else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
+            // Around a camera cut, and in a letterboxed cutscene: shown as rendered (no motion connects two shots).
+            const char *pauseWhy = nullptr;
+            if (c.warp != 0.0f && gmo::PauseNow(pickId, s.warpPauseLb != 0, &pauseWhy))
+            {
+                c.warp = 0.0f; c.warpSrc = 0; gFlow = nullptr;
+                if (cycleStart) secWarpPaused++;
+            }
         }
         if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame[c.warpSrc <= 2 ? c.warpSrc : 0]++; }
 
@@ -5395,6 +5420,16 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 else if (g_status.warpOn != 2 && warpWas != 2) warpWas = g_status.warpOn;
             }
+            winWarpPaused += secWarpPaused; winCuts += gmo::CutsTake();
+            if (t - winPauseT >= 10.0)
+            {
+                static int pauseLogs = 0;
+                if ((winWarpPaused || winCuts) && pauseLogs++ < 60)
+                    LOGI("BFI Presenter: frame warp, last %.0f s: %d camera cuts flagged by the game, %d strobe cycles not filled (camera cuts, "
+                         "letterboxed cutscenes)", t - winPauseT, winCuts, winWarpPaused);
+                winWarpPaused = winCuts = 0; winPauseT = t;
+            }
+            secWarpPaused = 0;
             secWarpCycles = 0; secWarpSum = 0.0;
             g_status.unevenRep    = secRepU;
             g_status.unevenSkip   = secSkipU;
@@ -8244,6 +8279,35 @@ static UINT flowW = 0, flowH = 0;
 static std::atomic<UINT> flowGen{0};                     // bumped when the motion textures are made anew
 static bool slotPend[kStage] = {}, slotOk[kStage] = {}, slotDepth[kStage] = {};
 static std::atomic<UINT64> slotId[kStage];
+// Camera cuts and letterboxed cutscenes (ep3): the frame after a cut (the game's reset flag, from Streamline or direct
+// DLSS calls) and the next ones aren't filled -- there is no motion connecting two shots, and the motion measured from
+// the picture across a cut is between two unrelated pictures. A cutscene letterboxed through DLSS (its output smaller
+// than the screen) pauses frame warp until it ends.
+static bool slotCut[kStage] = {};
+static std::atomic<UINT64> cutId{0};
+static std::atomic<int> cutsSec{0};
+static std::atomic<bool> lbOn{false};
+static std::atomic<double> lbT{0.0};
+// Only a letterbox that follows full-screen output in this session counts as a cutscene, and one that lasts over 10
+// minutes in a row is play (a game letterboxed throughout, by design): frame warp works there as usual.
+static std::atomic<bool> lbFullSeen{false};
+static std::atomic<double> lbStartT{0.0};
+static void NoteLetterbox(bool lb, unsigned w, unsigned h, unsigned fw, unsigned fh, const char *from)
+{
+    const bool was = lbOn.exchange(lb);
+    if (lb) lbT = Now();
+    if (!lb) lbFullSeen = true;
+    if (lb && !was) lbStartT = Now();
+    if (lb != was)
+    {
+        static int logged = 0;
+        if (logged++ < 40)
+        {
+            if (lb) LOGI("BFI Presenter: frame warp: letterboxed cutscene (%s output %ux%u of %ux%u)", from, w, h, fw, fh);
+            else    LOGI("BFI Presenter: frame warp: the letterboxed cutscene ended (%s output %ux%u)", from, w, h);
+        }
+    }
+}
 
 // What the game hands over, for the overlay and the log.
 static std::atomic<int> state{0};                        // 0 nothing seen yet, 1 vectors and depth, 2 vectors only, -1 not usable
@@ -8443,7 +8507,7 @@ static std::atomic<int> via{0};                          // where the game's mot
 static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
 {
     if (!On() || !g_device || !cmd) return;
-    const Tag *tg[2] = {}, *hl = nullptr;
+    const Tag *tg[2] = {}, *hl = nullptr, *outTag = nullptr;
     if (in && n && n <= 64 && Plaus(in))
         for (uint32_t i = 0; i < n; i++)
             for (const Base *b = in[i]; b && Plaus(b); b = (const Base *)b->next)
@@ -8451,7 +8515,15 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
                 {
                     const Tag *t = (const Tag *)b;
                     if (t->bufType <= 2 && t->res) { if (t->bufType == 2) hl = t; else tg[t->bufType] = t; }
+                    else if (t->bufType == 4 && t->res) outTag = t;
                 }
+    // The upscaler's output used only in part, wider than tall against the texture: a letterboxed cutscene.
+    if (outTag && Plaus(outTag->res) && outTag->ext.width && outTag->ext.height && outTag->res->width && outTag->res->height)
+    {
+        const Res *r = outTag->res;
+        NoteLetterbox(outTag->ext.height < 0.9 * r->height && outTag->ext.width >= 0.9 * r->width,
+                      outTag->ext.width, outTag->ext.height, r->width, r->height, "Streamline");
+    }
     std::lock_guard<std::mutex> l(lk);
     if (hl && g_shared.warpGameHud && Plaus(hl->res) && hl->res->native) CopyHud(*hl, cmd);
     for (int k = 0; k < 2; k++) if (!tg[k] && haveSet[k]) tg[k] = &setTag[k];
@@ -8893,11 +8965,36 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     b[1] = Transition(e.mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     if (e.hasDepth) b[2] = Transition(e.depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     list->ResourceBarrier(nb, b);
-    slotPend[s] = true; slotOk[s] = !e.reset; slotDepth[s] = e.hasDepth;
+    slotPend[s] = true; slotOk[s] = !e.reset; slotDepth[s] = e.hasDepth; slotCut[s] = e.reset;
 }
 
 // After the frame in slot s is published as game frame id.
-static void Published(UINT s, UINT64 id) { if (s < kStage && slotPend[s]) slotId[s] = id; }
+static void Published(UINT s, UINT64 id)
+{
+    if (s >= kStage || !slotPend[s]) return;
+    slotId[s] = id;
+    if (slotCut[s] && cutId.load() + 1 < id) { cutId = id; cutsSec++; }   // a run of reset frames counts once
+    else if (slotCut[s]) cutId = id;
+}
+static int CutsTake() { return cutsSec.exchange(0); }
+// No frame warp for this frame: within 3 rendered frames after a camera cut, or in a letterboxed cutscene.
+static bool PauseNow(UINT64 id, bool letterbox, const char **why)
+{
+    const UINT64 c = cutId.load();
+    const UINT64 k = (UINT64)std::max(1, g_status.fgActive ? fgK : 1);
+    if (c && id >= c && id < c + 3 * k) { *why = "camera cut"; return true; }
+    if (letterbox && lbOn.load() && Now() - lbT.load() < 1.0 && lbFullSeen.load())
+    {
+        if (Now() - lbStartT.load() < 600.0) { *why = "letterboxed cutscene"; return true; }
+        static double loggedFor = -1.0;
+        if (loggedFor != lbStartT.load())
+        {
+            loggedFor = lbStartT.load();
+            LOGI("BFI Presenter: frame warp: letterboxed for over 10 minutes -- taken as play, not a cutscene; frame warp works again");
+        }
+    }
+    return false;
+}
 
 // The presenter: is frame `id` in slot s warped with the game's motion? 0 no, 1 vectors and depth, 2 vectors only.
 static int SlotFor(int s, UINT64 id)
@@ -8933,6 +9030,7 @@ static ID3D12Resource *FlowRes(int s) { return s >= 0 && s < (int)kStage ? flow[
 static int StateNow(char *w, size_t n) { std::lock_guard<std::mutex> l(lk); snprintf(w, n, "%s", why); return state.load(); }
 static int HudNow() { return hudState.load(); }
 static int ViaNow() { return via.load(); }
+static int StateFast() { return state.load(); }
 // The check found the mask covering much of the picture: the HUD-less picture doesn't match the frame shown as it is
 // compared now. The next way of comparing is tried; after the last, the mask is switched off for the session (effects
 // drawn after the HUD-less picture -- ReShade's included -- or an encoding none of the modes undo).
@@ -8992,7 +9090,7 @@ static PFN_Eval o_Eval[2] = {}, o_EvalC[2] = {};
 static const int kSuccess = 1;                         // NVSDK_NGX_Result_Success
 enum { kSR = 1, kRR = 13 };                            // NVSDK_NGX_Feature_SuperSampling, _RayReconstruction
 enum { kMVLowRes = 1 << 1, kDepthInverted = 1 << 3 };  // NVSDK_NGX_DLSS_Feature_Flags
-struct Feat { int feature; int flags; unsigned w, h; };
+struct Feat { int feature; int flags; unsigned w, h, ow = 0, oh = 0; };
 static std::mutex lk;
 static std::map<uintptr_t, Feat> feats;                // by handle, from CreateFeature: the handle's address, not its id -- DLSS
                                                        // frame generation numbers its handles on its own (Directive 8020: super
@@ -9070,7 +9168,7 @@ static void OnCreate(int feature, const void *params, Handle *h)
     Feat f = { feature, -1, 0, 0 };
     unsigned fl = 0;
     if (GetU(params, "DLSS.Feature.Create.Flags", fl)) f.flags = (int)fl;
-    GetU(params, "Width", f.w); GetU(params, "Height", f.h);
+    GetU(params, "Width", f.w); GetU(params, "Height", f.h); GetU(params, "OutWidth", f.ow); GetU(params, "OutHeight", f.oh);
     std::lock_guard<std::mutex> l(lk);
     feats[(uintptr_t)h] = f;
     static int logged = 0;
@@ -9138,6 +9236,12 @@ static void OnEval(void *cmd, const Handle *h, const void *params)
     c.depthInverted = (flags & kDepthInverted) ? 1 : 0;
     c.cameraMotionIncluded = 1;
     c.reset = reset ? 1 : 0;
+    // DLSS's output smaller than the screen, wider than tall against it: a letterboxed cutscene (Townfall: 3840x1634).
+    if (known && f.ow && f.oh && g_stage[0])
+    {
+        const D3D12_RESOURCE_DESC sd = g_stage[0]->GetDesc();
+        gmo::NoteLetterbox(f.oh < 0.9 * sd.Height && f.ow >= 0.9 * sd.Width, f.ow, f.oh, (unsigned)sd.Width, sd.Height, "DLSS");
+    }
     c.mvInvalid = 3.402823466e38f;                         // DLSS has no marker for a missing vector
     static int logged = 0;
     if (logged < 4)
@@ -13587,6 +13691,25 @@ static void draw_overlay(reshade::api::effect_runtime *)
             else ImGui::Text("Waiting for the game's frame rate.");
             bool gm = s.warpGame != 0;
             if (ImGui::Checkbox("Use the game's own motion vectors and depth", &gm)) s.warpGame = gm ? 1 : 0;
+            if (s.warpGame)
+            {
+                ImGui::SameLine();
+                bool ev = s.warpEven != 0;
+                if (ImGui::Checkbox("Even pacing", &ev)) s.warpEven = ev ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion only: every strobe cycle shows the picture where the game's motion\n"
+                                                              "is at that moment, not just the cycles without a new frame, so every step on screen is the same.\n"
+                                                              "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
+                                                              "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
+                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
+            }
+            bool pl = s.warpPauseLb != 0;
+            if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
+                                                          "screen, e.g. Townfall): its quick cuts between camera angles have no motion to follow.\n"
+                                                          "Only after full-screen play in the same session, and not once a letterbox has lasted\n"
+                                                          "10 minutes (play, in a game letterboxed by design). Turn it off for a game whose play\n"
+                                                          "switches in and out of letterbox. Right after a camera cut the game flags, frames are\n"
+                                                          "never filled either way.");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (through Streamline or directly, DX12) its motion vectors and\n"
                                                           "depth, frame warp moves each part of the picture by the game's own motion for it, and\n"
                                                           "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
