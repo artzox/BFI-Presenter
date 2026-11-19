@@ -8680,6 +8680,21 @@ static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int fr
         pendN = 0; latest = -1; depthFailed = false;
         ringDev = g_device;
     }
+    {
+        // The main view: some games upscale more than one view a frame (Indiana Jones on Vulkan: a small 640x360 one
+        // next to the main view). Only the largest is used, so the warp never mixes two views' motion and the copies
+        // don't change size from call to call (remade on almost every call, the replaced ones filled video memory).
+        static uint64_t mainArea = 0; static double mainSeen = -1.0; static UINT mainW = 0, mainH = 0; static int sideLogged = 0;
+        const double tn = Now();
+        const uint64_t area = md.Width * (uint64_t)md.Height;
+        if (area < mainArea && tn - mainSeen < 0.5) { mv->Release(); if (dp) dp->Release(); cl->Release(); return; }
+        if (mainArea && area > mainArea && sideLogged++ < 2)
+            LOGI("BFI Presenter: frame warp, the game's own motion: the game upscales more than one view (%ux%u and %ux%u) -- only the "
+                 "largest is used", mainW, mainH, (UINT)md.Width, md.Height);
+        mainArea = area; mainSeen = tn; mainW = (UINT)md.Width; mainH = md.Height;
+        // replaced copies wait 5 s; if they pile up anyway (sizes changing all the time) the call is skipped
+        if (retired.size() > 16) { mv->Release(); if (dp) dp->Release(); cl->Release(); return; }
+    }
     const int k = (int)(seq % kRing);
     Entry &e = ring[k];
     if (!e.mv || e.mvW != (UINT)md.Width || e.mvH != md.Height || e.mvFmt != md.Format)
