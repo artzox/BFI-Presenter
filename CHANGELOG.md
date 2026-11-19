@@ -24,7 +24,7 @@ Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply 
 - **[DX] [Vulkan] Frame warp is no longer a test feature**: "(test)" is gone from the settings window, the ini and the guides. It stays off by default (`FrameWarp=0`); with it on, the game's own motion is used by default where the game gives it.
 - **[DX]** Settings window: frame warp moved to the end of **Frame pacing and latency**, after frame pacing and frames ahead.
 - **[Vulkan]** Otherwise no changes.
-- **[Docs]** Settings guide: **The game's own motion vectors and depth** under Every cap, the frame start's steps under **Hold at the frame start**.
+- **[Docs]** Settings guide: a picture of frame warp without it, with the motion from the picture and with the game's motion vectors; **The game's own motion vectors and depth** under Every cap, the frame start's steps under **Hold at the frame start**.
 
 ## [1.0.43] — 2026-11-18
 

@@ -240,6 +240,11 @@ Fills strobe cycles that have no new game frame. When a game misses the strobe r
 
 The motion is measured on the GPU between the last two frames, from the finished picture, so it works in every game without motion vectors, depth or Reflex. Where a DX12 game hands DLSS its own motion vectors and depth, those are used instead (below). It is averaged over the whole picture, so it follows the camera (with its depth) and nothing tears.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/frame-warp-dark.png">
+  <img src="img/frame-warp-light.png" alt="Three strobe flashes of a game at 57 fps on a 60 Hz strobe, the middle one without a new game frame, while the camera pans and a character runs across. Without frame warp the middle flash repeats the last frame: the picture stands still, then jumps. With frame warp and the motion measured from the picture, the background is moved to the right place but the character is carried with it, away from where it belongs. With the game's own motion vectors, the background and the character are both moved to where they belong." width="760">
+</picture>
+
 It is **not frame generation**. Frame generation holds each frame back until the next one exists and shows a picture in between, which costs a frame of latency. Frame warp never waits: it only carries the newest frame on, so latency is the same as without it. It also doesn't bring your input in sooner (as Reflex 2's Frame Warp does with the game's camera); it continues the motion of the last two frames.
 
 **When it can help**
