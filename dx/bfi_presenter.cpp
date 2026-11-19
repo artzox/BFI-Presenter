@@ -168,6 +168,9 @@ struct Settings
                               // own motion is used; elsewhere missing frames are filled as usual
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many
                               // pixels of the game frame (0 = off) -- a CRT shader's scanlines and mask stay in place
+    int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: the game's motion also while frame generation is on. Off by default:
+                              // the game's vectors are for its rendered frames, so on generated ones edges double up (outlines
+                              // around characters, e.g. 007 First Light, Directive 8020); the measured motion is used instead
     float warpMaxGameFg = 0.25f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
                               // many shown frames ahead (it overshot visibly from about 0.5 in 007 First Light)
     int   warpGameCheck = 1;  // FrameWarpGameMotionCheck (test, ini only): every 2 s the game's motion and the measured one in the log
@@ -351,6 +354,7 @@ static void LoadSettings(Settings &s)
     s.dlssInState = IniInt("DlssInputState", 64);
     s.warpGameCheck = IniInt("FrameWarpGameMotionCheck", 1) != 0 ? 1 : 0;
     s.warpGameHud = IniInt("FrameWarpGameHud", 1) != 0 ? 1 : 0;
+    s.warpGameFg = IniInt("FrameWarpGameMotionWithFG", 0) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.25f)));
     s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
     s.warpPauseLb = IniInt("FrameWarpPauseCutscenes", 1) ? 1 : 0;
@@ -587,6 +591,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarpMinRate", s.warpMinRate);
     IniWriteInt("FrameWarpGameMotion", s.warpGame);
     IniWriteInt("FrameWarpGameHud", s.warpGameHud);
+    IniWriteInt("FrameWarpGameMotionWithFG", s.warpGameFg);
     IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
     IniWriteInt("FrameWarpEvenPacing", s.warpEven);
     IniWriteInt("FrameWarpPauseCutscenes", s.warpPauseLb);
@@ -4399,7 +4404,7 @@ static DWORD WINAPI PresenterThread(void *)
             warpAhead = 0.0;
         }
         else if (cycleStart)
-            warpAhead = warpClock.Cycle((s.warpEven && s.warpGame && gmo::StateFast() > 0) ? 2 : 1, pickId, pickTime, tVb, (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0),
+            warpAhead = warpClock.Cycle((s.warpEven && s.warpGame && gmo::StateFast() > 0 && (!g_status.fgActive || s.warpGameFg)) ? 2 : 1, pickId, pickTime, tVb, (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0),
                                         (double)s.warpMax, (double)s.warpMinRate / 100.0);
         pickNew = cycleStart && pickId != lastShownId;
         pickRelT = (pickNew && g_relId[pickId % kRel] == pickId) ? g_relT[pickId % kRel] : 0.0;
@@ -4557,7 +4562,7 @@ static DWORD WINAPI PresenterThread(void *)
         {
             // The game's own motion (where it hands its upscaler motion vectors and depth): one game frame's motion,
             // warpAhead frames on. Otherwise the motion measured between this frame and the one shown before.
-            const int gsrc = s.warpGame ? gmo::SlotFor(pick, pickId) : 0;
+            const int gsrc = (s.warpGame && (!g_status.fgActive || s.warpGameFg)) ? gmo::SlotFor(pick, pickId) : 0;
             if (gsrc)
             {
                 const UINT fg = gmo::FlowGenNow();
@@ -8824,6 +8829,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
             // frame's motion. Every shown frame uses the newest vectors, for the share of that motion one shown frame
             // covers. (A generated frame sits between two rendered ones: its picture is a little off from the vectors'.)
             pendN = 0;
+            if (!g_shared.warpGameFg) return;             // the game's motion isn't used with frame generation (the default)
             if (latest < 0 || fgK < 2) return;            // not settled yet (or not really generating): the picture's motion
             k = latest;
             scale = 1.0f / (float)fgK;
@@ -13691,6 +13697,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
             else ImGui::Text("Waiting for the game's frame rate.");
             bool gm = s.warpGame != 0;
             if (ImGui::Checkbox("Use the game's own motion vectors and depth", &gm)) s.warpGame = gm ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (through Streamline or directly, DX12) its motion vectors and\n"
+                                                          "depth, frame warp moves each part of the picture by the game's own motion for it, and\n"
+                                                          "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
+                                                          "from the finished picture, which can only follow the camera. Other games keep the\n"
+                                                          "measured motion. The line below says which one is in use.");
             if (s.warpGame)
             {
                 ImGui::SameLine();
@@ -13710,17 +13721,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "10 minutes (play, in a game letterboxed by design). Turn it off for a game whose play\n"
                                                           "switches in and out of letterbox. Right after a camera cut the game flags, frames are\n"
                                                           "never filled either way.");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (through Streamline or directly, DX12) its motion vectors and\n"
-                                                          "depth, frame warp moves each part of the picture by the game's own motion for it, and\n"
-                                                          "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
-                                                          "from the finished picture, which can only follow the camera. Other games keep the\n"
-                                                          "measured motion. The line below says which one is in use.");
             {
-                const int src = st.warpCycles ? st.warpSrc : (s.warpGame && st.warpGameState > 0 ? st.warpGameState : 0);
+                const bool fgOff = st.fgActive && !s.warpGameFg;   // the game's motion isn't used with frame generation
+                const int src = st.warpCycles ? st.warpSrc : (s.warpGame && !fgOff && st.warpGameState > 0 ? st.warpGameState : 0);
                 ImGui::Text("Motion used: %s%s", src == 1 ? "the game's motion vectors and depth" : src == 2 ? "the game's motion vectors (no depth)"
                                                        : "measured from the picture",
                             src <= 0 ? "" : st.warpGameVia == 1 ? ", from DLSS" : ", from Streamline");
-                if (s.warpGame && st.warpGameWhy[0]) { ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (s.warpGame && fgOff && st.warpGameState > 0) { ImGui::SameLine(); ImGui::TextDisabled("(the game's is off with frame generation)"); }
+                else if (s.warpGame && st.warpGameWhy[0]) { ImGui::SameLine(); ImGui::TextDisabled("(?)");
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", st.warpGameWhy); }
                 else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
                     ImGui::SetTooltip("This game hasn't handed DLSS any motion data (no Streamline or DLSS call seen).");
@@ -13734,9 +13742,18 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "don't break up where parts of the picture move by different amounts. 0 = off.");
             if (s.warpGame)
             {
-                ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
-                                                              "further ahead than this (shown frames). Further out it overshoots and snaps back.");
+                bool gf = s.warpGameFg != 0;
+                if (ImGui::Checkbox("Also with frame generation", &gf)) s.warpGameFg = gf ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("The game's motion vectors are for the frames it renders, not the ones frame generation\n"
+                                                              "adds in between, so on those the edges of moving things double up (outlines around\n"
+                                                              "characters, e.g. 007 First Light, Directive 8020). Off by default: with frame generation\n"
+                                                              "on, frame warp uses the motion measured from the picture.");
+                if (s.warpGameFg)
+                {
+                    ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
+                                                                  "further ahead than this (shown frames). Further out it overshoots and snaps back.");
+                }
                 bool hud = s.warpGameHud != 0;
                 if (ImGui::Checkbox("Keep the HUD still (the game's HUD-less picture)", &hud)) s.warpGameHud = hud ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands its upscaler a picture without the HUD (e.g. 007 First Light),\n"
