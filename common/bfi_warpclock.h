@@ -92,13 +92,18 @@ struct WarpClock
         }
         // Even pacing (as test builds t1-t2, with the game's motion now): the position on screen moves on by the game's
         // frames per cycle each cycle (0.95 at 57 fps), a new frame taking its own step off, so every step on screen is
-        // the same. A game that holds the strobe rate (or a whole multiple of it) has nothing to even out: filled as mode 1.
-        // While frames have stopped coming (a hitch, loading) the picture waits at the limit.
+        // the same. While frames have stopped coming (a hitch, loading) the picture waits at the limit.
+        // A game that holds the strobe rate (or a whole multiple of it) still has frames that land on the pick: one
+        // repeated, the next skipped (Jusant at 60 of 60, 1-5 a second). Filling only the repeat gave steps of 1, 0.5,
+        // 1.5, 1; here the rate is taken as exactly that multiple, so the repeat moves on a whole frame and the skip takes
+        // it back (1, 0.9, 1.1, 1), and the offset settles quickly (no measuring error to carry): frames that arrive in
+        // time stay as rendered.
         const bool locked = rate > 0.9 && std::fabs(rate - std::floor(rate + 0.5)) < 0.012;
-        if (mode == 2 && !locked)
+        if (mode == 2)
         {
-            double a = ahead + rate - step;
-            a *= 0.99;                                     // settles back toward the frames as rendered (measuring errors)
+            const double r = locked ? std::floor(rate + 0.5) : rate;
+            double a = ahead + r - step;
+            a *= locked ? 0.9 : 0.99;                      // settles back toward the frames as rendered (measuring errors)
             if (a < 0.0) a = 0.0;
             if (a > maxAhead) a = maxAhead;
             if (!isNew && a < ahead) a = ahead;            // no step backward on a cycle without a new frame
