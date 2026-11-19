@@ -62,8 +62,8 @@ struct WarpVk
     // Set 2's layout: made before the BFI pipelines' layouts, which include it.
     bool CreateLayout(DeviceData *d)
     {
-        VkDescriptorSetLayoutBinding b[3] = {};
-        for (int i = 0; i < 3; i++)
+        VkDescriptorSetLayoutBinding b[4] = {};
+        for (int i = 0; i < 4; i++)
         {
             b[i].binding = (uint32_t)i;
             b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -71,7 +71,7 @@ struct WarpVk
             b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
         }
         VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        dli.bindingCount = 3;
+        dli.bindingCount = 4;                          // binding 3: the game's own motion for the frame (gvk)
         dli.pBindings = b;
         return d->CreateDescriptorSetLayout(d->device, &dli, nullptr, &dslW) == VK_SUCCESS;
     }
@@ -115,7 +115,7 @@ struct WarpVk
 
     // stageView: the staging ring's views (SHADER_READ_ONLY_OPTIMAL). Set 2 is required (false = the BFI pipelines
     // can't be used); the passes are optional (ok).
-    bool Init(DeviceData *d, const VkImageView *stageView, uint32_t frameW, uint32_t frameH)
+    bool Init(DeviceData *d, const VkImageView *stageView, const VkImageView *gameFlowView, uint32_t frameW, uint32_t frameH)
     {
         VkDevice dev = d->device;
         srcW = frameW; srcH = frameH;
@@ -129,7 +129,7 @@ struct WarpVk
         r = r && MakeImage(d, Out(), w[kOut], h[kOut]);
         if (r)
         {
-            VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * kStage * kStage };
+            VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * kStage * kStage };
             VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             dpi.maxSets = kStage * kStage;
             dpi.poolSizeCount = 1;
@@ -144,8 +144,16 @@ struct WarpVk
             r = r && d->AllocateDescriptorSets(dev, &dai, &dsW[0][0]) == VK_SUCCESS;
             for (uint32_t a = 0; r && a < kStage; a++)
                 for (uint32_t b = 0; b < kStage; b++)
+                {
                     WriteSet(d, dsW[a][b], view[Out()], VK_IMAGE_LAYOUT_GENERAL, stageView[b], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                              stageView[a], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_NULL_HANDLE);
+                    // the game's motion texture of the frame shown (the measured motion as a stand-in where there is none)
+                    VkDescriptorImageInfo gi = { lin, gameFlowView && gameFlowView[a] ? gameFlowView[a] : view[Out()], VK_IMAGE_LAYOUT_GENERAL };
+                    VkWriteDescriptorSet gw = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                    gw.dstSet = dsW[a][b]; gw.dstBinding = 3; gw.descriptorCount = 1;
+                    gw.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; gw.pImageInfo = &gi;
+                    d->UpdateDescriptorSets(d->device, 1, &gw, 0, nullptr);
+                }
         }
         ready = r;
         if (!r) return false;

@@ -1,0 +1,58 @@
+#version 450
+// Frame warp, Vulkan layer: the game's own motion (as dx/bfi_warp.h, PSWarpGame). The motion vectors and depth a game
+// hands DLSS (copied at its DLSS call) are turned into a motion texture at half the frame's size, at the game's
+// present, on the game's queue: xy = how far the picture at this point moved from the frame before to this one (uv),
+// z = 1 + k where the game's vector is valid (k: how much the motion kept up from the rendered frame before, 0..1;
+// 0 = no vector), w = how near the point is (0 far .. 1 near).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D gMv;
+layout(set = 0, binding = 1) uniform sampler2D gDepth;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D outImg;
+layout(set = 0, binding = 3) uniform sampler2D gMvPrev;   // the vectors of the rendered frame before (same size and format)
+layout(push_constant) uniform G
+{
+    vec2  outTexel;   // 1 / size of the motion texture written
+    vec2  mvScale;    // the vectors' scale to uv
+    vec4  mvMap;      // screen uv -> motion-vector texel: xy scale, zw offset (texels)
+    vec4  dMap;       // screen uv -> depth texel
+    uint  flags;      // 1 depth reversed (near = 1), 2 depth available
+    float mvInvalid;  // the value written where a vector is not valid
+    float perRendered;  // shown frames per rendered one (frame generation; 1 without): mvScale * this = a rendered frame's motion
+    float prevOk;     // 1 = gMvPrev holds the vectors of the rendered frame before
+} g;
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 osz = imageSize(outImg);
+    if (p.x >= osz.x || p.y >= osz.y) return;
+    vec2 uv = (vec2(p) + 0.5) * g.outTexel;
+    ivec2 msz = textureSize(gMv, 0);
+    ivec2 mq = clamp(ivec2(uv * g.mvMap.xy + g.mvMap.zw), ivec2(0), msz - 1);
+    vec2 m = texelFetch(gMv, mq, 0).xy;
+    if (m.x == g.mvInvalid || m.y == g.mvInvalid || any(isnan(m))) { imageStore(outImg, p, vec4(0.0)); return; }
+    float nearv = 0.0;
+    if ((g.flags & 2u) != 0u)
+    {
+        ivec2 dsz = textureSize(gDepth, 0);
+        ivec2 dq = clamp(ivec2(uv * g.dMap.xy + g.dMap.zw), ivec2(0), dsz - 1);
+        float d = texelFetch(gDepth, dq, 0).r;
+        nearv = (g.flags & 1u) != 0u ? d : 1.0 - d;
+    }
+    // How much the motion kept up (as DX, ep9): this point's motion against its motion one rendered frame before, where it
+    // was then; slower now -> k < 1, and a move past the rendered frame is scaled by it. Both under half a pixel: k = 1.
+    float k = 1.0;
+    if (g.prevOk > 0.5)
+    {
+        vec2 cur = m * g.mvScale * g.perRendered;
+        ivec2 pq = clamp(ivec2((uv + cur) * g.mvMap.xy + g.mvMap.zw), ivec2(0), msz - 1);
+        vec2 mp = texelFetch(gMvPrev, pq, 0).xy;
+        if (!(mp.x == g.mvInvalid || mp.y == g.mvInvalid || any(isnan(mp))))
+        {
+            vec2 px = 1.0 / g.outTexel;
+            float a = length(cur * px), b = length(mp * g.mvScale * g.perRendered * px);
+            if (b > 0.5) k = clamp(a / b, 0.0, 1.0);
+        }
+    }
+    // The pixel was at uv + m * scale in the frame before, so it moved by the opposite.
+    imageStore(outImg, p, vec4(-m * g.mvScale, 1.0 + k, clamp(nearv, 0.0, 1.0)));
+}

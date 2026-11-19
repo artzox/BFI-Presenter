@@ -44,6 +44,7 @@
 #include <atomic>
 #include <vector>
 #include <string>
+#include <map>
 #include <cstdarg>
 #include <cmath>
 #include <cstdint>
@@ -57,6 +58,49 @@
 #include "../common/bfi_osd.h"
 #include "../common/bfi_clockdrift.h"
 #include "../common/bfi_warpclock.h"
+#ifdef _WIN64
+namespace slp { static void Tick(double t); }   // Streamline probe (test), defined after InlineHook64
+namespace ngx { static void Tick(double t); }   // DLSS called directly (NGX, test), defined after gmo
+namespace gmo                                    // frame warp from the game's own motion (test), defined after slp
+{
+static void AtPresent(ID3D12GraphicsCommandList *list, UINT s);
+static void Published(UINT s, UINT64 id);
+static int  SlotFor(int s, UINT64 id);
+static float SlotLag(int s);
+static ID3D12Resource *FlowRes(int s);
+static UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride);
+static ID3D12Resource *FlowFor(int s, UINT gen);
+static bool PauseNow(UINT64 id, bool letterbox, const char **why);
+static int  CutsTake();
+static UINT FlowGenNow();
+static int  StateNow(char *why, size_t n);
+static int  StateFast();
+static int  ViaNow();
+static int  HudNow();
+static void HudBad(double pct);
+static void Release();
+}
+#else
+namespace gmo                                    // 32-bit games: no Streamline, the picture's own motion only
+{
+static inline void AtPresent(ID3D12GraphicsCommandList *, UINT) {}
+static inline void Published(UINT, UINT64) {}
+static inline int  SlotFor(int, UINT64) { return 0; }
+static inline float SlotLag(int) { return 0.0f; }
+static inline ID3D12Resource *FlowRes(int) { return nullptr; }
+static inline UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE, UINT) { return 0; }
+static inline ID3D12Resource *FlowFor(int, UINT) { return nullptr; }
+static inline bool PauseNow(UINT64, bool, const char **) { return false; }
+static inline int  CutsTake() { return 0; }
+static inline UINT FlowGenNow() { return 0; }
+static inline int  StateNow(char *why, size_t n) { if (n) why[0] = 0; return 0; }
+static inline int  StateFast() { return 0; }
+static inline int  ViaNow() { return 0; }
+static inline int  HudNow() { return 0; }
+static inline void HudBad(double) {}
+static inline void Release() {}
+}
+#endif
 
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d12.lib")
@@ -95,7 +139,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.43"
+#define BFI_ADDON_VERSION "1.0.44"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -113,10 +157,39 @@ struct Settings
     int   splitSide = 0;      // 0 = the left side without BFI, 1 = the right side
     int   splitPos = 50;      // the seam, percent of the width from the left
     int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
-    int   frameWarp = 0;      // FrameWarp (test): a strobe cycle without a new game frame shows the last one moved ahead
+    int   frameWarp = 0;      // FrameWarp: a strobe cycle without a new game frame shows the last one moved ahead
                               // along the camera's motion instead of lit again (no frame is held back: no added latency)
     float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
+    int   warpGame = 1;       // FrameWarpGameMotion: use the game's own motion vectors and depth where it hands them to
+                              // its upscaler (Streamline / DLSS, D3D12, 64-bit); otherwise the motion measured from the picture
+    int   warpGameHud = 1;    // FrameWarpGameHud: keep the HUD still with the game's HUD-less picture, where it gives one
+    int   warpPauseLb = 1;    // FrameWarpPauseCutscenes: no frame warp while a cutscene is letterboxed through DLSS (its output
+                              // smaller than the screen, e.g. Townfall)
+    int   warpEven = 0;       // FrameWarpEvenPacing: every strobe cycle moved to where the game's motion is, where the game's
+                              // own motion is used; elsewhere missing frames are filled as usual
+    float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many
+                              // pixels of the game frame (0 = off) -- a CRT shader's scanlines and mask stay in place
+    int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: the game's motion also while frame generation is on. Off by default:
+                              // the game's vectors are for its rendered frames, so on generated ones edges double up (outlines
+                              // around characters, e.g. 007 First Light, Directive 8020); the measured motion is used instead
+    int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (test, ini only): with the game's motion and frame generation, its
+                              // vectors read where each point is in the rendered frame: 1 = generated frames come before
+                              // the rendered one (DLSS frame generation), -1 = after it, 0 = off (read where shown, ep7)
+    int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
+                              // they are for a while (30 s, then longer)
+    int   warpEase = 1;       // FrameWarpGameMotionEase (test, ini only): with the game's motion and frame generation, the
+                              // part of a move past the rendered frame eases off as the game's motion slows (1 = on)
+    float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
+                              // many shown frames ahead (it overshot visibly from about 0.5 in 007 First Light)
+    int   warpGameCheck = 1;  // FrameWarpGameMotionCheck (test, ini only): every 2 s the game's motion and the measured one in the log
+    int   slHooks = 1;        // StreamlineHooks (test, ini only): 0 = Streamline is not hooked at all (no probe, frame warp
+                              // with the picture's own motion only) -- to compare a game's frame rate with and without
+    int   dlssHooks = 1;      // DlssHooks (test, ini only): 0 = DLSS called directly (NGX) is not hooked
+    int   dlssInState = 64;   // DlssInputState (test, ini only): the state DLSS's inputs are in at its call (64 = non-pixel
+                              // shader resource, as DLSS asks; 192 = all shader resource)
+    int   warpGameSign = 1;   // FrameWarpGameMotionSign (test, ini only): -1 turns the game's vectors round, in case a game's
+                              // scale has the other sign
     int   osd = 0;            // Osd: the in-game on-screen display (common/bfi_osd.h), Ctrl+Shift+F
     int   osdCorner = 1;      // OsdCorner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
     int   osdGraph = 1;       // OsdGraph: frame-time graph
@@ -283,6 +356,22 @@ static void LoadSettings(Settings &s)
     s.frameWarp = IniInt("FrameWarp", 0) != 0 ? 1 : 0;      // 2 (even pacing, test builds t1-t2) is gone: fill
     s.warpMax = std::max(0.25f, std::min(1.5f, IniFloat("FrameWarpMaxAhead", 1.0f)));
     s.warpMinRate = std::max(40, std::min(95, IniInt("FrameWarpMinRate", 75)));
+    s.warpGame = IniInt("FrameWarpGameMotion", 1) != 0 ? 1 : 0;
+    s.warpGameSign = IniInt("FrameWarpGameMotionSign", 1) < 0 ? -1 : 1;
+    s.slHooks = IniInt("StreamlineHooks", 1) != 0 ? 1 : 0;
+    s.dlssHooks = IniInt("DlssHooks", 1) != 0 ? 1 : 0;
+    s.dlssInState = IniInt("DlssInputState", 64);
+    s.warpGameCheck = IniInt("FrameWarpGameMotionCheck", 1) != 0 ? 1 : 0;
+    s.warpGameHud = IniInt("FrameWarpGameHud", 1) != 0 ? 1 : 0;
+    s.warpGameFg = IniInt("FrameWarpGameMotionWithFG", 0) ? 1 : 0;
+    s.warpFgLag = std::max(-1, std::min(1, IniInt("FrameWarpGameMotionFGLag", 1)));
+    s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
+    s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
+    s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
+    s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
+    s.warpPauseLb = IniInt("FrameWarpPauseCutscenes", 1) ? 1 : 0;
+    s.warpSnapX = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapX", 0.0f)));
+    s.warpSnapY = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapY", 0.0f)));
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -512,6 +601,14 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarp", s.frameWarp);
     IniWriteFloat("FrameWarpMaxAhead", s.warpMax);
     IniWriteInt("FrameWarpMinRate", s.warpMinRate);
+    IniWriteInt("FrameWarpGameMotion", s.warpGame);
+    IniWriteInt("FrameWarpGameHud", s.warpGameHud);
+    IniWriteInt("FrameWarpGameMotionWithFG", s.warpGameFg);
+    IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
+    IniWriteInt("FrameWarpEvenPacing", s.warpEven);
+    IniWriteInt("FrameWarpPauseCutscenes", s.warpPauseLb);
+    IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
+    IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -633,6 +730,12 @@ struct Status
     int    warpCycles = 0;                      // per second: strobe cycles shown moved ahead
     double warpRate = 0.0;                      // the game's frames per strobe cycle, as frame warp measures it
     double warpAvg = 0.0;                       // average distance ahead of those cycles, in game frames
+    int    warpSrc = 0;                         // what those cycles were moved with: 0 the picture's own motion, 1 the game's
+                                                // motion vectors and depth, 2 its motion vectors only
+    int    warpGameState = 0;                   // the game's own motion: 0 nothing seen, 1 vectors and depth, 2 vectors only, -1 not usable
+    char   warpGameWhy[160] = "";
+    int    warpGameVia = 0;                     // through 0 Streamline, 1 DLSS directly (NGX)
+    int    warpHud = 0;                         // the game's HUD mask: 0 none, 1 in use, -1 switched off
     int    reused = 0;                          // per second: refreshes that reused an already-drawn buffer   // per second: strobe cycles with no new game frame / frames never shown
     int    deviceLost = 0;
     int    flashHint = 0;                       // missed refreshes keep coming back (3 of the last 10 s; off after 30 s without)
@@ -981,6 +1084,17 @@ static std::atomic<int> g_cs11{-1};                // colour space the game set 
 
 
 // ---------------------------------------------------------------- helpers
+// A 16-bit float (frame warp's check reads its motion textures back).
+static float HalfToFloat(uint16_t h)
+{
+    const uint32_t sgn = (uint32_t)(h & 0x8000) << 16, ex = (h >> 10) & 0x1F, man = h & 0x3FF;
+    uint32_t f;
+    if (ex == 0) { if (!man) f = sgn; else { float v = std::ldexp((float)man, -24); return sgn ? -v : v; } }
+    else if (ex == 31) f = sgn | 0x7F800000u | (man << 13);
+    else f = sgn | ((ex + 112) << 23) | (man << 13);
+    float out; memcpy(&out, &f, 4); return out;
+}
+
 static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
 {
     D3D12_RESOURCE_BARRIER br = {};
@@ -1374,6 +1488,7 @@ static void ReleaseFrameResources()
 {
     for (UINT i = 0; i < kMaxBuf; i++) SafeRelease(g_virt[i]);
     for (UINT s = 0; s < kStage; s++) SafeRelease(g_stage[s]);
+    gmo::Release();
     g_bufCount = 0;
 }
 
@@ -1600,7 +1715,16 @@ cbuffer C : register(b0)
     float rfxRamp;    // SDR to HDR, RenoFX HDR Boost (flags & 256): Ramp Intensity
     float rfxColor;   // its colour blend, 0..1 (0 = brightness only)
     float rfxApl;     // its APL Limiter: 1 = on (the scene average is in aplTex, measured from this frame)
-    float warp;       // frame warp: the frame is shown this share of its measured motion further on (0 = as rendered)
+    float warp;       // frame warp: the frame is shown this share of its measured motion further on (0 = as rendered);
+                      // with the game's own motion (warpSrc != 0): this many game frames further on
+    float warpPrevN;  // the game's own motion: game frames between this frame and the one shown before (t4)
+    uint  warpSrc;    // 0 motion measured from the picture; 1 the game's motion vectors and depth; 2 its motion vectors only
+    float warpSnapX, warpSnapY;  // moves rounded to whole steps of this many game-frame pixels (0 = off): a CRT shader's scanlines
+                      // and mask stay where they are instead of breaking up where parts of the picture move differently
+    float warpLag;    // the game's motion with frame generation: shown frames this frame is behind the rendered frame its
+                      // motion vectors are for (a generated frame sits between two rendered ones; 0 = the rendered frame)
+    float warpEase;   // the game's motion: 1 = the part of a move past the rendered frame is scaled by how much the motion
+                      // kept up from the frame before (z - 1 of the motion texture): no overshoot when the camera slows down
 };
 Texture2D<float4> src : register(t0);
 Texture2D<float> aplTex : register(t1);
@@ -1612,8 +1736,51 @@ SamplerState linClamp : register(s0);
 // Frame warp (dx/bfi_warp.h): how far back along its motion the picture shown at uv is taken from, in uv. The vector
 // is read where the picture comes from (second step), so a moving area's own motion is used rather than what it
 // moves across; at most 8% of the screen.
+float4 GameFlow(float2 uv)
+{
+    uint w, h;
+    flowTex.GetDimensions(w, h);
+    int2 q = clamp(int2(uv * float2(w, h)), int2(0, 0), int2(w, h) - 1);
+    return flowTex.Load(int3(q, 0));
+}
+// With the game's own motion (one vector per pixel of the game's vectors, per game frame, with how near each point is): the place
+// the output pixel comes from is found in up to three steps along the motion, and each step checked -- does the
+// point found really move onto this pixel? Of the steps that do, the nearest point wins: what is in front covers
+// what is behind it. Where none does, the area is being uncovered, and the background's motion (the farthest of
+// the points found) fills it.
+// With frame generation, a generated frame shows everything warpLag shown frames short of where the vectors' (rendered)
+// frame has it, so the vectors are read where each point is in that frame: warpLag shown frames further along its
+// motion (ep8). The picture is still moved by warp.
+float2 WarpShiftGame(float2 uv)
+{
+    uint w, h;
+    src.GetDimensions(w, h);
+    const float2 osz = float2(w, h);                      // the check below is to a pixel of the game frame
+    const float L = warp - warpLag;                       // where along its motion the vectors are read
+    float2 m[3];
+    m[0] = GameFlow(uv).xy;
+    m[1] = GameFlow(uv - m[0] * L).xy;
+    m[2] = GameFlow(uv - m[1] * L).xy;
+    float2 best = float2(0.0, 0.0), back = float2(0.0, 0.0);
+    float bestNear = -1.0, backNear = 2.0, bestK = 1.0, backK = 1.0;
+    [unroll] for (int i = 0; i < 3; i++)
+    {
+        float4 g = GameFlow(uv - m[i] * L);
+        if (g.z < 0.5) continue;
+        if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; bestK = saturate(g.z - 1.0); }
+        if (g.w < backNear) { backNear = g.w; back = m[i]; backK = saturate(g.z - 1.0); }
+    }
+    if (bestNear < 0.0) { best = backNear <= 1.0 ? back : float2(0.0, 0.0); bestK = backK; }
+    // Up to the rendered frame the motion is known (a generated frame); past it, it's a guess that it carries on: that part
+    // eases off as the motion slows, so a camera coming to a stop isn't pushed past where it stops and snapped back (ep9).
+    const float known = clamp(warpLag, 0.0, warp);
+    const float k = warpEase > 0.5 ? bestK : 1.0;
+    return clamp(best * (known + (warp - known) * k), -0.08, 0.08);
+}
+
 float2 WarpShift(float2 uv)
 {
+    if (warpSrc != 0) return WarpShiftGame(uv);
     float4 f = flowTex.SampleLevel(linClamp, uv, 0);
     float2 d = f.xy * (f.z * warp);
     f = flowTex.SampleLevel(linClamp, uv - d, 0);
@@ -1646,7 +1813,7 @@ bool Still(int2 q, float2 size)
     if (n < 1) return false;
     float2 c = float2(q) + 0.5;
     float4 f = flowTex.SampleLevel(linClamp, c / size, 0);
-    float2 step = f.xy * f.z * size;                       // this part of the scene's motion since the frame before, pixels
+    float2 step = f.xy * size * (warpSrc != 0 ? min(f.z, 1.0) * warpPrevN : f.z);   // this part of the scene's motion since the frame before, pixels
     if (dot(step, step) < 2.25) return true;               // under a pixel and a half: nothing to tell apart
     float3 a = src.Load(int3(q, 0)).rgb;
     float3 d = abs(a - srcPrev.SampleLevel(linClamp, (c - step) / size, 0).rgb);
@@ -1669,9 +1836,13 @@ bool FetchWarped(float2 pos, out float3 c)
     float2 inv = 1.0 / size;
     float2 cp = pos * srcPerOut;
     float2 d = WarpShift(cp * inv) * size;
+    if (warpSnapX > 0.0) d.x = round(d.x / warpSnapX) * warpSnapX;
+    if (warpSnapY > 0.0) d.y = round(d.y / warpSnapY) * warpSnapY;
     if (dot(d, d) < 0.0004) return false;                 // under 1/50 pixel
     if (Still(int2(cp), size)) return false;
     float2 p = clamp(cp - d, float2(0.5, 0.5), size - 0.5);
+    // the game's HUD mask (w = -1): a HUD pixel is never moved, and no moved pixel is taken from the HUD
+    if (warpSrc != 0 && (GameFlow(cp * inv).w < -0.5 || GameFlow(p * inv).w < -0.5)) return false;
     if (Still(int2(p), size)) return false;
     if (srcPerOut.x > 1.0001 || srcPerOut.y > 1.0001)
     {
@@ -2239,7 +2410,13 @@ struct Constants
     float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
     float    rfxApl;                    // its APL Limiter: 1 = on (GPU-measured from the frame being shown)
     float    warp;                      // frame warp: share of the measured motion the frame is moved ahead (0 = off)
+    float    warpPrevN;                 // frame warp with the game's own motion: game frames back to the frame shown before
+    uint32_t warpSrc;                   // 0 motion from the picture, 1 the game's motion vectors and depth, 2 its vectors only
+    float    warpSnapX, warpSnapY;      // frame warp: moves rounded to whole steps of this many game-frame pixels (0 = off)
+    float    warpLag;                   // the game's motion with frame generation: shown frames behind its vectors' frame
+    float    warpEase;                  // the game's motion: 1 = moves past the rendered frame ease off as the motion slows
 };
+static_assert(sizeof(Constants) / 4 <= 63, "root constants: at most 64 DWORDs in the root signature");
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
 // every 32x18 cell's lit value is capped at C. Plain strobe: the lit refresh.
@@ -2404,9 +2581,11 @@ static void Trace(const char *fmt, ...)
 // they are usually ready), and kept on disk in BFIPresenter_shaders.bin next to the ini, keyed to the exact source and
 // compile flags: from the second start of a version there is no compile at all.
 static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce",
-                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth" };   // the last four: kWarpShader (dx/bfi_warp.h)
-static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
-static const int kShN = 9;
+                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud" };   // the last six: kWarpShader (dx/bfi_warp.h)
+static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
+static const int kShN = 11;
+static const int kShWarpGame = 9;                // frame warp from the game's own motion vectors and depth
+static const int kShWarpHud = 10;                // and its HUD mask from the game's HUD-less picture
 static const int kShWarp = 5;                    // first of the frame warp shaders
 static ID3DBlob *g_shBlob[kShN] = {};
 static HANDLE volatile g_shThread = nullptr;
@@ -2987,6 +3166,8 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
 // held start time don't count lost frames then or for 10 s after (Obduction: streaming stalls set off two searches in a
 // minute, both finding the start time already in use).
 static std::atomic<double> g_windowHungT{-1e9};
+// New frames shown, and how many came more than a third of a cycle late (the frame-start search: uneven frame times)
+static std::atomic<int> g_gameIvN{0}, g_gameIvLate{0};
 
 // PresenterResize: BFI (and DX12 SDR to HDR) start inside the game's first resize of its swap chain. Most games do one
 // at start-up; some never do on their own (Hades II, Wreckfest 2), and messages to their window don't make them (tried:
@@ -3451,7 +3632,31 @@ static DWORD WINAPI PresenterThread(void *)
     int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
     UINT64 warpPrevId = 0;
     int    secWarpCycles = 0;
+    int    secWarpPaused = 0;   // cycles not filled: a camera cut or a letterboxed cutscene
+    // Warp guard (ep10): a repeated cycle shown as it is reuses the picture already drawn; filled, it is drawn anew, and
+    // that submission can wait in the driver behind the game's own late frame (South of Midnight: about 6 ms, 214 of 296
+    // repeats then missed their refresh and the hitch guard switched BFI off). If filled repeats keep making their
+    // refresh late, repeats are shown as they are for a while.
+    bool   cycRepeat = false;          // this strobe cycle repeats the frame shown before
+    uint8_t warpRepHist = 0;           // the last 8 filled repeats: bit set = drawn too late for its refresh
+    int    warpRepHistN = 0;
+    double warpRepHoldT = -1.0, warpRepHoldS = 30.0;
+    int    secWarpHeld = 0;
+    int    winWarpPaused = 0, winCuts = 0, winWarpHeld = 0; double winPauseT = 0.0;
     double secWarpSum = 0.0;
+    int    secWarpGame[3] = {};             // cycles moved with: the picture's motion, the game's vectors and depth, its vectors only
+    UINT   gameFlowGen = ~0u;               // the game's own motion textures the presenter's views were written for
+    // Frame warp check (test, FrameWarpGameMotionCheck): every 2 s, on a cycle moved with the game's motion, the motion
+    // measured from the picture for the same pair of frames as well; both read back and compared in the log.
+    ID3D12Resource *chkRb[2] = {};          // readback: the game's motion texture, the measured one
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT chkFp[2] = {};
+    UINT   chkW[2] = {}, chkH[2] = {};
+    UINT64 chkBytes[2] = {};
+    UINT64 chkFence = 0, chkFrames = 0;
+    double chkT = 0.0;
+    bool   chkPending = false;
+    int    chkSrc = 0;
+    const UINT kGameFlowSrv = kStage + 2 + WarpGpu::kSrvCount;   // their views in srvHeap
     bool   kwarp = false;
     UINT64 measFence = 0;
     IDXGIOutput *output = nullptr;
@@ -3478,7 +3683,8 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount;   // the stage frames, the APL Limiter's cells and its 1x1 average, frame warp's textures
+    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
+                                                                       // frame warp's textures, the game's own motion per stage slot
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
 
@@ -3737,6 +3943,7 @@ static DWORD WINAPI PresenterThread(void *)
     LeaveCriticalSection(&g_cfgLock);
 
     uint64_t presents = 0, lastShownId = 0;
+    double pickNew0T = 0.0;                    // the staging time of the last new frame shown (the frame-start search)
     // LCD phase swap: refreshes held back from the strobe count. Each one repeats the cycle's last (dark)
     // refresh once, so with an even cycle the lit refresh moves to the panel's other drive polarity.
     uint64_t phaseShift = 0;
@@ -4224,6 +4431,15 @@ static DWORD WINAPI PresenterThread(void *)
         }
         if (cycleStart)
         {
+            cycRepeat = lastShownId && pickId == lastShownId;
+            if (pickNew0T > 0.0 && pickId != lastShownId && g_stageTime[pick] > pickNew0T)
+            {
+                // the game's frame times, for the frame-start search: a frame more than a third of a cycle late
+                g_gameIvN.fetch_add(1);
+                if (g_stageTime[pick] - pickNew0T > 1.35 * (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0) * (double)(pickId - lastShownId))
+                    g_gameIvLate.fetch_add(1);
+            }
+            if (pickId != lastShownId) pickNew0T = g_stageTime[pick];
             if (pickId == lastShownId) secFrameRepeats++;
             else if (lastShownId && pickId > lastShownId + 1) secFrameSkips += (int)(pickId - lastShownId - 1);
         }
@@ -4236,7 +4452,7 @@ static DWORD WINAPI PresenterThread(void *)
             warpAhead = 0.0;
         }
         else if (cycleStart)
-            warpAhead = warpClock.Cycle(s.frameWarp, pickId, pickTime, tVb, (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0),
+            warpAhead = warpClock.Cycle((s.warpEven && s.warpGame && gmo::StateFast() > 0 && (!g_status.fgActive || s.warpGameFg)) ? 2 : 1, pickId, pickTime, tVb, (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0),
                                         (double)s.warpMax, (double)s.warpMinRate / 100.0);
         pickNew = cycleStart && pickId != lastShownId;
         pickRelT = (pickNew && g_relId[pickId % kRel] == pickId) ? g_relT[pickId % kRel] : 0.0;
@@ -4387,11 +4603,54 @@ static DWORD WINAPI PresenterThread(void *)
         // frame older (frames never shown): the share of that motion for warpAhead game frames. In steps of 1/256, so
         // the cycle's refreshes compare equal and drawn buffers can still be reused.
         UINT64 warpOld = 0;
+        ID3D12Resource *gFlow = nullptr;                // this refresh's motion texture from the game's motion
         if (StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT) c.flags |= 1024u;
         if (warpAhead > 0.0 && s.frameWarp && warp.ok && (warpOld = warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrev >= 0 && warpPrev != pick && warpPrevId == warpOld && g_stageId[warpPrev] == warpOld && g_stageFence[warpPrev] <= done)
-            c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
-        if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; }
+        {
+            // The game's own motion (where it hands its upscaler motion vectors and depth): one game frame's motion,
+            // warpAhead frames on. Otherwise the motion measured between this frame and the one shown before.
+            const int gsrc = (s.warpGame && (!g_status.fgActive || s.warpGameFg)) ? gmo::SlotFor(pick, pickId) : 0;
+            if (gsrc)
+            {
+                const UINT fg = gmo::FlowGenNow();
+                if (fg != gameFlowGen)
+                {
+                    D3D12_CPU_DESCRIPTOR_HANDLE gh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                    gh.ptr += (SIZE_T)kGameFlowSrv * srvStride;
+                    gameFlowGen = gmo::WriteFlowSrvs(gh, srvStride);
+                }
+                gFlow = gmo::FlowFor(pick, gameFlowGen);   // one texture for the whole refresh (both barriers, the check)
+            }
+            if (gsrc && gFlow)
+            {
+                // with frame generation, a limit of its own (the game's motion overshoots visibly further out)
+                const double ahead = g_status.fgActive ? std::min(warpAhead, (double)s.warpMaxGameFg) : warpAhead;
+                c.warp = (float)(floor(ahead * 256.0 + 0.5) / 256.0);
+                c.warpPrevN = (float)(pickId - warpOld);
+                c.warpSrc = (uint32_t)gsrc;
+                c.warpLag = g_status.fgActive ? gmo::SlotLag(pick) : 0.0f;
+                c.warpEase = (g_status.fgActive && s.warpEase) ? 1.0f : 0.0f;
+            }
+            // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
+            else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
+            else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
+            c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
+            // Around a camera cut, and in a letterboxed cutscene: shown as rendered (no motion connects two shots).
+            const char *pauseWhy = nullptr;
+            if (c.warp != 0.0f && gmo::PauseNow(pickId, s.warpPauseLb != 0, &pauseWhy))
+            {
+                c.warp = 0.0f; c.warpSrc = 0; gFlow = nullptr;
+                if (cycleStart) secWarpPaused++;
+            }
+            // The warp guard: repeats shown as they are while it holds.
+            if (c.warp != 0.0f && cycRepeat && s.warpGuard && Now() < warpRepHoldT)
+            {
+                c.warp = 0.0f; c.warpSrc = 0; gFlow = nullptr;
+                if (cycleStart) secWarpHeld++;
+            }
+        }
+        if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame[c.warpSrc <= 2 ? c.warpSrc : 0]++; }
 
         if (pickNew2 < 0) pickNew2 = pick;                       // picked later (the wait above): the same frame
         const UINT64 pickId2 = pickNew2 >= 0 ? g_stageId[pickNew2] : 0;
@@ -4452,6 +4711,11 @@ static DWORD WINAPI PresenterThread(void *)
         {
             D3D12_RESOURCE_BARRIER b3 = Transition(g_stage[warpPrev], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &b3);
+            if (c.warpSrc != 0)
+            {
+                D3D12_RESOURCE_BARRIER b4 = Transition(gFlow, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                list->ResourceBarrier(1, &b4);
+            }
         }
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         rtv.ptr += (SIZE_T)bi * rtvStride;
@@ -4472,6 +4736,76 @@ static DWORD WINAPI PresenterThread(void *)
         // ones); the motion from the frame before is measured only when the frame is shown moved, once per pair.
         const bool tsOn = tsHeap && logf;                // timed only while the timing log runs
         if (tsOn) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 0);
+        // Frame warp check: the two motions read back (a cycle or more later), averaged and logged.
+        if (chkPending && g_presFence->GetCompletedValue() >= chkFence)
+        {
+            chkPending = false;
+            double sum[2][2] = {}, wsum[2] = {}, mag[2] = {};
+            int nAll[2] = {}, nOk[2] = {}, nHud = 0; HRESULT mapHr[2] = { E_FAIL, E_FAIL };
+            const D3D12_RESOURCE_DESC fd = g_stage[0]->GetDesc();
+            const double W = (double)fd.Width, H = (double)fd.Height;
+            static int hudBigN = 0;
+            for (int q = 0; q < 2; q++)
+            {
+                void *mp = nullptr;
+                // the whole buffer (gm7 asked for rows x row pitch, which is past its end when the last row isn't padded:
+                // E_INVALIDARG for the measured motion's 120-texel rows)
+                D3D12_RANGE rr = { 0, (SIZE_T)chkBytes[q] };
+                mapHr[q] = chkRb[q]->Map(0, &rr, &mp);
+                if (FAILED(mapHr[q]) || !mp) continue;
+                const int step = q == 0 ? 4 : 1;                 // the game's texture is large: every 4th texel
+                for (UINT y = 0; y < chkH[q]; y += step)
+                {
+                    const uint16_t *row = (const uint16_t *)((const uint8_t *)mp + chkFp[q].Offset + (size_t)y * chkFp[q].Footprint.RowPitch);
+                    for (UINT x = 0; x < chkW[q]; x += step)
+                    {
+                        const float fx = HalfToFloat(row[4 * x]), fy = HalfToFloat(row[4 * x + 1]);
+                        const float fz = HalfToFloat(row[4 * x + 2]), fw = HalfToFloat(row[4 * x + 3]);
+                        // the game's: z = 1 where its vector is valid; the measured (evened out): w = 1 where measured
+                        const float wgt = q == 0 ? (fz > 0.5f ? 1.0f : 0.0f) : (fw > 0.5f ? fz : 0.0f);
+                        nAll[q]++;
+                        if (q == 0 && fw < -0.5f) nHud++;
+                        if (wgt <= 0.0f || !std::isfinite(fx) || !std::isfinite(fy)) continue;
+                        nOk[q]++;
+                        sum[q][0] += fx * wgt; sum[q][1] += fy * wgt; wsum[q] += wgt;
+                        mag[q] += std::sqrt((double)fx * W * fx * W + (double)fy * H * fy * H) * wgt;   // pixels
+                    }
+                }
+                D3D12_RANGE wr = { 0, 0 };
+                chkRb[q]->Unmap(0, &wr);
+            }
+            // the HUD mask: how much of the picture it covers (much more than any HUD: it doesn't match -- switched off)
+            const double hudPct = nAll[0] ? 100.0 * nHud / nAll[0] : 0.0;
+            if (gmo::HudNow() > 0)
+            {
+                static int hudLogs = 0;
+                if (hudLogs++ < 30) LOGI("BFI Presenter: frame warp check: the HUD mask covers %.1f%% of the picture", hudPct);
+                if (hudPct > 35.0) { gmo::HudBad(hudPct); hudBigN = 0; } else hudBigN = 0;
+            }
+            if (!(wsum[0] > 0.0 && wsum[1] > 0.0 && chkFrames > 0))
+            {
+                static int nLog = 0;
+                if (nLog++ < 10)
+                    LOGI("BFI Presenter: frame warp check: nothing to compare (the game's motion: map 0x%08lX, %d of %d points valid, %ux%u; "
+                         "measured: map 0x%08lX, %d of %d points measured, %ux%u; %llu frames between)", (unsigned long)mapHr[0], nOk[0], nAll[0],
+                         chkW[0], chkH[0], (unsigned long)mapHr[1], nOk[1], nAll[1], chkW[1], chkH[1], (unsigned long long)chkFrames);
+            }
+            else
+            {
+                // per shown frame, in pixels of the game frame
+                const double gx = sum[0][0] / wsum[0] * W, gy = sum[0][1] / wsum[0] * H;
+                const double mx = sum[1][0] / wsum[1] * W / (double)chkFrames, my = sum[1][1] / wsum[1] * H / (double)chkFrames;
+                const double gl = std::sqrt(gx * gx + gy * gy), ml = std::sqrt(mx * mx + my * my);
+                const double ang = (gl > 0.05 && ml > 0.05) ? std::acos(std::max(-1.0, std::min(1.0, (gx * mx + gy * my) / (gl * ml)))) * 57.29578 : -1.0;
+                static int chkLogs = 0;
+                if (chkLogs++ < 150)
+                    LOGI("BFI Presenter: frame warp check: per shown frame, the game's motion %.1f, %.1f px (%.1f px; points moving %.1f px on average), "
+                         "measured from the picture %.1f, %.1f px (%.1f px), game / measured %.2f, %s%.0f deg apart (%llu frame%s between the pair, %s)",
+                         gx, gy, gl, mag[0] / wsum[0], mx, my, ml, ml > 0.05 ? gl / ml : 0.0,
+                         ang < 0.0 ? "direction n/a " : "", ang < 0.0 ? 0.0 : ang, (unsigned long long)chkFrames, chkFrames == 1 ? "" : "s",
+                         chkSrc == 1 ? "vectors and depth" : "vectors only");
+            }
+        }
         bool warpTouched = false;
         if (s.frameWarp && warp.ok)
         {
@@ -4481,7 +4815,58 @@ static DWORD WINAPI PresenterThread(void *)
                 warp.RecordLuma(list, srv, pickId, pickTime, StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT);
                 touched = true;
             }
-            if (c.warp != 0.0f && (warp.flowNew != pickId || warp.flowOld != warpOld)) { warp.RecordFlow(list); touched = true; }
+            if (c.warp != 0.0f && c.warpSrc == 0 && (warp.flowNew != pickId || warp.flowOld != warpOld)) { warp.RecordFlow(list); touched = true; }
+            // The check: the measured motion for this pair too, and both textures copied for reading back.
+            if (s.warpGameCheck && c.warpSrc != 0 && cycleStart && !chkPending && Now() - chkT >= 2.0 && gFlow)
+            {
+                if (warp.flowNew != pickId || warp.flowOld != warpOld) { warp.RecordFlow(list); touched = true; }
+                ID3D12Resource *srcR[2] = { gFlow, warp.flowOut[WarpGpu::Out()] };
+                bool okRb = true;
+                for (int q = 0; q < 2 && okRb; q++)
+                {
+                    const D3D12_RESOURCE_DESC dsc = srcR[q]->GetDesc();
+                    if (!chkRb[q] || chkW[q] != (UINT)dsc.Width || chkH[q] != dsc.Height)
+                    {
+                        SafeRelease(chkRb[q]);
+                        UINT64 total = 0;
+                        g_device->GetCopyableFootprints(&dsc, 0, 1, 0, &chkFp[q], nullptr, nullptr, &total);
+                        chkBytes[q] = total;
+                        D3D12_HEAP_PROPERTIES rh = {}; rh.Type = D3D12_HEAP_TYPE_READBACK;
+                        D3D12_RESOURCE_DESC bd = {};
+                        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1;
+                        bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                        okRb = SUCCEEDED(g_device->CreateCommittedResource(&rh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                                           nullptr, IID_PPV_ARGS(&chkRb[q])));
+                        chkW[q] = (UINT)dsc.Width; chkH[q] = dsc.Height;
+                    }
+                }
+                if (!okRb)
+                {
+                    static bool once = false;
+                    if (!once) { once = true; LOGW("BFI Presenter: frame warp check: its readback buffers could not be made"); }
+                    chkT = Now();
+                }
+                if (okRb)
+                {
+                    // both in PIXEL_SHADER_RESOURCE here (the game's moved there at the start of this list)
+                    D3D12_RESOURCE_BARRIER cb[2] = { Transition(srcR[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                                     Transition(srcR[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE) };
+                    list->ResourceBarrier(2, cb);
+                    for (int q = 0; q < 2; q++)
+                    {
+                        D3D12_TEXTURE_COPY_LOCATION dl = {}, sl = {};
+                        dl.pResource = chkRb[q]; dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dl.PlacedFootprint = chkFp[q];
+                        sl.pResource = srcR[q]; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
+                        list->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+                    }
+                    cb[0] = Transition(srcR[0], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    cb[1] = Transition(srcR[1], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    list->ResourceBarrier(2, cb);
+                    chkPending = true; chkFence = reserve; chkFrames = pickId - warpOld; chkT = Now(); chkSrc = (int)c.warpSrc;
+                    static int nRec = 0;
+                    if (nRec++ < 3) LOGI("BFI Presenter: frame warp check: both motions copied for reading back (fence %llu)", (unsigned long long)reserve);
+                }
+            }
             warpTouched = touched;
             if (touched)
             {
@@ -4491,7 +4876,13 @@ static DWORD WINAPI PresenterThread(void *)
             }
         }
         if (tsOn) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 1);
-        list->SetGraphicsRootDescriptorTable(4, warp.ok ? warp.FlowSrv() : srv);   // t3 (read only while a frame is shown moved)
+        if (c.warpSrc != 0)
+        {
+            D3D12_GPU_DESCRIPTOR_HANDLE gs = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            gs.ptr += (UINT64)(kGameFlowSrv + (UINT)pick) * srvStride;
+            list->SetGraphicsRootDescriptorTable(4, gs);                           // t3: the game's own motion for this frame
+        }
+        else list->SetGraphicsRootDescriptorTable(4, warp.ok ? warp.FlowSrv() : srv);   // t3 (read only while a frame is shown moved)
         {
             D3D12_GPU_DESCRIPTOR_HANDLE psrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
             psrv.ptr += (UINT64)(c.warp != 0.0f ? warpPrev : pick) * srvStride;
@@ -4599,6 +4990,11 @@ static DWORD WINAPI PresenterThread(void *)
         {
             D3D12_RESOURCE_BARRIER b3 = Transition(g_stage[warpPrev], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             list->ResourceBarrier(1, &b3);
+            if (c.warpSrc != 0)
+            {
+                D3D12_RESOURCE_BARRIER b4 = Transition(gFlow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                list->ResourceBarrier(1, &b4);
+            }
         }
         if (FAILED(list->Close())) LOGE("BFI Presenter: presenter draw list failed to record (Close) -- see BFIPresenter_debug.txt with Diagnostics=2");
 
@@ -4619,6 +5015,22 @@ static DWORD WINAPI PresenterThread(void *)
             while (g_holdPresents.load() > 0 && g_running.load() && Now() - th < 2.0) Sleep(1);
         }
         const double tSub = Now();
+        if (cycleStart && cycRepeat && c.warp != 0.0f && s.warpGuard)
+        {
+            const bool late = tSub - tFence > 0.4 / (modeHz > 0.0 ? modeHz : 120.0);
+            warpRepHist = (uint8_t)((warpRepHist << 1) | (late ? 1 : 0));
+            if (warpRepHistN < 8) warpRepHistN++;
+            int n = 0; for (int b = 0; b < 8; b++) n += (warpRepHist >> b) & 1;
+            if (warpRepHistN >= 5 && n >= 3)
+            {
+                warpRepHoldT = tSub + warpRepHoldS;
+                LOGI("BFI Presenter: frame warp guard: %d of the last %d filled repeats were drawn too late for their refresh (drawing one took "
+                     "%.1f ms; the game's own late frame was being sent to the GPU at the same time) -- repeats are shown as they are for %.0f s",
+                     n, warpRepHistN, (tSub - tFence) * 1000.0, warpRepHoldS);
+                warpRepHoldS = std::min(300.0, warpRepHoldS * 2.0);
+                warpRepHist = 0; warpRepHistN = 0;
+            }
+        }
         PresStage(ST_PRESENT);
         HRESULT hr;
         hr = OwnPresent();
@@ -4952,6 +5364,10 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 g_status.fgLimitUs = want;
             }
+#ifdef _WIN64
+            slp::Tick(t);
+            ngx::Tick(t);
+#endif
             DXGI_FRAME_STATISTICS st = {};
             const double tSt0 = Now();
             const bool sok = SUCCEEDED(ScStats(&st));
@@ -5047,6 +5463,24 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.warpCycles   = secWarpCycles;
             g_status.warpAvg      = secWarpCycles ? secWarpSum / secWarpCycles : 0.0;
             g_status.warpRate     = warpClock.rate;
+            g_status.warpSrc      = secWarpGame[1] ? 1 : secWarpGame[2] ? 2 : 0;
+            g_status.warpGameState = gmo::StateNow(g_status.warpGameWhy, sizeof(g_status.warpGameWhy));
+            g_status.warpGameVia = gmo::ViaNow();
+            g_status.warpHud = gmo::HudNow();
+            {
+                // the log says which motion frame warp uses, when it changes (at most every 5 s)
+                static int srcWas = -1;
+                static double srcLogT = -10.0;
+                const int src = secWarpCycles ? g_status.warpSrc : -1;
+                if (src >= 0 && src != srcWas && t - srcLogT > 5.0)
+                {
+                    LOGI("BFI Presenter: frame warp moves the picture with %s (%d of %d cycles in the last second)",
+                         src == 1 ? "the game's own motion vectors and depth" : src == 2 ? "the game's own motion vectors (no depth)"
+                                  : "the motion measured from the picture", src ? secWarpGame[src] : secWarpGame[0], secWarpCycles);
+                    srcWas = src; srcLogT = t;
+                }
+            }
+            secWarpGame[0] = secWarpGame[1] = secWarpGame[2] = 0;
             {
                 // the log says when frame warp starts and stops working (at most every 5 s)
                 static int warpWas = 0;
@@ -5063,6 +5497,16 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 else if (g_status.warpOn != 2 && warpWas != 2) warpWas = g_status.warpOn;
             }
+            winWarpPaused += secWarpPaused; winCuts += gmo::CutsTake(); winWarpHeld += secWarpHeld;
+            if (t - winPauseT >= 10.0)
+            {
+                static int pauseLogs = 0;
+                if ((winWarpPaused || winCuts || winWarpHeld) && pauseLogs++ < 60)
+                    LOGI("BFI Presenter: frame warp, last %.0f s: %d camera cuts flagged by the game, %d strobe cycles not filled (camera cuts, "
+                         "letterboxed cutscenes), %d repeats shown as they are (the warp guard)", t - winPauseT, winCuts, winWarpPaused, winWarpHeld);
+                winWarpPaused = winCuts = winWarpHeld = 0; winPauseT = t;
+            }
+            secWarpPaused = 0; secWarpHeld = 0;
             secWarpCycles = 0; secWarpSum = 0.0;
             g_status.unevenRep    = secRepU;
             g_status.unevenSkip   = secSkipU;
@@ -5659,7 +6103,9 @@ static DWORD WINAPI PresenterThread(void *)
                     static int swIdx = -1, swN = 0, swSecs = 0, swBad = 0, swShown = 0, swRelN = 0, swRep = 0;
                     static double swPhase = 0.0, swStart = 0.0, swDoneT = -1.0, swBestMs = 0.0, swRel = 0.0, swScore[16] = {}, swRelMs[16] = {},
                                   swSlack = 1.0, swSlackK[16] = {};
-                    static int swTight = 0;
+                    static int swIvN = 0, swIvLate = 0;     // the search: new frames shown, and those over a third of a cycle late
+                    static unsigned swTightHist = 0;     // the last 5 seconds: frames repeated with little to spare (one bit each)
+                    static double swBackMs = 0.0;        // moved earlier since the start time was found (more to spare)
                     static int swShownK[16] = {};
                     static bool swWasOn = false;
                     // The automatic frame cap at the frame start keeps the start time it found while the cap goes up to
@@ -5728,6 +6174,7 @@ static DWORD WINAPI PresenterThread(void *)
                         // The automatic frame cap at the frame start: only while the game holds the cap. Below it (a scene
                         // too heavy for 60) every start time loses frames and a search only shows its bad ones (Days Gone:
                         // four searches in four minutes, each started in a scene at 55-59 fps).
+                        const int ivNSec = g_gameIvN.exchange(0), ivLateSec = g_gameIvLate.exchange(0);
                         const bool ok = holds && !hitchPaused && (g_fgPaceKind.load() != 2 || stNow.gameFps >= 0.98 * capFps) &&
                                         t - g_windowHungT.load() > 10.0;
                         const double base = swPhase - std::fmod(swPhase, cyc);   // stay within the same cycle's worth of moves
@@ -5739,6 +6186,8 @@ static DWORD WINAPI PresenterThread(void *)
                         {
                             swN = std::max(4, std::min(16, (int)(cyc / 0.002 + 0.5)));
                             swIdx = 0; swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swBad = 0;
+                            swTightHist = 0; swBackMs = 0.0;
+                            swIvN = swIvLate = 0;
                             swStart = base;
                             moveTo(swStart);
                             LOGI("BFI Presenter: %s: trying %d start times across the strobe cycle (%.0f s)",
@@ -5750,6 +6199,7 @@ static DWORD WINAPI PresenterThread(void *)
                             if (!ok) { swSecs = 0; swShown = swRelN = swRep = 0; swRel = 0.0; swSlack = 1.0; }
                             else if (++swSecs >= settle)
                             {
+                                swIvN += ivNSec; swIvLate += ivLateSec;
                                 swShown += relN; swRel += relSum; swRelN += relN; swRep += stNow.frameRepeats;
                                 if (p10 >= 0.0) swSlack = std::min(swSlack, p10);
                                 // The automatic frame cap at the frame start: a start time that loses frames in its first
@@ -5775,8 +6225,21 @@ static DWORD WINAPI PresenterThread(void *)
                                     if (swIdx < swN) moveTo(start + swIdx * cyc / swN);
                                     else
                                     {
+                                        // Uneven frame times (ep10): over 2% of the game's frames came more than a third of a cycle
+                                        // late during the search -- the quickest start with 3-5 ms to spare missed one cycle in 10
+                                        // (South of Midnight: +14.6 ms with 4.6 ms to spare, 296 repeats in 52 s). There, 6 ms to
+                                        // spare first, then 3 ms, then any start time that showed every frame.
+                                        const int ivN = swIvN, ivLate = swIvLate;
+                                        const bool uneven = !fsr && ivN >= 200 && ivLate * 50 > ivN;
+                                        if (uneven)
+                                            for (int k = 0; k < swN; k++)
+                                                if (swScore[k] < 1e3)
+                                                    swScore[k] = swSlackK[k] >= 0.006 ? swRelMs[k] : swSlackK[k] >= 0.003 ? 50.0 + swRelMs[k] : 100.0 + swRelMs[k];
                                         int best = 0;
                                         for (int k = 1; k < swN; k++) if (swScore[k] < swScore[best]) best = k;
+                                        if (uneven)
+                                            LOGI("BFI Presenter: %s: the game's frame times are uneven (%d of %d frames over a third of a cycle late) -- "
+                                                 "a start time with more to spare is preferred", swName, ivLate, ivN);
                                         moveTo(start + best * cyc / swN);
                                         swIdx = -1; swDoneT = t; swBestMs = swRelMs[best];
                                         learnSw();
@@ -5796,16 +6259,27 @@ static DWORD WINAPI PresenterThread(void *)
                         // slower than the start time found.
                         else
                         {
-                            swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + 6.0))) ? swBad + 1 : 0;
-                            // Held, frames repeating close to their flash (the GPU work grew): 2 ms earlier, once per 3 s.
-                            swTight = (!fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.0015) ? swTight + 1 : 0;
-                            if (swTight >= 3)
+                            swBad = (ok && (relN < (int)(0.9 * capFps) || (relN > 0 && relSum / relN > swBestMs + swBackMs + 6.0))) ? swBad + 1 : 0;   // the steps back below
+                            // don't count as slower
+                            // Held, frames repeating with little to spare before their flash (the GPU work grew): 2 ms
+                            // earlier when 3 of the last 5 seconds had 2 or more repeats with under 6 ms to spare (the 10th
+                            // percentile: the few frames that miss are below it), at most 8 ms earlier than the start time
+                            // found. Stray: the search took the quickest start time (4.4 ms to spare), then 2-7 frames a
+                            // second repeated at 0.5-3.5 ms to spare -- never under the 1.5 ms (3 s in a row) this needed
+                            // before, so it stayed there; 2 ms earlier had 8.5 ms. Kena (gm14, under 3 ms): 1-5 repeats a
+                            // second at 2.5-5 ms to spare, never moved.
+                            // Only where the game holds the cap, so a scene too heavy for it moves nothing.
+                            const bool tight = !fsr && ok && stNow.frameRepeats >= 2 && p10 >= 0.0 && p10 < 0.006;
+                            swTightHist = ((swTightHist << 1) | (tight ? 1u : 0u)) & 0x1Fu;
+                            int nTight = 0; for (int k = 0; k < 5; k++) nTight += (swTightHist >> k) & 1u;
+                            if (nTight >= 3 && swBackMs < 7.9)
                             {
-                                swTight = 0;
+                                swTightHist = 0;
+                                swBackMs += 2.0;
                                 moveTo(swPhase - 0.002);
                                 learnSw();
-                                LOGI("BFI Presenter: %s: frames repeated close to their flash -- 2 ms earlier",
-                                     swName);
+                                LOGI("BFI Presenter: %s: frames repeated with %.1f ms to spare before their flash -- 2 ms earlier "
+                                     "(%.0f ms earlier than the start time found)", swName, p10 * 1000.0, swBackMs);
                             }
                         }
                     }
@@ -6153,6 +6627,7 @@ static DWORD WINAPI PresenterThread(void *)
     SafeRelease(psAplC);
     SafeRelease(psAplR);
     warp.Release();
+    SafeRelease(chkRb[0]); SafeRelease(chkRb[1]);
     for (int i = 0; i < kWarpShN; i++) SafeRelease(psWarp[i]);
     SafeRelease(rootSig);
     SafeRelease(rsBlob);
@@ -6538,6 +7013,7 @@ static HRESULT SubmitGameFrameLocked()
     br[0] = Transition(g_virt[g_cur], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
     br[1] = Transition(g_stage[s], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     g_copyList->ResourceBarrier(2, br);
+    gmo::AtPresent(g_copyList, s);            // frame warp: this frame's motion from the game's own vectors and depth
     {
         const HRESULT ch = g_copyList->Close();
         static bool once = false;
@@ -6558,6 +7034,7 @@ static HRESULT SubmitGameFrameLocked()
     EnterCriticalSection(&g_lock);            // publish: selectable from here on
     g_stageFence[s] = g_gameFenceVal;
     g_stageId[s]    = ++g_frameId;
+    gmo::Published(s, g_frameId);
     g_recentFence[g_frameId % 8] = g_gameFenceVal;
     g_stageTime[s]  = Now();
     LeaveCriticalSection(&g_lock);
@@ -7476,6 +7953,1528 @@ static void *InlineHook64(void *target, void *hook, char *why, size_t whyLen)
     FlushInstructionCache(GetCurrentProcess(), code, len);
     return tramp;
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Streamline probe (test build sl1): what a game hands DLSS through Streamline each frame -- the tagged
+// buffers (depth, motion vectors) and the camera constants -- logged every 10 s. Only sl.interposer.dll's
+// slSetTag, slSetTagForFrame, slSetConstants and slEvaluateFeature are hooked: a few calls a frame, no
+// draw events (the depth probe through ReShade's draw events crashed South of Midnight). Nothing is changed.
+// Layouts follow the Streamline SDK 2.x headers (sl_struct.h, sl.h, sl_consts.h); values are checked for
+// sanity before they are logged.
+namespace slp
+{
+struct Base { void *next; uint8_t type[16]; size_t version; };                   // sl::BaseStructure, 32 bytes
+struct Res  { Base b; uint32_t type; uint32_t pad; void *native; void *mem; void *view; uint32_t state;
+              uint32_t width, height, nativeFormat, mips, layers; };              // sl::Resource (start)
+struct Ext  { uint32_t top, left, width, height; };                               // sl::Extent
+struct Tag  { Base b; Res *res; uint32_t bufType; uint32_t lifecycle; Ext ext; };   // sl::ResourceTag (2.4: the extent by value)
+static_assert(sizeof(Tag) == 64, "sl::ResourceTag layout");
+struct Consts                                                                     // sl::Constants (start)
+{
+    Base b;
+    float viewToClip[16], clipToView[16], clipToLensClip[16], clipToPrevClip[16], prevClipToClip[16];
+    float jitter[2], mvecScale[2], pinhole[2];
+    float pos[3], up[3], right[3], fwd[3];
+    float zNear, zFar, fov, aspect, mvInvalid;
+    uint8_t depthInverted, cameraMotionIncluded, mv3D, reset, ortho, mvDilated, mvJittered;
+};
+static_assert(offsetof(Consts, zNear) == 424 && offsetof(Consts, depthInverted) == 444, "sl::Constants layout");
+
+typedef int (*PFN_SetTag)(const void *vp, const Tag *tags, uint32_t n, void *cmd);
+typedef int (*PFN_SetTagForFrame)(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd);
+typedef int (*PFN_SetConstants)(const Consts &c, const void *frame, const void *vp);
+typedef int (*PFN_Evaluate)(uint32_t feature, const void *frame, const Base **inputs, uint32_t n, void *cmd);
+static PFN_SetTag o_SetTag; static PFN_SetTagForFrame o_SetTagForFrame; static PFN_SetConstants o_SetConstants; static PFN_Evaluate o_Evaluate;
+
+struct TagStat { uint32_t calls = 0, w = 0, h = 0, fmt = 0, extW = 0, extH = 0, resW = 0, resH = 0;
+                 uint32_t noRes = 0, badRes = 0, noNative = 0, badNative = 0, noQI = 0, ok = 0; bool d3d12 = false, d3d11 = false; };
+static std::mutex g_lk;
+static bool g_tried = false, g_hooked = false;
+static double g_winT = 0.0;
+static int g_reports = 0;
+static std::map<uint32_t, TagStat> g_tags, g_tagsEval;   // from slSetTag / from slEvaluateFeature's inputs
+static std::map<uint32_t, uint32_t> g_evalIn;               // other structures in slEvaluateFeature's inputs, by GUID's first word
+static int g_rawLeft = 8;                                   // raw tag dumps left (sl4)
+static const uint8_t kTagGuid[16] = { 0xad,0x5a,0x6a,0x4c, 0x45,0xb4, 0x6c,0x49, 0x87,0xff,0x1a,0xf3,0x84,0x5b,0xe6,0x53 };
+static std::map<uint32_t, uint32_t> g_evals;
+static uint32_t g_consts = 0, g_constsBad = 0, g_resets = 0;
+static Consts g_last = {}; static bool g_haveLast = false;
+static double g_moved = 0.0, g_turned = 0.0;      // camera travel and turning over the window (from pos and fwd)
+static float g_prevPos[3], g_prevFwd[3]; static bool g_havePrev = false;
+
+// Every pointer from the game is checked before it is read: Rift Apart (sl1) crashed reading a tag's extent
+// at 0x100000008 -- a Streamline older than the 2.x layout assumed here, or a different one.
+static bool Readable(const void *p, size_t n)
+{
+    if (!p || (uintptr_t)p < 0x10000) return false;
+    MEMORY_BASIC_INFORMATION mi = {};
+    if (!VirtualQuery(p, &mi, sizeof(mi)) || mi.State != MEM_COMMIT) return false;
+    if (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    return (const BYTE *)p + n <= (const BYTE *)mi.BaseAddress + mi.RegionSize;
+}
+// Cheap check without a system call: Rift Apart slowed to 13 fps with VirtualQuery on every tag (sl4) --
+// it takes the process's address-space lock, which the game's streaming threads hold for long stretches.
+// So VirtualQuery runs only on one sampled call a second; every other call just checks the pointer's range.
+static inline bool Plaus(const void *p) { const uintptr_t u = (uintptr_t)p; return u >= 0x10000 && u < 0x7FFFFFFF0000ull && !(u & 7); }
+static std::atomic<bool> g_deepDue{true};
+static bool g_deep = false;                          // this call is the sampled one (set under g_lk)
+static inline bool Chk(const void *p, size_t n) { return g_deep ? Readable(p, n) : Plaus(p); }
+static double g_probeS = 0.0, g_probeMaxS = 0.0; static uint32_t g_probeCalls = 0;   // time in the probe's own code
+static uint32_t g_badTags = 0;
+static char g_slVer[48] = "unknown";
+static thread_local int g_slDepth = 0;               // inside slEvaluateFeature on this thread (its own DLSS call is left to this hook)
+static int g_slMajor = 0;
+
+static const char *TagName(uint32_t t)
+{
+    switch (t)
+    {
+    case 0: return "depth"; case 1: return "motion vectors"; case 2: return "HUD-less colour"; case 3: return "upscaler input colour";
+    case 4: return "upscaler output colour"; case 5: return "normals"; case 6: return "roughness"; case 7: return "albedo";
+    default: return nullptr;
+    }
+}
+
+static void NoteOne(const Tag &tg, std::map<uint32_t, TagStat> &into, const char *from)
+{
+    if (tg.b.version > 64 || tg.bufType > 255) { g_badTags++; return; }
+    TagStat &s = into[tg.bufType];
+    s.calls++;
+    if (tg.ext.width) { s.extW = tg.ext.width; s.extH = tg.ext.height; }
+    Res *r = tg.res;
+    const bool rOk = r && Chk(r, sizeof(Res));
+    if (g_rawLeft > 0 && g_deep)
+    {
+        g_rawLeft--;
+        LOGI("BFI Presenter: Streamline probe: raw tag (%s): type %u, lifecycle %u, extent %u,%u %ux%u, resource %p%s native %p, res size %ux%u fmt %u, state 0x%x",
+             from, tg.bufType, tg.lifecycle, tg.ext.left, tg.ext.top, tg.ext.width, tg.ext.height, (void *)r, rOk ? "" : " (unreadable)",
+             rOk ? r->native : nullptr, rOk ? r->width : 0, rOk ? r->height : 0, rOk ? r->nativeFormat : 0, rOk ? r->state : 0);
+    }
+    if (!r) { s.noRes++; return; }
+    if (!rOk) { s.badRes++; return; }
+    if (r->width) { s.resW = r->width; s.resH = r->height; }
+    if (!r->native) { s.noNative++; return; }
+    if (!g_deep) { if (Plaus(r->native)) s.ok++; else s.badNative++; return; }   // the texture is looked up only on the sampled call
+    if (!Readable(r->native, 8) || !Readable(*(void **)r->native, 24)) { s.badNative++; return; }
+    if (s.w) { s.ok++; return; }                         // size looked up once per buffer type and window
+    IUnknown *u = (IUnknown *)r->native;
+    ID3D12Resource *r12 = nullptr; ID3D11Texture2D *t11 = nullptr;
+    if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D12Resource), (void **)&r12)) && r12)
+    {
+        const D3D12_RESOURCE_DESC d = r12->GetDesc();
+        s.w = (uint32_t)d.Width; s.h = d.Height; s.fmt = (uint32_t)d.Format; s.d3d12 = true; s.ok++;
+        r12->Release();
+    }
+    else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&t11)) && t11)
+    {
+        D3D11_TEXTURE2D_DESC d = {}; t11->GetDesc(&d);
+        s.w = d.Width; s.h = d.Height; s.fmt = (uint32_t)d.Format; s.d3d11 = true; s.ok++;
+        t11->Release();
+    }
+    else s.noQI++;
+}
+
+static void NoteTags(const Tag *tags, uint32_t n)
+{
+    const double t0 = Now();
+    std::lock_guard<std::mutex> l(g_lk);
+    g_deep = g_deepDue.exchange(false);
+    if (n != 0 && n <= 64 && Chk(tags, n * sizeof(Tag))) { for (uint32_t i = 0; i < n; i++) NoteOne(tags[i], g_tags, "slSetTag"); }
+    else g_badTags++;
+    const double d = Now() - t0; g_probeS += d; g_probeCalls++; if (d > g_probeMaxS) g_probeMaxS = d;
+}
+
+// slEvaluateFeature can carry the tags itself, as inputs (each a chain of structures through 'next').
+static void NoteInputs(const Base **in, uint32_t n)
+{
+    const double t0 = Now();
+    std::lock_guard<std::mutex> l(g_lk);
+    g_deep = g_deepDue.exchange(false);
+    if (in && n != 0 && n <= 64 && Chk(in, n * sizeof(void *)))
+    {
+        for (uint32_t i = 0; i < n; i++)
+        {
+            const Base *b = in[i];
+            for (int depth = 0; b && depth < 8; depth++)
+            {
+                if (!Chk(b, sizeof(Base))) { g_badTags++; break; }
+                if (memcmp(b->type, kTagGuid, 16) == 0) { if (Chk(b, sizeof(Tag))) NoteOne(*(const Tag *)b, g_tagsEval, "slEvaluateFeature"); }
+                else { uint32_t g; memcpy(&g, b->type, 4); g_evalIn[g]++; }
+                b = (const Base *)b->next;
+            }
+        }
+    }
+    const double d = Now() - t0; g_probeS += d; g_probeCalls++; if (d > g_probeMaxS) g_probeMaxS = d;
+}
+
+} // namespace slp
+namespace gmo
+{
+static void NoteSetTags(const slp::Tag *tags, uint32_t n, void *cmd);
+static void NoteConsts(const slp::Consts &c);
+static void OnEvaluate(const slp::Base **in, uint32_t n, void *cmd);
+}
+namespace slp
+{
+static int hk_SetTag(const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); gmo::NoteSetTags(tags, n, cmd); return o_SetTag(vp, tags, n, cmd); }
+static int hk_SetTagForFrame(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); gmo::NoteSetTags(tags, n, cmd); return o_SetTagForFrame(frame, vp, tags, n, cmd); }
+static int hk_SetConstants(const Consts &c, const void *frame, const void *vp)
+{
+    {
+        std::lock_guard<std::mutex> l(g_lk);
+        g_consts++;
+        if (!Plaus(&c)) { g_constsBad++; return o_SetConstants(c, frame, vp); }
+        const bool sane = c.fov > 0.05f && c.fov < 3.2f && c.zNear > 0.0f && c.zFar != c.zNear;
+        if (!sane) g_constsBad++;
+        else
+        {
+            if (c.reset == 1) g_resets++;
+            if (g_havePrev)
+            {
+                const double dx = c.pos[0] - g_prevPos[0], dy = c.pos[1] - g_prevPos[1], dz = c.pos[2] - g_prevPos[2];
+                g_moved += std::sqrt(dx * dx + dy * dy + dz * dz);
+                const double dot = c.fwd[0] * g_prevFwd[0] + c.fwd[1] * g_prevFwd[1] + c.fwd[2] * g_prevFwd[2];
+                g_turned += std::acos(std::max(-1.0, std::min(1.0, dot))) * 57.29578;
+            }
+            memcpy(g_prevPos, c.pos, sizeof(g_prevPos)); memcpy(g_prevFwd, c.fwd, sizeof(g_prevFwd)); g_havePrev = true;
+            g_last = c; g_haveLast = true;
+        }
+    }
+    if (Plaus(&c)) gmo::NoteConsts(c);
+    return o_SetConstants(c, frame, vp);
+}
+static int hk_Evaluate(uint32_t feature, const void *frame, const Base **inputs, uint32_t n, void *cmd)
+{
+    { std::lock_guard<std::mutex> l(g_lk); g_evals[feature]++; }
+    NoteInputs(inputs, n);
+    if (feature == 0 || feature == 1001) gmo::OnEvaluate(inputs, n, cmd);   // DLSS / DLSS ray reconstruction: the game's motion
+                                                                              // vectors and depth for frame warp
+    g_slDepth++;
+    const int r = o_Evaluate(feature, frame, inputs, n, cmd);
+    g_slDepth--;
+    return r;
+}
+
+static const char *FeatureName(uint32_t f)
+{
+    switch (f)
+    {
+    case 0: return "DLSS"; case 1: return "NRD"; case 2: return "NIS"; case 3: return "Reflex"; case 4: return "PCL";
+    case 1000: return "DLSS frame generation"; case 1001: return "DLSS ray reconstruction"; default: return nullptr;
+    }
+}
+
+// Once a second from the presenter: hooks Streamline when it is loaded, and reports every 10 s.
+static void Tick(double t)
+{
+    if (!g_tried)
+    {
+        HMODULE sl = GetModuleHandleA("sl.interposer.dll");
+        if (!sl) return;
+        g_tried = true;
+        if (!g_shared.slHooks)
+        {
+            LOGI("BFI Presenter: Streamline found, not hooked (StreamlineHooks=0): frame warp uses the picture's own motion");
+            return;
+        }
+        {
+            char path[MAX_PATH] = "";
+            GetModuleFileNameA(sl, path, MAX_PATH);
+            DWORD h = 0, n = GetFileVersionInfoSizeA(path, &h);
+            std::vector<BYTE> vb(n ? n : 1);
+            VS_FIXEDFILEINFO *fi = nullptr; UINT fl = 0;
+            if (n && GetFileVersionInfoA(path, 0, n, vb.data()) && VerQueryValueA(vb.data(), "\\", (void **)&fi, &fl) && fi)
+            {
+                g_slMajor = HIWORD(fi->dwFileVersionMS);
+                snprintf(g_slVer, sizeof(g_slVer), "%u.%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS),
+                         HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+            }
+        }
+        if (g_slMajor < 2)
+        {
+            LOGI("BFI Presenter: Streamline probe (test build): sl.interposer.dll version %s -- not 2.x, left alone", g_slVer);
+            return;
+        }
+        struct { const char *name; void *hook; void **orig; } fns[] = {
+            { "slSetTag", (void *)&hk_SetTag, (void **)&o_SetTag },
+            { "slSetTagForFrame", (void *)&hk_SetTagForFrame, (void **)&o_SetTagForFrame },
+            { "slSetConstants", (void *)&hk_SetConstants, (void **)&o_SetConstants },
+            { "slEvaluateFeature", (void *)&hk_Evaluate, (void **)&o_Evaluate },
+        };
+        char list[400] = "";
+        for (auto &f : fns)
+        {
+            void *p = (void *)GetProcAddress(sl, f.name);
+            char why[96] = "not exported";
+            void *orig = p ? InlineHook64(p, f.hook, why, sizeof(why)) : nullptr;
+            if (orig) { *f.orig = orig; g_hooked = true; }
+            char one[160];
+            snprintf(one, sizeof(one), "%s%s %s%s%s", list[0] ? "; " : "", f.name, orig ? "hooked" : "not hooked", orig ? "" : " -- ", orig ? "" : why);
+            strncat(list, one, sizeof(list) - strlen(list) - 1);
+        }
+        LOGI("BFI Presenter: Streamline probe (test build): sl.interposer.dll %s: %s", g_slVer, list);
+        g_winT = t;
+        return;
+    }
+    if (!g_hooked) return;
+    g_deepDue = true;                                  // one sampled (fully checked) call a second
+    if (g_reports >= 60 || t - g_winT < 10.0) return;
+    // Take the window's numbers under the lock, then log without it (the game's render thread waits on the lock).
+    std::map<uint32_t, TagStat> tagsSet, tagsEv; std::map<uint32_t, uint32_t> evalIn, evals;
+    uint32_t badTags, consts, constsBad, resets, probeCalls; double moved, turned, probeS, probeMaxS; Consts last; bool haveLast;
+    {
+        std::lock_guard<std::mutex> l(g_lk);
+        tagsSet.swap(g_tags); tagsEv.swap(g_tagsEval); evalIn.swap(g_evalIn); evals.swap(g_evals);
+        badTags = g_badTags; consts = g_consts; constsBad = g_constsBad; resets = g_resets; moved = g_moved; turned = g_turned;
+        last = g_last; haveLast = g_haveLast; probeCalls = g_probeCalls; probeS = g_probeS; probeMaxS = g_probeMaxS;
+        g_badTags = 0; g_consts = g_constsBad = g_resets = 0; g_moved = g_turned = 0.0; g_haveLast = false;
+        g_probeCalls = 0; g_probeS = g_probeMaxS = 0.0;
+    }
+    const double secs = t - g_winT;
+    g_winT = t;
+    g_reports++;
+    // One line per buffer type (the log line is capped at 512 characters).
+    auto list = [&](std::map<uint32_t, TagStat> &m, const char *from) {
+        for (auto &kv : m)
+        {
+            const TagStat &s = kv.second;
+            const char *nm = TagName(kv.first);
+            char nb[24]; snprintf(nb, sizeof(nb), "type %u", kv.first);
+            char extra[80] = "";
+            if (s.resW) snprintf(extra, sizeof(extra), ", stated %ux%u", s.resW, s.resH);
+            if (s.extW) { char e[40]; snprintf(e, sizeof(e), ", used %ux%u", s.extW, s.extH); strncat(extra, e, sizeof(extra) - strlen(extra) - 1); }
+            LOGI("BFI Presenter: Streamline probe: %s tag %s %.0f/s: %ux%u fmt %u%s%s [ok %u, no resource %u, resource unreadable %u, no native %u, "
+                 "native unreadable %u, not a texture %u]", from, nm ? nm : nb, s.calls / secs, s.w, s.h, s.fmt,
+                 s.d3d12 ? " D3D12" : s.d3d11 ? " D3D11" : "", extra, s.ok, s.noRes, s.badRes, s.noNative, s.badNative, s.noQI);
+        }
+    };
+    list(tagsSet, "slSetTag");
+    list(tagsEv, "slEvaluateFeature");
+    char other[300] = "";
+    for (auto &kv : evalIn)
+    {
+        char one[48]; snprintf(one, sizeof(one), "%s%08x %.0f/s", other[0] ? ", " : "", kv.first, kv.second / secs);
+        strncat(other, one, sizeof(other) - strlen(other) - 1);
+    }
+    char ev[300] = "";
+    for (auto &kv : evals)
+    {
+        char one[80]; const char *nm = FeatureName(kv.first);
+        snprintf(one, sizeof(one), "%s%s%s %.0f/s", ev[0] ? ", " : "", nm ? nm : "feature ", nm ? "" : std::to_string(kv.first).c_str(), kv.second / secs);
+        strncat(ev, one, sizeof(ev) - strlen(ev) - 1);
+    }
+    LOGI("BFI Presenter: Streamline probe: last %.0f s: %u slSetTag buffer types, %u inside slEvaluateFeature, unreadable tag calls %u | evaluated: %s | "
+         "other evaluate inputs: %s", secs, (unsigned)tagsSet.size(), (unsigned)tagsEv.size(), badTags, ev[0] ? ev : "none", other[0] ? other : "none");
+    LOGI("BFI Presenter: Streamline probe: its own time in the game's calls: %u calls, %.1f us on average, %.0f us at most", probeCalls,
+         probeCalls ? probeS * 1e6 / probeCalls : 0.0, probeMaxS * 1e6);
+    if (haveLast)
+    {
+        const Consts &c = last;
+        bool mat = false;
+        for (int i = 0; i < 16; i++) if (c.viewToClip[i] != 0.0f) mat = true;
+        LOGI("BFI Presenter: Streamline probe: camera constants %.0f/s (%u implausible), FOV %.1f deg, aspect %.2f, near %.3g, far %.3g, depth %s, "
+             "motion vectors scale %.3g x %.3g%s%s%s, view-to-clip matrix %s, camera moved %.1f units and turned %.0f deg in %.0f s, %u resets",
+             consts / secs, constsBad, c.fov * 57.29578, c.aspect, c.zNear, c.zFar,
+             c.depthInverted == 1 ? "reversed" : c.depthInverted == 0 ? "standard" : "not stated", c.mvecScale[0], c.mvecScale[1],
+             c.cameraMotionIncluded == 1 ? ", include camera motion" : "", c.mvJittered == 1 ? ", jittered" : "", c.mv3D == 1 ? ", 3D" : "",
+             mat ? "set" : "all zero", moved, turned, secs, resets);
+    }
+    else LOGI("BFI Presenter: Streamline probe: no camera constants in the last %.0f s (%u calls, %u implausible)", secs, consts, constsBad);
+}
+} // namespace slp
+
+// ---------------------------------------------------------------------------------------------------------
+// Frame warp from the game's own motion (test): where a D3D12 game hands its upscaler its motion vectors and depth
+// through Streamline (DLSS), frame warp moves each part of the picture by the game's own vector for it instead of
+// the motion it measures from the finished picture, and where things overlap the nearer one wins.
+//
+//   1. At the upscaler call (slEvaluateFeature, the game's render thread): the game's motion vectors and depth are
+//      copied on the game's own command list -- copies only, so nothing the game has set on its list is changed --
+//      into one of three pairs of textures, with the camera constants of that frame (motion-vector scale, reversed
+//      depth, a camera cut).
+//   2. At the game's Present (its Present thread): the oldest copy not yet taken becomes that frame's motion
+//      texture (PSWarpGame, dx/bfi_warp.h), 1/4 of the game frame, made on the presenter's copy list on the game's
+//      queue right after the frame is copied into its staging slot. One per staging slot.
+//   3. The presenter (per refresh) reads that slot's motion texture when it shows the frame moved ahead.
+//
+// Nothing of this runs while frame warp is off. Games without Streamline, DX11 games and games whose motion vectors
+// leave out the camera's motion keep the motion measured from the picture; the overlay says which is used.
+namespace gmo
+{
+using slp::Tag; using slp::Res; using slp::Consts; using slp::Base; using slp::Plaus;
+
+static const int kRing = 3;
+struct Entry
+{
+    ID3D12Resource *mv = nullptr, *depth = nullptr;       // the copies (ours)
+    DXGI_FORMAT mvFmt = DXGI_FORMAT_UNKNOWN, dFmt = DXGI_FORMAT_UNKNOWN;   // the game's formats
+    UINT mvW = 0, mvH = 0, dW = 0, dH = 0;
+    float mvMap[4] = {}, dMap[4] = {};                    // screen uv -> texel: xy scale, zw offset
+    float mvScale[2] = {}, mvInvalid = 0.0f;
+    bool  depthRev = false, hasDepth = false, reset = false;
+    UINT  gen = 0;                                        // bumped when the copies are made anew
+};
+struct GConsts { float outTexel[2], mvScale[2], mvMap[4], dMap[4], mvInvalid; uint32_t flags; float pad[2]; float hMap[4]; float hudThr; uint32_t hudMode; float pad2[2]; };
+static_assert(sizeof(GConsts) == 96, "PSWarpGame / PSWarpHud constants");
+
+static std::mutex lk;
+static Entry ring[kRing];
+static int  pend[kRing]; static int pendN = 0;            // filled entries not yet taken by a Present, oldest first
+static int  latest = -1;                                 // the newest filled entry (frame generation: every Present uses it)
+static int  evalsSec = 0, presSec = 0; static double secT = 0.0;
+static double perEval = 1.0;                             // Presents per upscaler call over the last seconds (2 or 3 with frame generation)
+static int  fgK = 0;                                     // frame generation: shown frames per rendered one, a whole number (0 = not settled)
+static int  fgKNext = 0, fgKSecs = 0;
+static uint64_t seq = 0;
+static UINT genNext = 1;
+static std::vector<std::pair<ID3D12Resource *, double>> retired;   // replaced copies, released 5 s on (a game list that
+                                                         // copied into one has run by then; they used to stay until the
+                                                         // device changed: ~100 MB more each time Townfall letterboxed)
+static Tag setTag[2]; static Res setRes[2]; static bool haveSet[2] = {};   // the last depth / vectors given to slSetTag
+
+// HUD mask: the game's HUD-less picture (Streamline buffer type 2), copied when the game tags it with a command list
+// (at its slSetTag or upscaler call), else used where it is at the Present when it stays valid until then.
+static ID3D12Resource *hudCopy = nullptr;                // the copy (ours), in COPY_DEST between uses
+static DXGI_FORMAT hudFmt = DXGI_FORMAT_UNKNOWN;
+static UINT  hudW = 0, hudH = 0;
+static float hudMap[4] = {};
+static double hudCopyT = -10.0;                          // when it was last copied
+static Tag   hudLiveTag; static Res hudLiveRes; static bool hudLive = false;   // valid until the Present (no copy)
+static ID3D12Resource *hudRaw[2] = {}, *hudMask = nullptr;   // the motion texture's size, R8; in PIXEL_SHADER_RESOURCE between uses
+static int  hudCur = 0;
+static bool hudMaskOk = false;                           // hudMask holds a mask from the last Presents
+static ID3D12PipelineState *psoHud = nullptr;
+static std::atomic<int> hudState{0};                     // 0 no HUD-less picture seen, 1 in use, -1 switched off (didn't match)
+// How the frame and the HUD-less picture are compared (PSWarpHud's gHudMode). 007 First Light's HUD-less picture is
+// linear (RGBA16F) against an HDR10 frame: compared as they are, the mask covered 99.9% (gm9). The modes are tried
+// in turn, from the likeliest for the two formats; the check (every 2 s) moves on when the mask covers too much.
+static int hudModes[3] = { 0, 1, 2 }; static int hudModeN = 3; static std::atomic<int> hudModeI{0};
+static bool hudModesSet = false;
+static char hudWhy[160] = "";
+static Consts consts = {}; static bool haveConsts = false;
+static bool depthFailed = false;                         // a copy texture of the game's depth format couldn't be made
+static ID3D12Device *ringDev = nullptr;                  // the device the copies belong to (not owned)
+
+// GPU objects for step 2 (Present thread)
+static ID3D12RootSignature *rs = nullptr;
+static ID3D12PipelineState *pso = nullptr;
+static ID3D12DescriptorHeap *srvHeap = nullptr, *rtvHeap = nullptr;
+static UINT srvStride = 0, rtvStride = 0;
+static ID3D12Resource *flow[kStage] = {};
+// The motion textures are made anew when the game's vector size changes (Townfall: its cutscenes switch between 2258x1271
+// and a letterboxed 2258x961, twice within 2 s before the GPU hung in 1.0.44-ep1). The old ones were released at once,
+// while the presenter's queue could still be reading one and its command list had a barrier on one and the matching
+// barrier back on the new one. Now they are swapped under flowLk, kept for 3 s before release, and the presenter takes
+// one texture per refresh, with the generation its views were written for.
+static std::mutex flowLk;
+struct RetiredRes { ID3D12Resource *r; double t; };
+static std::vector<RetiredRes> flowRetired;
+static UINT flowW = 0, flowH = 0;
+static std::atomic<UINT> flowGen{0};                     // bumped when the motion textures are made anew
+static bool slotPend[kStage] = {}, slotOk[kStage] = {}, slotDepth[kStage] = {};
+static float slotLag[kStage] = {};                       // frame generation: shown frames this one is behind its vectors' frame
+static uint64_t fgSeqSeen = 0; static int fgIdx = 0;     // which shown frame since the last upscaler call (0 = the first)
+static std::atomic<UINT64> slotId[kStage];
+// Camera cuts and letterboxed cutscenes (ep3): the frame after a cut (the game's reset flag, from Streamline or direct
+// DLSS calls) and the next ones aren't filled -- there is no motion connecting two shots, and the motion measured from
+// the picture across a cut is between two unrelated pictures. A cutscene letterboxed through DLSS (its output smaller
+// than the screen) pauses frame warp until it ends.
+static bool slotCut[kStage] = {};
+static std::atomic<UINT64> cutId{0};
+static std::atomic<int> cutsSec{0};
+static std::atomic<bool> lbOn{false};
+static std::atomic<double> lbT{0.0};
+// Only a letterbox that follows full-screen output in this session counts as a cutscene, and one that lasts over 10
+// minutes in a row is play (a game letterboxed throughout, by design): frame warp works there as usual.
+static std::atomic<bool> lbFullSeen{false};
+static std::atomic<double> lbStartT{0.0};
+static void NoteLetterbox(bool lb, unsigned w, unsigned h, unsigned fw, unsigned fh, const char *from)
+{
+    const bool was = lbOn.exchange(lb);
+    if (lb) lbT = Now();
+    if (!lb) lbFullSeen = true;
+    if (lb && !was) lbStartT = Now();
+    if (lb != was)
+    {
+        static int logged = 0;
+        if (logged++ < 40)
+        {
+            if (lb) LOGI("BFI Presenter: frame warp: letterboxed cutscene (%s output %ux%u of %ux%u)", from, w, h, fw, fh);
+            else    LOGI("BFI Presenter: frame warp: the letterboxed cutscene ended (%s output %ux%u)", from, w, h);
+        }
+    }
+}
+
+// What the game hands over, for the overlay and the log.
+static std::atomic<int> state{0};                        // 0 nothing seen yet, 1 vectors and depth, 2 vectors only, -1 not usable
+static char why[160] = "";
+static int  whyLogged = 0;
+
+static void SetState(int st, const char *fmt, ...)
+{
+    char b[160];
+    va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof(b), fmt, ap); va_end(ap);
+    state = st;
+    if (strcmp(b, why) != 0)
+    {
+        snprintf(why, sizeof(why), "%s", b);
+        if (whyLogged++ < 20) LOGI("BFI Presenter: frame warp, the game's own motion: %s", b);
+    }
+}
+
+static DXGI_FORMAT CopyFormat(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32G8X24_TYPELESS;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24G8_TYPELESS;
+    case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_TYPELESS;
+    default: return f;
+    }
+}
+static DXGI_FORMAT DepthView(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+static DXGI_FORMAT MvView(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+static bool On() { return g_shared.frameWarp != 0 && g_shared.warpGame != 0 && !g_dx11.load(); }
+
+// slSetTag: the last depth and motion vectors a game tagged with a resource (games that pass them here rather than to
+// slEvaluateFeature). Only tags that stay valid up to the upscaler call are kept.
+static void CopyHud(const Tag &t, void *cmd);
+static void NoteSetTags(const Tag *tags, uint32_t n, void *cmd)
+{
+    if (!On() || !tags || n == 0 || n > 64 || !Plaus(tags)) return;
+    std::lock_guard<std::mutex> l(lk);
+    for (uint32_t i = 0; i < n; i++)
+    {
+        const Tag &t = tags[i];
+        if (t.bufType == 2) { if (g_shared.warpGameHud && t.res && Plaus(t.res) && t.res->native) CopyHud(t, cmd); continue; }
+        if (t.bufType > 1) continue;
+        const int k = (int)t.bufType;
+        // Any life-cycle: 007 First Light tags its depth here and hands only the vectors to the upscaler call that
+        // follows on the same frame. One valid only when tagged is forgotten at that upscaler call (OnEvaluate).
+        if (!t.res || !Plaus(t.res) || !t.res->native) { haveSet[k] = false; continue; }
+        setTag[k] = t; setRes[k] = *t.res; setTag[k].res = &setRes[k]; haveSet[k] = true;
+    }
+}
+
+static void NoteConsts(const Consts &c) { std::lock_guard<std::mutex> l(lk); consts = c; haveConsts = true; }
+
+static ID3D12Resource *Native(const Res *r, D3D12_RESOURCE_DESC *d)
+{
+    if (!r || !Plaus(r) || !r->native || !Plaus(r->native)) return nullptr;
+    ID3D12Resource *n = nullptr;
+    if (FAILED(((IUnknown *)r->native)->QueryInterface(__uuidof(ID3D12Resource), (void **)&n)) || !n) return nullptr;
+    // The same GPU as the presenter's device? Compared by adapter, not by pointer: ReShade and Streamline each put a
+    // device of their own in front of the driver's (gm1: the pointers differed for the same device). D3D12 makes one
+    // device per adapter, so the same adapter is the same device.
+    ID3D12Device *dev = nullptr;
+    bool same = false;
+    if (SUCCEEDED(n->GetDevice(IID_PPV_ARGS(&dev))) && dev)
+    {
+        const LUID a = dev->GetAdapterLuid(), b = g_device->GetAdapterLuid();
+        same = a.LowPart == b.LowPart && a.HighPart == b.HighPart;
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            LOGI("BFI Presenter: frame warp, the game's own motion: the game's buffers are on device %p, the presenter's is %p (%s adapter)",
+                 (void *)dev, (void *)g_device, same ? "the same" : "another");
+        }
+        dev->Release();
+    }
+    if (!same) { n->Release(); return nullptr; }
+    *d = n->GetDesc();
+    if (d->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d->SampleDesc.Count != 1) { n->Release(); return nullptr; }
+    return n;                                             // AddRef'd: the caller releases
+}
+
+static ID3D12Resource *MakeCopy(const D3D12_RESOURCE_DESC &src, const wchar_t *name)
+{
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = src.Width; rd.Height = src.Height; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = CopyFormat(src.Format);
+    rd.SampleDesc.Count = 1;
+    ID3D12Resource *r = nullptr;
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&r))))
+        return nullptr;
+    r->SetName(name);
+    return r;
+}
+
+static void Map(const Tag &t, UINT w, UINT h, float m[4])
+{
+    const bool e = t.ext.width && t.ext.height;
+    m[0] = e ? (float)t.ext.width : (float)w;  m[1] = e ? (float)t.ext.height : (float)h;
+    m[2] = e ? (float)t.ext.left : 0.0f;       m[3] = e ? (float)t.ext.top : 0.0f;
+}
+
+static const char *HudModeName(uint32_t m)
+{
+    return m == 1 ? "HDR10 frame against a linear scRGB picture" : m == 2 ? "sRGB frame against a linear picture" : "the same encoding";
+}
+
+static DXGI_FORMAT ColorView(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        return f;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+// The HUD-less picture: copied now on the game's list when there is one (lk held). Without a list, kept to be read at
+// the Present if it stays valid until then.
+static void CopyHud(const Tag &t, void *cmd)
+{
+    if (hudState.load() < 0 || !g_device) return;
+    if (!cmd)
+    {
+        if (t.lifecycle == 1) { hudLiveTag = t; hudLiveRes = *t.res; hudLiveTag.res = &hudLiveRes; hudLive = true; }
+        return;
+    }
+    D3D12_RESOURCE_DESC hd = {};
+    ID3D12Resource *src = Native(t.res, &hd);
+    if (!src) return;
+    ID3D12GraphicsCommandList *cl = nullptr;
+    const uint32_t st = t.res->state;
+    if (st == UINT_MAX || ColorView(hd.Format) == DXGI_FORMAT_UNKNOWN ||
+        FAILED(((IUnknown *)cmd)->QueryInterface(__uuidof(ID3D12GraphicsCommandList), (void **)&cl)) || !cl)
+    { src->Release(); return; }
+    if (!hudCopy || hudW != (UINT)hd.Width || hudH != hd.Height || hudFmt != hd.Format)
+    {
+        if (hudCopy) retired.push_back({ hudCopy, Now() });
+        hudCopy = MakeCopy(hd, L"BFI frame warp: the game's HUD-less picture");
+        hudW = (UINT)hd.Width; hudH = hd.Height; hudFmt = hd.Format;
+    }
+    if (hudCopy)
+    {
+        D3D12_RESOURCE_BARRIER b0, b1;
+        const bool tr = !(st & D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (tr) { b0 = Transition(src, (D3D12_RESOURCE_STATES)st, D3D12_RESOURCE_STATE_COPY_SOURCE); cl->ResourceBarrier(1, &b0); }
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, sl = {};
+        dst.Type = sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource = hudCopy; sl.pResource = src;
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &sl, nullptr);
+        if (tr) { b1 = Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, (D3D12_RESOURCE_STATES)st); cl->ResourceBarrier(1, &b1); }
+        Map(t, hudW, hudH, hudMap);
+        hudCopyT = Now();
+        hudLive = false;
+    }
+    cl->Release();
+    src->Release();
+}
+
+static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int from);
+static std::atomic<int> via{0};                          // where the game's motion comes from: 0 Streamline, 1 DLSS (NGX)
+
+// Step 1, from the slEvaluateFeature hook (DLSS), before the call goes on.
+static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
+{
+    if (!On() || !g_device || !cmd) return;
+    const Tag *tg[2] = {}, *hl = nullptr, *outTag = nullptr;
+    if (in && n && n <= 64 && Plaus(in))
+        for (uint32_t i = 0; i < n; i++)
+            for (const Base *b = in[i]; b && Plaus(b); b = (const Base *)b->next)
+                if (memcmp(b->type, slp::kTagGuid, 16) == 0)
+                {
+                    const Tag *t = (const Tag *)b;
+                    if (t->bufType <= 2 && t->res) { if (t->bufType == 2) hl = t; else tg[t->bufType] = t; }
+                    else if (t->bufType == 4 && t->res) outTag = t;
+                }
+    // The upscaler's output used only in part, wider than tall against the texture: a letterboxed cutscene.
+    if (outTag && Plaus(outTag->res) && outTag->ext.width && outTag->ext.height && outTag->res->width && outTag->res->height)
+    {
+        const Res *r = outTag->res;
+        NoteLetterbox(outTag->ext.height < 0.9 * r->height && outTag->ext.width >= 0.9 * r->width,
+                      outTag->ext.width, outTag->ext.height, r->width, r->height, "Streamline");
+    }
+    std::lock_guard<std::mutex> l(lk);
+    if (hl && g_shared.warpGameHud && Plaus(hl->res) && hl->res->native) CopyHud(*hl, cmd);
+    for (int k = 0; k < 2; k++) if (!tg[k] && haveSet[k]) tg[k] = &setTag[k];
+    // slSetTag's tags valid only when tagged (life-cycle 0): for this upscaler call only
+    struct Forget { ~Forget() { for (int k = 0; k < 2; k++) if (haveSet[k] && setTag[k].lifecycle == 0) haveSet[k] = false; } } forget;
+    if (!tg[1]) { SetState(-1, "the game hands its upscaler no motion vectors that last to the upscaler call -- the picture's own motion is used"); return; }
+    if (!haveConsts) { SetState(-1, "no camera constants from the game -- the picture's own motion is used"); return; }
+    if (consts.cameraMotionIncluded != 1)
+    { SetState(-1, "the game's motion vectors leave out the camera's motion (not supported in this test) -- the picture's own motion is used"); return; }
+    Feed(tg, consts, cmd, 0);
+}
+
+// The copies and the ring entry, from either source (lk held): Streamline's tags, or the parameters of a direct DLSS
+// call (NGX) put into the same shape. via: 0 Streamline, 1 DLSS (NGX).
+static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int from)
+{
+    if (!retired.empty())
+    {
+        const double tn = Now();
+        for (size_t i = 0; i < retired.size();)
+            if (tn - retired[i].second > 5.0) { retired[i].first->Release(); retired[i] = retired.back(); retired.pop_back(); }
+            else i++;
+    }
+    ID3D12GraphicsCommandList *cl = nullptr;
+    if (FAILED(((IUnknown *)cmd)->QueryInterface(__uuidof(ID3D12GraphicsCommandList), (void **)&cl)) || !cl)
+    { SetState(-1, "the upscaler call has no D3D12 command list -- the picture's own motion is used"); return; }
+    D3D12_RESOURCE_DESC md = {}, dd = {};
+    ID3D12Resource *mv = Native(tg[1]->res, &md);
+    ID3D12Resource *dp = (tg[0] && !depthFailed) ? Native(tg[0]->res, &dd) : nullptr;
+    if (dp && DepthView(dd.Format) == DXGI_FORMAT_UNKNOWN) { dp->Release(); dp = nullptr; }
+    if (!mv || MvView(md.Format) == DXGI_FORMAT_UNKNOWN)
+    {
+        // A second, occasional upscaler call with 8-bit "vectors" (Rift Apart, Spider-Man 2): skipped quietly while
+        // the main one works.
+        if (mv && state.load() > 0) { mv->Release(); if (dp) dp->Release(); cl->Release(); return; }
+        SetState(-1, mv ? "the game's motion vectors are in a format not supported (%d) -- the picture's own motion is used"
+                        : "the game's motion vectors are not a D3D12 texture on the presenter's GPU -- the picture's own motion is used", (int)md.Format);
+        if (mv) mv->Release();
+        if (dp) dp->Release();
+        cl->Release();
+        return;
+    }
+    const uint32_t mvState = tg[1]->res->state, dState = dp ? tg[0]->res->state : 0;
+    if (mvState == UINT_MAX || (dp && dState == UINT_MAX))
+    {
+        SetState(-1, "the game didn't give its buffers' states -- the picture's own motion is used");
+        mv->Release(); if (dp) dp->Release(); cl->Release();
+        return;
+    }
+    if (ringDev != g_device)
+    {
+        // A new device: the copies of the old one go (kept across swap chain resizes otherwise -- a copy the game has
+        // recorded on a list it hasn't submitted yet must still exist when that list runs).
+        for (int i = 0; i < kRing; i++) { SafeRelease(ring[i].mv); SafeRelease(ring[i].depth); ring[i] = Entry(); }
+        SafeRelease(hudCopy); hudW = hudH = 0; hudFmt = DXGI_FORMAT_UNKNOWN; hudLive = false; hudModesSet = false;
+        for (auto &r : retired) r.first->Release();
+        retired.clear();
+        pendN = 0; latest = -1; depthFailed = false;
+        ringDev = g_device;
+    }
+    {
+        // The main view: some games upscale more than one view a frame (Indiana Jones on Vulkan: a small 640x360 one
+        // next to the main view). Only the largest is used, so the warp never mixes two views' motion and the copies
+        // don't change size from call to call (remade on almost every call, the replaced ones filled video memory).
+        static uint64_t mainArea = 0; static double mainSeen = -1.0; static UINT mainW = 0, mainH = 0; static int sideLogged = 0;
+        const double tn = Now();
+        const uint64_t area = md.Width * (uint64_t)md.Height;
+        if (area < mainArea && tn - mainSeen < 0.5) { mv->Release(); if (dp) dp->Release(); cl->Release(); return; }
+        if (mainArea && area > mainArea && sideLogged++ < 2)
+            LOGI("BFI Presenter: frame warp, the game's own motion: the game upscales more than one view (%ux%u and %ux%u) -- only the "
+                 "largest is used", mainW, mainH, (UINT)md.Width, md.Height);
+        mainArea = area; mainSeen = tn; mainW = (UINT)md.Width; mainH = md.Height;
+        // replaced copies wait 5 s; if they pile up anyway (sizes changing all the time) the call is skipped
+        if (retired.size() > 16) { mv->Release(); if (dp) dp->Release(); cl->Release(); return; }
+    }
+    const int k = (int)(seq % kRing);
+    Entry &e = ring[k];
+    if (!e.mv || e.mvW != (UINT)md.Width || e.mvH != md.Height || e.mvFmt != md.Format)
+    {
+        if (e.mv) retired.push_back({ e.mv, Now() });
+        e.mv = MakeCopy(md, L"BFI frame warp: game motion vectors");
+        e.mvW = (UINT)md.Width; e.mvH = md.Height; e.mvFmt = md.Format; e.gen = genNext++;
+    }
+    if (dp && (!e.depth || e.dW != (UINT)dd.Width || e.dH != dd.Height || e.dFmt != dd.Format))
+    {
+        if (e.depth) retired.push_back({ e.depth, Now() });
+        e.depth = MakeCopy(dd, L"BFI frame warp: game depth");
+        e.dW = (UINT)dd.Width; e.dH = dd.Height; e.dFmt = dd.Format; e.gen = genNext++;
+        if (!e.depth)
+        {
+            depthFailed = true;
+            LOGW("BFI Presenter: frame warp, the game's own motion: no copy of the game's depth (format %d) -- motion vectors only", (int)dd.Format);
+        }
+    }
+    if (!e.mv) { SetState(-1, "no copy of the game's motion vectors could be made"); mv->Release(); if (dp) dp->Release(); cl->Release(); return; }
+    if (dp && !e.depth) { dp->Release(); dp = nullptr; }
+
+    // The copies, on the game's list. A buffer not in a state it can be copied from is moved there and back.
+    D3D12_RESOURCE_BARRIER pre[2], post[2]; UINT nb = 0;
+    if (!(mvState & D3D12_RESOURCE_STATE_COPY_SOURCE))
+    { pre[nb] = Transition(mv, (D3D12_RESOURCE_STATES)mvState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      post[nb] = Transition(mv, D3D12_RESOURCE_STATE_COPY_SOURCE, (D3D12_RESOURCE_STATES)mvState); nb++; }
+    if (dp && !(dState & D3D12_RESOURCE_STATE_COPY_SOURCE))
+    { pre[nb] = Transition(dp, (D3D12_RESOURCE_STATES)dState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      post[nb] = Transition(dp, D3D12_RESOURCE_STATE_COPY_SOURCE, (D3D12_RESOURCE_STATES)dState); nb++; }
+    if (nb) cl->ResourceBarrier(nb, pre);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.Type = src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = e.mv; src.pResource = mv;
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    if (dp) { dst.pResource = e.depth; src.pResource = dp; cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr); }   // subresource 0: the depth plane
+    if (nb) cl->ResourceBarrier(nb, post);
+    cl->Release();
+
+    Map(*tg[1], e.mvW, e.mvH, e.mvMap);
+    if (dp) Map(*tg[0], e.dW, e.dH, e.dMap);
+    e.mvScale[0] = consts.mvecScale[0]; e.mvScale[1] = consts.mvecScale[1];
+    e.mvInvalid = consts.mvInvalid;
+    e.depthRev = consts.depthInverted == 1;
+    e.hasDepth = dp != nullptr;
+    e.reset = consts.reset == 1;
+    mv->Release(); if (dp) dp->Release();
+    if (pendN >= 2) { pend[0] = pend[1]; pendN = 1; }      // a Present that never came: the older copy is dropped
+    pend[pendN++] = k;
+    latest = k;
+    evalsSec++;
+    seq++;
+    via = from;
+    const char *srcName = from == 1 ? "DLSS (NGX)" : "Streamline";
+    if (g_status.fgActive)
+        SetState(e.hasDepth ? 1 : 2, "the game's motion vectors (%ux%u)%s from %s are used, with frame generation: each shown frame moves by 1/%.0f of a rendered frame's motion",
+                 e.mvW, e.mvH, e.hasDepth ? " and depth" : "", srcName, (double)(fgK >= 2 ? fgK : 2));
+    else if (e.hasDepth)
+        SetState(1, "the game's motion vectors (%ux%u) and depth (%ux%u) from %s are used", e.mvW, e.mvH, e.dW, e.dH, srcName);
+    else
+        SetState(2, "the game's motion vectors (%ux%u) from %s are used, without depth", e.mvW, e.mvH, srcName);
+}
+
+static bool EnsureGpu()
+{
+    if (pso) return true;
+    if (!g_shDone || !g_shBlob[0] || !g_shBlob[kShWarpGame] || !g_device) return false;
+    static bool failed = false;
+    if (failed) return false;
+    D3D12_DESCRIPTOR_RANGE range = {};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 7;
+    range.BaseShaderRegister = 5;                          // t5 the vectors, t6 the depth, t7 the HUD mask, t8-t10 its pass's inputs,
+                                                           // t11 the vectors of the rendered frame before
+    D3D12_ROOT_PARAMETER p[2] = {};
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    p[0].Constants.ShaderRegister = 1;                     // b1
+    p[0].Constants.Num32BitValues = sizeof(GConsts) / 4;
+    p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[1].DescriptorTable.NumDescriptorRanges = 1;
+    p[1].DescriptorTable.pDescriptorRanges = &range;
+    p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.NumParameters = 2; rsd.pParameters = p;
+    ID3DBlob *blob = nullptr, *err = nullptr;
+    bool ok = SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) &&
+              SUCCEEDED(g_device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs)));
+    SafeRelease(blob); SafeRelease(err);
+    if (ok)
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = rs;
+        pd.VS = { g_shBlob[0]->GetBufferPointer(), g_shBlob[0]->GetBufferSize() };
+        pd.PS = { g_shBlob[kShWarpGame]->GetBufferPointer(), g_shBlob[kShWarpGame]->GetBufferSize() };
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        pd.SampleDesc.Count = 1;
+        ok = SUCCEEDED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)));
+        if (ok && g_shBlob[kShWarpHud])
+        {
+            pd.PS = { g_shBlob[kShWarpHud]->GetBufferPointer(), g_shBlob[kShWarpHud]->GetBufferSize() };
+            pd.NumRenderTargets = 2;
+            pd.RTVFormats[0] = pd.RTVFormats[1] = DXGI_FORMAT_R8_UNORM;
+            pd.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            if (FAILED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoHud)))) psoHud = nullptr;   // optional
+        }
+    }
+    if (ok)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+        // one block of 6 views per staging slot, written at that slot's Present (its previous use is finished then:
+        // the game's side waits for the slot's last copy list before reusing it)
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 7 * kStage; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ok = SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = kStage + 3; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
+        srvStride = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        rtvStride = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    }
+    if (!ok)
+    {
+        failed = true;
+        SafeRelease(psoHud); SafeRelease(pso); SafeRelease(rs); SafeRelease(srvHeap); SafeRelease(rtvHeap);
+        LOGW("BFI Presenter: frame warp, the game's own motion: its pass could not be created -- the picture's own motion is used");
+    }
+    return ok;
+}
+
+// The motion textures: one vector per pixel of the game's own vectors, at most half the game frame's size (gm1-gm4
+// had one per 4x4 pixels of the frame, coarser than the game's vectors: thin things -- window frames, the edges of
+// columns -- broke into steps and bent).
+static bool EnsureFlow(UINT mvW, UINT mvH)
+{
+    if (!g_stage[0]) return false;
+    const D3D12_RESOURCE_DESC sd = g_stage[0]->GetDesc();
+    const UINT w = std::max(64u, std::min(mvW, ((UINT)sd.Width + 1) / 2)), h = std::max(64u, std::min(mvH, (sd.Height + 1) / 2));
+    {
+        // Retired textures released 3 s on: no queue reads them by then.
+        std::lock_guard<std::mutex> l(flowLk);
+        const double tn = Now();
+        for (size_t i = 0; i < flowRetired.size();)
+            if (tn - flowRetired[i].t > 3.0) { flowRetired[i].r->Release(); flowRetired[i] = flowRetired.back(); flowRetired.pop_back(); }
+            else i++;
+    }
+    if (flow[0] && flowW == w && flowH == h) return true;
+    {
+        std::lock_guard<std::mutex> l(flowLk);
+        const double tn = Now();
+        for (UINT i = 0; i < kStage; i++)
+        {
+            if (flow[i]) flowRetired.push_back({ flow[i], tn });
+            flow[i] = nullptr; slotPend[i] = slotOk[i] = false; slotId[i] = 0;
+        }
+        ID3D12Resource **hr0[3] = { &hudRaw[0], &hudRaw[1], &hudMask };
+        for (auto r : hr0) { if (*r) flowRetired.push_back({ *r, tn }); *r = nullptr; }
+        hudMaskOk = false;
+        flowGen++;                                        // the presenter's views of the old ones are out of date
+    }
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *nf[kStage] = {};
+    for (UINT i = 0; i < kStage; i++)
+    {
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&nf[i]))))
+        {
+            for (UINT j = 0; j < kStage; j++) SafeRelease(nf[j]);
+            return false;
+        }
+        nf[i]->SetName(L"BFI frame warp: the game's motion");
+        D3D12_CPU_DESCRIPTOR_HANDLE rh = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rh.ptr += (SIZE_T)i * rtvStride;
+        g_device->CreateRenderTargetView(nf[i], nullptr, rh);
+    }
+    {
+        std::lock_guard<std::mutex> l(flowLk);
+        for (UINT i = 0; i < kStage; i++) flow[i] = nf[i];
+    }
+    // the HUD mask's textures (optional)
+    rd.Format = DXGI_FORMAT_R8_UNORM;
+    ID3D12Resource **hr[3] = { &hudRaw[0], &hudRaw[1], &hudMask };
+    for (int i = 0; i < 3; i++)
+    {
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(hr[i]))))
+        { SafeRelease(hudRaw[0]); SafeRelease(hudRaw[1]); SafeRelease(hudMask); break; }
+        (*hr[i])->SetName(L"BFI frame warp: HUD mask");
+        D3D12_CPU_DESCRIPTOR_HANDLE rh = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rh.ptr += (SIZE_T)(kStage + i) * rtvStride;
+        g_device->CreateRenderTargetView(*hr[i], nullptr, rh);
+    }
+    {
+        std::lock_guard<std::mutex> l(flowLk);
+        flowW = w; flowH = h;
+        flowGen++;
+    }
+    return true;
+}
+
+// Step 2, on the copy list that has just copied the game's frame into staging slot s (before it is closed).
+static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
+{
+    if (s >= kStage) return;
+    slotId[s] = 0; slotPend[s] = slotOk[s] = false;
+    if (!On()) { std::lock_guard<std::mutex> l(lk); pendN = 0; latest = -1; return; }
+    Entry e, ep;
+    int k;
+    float scale = 1.0f, lag = 0.0f;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        presSec++;
+        const double tn = Now();
+        if (tn - secT >= 1.0)
+        {
+            if (evalsSec > 0 && presSec > 0)
+            {
+                perEval = std::max(1.0, std::min(4.0, (double)presSec / evalsSec));
+                // A whole number, taken once two seconds in a row agree (gm4 used a running average, which started at
+                // 1 and wandered: with 1 against a real 2 a filled flash moved twice as far and snapped back).
+                const int kk = (int)std::floor(perEval + 0.5);
+                if (kk == fgKNext) { if (++fgKSecs >= 2) fgK = kk; }
+                else { fgKNext = kk; fgKSecs = 1; }
+            }
+            evalsSec = presSec = 0; secT = tn;
+        }
+        if (g_status.fgActive)
+        {
+            // Frame generation: two or three frames are shown per rendered one, and the game's vectors are a rendered
+            // frame's motion. Every shown frame uses the newest vectors, for the share of that motion one shown frame
+            // covers. (A generated frame sits between two rendered ones: its picture is a little off from the vectors'.)
+            pendN = 0;
+            if (!g_shared.warpGameFg) return;             // the game's motion isn't used with frame generation (the default)
+            if (latest < 0 || fgK < 2) return;
+            // DLSS frame generation shows the generated frames first, then the rendered one the latest vectors are for:
+            // the i-th Present since the upscaler call is fgK-1-i shown frames behind it.
+            if (seq != fgSeqSeen) { fgSeqSeen = seq; fgIdx = 0; } else if (fgIdx < 8) fgIdx++;
+            const int lf = g_shared.warpFgLag;
+            lag = lf > 0 ? (float)std::max(0, fgK - 1 - fgIdx) : lf < 0 ? -(float)std::min(fgIdx, fgK - 1) : 0.0f;            // not settled yet (or not really generating): the picture's motion
+            k = latest;
+            scale = 1.0f / (float)fgK;
+        }
+        else
+        {
+            if (pendN == 0) return;                       // no upscaler call since the last Present (a menu, DLSS off)
+            k = pend[0];
+            for (int i = 1; i < pendN; i++) pend[i - 1] = pend[i];
+            pendN--;
+        }
+        e = ring[k];
+        ep = ring[(k + kRing - 1) % kRing];
+    }
+    if (!e.mv || !EnsureGpu() || !EnsureFlow(e.mvW, e.mvH)) return;
+    // the rendered frame before's vectors (how much the motion kept up), where they are the same kind
+    const bool prevOk = ep.mv && ep.mv != e.mv && ep.mvW == e.mvW && ep.mvH == e.mvH && ep.mvFmt == e.mvFmt && !e.reset;
+    // The HUD-less picture for the mask: a copy made this frame (or a few frames ago), or the game's own buffer when it
+    // stays valid until the Present.
+    ID3D12Resource *hl = nullptr; uint32_t hlState = 0; DXGI_FORMAT hlFmt = DXGI_FORMAT_UNKNOWN; float hlMap[4] = {};
+    bool hlLive = false;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        if (g_shared.warpGameHud && hudState.load() >= 0 && psoHud && hudMask)
+        {
+            if (hudCopy && Now() - hudCopyT < 0.25) { hl = hudCopy; hl->AddRef(); hlState = D3D12_RESOURCE_STATE_COPY_DEST; hlFmt = hudFmt; memcpy(hlMap, hudMap, sizeof(hlMap)); }
+            else if (hudLive)
+            {
+                D3D12_RESOURCE_DESC d = {};
+                if ((hl = Native(hudLiveTag.res, &d)) != nullptr)
+                {
+                    hlState = hudLiveRes.state; hlFmt = d.Format; hlLive = true; Map(hudLiveTag, (UINT)d.Width, d.Height, hlMap);
+                    if (hlState == UINT_MAX || ColorView(hlFmt) == DXGI_FORMAT_UNKNOWN) { hl->Release(); hl = nullptr; }
+                }
+            }
+        }
+    }
+    // the views for this slot: t5 vectors, t6 depth, t7 HUD mask, t8 the frame, t9 the HUD-less picture, t10 the raw mask before
+    D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+    sh.ptr += (SIZE_T)(7 * s) * srvStride;
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        auto at = [&](int i) { D3D12_CPU_DESCRIPTOR_HANDLE h = sh; h.ptr += (SIZE_T)i * srvStride; return h; };
+        sv.Format = MvView(e.mvFmt);
+        g_device->CreateShaderResourceView(e.mv, &sv, at(0));
+        g_device->CreateShaderResourceView(prevOk ? ep.mv : nullptr, &sv, at(6));
+        sv.Format = e.hasDepth ? DepthView(e.dFmt) : DXGI_FORMAT_R32_FLOAT;
+        g_device->CreateShaderResourceView(e.hasDepth ? e.depth : nullptr, &sv, at(1));
+        sv.Format = DXGI_FORMAT_R8_UNORM;
+        g_device->CreateShaderResourceView(hudMask, &sv, at(2));
+        sv.Format = StageFormat();
+        g_device->CreateShaderResourceView(g_stage[s], &sv, at(3));
+        sv.Format = hl ? ColorView(hlFmt) : DXGI_FORMAT_R8G8B8A8_UNORM;
+        g_device->CreateShaderResourceView(hl, &sv, at(4));
+        sv.Format = DXGI_FORMAT_R8_UNORM;
+        g_device->CreateShaderResourceView(hudRaw[1 - hudCur], &sv, at(5));
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE gh = srvHeap->GetGPUDescriptorHandleForHeapStart();
+    gh.ptr += (UINT64)(7 * s) * srvStride;
+    list->SetDescriptorHeaps(1, &srvHeap);
+    list->SetGraphicsRootSignature(rs);
+    list->SetGraphicsRootDescriptorTable(1, gh);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)flowW, (float)flowH, 0.0f, 1.0f };
+    D3D12_RECT sc = { 0, 0, (LONG)flowW, (LONG)flowH };
+    list->RSSetViewports(1, &vp);
+    list->RSSetScissorRects(1, &sc);
+    GConsts gc = {};
+    gc.outTexel[0] = 1.0f / (float)flowW; gc.outTexel[1] = 1.0f / (float)flowH;
+    gc.mvScale[0] = e.mvScale[0] * (float)g_shared.warpGameSign * scale; gc.mvScale[1] = e.mvScale[1] * (float)g_shared.warpGameSign * scale;
+    memcpy(gc.mvMap, e.mvMap, sizeof(gc.mvMap)); memcpy(gc.dMap, e.dMap, sizeof(gc.dMap));
+    gc.mvInvalid = e.mvInvalid;
+    gc.pad[0] = scale > 0.0f ? 1.0f / scale : 1.0f;        // shown frames per rendered one: back to a whole rendered frame's motion
+    gc.pad[1] = prevOk ? 1.0f : 0.0f;
+    const bool linear = StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (linear ? 8u : 0u);
+    memcpy(gc.hMap, hlMap, sizeof(gc.hMap));
+    if (hl && !hudModesSet)
+    {
+        // the order to try: a float picture against a 10- or 8-bit frame is most likely HDR10 / sRGB against linear
+        const DXGI_FORMAT v = ColorView(hlFmt), f = StageFormat();
+        const bool hlFloat = v == DXGI_FORMAT_R16G16B16A16_FLOAT || v == DXGI_FORMAT_R32G32B32A32_FLOAT || v == DXGI_FORMAT_R11G11B10_FLOAT;
+        const bool fFloat = f == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (hlFloat && !fFloat) { hudModes[0] = f == DXGI_FORMAT_R10G10B10A2_UNORM ? 1 : 2; hudModes[1] = hudModes[0] == 1 ? 2 : 1; hudModes[2] = 0; }
+        else { hudModes[0] = 0; hudModes[1] = 1; hudModes[2] = 2; }
+        hudModeI = 0; hudModesSet = true;
+    }
+    gc.hudMode = (uint32_t)hudModes[std::min(hudModeI.load(), hudModeN - 1)];
+    gc.hudThr = (linear || gc.hudMode != 0) ? 0.08f : 0.04f;
+
+    // 1. The HUD mask (when the game gives a HUD-less picture)
+    if (hl)
+    {
+        D3D12_RESOURCE_BARRIER hb[4]; UINT nh = 0;
+        hb[nh++] = Transition(g_stage[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        const bool hlTr = !(hlState & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (hlTr) hb[nh++] = Transition(hl, (D3D12_RESOURCE_STATES)hlState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        hb[nh++] = Transition(hudRaw[hudCur], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        hb[nh++] = Transition(hudMask, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(nh, hb);
+        list->SetPipelineState(psoHud);
+        list->SetGraphicsRoot32BitConstants(0, sizeof(GConsts) / 4, &gc, 0);
+        D3D12_CPU_DESCRIPTOR_HANDLE rt[2] = { rtvHeap->GetCPUDescriptorHandleForHeapStart(), rtvHeap->GetCPUDescriptorHandleForHeapStart() };
+        rt[0].ptr += (SIZE_T)(kStage + hudCur) * rtvStride;
+        rt[1].ptr += (SIZE_T)(kStage + 2) * rtvStride;
+        list->OMSetRenderTargets(2, rt, FALSE, nullptr);
+        list->DrawInstanced(3, 1, 0, 0);
+        nh = 0;
+        hb[nh++] = Transition(g_stage[s], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        if (hlTr) hb[nh++] = Transition(hl, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, (D3D12_RESOURCE_STATES)hlState);
+        hb[nh++] = Transition(hudRaw[hudCur], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        hb[nh++] = Transition(hudMask, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(nh, hb);
+        hudCur = 1 - hudCur;
+        hudMaskOk = true;
+        if (hudState.load() == 0)
+        {
+            hudState = 1;
+            LOGI("BFI Presenter: frame warp, the game's own motion: the HUD is kept still with the game's HUD-less picture (%ux%u, format %d, "
+                 "the frame's %d, %s); compared as: %s", (unsigned)hlMap[0], (unsigned)hlMap[1], (int)hlFmt, (int)StageFormat(),
+                 hlLive ? "read at the Present" : "copied when tagged", HudModeName(gc.hudMode));
+        }
+        hl->Release();
+    }
+    else hudMaskOk = false;
+    if (hudMaskOk) gc.flags |= 4u;
+
+    // 2. The motion texture
+    D3D12_RESOURCE_BARRIER b[4] = {
+        Transition(flow[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+        Transition(e.mv, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) };
+    UINT nb = 2;
+    if (e.hasDepth) b[nb++] = Transition(e.depth, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (prevOk) b[nb++] = Transition(ep.mv, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    list->ResourceBarrier(nb, b);
+    list->SetPipelineState(pso);
+    list->SetGraphicsRoot32BitConstants(0, sizeof(GConsts) / 4, &gc, 0);
+    D3D12_CPU_DESCRIPTOR_HANDLE rh = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rh.ptr += (SIZE_T)s * rtvStride;
+    list->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+    list->DrawInstanced(3, 1, 0, 0);
+    nb = 0;
+    b[nb++] = Transition(flow[s], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+    b[nb++] = Transition(e.mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (e.hasDepth) b[nb++] = Transition(e.depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (prevOk) b[nb++] = Transition(ep.mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->ResourceBarrier(nb, b);
+    slotPend[s] = true; slotOk[s] = !e.reset; slotDepth[s] = e.hasDepth; slotCut[s] = e.reset; slotLag[s] = lag;
+}
+
+// After the frame in slot s is published as game frame id.
+static void Published(UINT s, UINT64 id)
+{
+    if (s >= kStage || !slotPend[s]) return;
+    slotId[s] = id;
+    if (slotCut[s] && cutId.load() + 1 < id) { cutId = id; cutsSec++; }   // a run of reset frames counts once
+    else if (slotCut[s]) cutId = id;
+}
+static int CutsTake() { return cutsSec.exchange(0); }
+// No frame warp for this frame: within 3 rendered frames after a camera cut, or in a letterboxed cutscene.
+static bool PauseNow(UINT64 id, bool letterbox, const char **why)
+{
+    const UINT64 c = cutId.load();
+    const UINT64 k = (UINT64)std::max(1, g_status.fgActive ? fgK : 1);
+    if (c && id >= c && id < c + 3 * k) { *why = "camera cut"; return true; }
+    if (letterbox && lbOn.load() && Now() - lbT.load() < 1.0 && lbFullSeen.load())
+    {
+        if (Now() - lbStartT.load() < 600.0) { *why = "letterboxed cutscene"; return true; }
+        static double loggedFor = -1.0;
+        if (loggedFor != lbStartT.load())
+        {
+            loggedFor = lbStartT.load();
+            LOGI("BFI Presenter: frame warp: letterboxed for over 10 minutes -- taken as play, not a cutscene; frame warp works again");
+        }
+    }
+    return false;
+}
+
+// The presenter: is frame `id` in slot s warped with the game's motion? 0 no, 1 vectors and depth, 2 vectors only.
+static float SlotLag(int s) { return (s >= 0 && s < (int)kStage) ? slotLag[s] : 0.0f; }
+static int SlotFor(int s, UINT64 id)
+{
+    if (s < 0 || s >= (int)kStage || !id || slotId[s].load() != id || !slotOk[s]) return 0;
+    return slotDepth[s] ? 1 : 2;
+}
+
+// The presenter: shader-resource views of the motion textures, into its own heap (when they were made anew).
+static UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride)
+{
+    std::lock_guard<std::mutex> l(flowLk);
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+    sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    for (UINT i = 0; i < kStage; i++)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)i * stride;
+        g_device->CreateShaderResourceView(flow[i], &sv, h);   // a null view while there is none
+    }
+    return flowGen.load();
+}
+// The slot's motion texture if the views the presenter wrote (generation gen) are still for it; else none this refresh.
+static ID3D12Resource *FlowFor(int s, UINT gen)
+{
+    std::lock_guard<std::mutex> l(flowLk);
+    return s >= 0 && s < (int)kStage && flowGen.load() == gen ? flow[s] : nullptr;
+}
+static UINT FlowGenNow() { return flowGen.load(); }
+static ID3D12Resource *FlowRes(int s) { return s >= 0 && s < (int)kStage ? flow[s] : nullptr; }
+static int StateNow(char *w, size_t n) { std::lock_guard<std::mutex> l(lk); snprintf(w, n, "%s", why); return state.load(); }
+static int HudNow() { return hudState.load(); }
+static int ViaNow() { return via.load(); }
+static int StateFast() { return state.load(); }
+// The check found the mask covering much of the picture: the HUD-less picture doesn't match the frame shown as it is
+// compared now. The next way of comparing is tried; after the last, the mask is switched off for the session (effects
+// drawn after the HUD-less picture -- ReShade's included -- or an encoding none of the modes undo).
+static void HudBad(double pct)
+{
+    if (hudState.load() < 0) return;
+    const int i = hudModeI.load();
+    if (i + 1 < hudModeN)
+    {
+        hudModeI = i + 1;
+        LOGI("BFI Presenter: frame warp, the game's own motion: the HUD mask covered %.0f%% compared as %s -- now trying: %s",
+             pct, HudModeName((uint32_t)hudModes[i]), HudModeName((uint32_t)hudModes[i + 1]));
+        return;
+    }
+    hudState = -1;
+    LOGW("BFI Presenter: frame warp, the game's own motion: HUD protection off -- the game's HUD-less picture differs from the frame "
+         "shown over %.0f%% of it in every way of comparing tried (effects drawn after it, ReShade's included?)", pct);
+}
+
+// With the frame resources (the swap chain resized or gone): the motion textures and the pass. The copies of the
+// game's buffers stay (see OnEvaluate) until the device changes.
+static void Release()
+{
+    std::lock_guard<std::mutex> l(lk);
+    {
+        std::lock_guard<std::mutex> l2(flowLk);
+        for (UINT i = 0; i < kStage; i++) { SafeRelease(flow[i]); slotPend[i] = slotOk[i] = false; slotId[i] = 0; }
+        for (auto &r : flowRetired) r.r->Release();
+        flowRetired.clear();
+    }
+    flowW = flowH = 0;
+    flowGen++;
+    SafeRelease(hudRaw[0]); SafeRelease(hudRaw[1]); SafeRelease(hudMask); hudMaskOk = false;
+    pendN = 0; latest = -1; haveSet[0] = haveSet[1] = false; hudLive = false;
+    SafeRelease(psoHud); SafeRelease(pso); SafeRelease(rs); SafeRelease(srvHeap); SafeRelease(rtvHeap);
+}
+} // namespace gmo
+
+// ---------------------------------------------------------------------------------------------------------
+// The game's own motion from DLSS called directly (NGX, test): games that call DLSS without Streamline (most Unreal
+// Engine games, Townfall) hand it their motion vectors and depth in an NGX parameter object at
+// NVSDK_NGX_D3D12_EvaluateFeature. Those exports of the driver's _nvngx.dll (or a nvngx.dll in the game's folder) are
+// hooked; at each DLSS call (super resolution or ray reconstruction) the parameters are read and put into the shape
+// Streamline's tags have, and gmo::Feed copies the buffers as for Streamline. A DLSS call made by Streamline itself is
+// left to the Streamline hook. Layouts and names follow the DLSS SDK headers (nvsdk_ngx.h, nvsdk_ngx_defs.h,
+// nvsdk_ngx_params.h).
+namespace ngx
+{
+using slp::Plaus; using slp::Readable;
+struct Handle { unsigned int id; };
+typedef int (*PFN_Create)(void *cl, int feature, void *params, Handle **out);
+typedef int (*PFN_Eval)(void *cl, const Handle *h, const void *params, void *cb);
+typedef int (*PFN_Get)(const void *self, const char *name, void *out);
+// hooked in up to two modules: a nvngx.dll in the game's folder (OptiScaler) and the driver's _nvngx.dll
+static PFN_Create o_Creates[2] = {};
+static PFN_Eval o_Eval[2] = {}, o_EvalC[2] = {};
+static const int kSuccess = 1;                         // NVSDK_NGX_Result_Success
+enum { kSR = 1, kRR = 13 };                            // NVSDK_NGX_Feature_SuperSampling, _RayReconstruction
+enum { kMVLowRes = 1 << 1, kDepthInverted = 1 << 3 };  // NVSDK_NGX_DLSS_Feature_Flags
+struct Feat { int feature; int flags; unsigned w, h, ow = 0, oh = 0; };
+static std::mutex lk;
+static std::map<uintptr_t, Feat> feats;                // by handle, from CreateFeature: the handle's address, not its id -- DLSS
+                                                       // frame generation numbers its handles on its own (Directive 8020: super
+                                                       // resolution and frame generation both handle 1)
+static bool tried[2] = {};                             // "nvngx.dll", "_nvngx.dll"
+static bool hooked = false;
+static thread_local int inside = 0;                    // nested NGX call (OptiScaler calling the driver's DLSS)
+// The parameter object is a C++ interface: 8 Set overloads, then 8 Get overloads, then Reset. MSVC puts overloads
+// of one name in reverse order, so Get(ID3D12Resource**) is slot 9 there and slot 14 in declaration order. Which one
+// is found once, from the first DLSS call, by asking for "MotionVectors" and checking that what comes back is a D3D12
+// texture. Int and unsigned int getters are slots 11 and 12 either way round (both read a 4-byte value).
+static int slotRes = 0, slotF = 0;                     // 0 = not found yet, -1 = not recognised (NGX left alone)
+static uint32_t nEval = 0, nUsed = 0, nOther = 0, nUnknown = 0, nNoMv = 0, nSl = 0;
+static std::map<int, uint32_t> nFeat;
+static double winT = 0.0; static int reports = 0;
+
+static int Get(const void *p, int slot, const char *name, void *out) { return ((PFN_Get)(*(void ***)p)[slot])(p, name, out); }
+static bool GetU(const void *p, const char *name, unsigned &v)
+{
+    uint64_t x = 0;                                        // int or unsigned int: slot 11 or 12 in either order
+    if (Get(p, 11, name, &x) != kSuccess && Get(p, 12, name, &x) != kSuccess) return false;
+    v = (unsigned)x; return true;
+}
+
+// A D3D12 texture? Only for the one-time layout check: the pointer, its vtable and the vtable's first function are
+// checked (the function must be in a loaded module) before anything is called.
+static bool LooksLikeD3D12(void *p)
+{
+    if (!Plaus(p) || !Readable(p, 8)) return false;
+    void **vt = *(void ***)p;
+    if (!Plaus(vt) || !Readable(vt, 24)) return false;
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)vt[0], &m) || !m) return false;
+    ID3D12Resource *r = nullptr;
+    if (FAILED(((IUnknown *)p)->QueryInterface(__uuidof(ID3D12Resource), (void **)&r)) || !r) return false;
+    r->Release();
+    return true;
+}
+
+static void *GetRes(const void *p, const char *name, const char *enc)
+{
+    uint64_t v = 0;
+    if (Get(p, slotRes, name, &v) == kSuccess && v) return (void *)(uintptr_t)v;
+    v = 0;
+    if (enc && Get(p, slotRes, enc, &v) == kSuccess && v) return (void *)(uintptr_t)v;
+    return nullptr;
+}
+
+static bool Layout(const void *p)
+{
+    if (slotRes) return slotRes > 0;
+    const int tryRes[2] = { 9, 14 };
+    for (int i = 0; i < 2 && !slotRes; i++)
+    {
+        for (const char *nm : { "MotionVectors", "#\x27" })
+        {
+            uint64_t v = 0;                                // 8 bytes: in the other order the slot is Get(float*)
+            if (Get(p, tryRes[i], nm, &v) == kSuccess && v && LooksLikeD3D12((void *)(uintptr_t)v))
+            { slotRes = tryRes[i]; slotF = tryRes[i] == 9 ? 14 : 9; break; }
+        }
+    }
+    if (!slotRes)
+    {
+        slotRes = -1;
+        LOGW("BFI Presenter: frame warp, the game's own motion: DLSS's parameter object isn't laid out as expected -- direct DLSS calls are left alone");
+        return false;
+    }
+    LOGI("BFI Presenter: frame warp, the game's own motion: DLSS parameters read in %s order", slotRes == 9 ? "MSVC's" : "declaration");
+    return true;
+}
+
+static void OnCreate(int feature, const void *params, Handle *h)
+{
+    if (!h || !Plaus(h) || !params || !Plaus(params)) return;
+    Feat f = { feature, -1, 0, 0 };
+    unsigned fl = 0;
+    if (GetU(params, "DLSS.Feature.Create.Flags", fl)) f.flags = (int)fl;
+    GetU(params, "Width", f.w); GetU(params, "Height", f.h); GetU(params, "OutWidth", f.ow); GetU(params, "OutHeight", f.oh);
+    std::lock_guard<std::mutex> l(lk);
+    feats[(uintptr_t)h] = f;
+    static int logged = 0;
+    if (logged++ < 8)
+        LOGI("BFI Presenter: DLSS feature %d created (handle %u): render size %ux%u, flags 0x%x%s", feature, h->id, f.w, f.h, (unsigned)fl,
+             f.flags < 0 ? " (not stated)" : "");
+}
+
+static void OnEval(void *cmd, const Handle *h, const void *params)
+{
+    if (!gmo::On() || !g_device || !cmd || !params || !Plaus(params) || !h || !Plaus(h)) return;
+    Feat f = { 0, -1, 0, 0 };
+    bool known;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        nEval++;
+        if (slp::g_slDepth > 0) { nSl++; return; }          // Streamline's own DLSS call: the Streamline hook has it
+        auto it = feats.find((uintptr_t)h);
+        known = it != feats.end();
+        if (known) f = it->second;
+        nFeat[known ? f.feature : -1]++;
+        if (known && f.feature != kSR && f.feature != kRR) { nOther++; return; }
+        if (!known) nUnknown++;
+        if (!Layout(params)) return;
+    }
+    void *mv = GetRes(params, "MotionVectors", "#\x27");
+    if (!mv) { std::lock_guard<std::mutex> l(lk); nNoMv++; return; }   // not an upscaler call (frame generation has names of its own)
+    void *dp = GetRes(params, "Depth", "#\x3d");
+    float sx = 1.0f, sy = 1.0f;
+    if (Get(params, slotF, "MV.Scale.X", &sx) != kSuccess) Get(params, slotF, "#\x2c", &sx);
+    if (Get(params, slotF, "MV.Scale.Y", &sy) != kSuccess) Get(params, slotF, "#\x2d", &sy);
+    unsigned reset = 0, rw = 0, rh = 0, flags = 0, mvX = 0, mvY = 0, dX = 0, dY = 0, cw = 0, ch = 0;
+    GetU(params, "Reset", reset);
+    GetU(params, "DLSS.Render.Subrect.Dimensions.Width", rw); GetU(params, "DLSS.Render.Subrect.Dimensions.Height", rh);
+    GetU(params, "DLSS.Input.MV.Subrect.Base.X", mvX); GetU(params, "DLSS.Input.MV.Subrect.Base.Y", mvY);
+    GetU(params, "DLSS.Input.Depth.Subrect.Base.X", dX); GetU(params, "DLSS.Input.Depth.Subrect.Base.Y", dY);
+    if (!rw || !rh) { rw = f.w; rh = f.h; }
+    if ((!rw || !rh) && GetU(params, "Width", cw) && GetU(params, "Height", ch)) { rw = cw; rh = ch; }
+    bool flagsGiven = f.flags >= 0;
+    if (flagsGiven) flags = (unsigned)f.flags;
+    else if (GetU(params, "DLSS.Feature.Create.Flags", flags)) flagsGiven = true;
+    else flags = kMVLowRes | kDepthInverted;               // not stated: as most current engines (Unreal's included)
+
+    // The vectors' texture size, for vectors at the output size (no MVLowRes) and for a missing render size.
+    UINT mvW = 0, mvH = 0;
+    {
+        ID3D12Resource *r = nullptr;
+        if (Plaus(mv) && SUCCEEDED(((IUnknown *)mv)->QueryInterface(__uuidof(ID3D12Resource), (void **)&r)) && r)
+        { const D3D12_RESOURCE_DESC d = r->GetDesc(); mvW = (UINT)d.Width; mvH = d.Height; r->Release(); }
+    }
+    if (!mvW) return;
+    const bool low = (flags & kMVLowRes) != 0;
+    if (!rw || !rh) { rw = mvW; rh = mvH; }
+
+    // Into Streamline's shape: the extents in use, the vector scale to screen uv (DLSS's scale goes to pixels of the
+    // vectors' own size), reversed depth, a camera cut. DLSS's vectors always include the camera's motion.
+    slp::Res res[2] = {}; slp::Tag tag[2] = {};
+    res[1].native = mv; res[1].state = (uint32_t)g_shared.dlssInState;
+    tag[1].res = &res[1]; tag[1].bufType = 1;
+    if (low) tag[1].ext = { mvY, mvX, rw, rh };            // top, left, width, height
+    if (dp) { res[0].native = dp; res[0].state = (uint32_t)g_shared.dlssInState; tag[0].res = &res[0]; tag[0].bufType = 0; tag[0].ext = { dY, dX, rw, rh }; }
+    slp::Consts c = {};
+    c.mvecScale[0] = sx / (float)(low ? rw : mvW);
+    c.mvecScale[1] = sy / (float)(low ? rh : mvH);
+    c.depthInverted = (flags & kDepthInverted) ? 1 : 0;
+    c.cameraMotionIncluded = 1;
+    c.reset = reset ? 1 : 0;
+    // DLSS's output smaller than the screen, wider than tall against it: a letterboxed cutscene (Townfall: 3840x1634).
+    if (known && f.ow && f.oh && g_stage[0])
+    {
+        const D3D12_RESOURCE_DESC sd = g_stage[0]->GetDesc();
+        gmo::NoteLetterbox(f.oh < 0.9 * sd.Height && f.ow >= 0.9 * sd.Width, f.ow, f.oh, (unsigned)sd.Width, sd.Height, "DLSS");
+    }
+    c.mvInvalid = 3.402823466e38f;                         // DLSS has no marker for a missing vector
+    static int logged = 0;
+    if (logged < 4)
+    {
+        logged++;
+        LOGI("BFI Presenter: DLSS call (feature %d%s): vectors %ux%u%s, scale %.3g x %.3g, render %ux%u, depth %s, flags 0x%x%s",
+             known ? f.feature : -1, known ? "" : ", created before the hook", mvW, mvH, low ? " (render size)" : " (output size)", sx, sy, rw, rh,
+             dp ? ((flags & kDepthInverted) ? "reversed" : "standard") : "none", flags, flagsGiven ? "" : " (assumed: not stated)");
+    }
+    const slp::Tag *tg[2] = { dp ? &tag[0] : nullptr, &tag[1] };
+    {
+        std::lock_guard<std::mutex> l(gmo::lk);
+        gmo::Feed(tg, c, cmd, 1);
+    }
+    std::lock_guard<std::mutex> l(lk);
+    nUsed++;
+}
+
+template <int I> static int hk_Create(void *cl, int feature, void *params, Handle **out)
+{
+    inside++;
+    const int r = o_Creates[I](cl, feature, params, out);
+    inside--;
+    if (r == kSuccess && out && Plaus(out) && inside == 0) OnCreate(feature, params, *out);
+    return r;
+}
+template <int I> static int hk_Eval(void *cl, const Handle *h, const void *params, void *cb)
+{
+    if (inside == 0) OnEval(cl, h, params);
+    inside++;
+    const int r = o_Eval[I](cl, h, params, cb);
+    inside--;
+    return r;
+}
+template <int I> static int hk_EvalC(void *cl, const Handle *h, const void *params, void *cb)
+{
+    if (inside == 0) OnEval(cl, h, params);
+    inside++;
+    const int r = o_EvalC[I](cl, h, params, cb);
+    inside--;
+    return r;
+}
+
+// Once a second from the presenter: hooks DLSS's exports once a module with them is loaded; reports every 10 s.
+static void Tick(double t)
+{
+    static const char *mods[2] = { "nvngx.dll", "_nvngx.dll" };
+    for (int i = 0; i < 2; i++)
+    {
+        if (tried[i]) continue;
+        HMODULE m = GetModuleHandleA(mods[i]);
+        if (!m) continue;
+        tried[i] = true;
+        if (!g_shared.dlssHooks)
+        {
+            LOGI("BFI Presenter: %s found, not hooked (DlssHooks=0)", mods[i]);
+            continue;
+        }
+        void *fC = (void *)GetProcAddress(m, "NVSDK_NGX_D3D12_CreateFeature");
+        void *fE = (void *)GetProcAddress(m, "NVSDK_NGX_D3D12_EvaluateFeature");
+        void *fEC = (void *)GetProcAddress(m, "NVSDK_NGX_D3D12_EvaluateFeature_C");
+        if (!fE && !fEC) { LOGI("BFI Presenter: %s has no D3D12 DLSS calls -- not hooked", mods[i]); continue; }
+        struct { const char *name; void *fn; void *hook; void **orig; } fns[3] = {
+            { "CreateFeature", fC, i ? (void *)&hk_Create<1> : (void *)&hk_Create<0>, (void **)&o_Creates[i] },
+            { "EvaluateFeature", fE, i ? (void *)&hk_Eval<1> : (void *)&hk_Eval<0>, (void **)&o_Eval[i] },
+            { "EvaluateFeature_C", fEC, i ? (void *)&hk_EvalC<1> : (void *)&hk_EvalC<0>, (void **)&o_EvalC[i] },
+        };
+        char list[400] = "";
+        for (auto &f : fns)
+        {
+            char why[96] = "not exported";
+            void *orig = f.fn ? InlineHook64(f.fn, f.hook, why, sizeof(why)) : nullptr;
+            if (orig) { *f.orig = orig; hooked = true; }
+            char one[160];
+            snprintf(one, sizeof(one), "%s%s %s%s%s", list[0] ? "; " : "", f.name, orig ? "hooked" : "not hooked", orig ? "" : " -- ", orig ? "" : why);
+            strncat(list, one, sizeof(list) - strlen(list) - 1);
+        }
+        char path[MAX_PATH] = "";
+        GetModuleFileNameA(m, path, MAX_PATH);
+        LOGI("BFI Presenter: DLSS (NGX, test build): %s: %s", path, list);
+        if (!winT) winT = t;
+    }
+    if (!hooked || reports >= 30 || t - winT < 10.0) return;
+    uint32_t e, u, o, un, nm, sl; std::map<int, uint32_t> fs;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        e = nEval; u = nUsed; o = nOther; un = nUnknown; nm = nNoMv; sl = nSl; fs.swap(nFeat);
+        nEval = nUsed = nOther = nUnknown = nNoMv = nSl = 0;
+    }
+    const double secs = t - winT;
+    winT = t;
+    if (!e) return;
+    reports++;
+    char fl[200] = "";
+    for (auto &kv : fs)
+    {
+        char one[64];
+        if (kv.first < 0) snprintf(one, sizeof(one), "%sa feature created before the hook %.0f/s", fl[0] ? ", " : "", kv.second / secs);
+        else snprintf(one, sizeof(one), "%sfeature %d %.0f/s", fl[0] ? ", " : "", kv.first, kv.second / secs);
+        strncat(fl, one, sizeof(fl) - strlen(fl) - 1);
+    }
+    LOGI("BFI Presenter: DLSS (NGX): last %.0f s: %.0f calls/s (%s), used %.0f/s, from Streamline %.0f/s, other features %.0f/s, created before the hook %.0f/s, "
+         "without vectors %.0f/s", secs, e / secs, fl[0] ? fl : "none", u / secs, sl / secs, o / secs, un / secs, nm / secs);
+}
+} // namespace ngx
 
 // NvAPI functions, once nvapi64.dll is in the game (it isn't loaded by the presenter).
 static bool ReflexApi()
@@ -11195,6 +13194,10 @@ static void on_osd(reshade::api::effect_runtime *rt)
     d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
     d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
     d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
+    // which motion: what the last second's moved cycles used, or (none moved) what the game hands over
+    d.warpSrc = g_status.warpCycles ? g_status.warpSrc
+              : (g_shared.warpGame && g_status.warpGameState > 0 ? g_status.warpGameState : 0);
+    d.warpVia = g_status.warpGameVia;
     LeaveCriticalSection(&g_cfgLock);
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
 }
@@ -11762,38 +13765,6 @@ static void draw_overlay(reshade::api::effect_runtime *)
         // ---------------------------------------------------------- every cap
         ImGui::Spacing();
         ImGui::SeparatorText("Every cap");
-        bool fw = s.frameWarp != 0;
-        if (ImGui::Checkbox("Frame warp: fill missing frames (test, Ctrl+Shift+W)", &fw)) s.frameWarp = fw ? 1 : 0;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("For games that run just under the strobe rate (50-59 fps against a 60 Hz strobe). A strobe\n"
-                                                      "cycle without a new game frame normally lights the last one again: the picture stands\n"
-                                                      "still for a flash, then jumps. Frame warp shows that frame moved part of the way along the\n"
-                                                      "camera's motion instead. Frames that arrive in time are shown exactly as rendered, and no\n"
-                                                      "frame is held back, so it adds no latency (unlike frame generation).\n"
-                                                      "\n"
-                                                      "Worth trying: a game that holds about 75-99%% of the strobe rate and misses a frame now and\n"
-                                                      "then, in camera pans and turns.\n"
-                                                      "Not useful: the game holds the strobe rate (nothing to fill); far below it (use the Half\n"
-                                                      "cap or frame generation); for hitches and loading stalls; for things that move on their own\n"
-                                                      "(a character, a car), which keep their stutter. With frame generation it works, with less to fill.\n"
-                                                      "A filled flash is a guess: edges of things moving against the background can smear for that\n"
-                                                      "flash, and a CRT shader's mask moves with the picture. Test build: see the settings guide.");
-        if (s.frameWarp)
-        {
-            ImGui::Indent(16.0f);
-            ImGui::SliderFloat("Furthest ahead (game frames)", &s.warpMax, 0.25f, 1.5f, "%.2f");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("A frame is never shown further ahead than this. Lower = fewer errors, but a\n"
-                                                          "missing frame is only partly filled.");
-            ImGui::SliderInt("Only from (% of the strobe rate)", &s.warpMinRate, 40, 95);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame warp works while the game makes at least this share of the strobe rate\n"
-                                                          "(75%% of a 60 Hz strobe = 45 fps). Below it frames repeat as without it: the\n"
-                                                          "further a frame has to be moved, the more errors show.");
-            if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see ReShade.log).");
-            else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
-                                                 st.warpRate * 100.0, st.warpCycles, st.warpAvg);
-            else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
-            else ImGui::Text("Waiting for the game's frame rate.");
-            ImGui::Unindent(16.0f);
-        }
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lowest latency shows the newest frame -- best at the Refresh cap, and needed by the hold at\nthe frame start. Smooth holds up to one finished frame in reserve (about one refresh more latency)\nso every frame is lit once and in order -- it only helps at the Half or Quarter cap.");
         if (s.pacingMode == 0)
@@ -11815,6 +13786,107 @@ static void draw_overlay(reshade::api::effect_runtime *)
         else ImGui::TextDisabled("Frames ahead in use: %d", st.aheadInUse);
         ImGui::Unindent(16.0f);
         ImGui::TextDisabled("Fine-tuning (later release at Refresh rate, the just-in-time margin, lining Reflex's limit up): Advanced.");
+        ImGui::Spacing();
+        bool fw = s.frameWarp != 0;
+        if (ImGui::Checkbox("Frame warp: fill missing frames (Ctrl+Shift+W)", &fw)) s.frameWarp = fw ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("For games that run just under the strobe rate (50-59 fps against a 60 Hz strobe). A strobe\n"
+                                                      "cycle without a new game frame normally lights the last one again: the picture stands\n"
+                                                      "still for a flash, then jumps. Frame warp shows that frame moved part of the way along the\n"
+                                                      "camera's motion instead. Frames that arrive in time are shown exactly as rendered, and no\n"
+                                                      "frame is held back, so it adds no latency (unlike frame generation).\n"
+                                                      "\n"
+                                                      "Worth trying: a game that holds about 75-99%% of the strobe rate and misses a frame now and\n"
+                                                      "then, in camera pans and turns.\n"
+                                                      "Not useful: the game holds the strobe rate (nothing to fill); far below it (use the Half\n"
+                                                      "cap or frame generation); for hitches and loading stalls; for things that move on their own\n"
+                                                      "(a character, a car), which keep their stutter. With frame generation it works, with less to fill.\n"
+                                                      "A filled flash is a guess: edges of things moving against the background can smear for that\n"
+                                                      "flash, and a CRT shader's mask moves with the picture (see Snap below). Details: the settings guide.");
+        if (s.frameWarp)
+        {
+            ImGui::Indent(16.0f);
+            ImGui::SliderFloat("Furthest ahead (game frames)", &s.warpMax, 0.25f, 1.5f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("A frame is never shown further ahead than this. Lower = fewer errors, but a\n"
+                                                          "missing frame is only partly filled.");
+            ImGui::SliderInt("Only from (% of the strobe rate)", &s.warpMinRate, 40, 95);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame warp works while the game makes at least this share of the strobe rate\n"
+                                                          "(75%% of a 60 Hz strobe = 45 fps). Below it frames repeat as without it: the\n"
+                                                          "further a frame has to be moved, the more errors show.");
+            if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see ReShade.log).");
+            else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
+                                                 st.warpRate * 100.0, st.warpCycles, st.warpAvg);
+            else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
+            else ImGui::Text("Waiting for the game's frame rate.");
+            bool gm = s.warpGame != 0;
+            if (ImGui::Checkbox("Use the game's own motion vectors and depth", &gm)) s.warpGame = gm ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (through Streamline or directly, DX12) its motion vectors and\n"
+                                                          "depth, frame warp moves each part of the picture by the game's own motion for it, and\n"
+                                                          "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
+                                                          "from the finished picture, which can only follow the camera. Other games keep the\n"
+                                                          "measured motion. The line below says which one is in use.");
+            if (s.warpGame)
+            {
+                ImGui::SameLine();
+                bool ev = s.warpEven != 0;
+                if (ImGui::Checkbox("Even pacing", &ev)) s.warpEven = ev ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion only: every strobe cycle shows the picture where the game's motion\n"
+                                                              "is at that moment, not just the cycles without a new frame, so every step on screen is the same.\n"
+                                                              "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
+                                                              "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
+                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
+            }
+            bool pl = s.warpPauseLb != 0;
+            if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
+                                                          "screen, e.g. Townfall): its quick cuts between camera angles have no motion to follow.\n"
+                                                          "Only after full-screen play in the same session, and not once a letterbox has lasted\n"
+                                                          "10 minutes (play, in a game letterboxed by design). Turn it off for a game whose play\n"
+                                                          "switches in and out of letterbox. Right after a camera cut the game flags, frames are\n"
+                                                          "never filled either way.");
+            {
+                const bool fgOff = st.fgActive && !s.warpGameFg;   // the game's motion isn't used with frame generation
+                const int src = st.warpCycles ? st.warpSrc : (s.warpGame && !fgOff && st.warpGameState > 0 ? st.warpGameState : 0);
+                ImGui::Text("Motion used: %s%s", src == 1 ? "the game's motion vectors and depth" : src == 2 ? "the game's motion vectors (no depth)"
+                                                       : "measured from the picture",
+                            src <= 0 ? "" : st.warpGameVia == 1 ? ", from DLSS" : ", from Streamline");
+                if (s.warpGame && fgOff && st.warpGameState > 0) { ImGui::SameLine(); ImGui::TextDisabled("(the game's is off with frame generation)"); }
+                else if (s.warpGame && st.warpGameWhy[0]) { ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", st.warpGameWhy); }
+                else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("This game hasn't handed DLSS any motion data (no Streamline or DLSS call seen).");
+            }
+            ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader (e.g.\n"
+                                                          "CRT-Standalone), set it to the mask's width so the mask stays in place. 0 = off.");
+            ImGui::SliderFloat("Snap moves up and down (px)", &s.warpSnapY, 0.0f, 16.0f, s.warpSnapY > 0.0f ? "%.2f" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader,\n"
+                                                          "set it to the scanline width (e.g. CRT-Standalone's Scanline Width) so the scanlines\n"
+                                                          "don't break up where parts of the picture move by different amounts. 0 = off.");
+            if (s.warpGame)
+            {
+                bool gf = s.warpGameFg != 0;
+                if (ImGui::Checkbox("Also with frame generation", &gf)) s.warpGameFg = gf ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("The game's motion vectors are for the frames it renders, not the ones frame generation\n"
+                                                              "adds in between, so on those the edges of moving things double up (outlines around\n"
+                                                              "characters, e.g. 007 First Light, Directive 8020). Off by default: with frame generation\n"
+                                                              "on, frame warp uses the motion measured from the picture.");
+                if (s.warpGameFg)
+                {
+                    ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
+                                                                  "further ahead than this (shown frames). Further out it overshoots and snaps back.");
+                }
+                bool hud = s.warpGameHud != 0;
+                if (ImGui::Checkbox("Keep the HUD still (the game's HUD-less picture)", &hud)) s.warpGameHud = hud ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands its upscaler a picture without the HUD (e.g. 007 First Light),\n"
+                                                              "whatever differs from it is HUD and is never moved. Switches itself off if the\n"
+                                                              "two don't match (effects drawn after it, ReShade's included).");
+                if (s.warpGameHud)
+                    ImGui::TextDisabled(st.warpHud > 0 ? "HUD mask: in use" : st.warpHud < 0 ? "HUD mask: off (the HUD-less picture doesn't match the frame)"
+                                                       : "HUD mask: the game gives no HUD-less picture");
+            }
+            ImGui::Unindent(16.0f);
+        }
     }
 
     // ================================================================ 4. status

@@ -63,12 +63,17 @@ struct WarpClock
 
     // Once per strobe cycle, at its start. id: the frame the cycle shows; frameT: when the game presented it;
     // now: the pick; cycleSec: one strobe cycle. Returns how far ahead of that frame to show it (game frames).
-    double Cycle(bool on, uint64_t id, double frameT, double now, double cycleSec, double maxAhead, double minRate)
+    // mode: 0 off, 1 fill missing frames, 2 even pacing (1.0.44: only where the game's own motion is used --
+    // every cycle shows the picture where the game's motion is at that moment).
+    double Cycle(int mode, uint64_t id, double frameT, double now, double cycleSec, double maxAhead, double minRate)
     {
+        const bool on = mode != 0;
         const bool isNew = id != lastId;
+        double step = 0.0;
         if (isNew)
         {
             const bool jump = lastId == 0 || id < lastId || id - lastId > 16 || frameT - lastNewT > 0.5;
+            step = jump ? 1.0e9 : (double)(id - lastId);
             if (jump) { histN = histAt = 0; }
             histId[histAt] = id; histT[histAt] = frameT;
             histAt = (histAt + 1) % kHist;
@@ -83,6 +88,26 @@ struct WarpClock
         if (!engaged)
         {
             if (isNew) ahead = 0.0;                        // never backward: the offset goes as the next frame arrives
+            return ahead;
+        }
+        // Even pacing (as test builds t1-t2, with the game's motion now): the position on screen moves on by the game's
+        // frames per cycle each cycle (0.95 at 57 fps), a new frame taking its own step off, so every step on screen is
+        // the same. While frames have stopped coming (a hitch, loading) the picture waits at the limit.
+        // A game that holds the strobe rate (or a whole multiple of it) still has frames that land on the pick: one
+        // repeated, the next skipped (Jusant at 60 of 60, 1-5 a second). Filling only the repeat gave steps of 1, 0.5,
+        // 1.5, 1; here the rate is taken as exactly that multiple, so the repeat moves on a whole frame and the skip takes
+        // it back (1, 0.9, 1.1, 1), and the offset settles quickly (no measuring error to carry): frames that arrive in
+        // time stay as rendered.
+        const bool locked = rate > 0.9 && std::fabs(rate - std::floor(rate + 0.5)) < 0.012;
+        if (mode == 2)
+        {
+            const double r = locked ? std::floor(rate + 0.5) : rate;
+            double a = ahead + r - step;
+            a *= locked ? 0.9 : 0.99;                      // settles back toward the frames as rendered (measuring errors)
+            if (a < 0.0) a = 0.0;
+            if (a > maxAhead) a = maxAhead;
+            if (!isNew && a < ahead) a = ahead;            // no step backward on a cycle without a new frame
+            ahead = a;
             return ahead;
         }
         if (isNew) return ahead = 0.0;                     // frames are shown as rendered

@@ -58,8 +58,11 @@
 
 #include "shaders_spv.h"
 #include "../common/bfi_warpclock.h"   // frame warp: how far ahead each strobe cycle shows its frame (shared with DX)
+#include "../common/bfi_inlinehook.h"  // x64 inline hooks (DLSS calls for the game's motion; shared with DX)
+struct Swapchain; struct DeviceData;
+namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
-#define BFI_VERSION "1.0.43"
+#define BFI_VERSION "1.0.44"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -269,10 +272,22 @@ struct Settings
     int   osdGraph = 1;       // OsdGraph: frame-time graph
     int   osdLoads = 1;       // OsdLoads: CPU / GPU load
     float osdScale = 1.0f;    // OsdScale: text size
-    int   frameWarp = 0;      // FrameWarp (test): a strobe cycle without a new game frame shows the last one moved ahead
+    int   frameWarp = 0;      // FrameWarp: a strobe cycle without a new game frame shows the last one moved ahead
                               // along the camera's motion instead of lit again (as in the DX add-on, v1.0.41)
     float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
+    int   warpGame = 1;       // FrameWarpGameMotion (as DX 1.0.44): the game's own motion vectors and depth where it hands them to DLSS
+    int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: also while frame generation is on (edges double up on generated frames)
+    float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this many shown frames
+    float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many pixels
+    int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
+    int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
+                              // is in the rendered frame: 1 generated frames before the rendered one, -1 after it, 0 off
+    int   warpEase = 1;       // FrameWarpGameMotionEase (ini only, as DX): moves past the rendered frame ease off as the motion slows
+    int   warpGuard = 1;      // FrameWarpGuard (ini only, as DX): filled repeats that keep making their refresh late are shown as they are
+    int   warpPauseLb = 1;    // FrameWarpPauseCutscenes (as DX): no frame warp while a cutscene is letterboxed through DLSS
+    int   dlssHooks = 1;      // DlssHooks: DLSS's Vulkan calls are hooked for the game's motion (0 = left alone)
+    int   dlssLayout = 1;     // DlssInputLayout (ini only): the layout DLSS's inputs are in at its call (VkImageLayout, 1 = GENERAL)
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
@@ -289,7 +304,12 @@ struct Settings
     int   learnPerGame = 1;      // LearnPerGame: the automatic frame cap starts from what it found for the game last time
     int   threadBoost = 1;       // PresenterThreadBoost: the presenter thread registered with MMCSS (applies at the next start)
     int   autoCapFrameStart = 1; // AutoCapAtFrameStart: the automatic frame cap times the game's frame start with a search across the strobe cycle
+    int   reflexAtSleep = 1;  // ReflexLimitAtSleep (as DX): without frame generation, the automatic frame cap paces a Reflex game
+                              // at its Reflex sleep instead of holding it in its present (1.0.45)
+    int   reflexAlign = 1;    // ReflexAlign (as DX): that limit's frame start steered so frames are ready just before the lit pick
+    int   learnReflex = 1;    // LearnReflexStart (as DX): the Reflex frame limit starts where it settled last time (with LearnPerGame)
     int   alignCoarse = 1;    // ReflexAlignCoarse: frames ready far ahead of the pick under the Reflex frame limit are moved closer once
+    int   reflexOwn = 0;      // ReflexOwnLimit (test): the game's own Reflex frame limit is applied at its Reflex sleep (it was only taken out of the driver)
     int   sleepGrid = 1;      // SleepLimitGrid: the frame limit at the game's Reflex sleep keeps its place in the strobe cycle
     int   fgDllCheck = 1;     // FrameGenDllCheck: a loaded frame generation DLL counts as frame generation (games without Reflex)
     int   gameCap  = 1;       // 0 off, 1 refresh rate, 2 half refresh, 3 quarter refresh,
@@ -313,6 +333,7 @@ struct Settings
     int   hitchGapMs = 1000;  // no new game frame for this long counts as loading
     int   pacing   = 1;       // wait for vblank before each present
     int   queueAhead = 0;     // keep one extra refresh queued (covers a late draw; +1 refresh latency)
+    int   queueDark = 1;      // QueueDarkRefresh (as DX 1.0.43): the cycle's second refresh is drawn and queued right after the lit one
     int   log      = 0;
     int   ownQueue = 1;       // present on a queue of the layer's own (else share the game's)
     int   queuePriority = 2;  // PresenterQueuePriority (applies at the next start): 0 off, 1 high, 2 realtime if allowed else high --
@@ -382,6 +403,18 @@ static void LoadSettings(Settings &s)
     s.frameWarp = KvInt(kv, "FrameWarp", 0) != 0 ? 1 : 0;
     s.warpMax = Clamp(KvFloat(kv, "FrameWarpMaxAhead", 1.0f), 0.25f, 1.5f);
     s.warpMinRate = Clamp(KvInt(kv, "FrameWarpMinRate", 75), 40, 95);
+    s.warpGame = KvInt(kv, "FrameWarpGameMotion", 1) ? 1 : 0;
+    s.warpGameFg = KvInt(kv, "FrameWarpGameMotionWithFG", 0) ? 1 : 0;
+    s.warpMaxGameFg = Clamp(KvFloat(kv, "FrameWarpGameMotionMaxAheadFG", 0.10f), 0.1f, 1.5f);
+    s.warpSnapX = Clamp(KvFloat(kv, "FrameWarpSnapX", 0.0f), 0.0f, 16.0f);
+    s.warpSnapY = Clamp(KvFloat(kv, "FrameWarpSnapY", 0.0f), 0.0f, 16.0f);
+    s.warpEven = KvInt(kv, "FrameWarpEvenPacing", 0) ? 1 : 0;
+    s.warpFgLag = Clamp(KvInt(kv, "FrameWarpGameMotionFGLag", 1), -1, 1);
+    s.warpEase = KvInt(kv, "FrameWarpGameMotionEase", 1) ? 1 : 0;
+    s.warpGuard = KvInt(kv, "FrameWarpGuard", 1) ? 1 : 0;
+    s.warpPauseLb = KvInt(kv, "FrameWarpPauseCutscenes", 1) ? 1 : 0;
+    s.dlssHooks = KvInt(kv, "DlssHooks", 1) ? 1 : 0;
+    s.dlssLayout = KvInt(kv, "DlssInputLayout", 1);
     s.osdCorner = std::max(0, std::min(3, KvInt(kv, "OsdCorner", 1)));
     s.osdGraph = KvInt(kv, "OsdGraph", 1) ? 1 : 0;
     s.osdLoads = KvInt(kv, "OsdLoads", 1) ? 1 : 0;
@@ -404,7 +437,11 @@ static void LoadSettings(Settings &s)
     s.autoCap = KvInt(kv, "AutoFrameCap", 1) ? 1 : 0;
     s.fgDllCheck = KvInt(kv, "FrameGenDllCheck", 1) ? 1 : 0;
     s.sleepGrid = KvInt(kv, "SleepLimitGrid", 1) ? 1 : 0;
+    s.reflexOwn = KvInt(kv, "ReflexOwnLimit", 0) ? 1 : 0;
     s.alignCoarse = KvInt(kv, "ReflexAlignCoarse", 1) ? 1 : 0;
+    s.reflexAtSleep = KvInt(kv, "ReflexLimitAtSleep", 1) ? 1 : 0;
+    s.reflexAlign = KvInt(kv, "ReflexAlign", 1) ? 1 : 0;
+    s.learnReflex = KvInt(kv, "LearnReflexStart", 1) ? 1 : 0;
     s.autoCapFrameStart = KvInt(kv, "AutoCapAtFrameStart", 1) ? 1 : 0;
     s.learnPerGame = KvInt(kv, "LearnPerGame", 1) ? 1 : 0;
     s.threadBoost = KvInt(kv, "PresenterThreadBoost", 1) ? 1 : 0;
@@ -427,6 +464,7 @@ static void LoadSettings(Settings &s)
     s.hitchGapMs = Clamp(KvInt(kv, "HitchGuardLoadingMs", 1000), 150, 5000);
     s.pacing   = KvInt(kv, "WaitForVBlank", 1);
     s.queueAhead = KvInt(kv, "QueueAhead", 0) ? 1 : 0;
+    s.queueDark = KvInt(kv, "QueueDarkRefresh", 1) ? 1 : 0;
     s.log      = KvInt(kv, "Log", 0);
     s.ownQueue = KvInt(kv, "VulkanOwnQueue", 1) ? 1 : 0;
     s.queuePriority = Clamp(KvInt(kv, "PresenterQueuePriority", 2), 0, 2);
@@ -457,14 +495,14 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
-    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexLimitAtSleep", s.reflexAtSleep); I("ReflexAlign", s.reflexAlign); I("LearnReflexStart", s.learnReflex); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
     I("AutoFramesAhead", s.autoAhead); I("SmoothCatchUp", s.smoothCatchUp); I("PresenterBuffers", s.presBuffers); I("VulkanExclusiveFullscreen", s.vkExclusive); I("VulkanAutoRecover", s.vkAutoRecover); I("AblGuard", s.ablGuard);
     I("AblGuardBudgetNits", s.ablBudget); k.push_back({"AblCurve", s.ablCurve}); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs); I("FlashHints", s.flashHints);
-    I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue); I("PresenterQueuePriority", s.queuePriority);
+    I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("QueueDarkRefresh", s.queueDark); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue); I("PresenterQueuePriority", s.queuePriority);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
     F("SdrHighlightKnee", s.sdrKnee); I("SdrGamma", s.sdrGamma); I("SdrHighlightMethod", s.sdrMethod); F("SdrBoostStart", s.sdrBoostStart); F("SdrBoostRamp", s.sdrBoostRamp); I("SdrBoostSpace", s.sdrBoostSpace); F("SdrBoostColor", s.sdrBoostColor); I("SdrBoostAplLimiter", s.sdrBoostApl); F("SdrGamutExpansion", s.sdrGamut);
     return k;
@@ -495,6 +533,8 @@ struct Status
     int    warpOn = 0;                      // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
     int    warpCycles = 0;                  // per second: strobe cycles shown moved ahead
     double warpAvg = 0.0, warpRate = 0.0;   // their average offset (game frames); the game's frames per strobe cycle
+    int    warpSrc = 0;                     // what moved them: 0 the measured motion, 1 the game's vectors and depth, 2 its vectors only
+    int    warpGameState = 0;               // the game's motion: 0 no DLSS call seen, 1 vectors and depth, 2 vectors only
     int    lrState = 0;                     // just-in-time release: 0 off, 1 measuring, 2 active, 3 at its limit
     double lrEst = 0.0, lrMargin = 0.0;
     int    lrMisses = 0;
@@ -627,9 +667,39 @@ static std::atomic<long> g_vkSleepSec{0};       // the game's Reflex sleep calls
 static std::atomic<double> g_vkSleepLastT{0.0};  // last Reflex sleep call
 static std::atomic<int>  g_vkSleepLimitUs{0};    // Reflex frame limit applied in the game's sleep call, per rendered frame (0 = off)
 static std::atomic<int>  g_vkFgFactor{1};        // presents per rendered frame, from Reflex sleep calls
+static std::atomic<int>  g_vkOwnLimit{0};        // ReflexOwnLimit (copied from the settings)
 static std::atomic<int>  g_vkSleepGrid{1};       // SleepLimitGrid (copied from the settings)
+static std::atomic<bool> g_vkAlignHunted{false};  // the Reflex limit's alignment went round the strobe cycle: off for the session
+static std::atomic<int>  g_vkSleepPhaseUs{-1};   // where in the strobe cycle the sleep limit starts frames now (-1: not on the grid)
+static std::atomic<double> g_vkSleepPhaseT{0.0};
 static std::atomic<int>  g_vkSleepShiftUs{0};    // move the sleep limit's next wake-up by this much (+ later), taken once
-static std::atomic<bool> g_vkRfxBad{false};      // the game collapsed under the limit: off for the session
+static std::atomic<bool> g_vkRfxBad{false};
+// vp3: the hitch guard's pauses (the last 8), for the limit at the game's Reflex sleep to back off and for "gave up" to be
+// remembered only from a steady session.
+static std::atomic<double> g_vkPauseT[8];
+static std::atomic<int> g_vkPauseN{0};
+static std::atomic<bool> g_vkAtSleepBad{false};   // the limit at the game's Reflex sleep led to missed refreshes: off for the session
+// The pauses while the limit at the game's Reflex sleep was on without frame generation (from 2 s after it came on), kept
+// across swap chain rebuilds (vp4: the third pause came 0.6 s before an automatic rebuild, which switched the limit off
+// and on again and started the count over).
+static std::atomic<double> g_vkAtSleepPauseT[8];
+static std::atomic<int> g_vkAtSleepPauseN{0};
+static std::atomic<double> g_vkAtSleepOnT{0.0};
+static int VkAtSleepPausesSince(double since)
+{
+    int n = 0;
+    const int k = g_vkAtSleepPauseN.load();
+    for (int i = 0; i < 8 && i < k; i++) if (g_vkAtSleepPauseT[i].load() >= since) n++;
+    return n;
+}
+static std::atomic<bool> g_vkHuntSteady{true};    // presentation was steady when the alignment went round the strobe cycle
+static int VkPausesSince(double since)
+{
+    int n = 0;
+    const int k = g_vkPauseN.load();
+    for (int i = 0; i < 8 && i < k; i++) if (g_vkPauseT[i].load() >= since) n++;
+    return n;
+}      // the game collapsed under the limit: off for the session
 static bool g_active = false;      // BFIPresenter.ini found: the layer manages swap chains in this process
 static std::atomic<bool> g_surfCaps2Ext{false};    // VK_KHR_get_surface_capabilities2 enabled (needed by full_screen_exclusive)
 static std::atomic<bool> g_colorspaceExt{false};   // VK_EXT_swapchain_colorspace enabled (HDR10 presentation possible)
@@ -657,8 +727,14 @@ struct Constants
     uint32_t splitMode;           // 0 off, 1 left side without BFI, 2 right side
     float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
     float    rfxApl;                    // its APL Limiter: 1 = on (GPU-measured from the frame being shown)
-    float    warp;                      // frame warp: share of the measured motion the frame is moved ahead (0 = off)
+    float    warp;                      // frame warp: share of the measured motion the frame is moved ahead (0 = off);
+                                        // with the game's own motion (warpSrc != 0): game frames ahead
+    uint32_t warpSrc;                   // 0 motion from the picture, 1 the game's motion vectors and depth, 2 its vectors only
+    float    warpPrevN;                 // the game's own motion: game frames back to the frame shown before
+    float    warpSnapX, warpSnapY;      // moves rounded to whole steps of this many game-frame pixels (0 = off)
+    float    warpLag;                   // the game's motion with frame generation: shown frames behind its vectors' frame
 };
+static_assert(sizeof(Constants) <= 128, "push constants: 128 bytes is the most every GPU offers");
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
 // every 32x18 cell's lit value is capped at C. Plain strobe: the lit refresh.
@@ -814,6 +890,19 @@ struct Swapchain
     double         stageTime[kStage] = {};
     uint64_t       stagePresentId[kStage] = {};
     uint64_t       slotReadSub[kStage] = {};    // presenter submission that last read the slot
+    // Frame warp with the game's own motion (gvk): a motion texture per staging slot at half the frame's size, written at
+    // the game's present from the vectors and depth it handed DLSS for that frame.
+    VkImage        gFlow[kStage] = {};
+    VkDeviceMemory gFlowMem[kStage] = {};
+    VkImageView    gFlowView[kStage] = {};
+    uint32_t       gW = 0, gH = 0;
+    bool           gFlowInit[kStage] = {};      // in GENERAL
+    bool           gPend[kStage] = {};          // written for the frame being staged in the slot
+    uint64_t       gSlotId[kStage] = {};        // the game frame its motion texture is for (0 = none)
+    bool           gSlotDepth[kStage] = {};
+    float          gSlotLag[kStage] = {};
+    bool           gPendCut[kStage] = {};
+    uint64_t       gCutId = 0;                  // the last frame the game flagged as a camera cut
     int            presCurSlot = -1;
     int            presCurSlot2 = -1;           // split comparison: the newer frame its side without BFI shows
     int            presPrevSlot = -1;           // frame warp: the frame shown before the current one (kept in the ring)
@@ -1699,7 +1788,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     if (p)
     {
         // Frame warp: set 2 is needed by the BFI pipelines; its passes are optional.
-        p = R.warp.Init(d, sc->stageView, sc->extent.width, sc->extent.height);
+        p = R.warp.Init(d, sc->stageView, sc->gFlowView, sc->extent.width, sc->extent.height);
         if (p && !R.warp.ok) LOGW("BFI Presenter: frame warp unavailable (its compute passes could not be created)");
     }
     if (!p)
@@ -1903,6 +1992,12 @@ struct LearnRec
     double bestMs = 0.0;    // release -> flash at that start time
     double hz = 0.0;        // the refresh rate and frames per strobe cycle it was learned at
     int    frames = 0;
+    // The Reflex frame limit at the game's sleep (LearnReflexStart, as DX 1.0.43): where in the strobe cycle its frames start
+    // once the alignment has settled, the margin it settled with, and the frame-generation factor that was for.
+    double rfxMs = -1.0;        // start in the strobe cycle (ms), -1 not known
+    double rfxMarginMs = 0.0;   // frames ready this long before the pick
+    int    rfxFg = 0;           // 1 = no frame generation, 2-4 = its factor
+    int    rfxGaveUp = 0;       // 1 = the alignment went round the strobe cycle (the game's frames don't follow it)
 };
 static SRWLOCK     g_learnLock = SRWLOCK_INIT;
 static std::string g_learnKey;          // section in use ("" = none read yet)
@@ -1997,6 +2092,13 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
         snprintf(b, sizeof(b), "%ld", (long)std::lround(out.bestMs * 1000.0)); WritePrivateProfileStringA(sec, "ReleaseToFlashUs", b, path);
         snprintf(b, sizeof(b), "%ld", (long)std::lround(out.hz * 1000.0));     WritePrivateProfileStringA(sec, "RefreshMilliHz", b, path);
         snprintf(b, sizeof(b), "%d", out.frames);                             WritePrivateProfileStringA(sec, "Frames", b, path);
+        if (out.rfxMs >= 0.0)
+        {
+            snprintf(b, sizeof(b), "%ld", (long)std::lround(out.rfxMs * 1000.0));       WritePrivateProfileStringA(sec, "ReflexStartUs", b, path);
+            snprintf(b, sizeof(b), "%ld", (long)std::lround(out.rfxMarginMs * 1000.0)); WritePrivateProfileStringA(sec, "ReflexMarginUs", b, path);
+            snprintf(b, sizeof(b), "%d", out.rfxFg);                                    WritePrivateProfileStringA(sec, "ReflexFrameGen", b, path);
+        }
+        if (out.rfxGaveUp) WritePrivateProfileStringA(sec, "ReflexAlignGaveUp", "1", path);
     }
     if (forget && !cur.empty())
     {
@@ -2025,7 +2127,11 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
         r.fsMs   = get("FrameStartUs", 0) / 1000.0;
         r.bestMs = get("ReleaseToFlashUs", 0) / 1000.0;
         r.hz     = get("RefreshMilliHz", 0) / 1000.0;
+        r.rfxMs       = get("ReflexStartUs", -1000) / 1000.0;
+        r.rfxMarginMs = get("ReflexMarginUs", 0) / 1000.0;
+        r.rfxFg       = (int)get("ReflexFrameGen", 0);
     }
+    r.rfxGaveUp = (int)get("ReflexAlignGaveUp", 0);
     AcquireSRWLockExclusive(&g_learnLock);
     g_learnKey = key;
     g_learnRead = r;
@@ -2034,7 +2140,7 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
     ReleaseSRWLockExclusive(&g_learnLock);
 }
 #else
-struct LearnRec { int down = -1; double fsMs = 0.0, bestMs = 0.0, hz = 0.0; int frames = 0; };
+struct LearnRec { int down = -1; double fsMs = 0.0, bestMs = 0.0, hz = 0.0; int frames = 0; double rfxMs = -1.0, rfxMarginMs = 0.0; int rfxFg = 0, rfxGaveUp = 0; };
 static void LearnPost(const LearnRec &) {}
 static int LearnFetch(int, LearnRec &) { return 0; }
 static std::atomic<bool> g_learnForgetFile{false}, g_learnForgetNow{false};
@@ -2141,6 +2247,7 @@ static void PresenterThread(Swapchain *sc)
     double secRelSum = 0.0, secReady[256];
     int fsAheadSeen = 0;   // frames ahead the frame-start check/search began at
     int fsState = 0, fsSecs = 0, fsIdx = 0, fsN = 8, fsBad = 0, fsTight = 0, fsBaseN = 0, fsShown = 0, fsRelN = 0, fsRep = 0;
+    double fsBackMs = 0.0;   // moved earlier since the start time was found (DX 1.0.44)
     double fsLeadCur = 0.0, fsStart = 0.0, fsBestMs = 0.0, fsDoneT = -1.0, fsDeclT = -1e9, fsOffT = -1e9, fsKeptLead = -1.0,
            fsBaseRel = 0.0, fsBaseP10 = 1.0, fsRel = 0.0, fsSlack = 1.0, fsScore[16] = {}, fsRelK[16] = {}, fsSlackK[16] = {};
     int fsShownK[16] = {};
@@ -2163,11 +2270,17 @@ static void PresenterThread(Swapchain *sc)
     // present blocks anyway the queue is deeper than wanted and one tick is
     // skipped, and after a missed tick the extra refresh is primed again.
     bool qaPrimed = false, qaSkipWait = false, qaSkipNext = false;
+    // QueueDarkRefresh (as the DX add-on, 1.0.43): the refresh after the lit one shows the same game frame, so it is drawn
+    // and presented right after the lit refresh instead of one vblank later. A stall while it is drawn then has two
+    // refreshes of room instead of one, and the lit refresh's pick doesn't move: no added latency.
+    bool pairNext = false, pairWaited = false, pairOff = false;
+    double pairVbT = 0.0, pairLitPresS = 0.0, pairStartT = 0.0, pairRetryT = 0.0, pairDrainT = -10.0;
+    int pairBlocked = 0, pairSeen = 0, pairLogs = 0, pairBadWins = 0, pairRetries = 0, pairDrains = 0;
     int  secQaSkips = 0, secQaPrimes = 0;
     int autoAhead = 1, missSecs = 0, spareSecs = 0;
     double fseRetryT = 0.0; int fseShown = -2;
     // presentation health: slow image returns per second, automatic rebuild
-    int slowCount = 0, slowRun = 0, goodRun = 0, lastSlow = 0; bool kMark = false, markReq = false;
+    int slowCount = 0, slowLate = 0, slowRun = 0, goodRun = 0, lastSlow = 0; bool kMark = false, markReq = false;
     bool afterRebuild = Now() - g_lastRebuildT < 20.0, rebuildReq = false, kRebuild = false;
     double slowSecT = Now();
     // Uneven strobe cycles over the last 30 seconds (one count per second), so
@@ -2211,8 +2324,13 @@ static void PresenterThread(Swapchain *sc)
     int      warpPrev = -1;
     uint64_t warpPrevId = 0;
     bool     warpPrevReady = false, cycleStartW = false;
-    int      secWarpCycles = 0;
+    int      secWarpCycles = 0, secWarpGame = 0, secWarpCut = 0;   // per second: cycles moved, of them with the game's motion; paused at cuts
+    int      secWarpLb = 0, secWarpHeld = 0, winWarpLb = 0, winWarpHeld = 0;   // ... in letterboxed cutscenes; repeats held by the guard
+    bool     cycRepeatW = false;          // this strobe cycle repeats the frame shown before
+    uint8_t  warpRepHist = 0; int warpRepHistN = 0;   // the warp guard: the last 8 filled repeats, bit set = drawn too late for its refresh
+    double   warpRepHoldT = -1.0, warpRepHoldS = 30.0;
     double   secWarpSum = 0.0;
+    int      winWarpCut = 0; double winCutT = 0.0;
     double   tsPassMs = -1.0, tsDrawMs = -1.0;   // the last GPU times read back (timing log)
     int      tsDrawWarped = 0;
     FILE *logf = nullptr;
@@ -2318,21 +2436,54 @@ static void PresenterThread(Swapchain *sc)
         bool vblank = false;
         const bool qa = s.queueAhead && s.pacing;
         if (!qa) { qaPrimed = false; qaSkipWait = false; qaSkipNext = false; }
-        const bool primeIter = qaSkipWait;
+        const bool pairIter = pairNext;      // the refresh queued behind the lit one: drawn now, no vblank wait, no tick
+        pairNext = false;
+        const bool primeIter = qaSkipWait || pairIter;
         qaSkipWait = false;
-        if (s.pacing && !primeIter) vblank = vb.Wait();
+        auto tickAt = [&](uint64_t pres, double tt) {
+            sc->strobeFrames.store(s.frames);
+            g_vkSleepGrid.store(s.sleepGrid);
+            g_vkOwnLimit.store(s.reflexOwn);
+            sc->tickSlot.store((int)((pres - phaseShift) % (uint64_t)s.frames));
+            sc->tickT.store(tt);
+            sc->ticks.fetch_add(1);
+            sc->tickCv.notify_all();
+        };
+        if (s.pacing && !primeIter)
+        {
+            vblank = vb.Wait();
+            if (vblank && pairVbT > 0.0)
+            {
+                // After a pair two refreshes are queued: this is the vblank the queued one would have been drawn at, and
+                // the next lit refresh is drawn one vblank later (as DX).
+                const double perP = 1.0 / (vb.modeHz > 1.0 ? vb.modeHz : 120.0);
+                const double tw = Now();
+                if (tw < pairVbT + 1.5 * perP)
+                {
+                    tickAt(presents - 1, tw);
+                    vb.Wait();
+                }
+                else
+                {
+                    tickAt(presents - 1, tw - perP);
+                    // The queued present waited for a flip: one more vblank empties the queue (at most once in 0.5 s).
+                    if (pairWaited && tw - pairDrainT >= 0.5)
+                    {
+                        tickAt(presents, tw);
+                        vb.Wait();
+                        pairDrainT = Now();
+                        if (++pairDrains <= 20)
+                            LOGI("BFI Presenter: QueueDarkRefresh: a flip was still pending after the pair -- skipped one vblank "
+                                 "to empty the queue (%d so far)", pairDrains);
+                    }
+                }
+                pairVbT = 0.0;
+            }
+        }
         // Release the game's frame cap at the vblank itself, not after this
         // refresh's present: the present's varying length shifted each release
         // and games timed their animation to the uneven gaps (DX12 add-on v0.67).
-        if (vblank)
-        {
-            sc->strobeFrames.store(s.frames);
-            g_vkSleepGrid.store(s.sleepGrid);
-            sc->tickSlot.store((int)((presents - phaseShift) % (uint64_t)s.frames));
-            sc->tickT.store(Now());
-            sc->ticks.fetch_add(1);
-            sc->tickCv.notify_all();
-        }
+        if (vblank) tickAt(presents, Now());
         const double tVb = Now();
         {
             // Just-in-time release: Half / Quarter cap (any pacing) when the
@@ -2475,6 +2626,7 @@ static void PresenterThread(Swapchain *sc)
             // Frame warp keeps the frame shown before this one in the ring: what is the same in both stands still on
             // the screen (a HUD) and is not moved.
             cycleStartW = cycleStart;
+            if (cycleStart) cycRepeatW = lastShownId && pickId == lastShownId;
             if (!s.frameWarp || !R.warp.ok) { warpPrev = -1; warpPrevId = 0; }
             else if (pick >= 0 && lastShown >= 0 && lastShownId && pickId != lastShownId)
             {
@@ -2633,14 +2785,53 @@ static void PresenterThread(Swapchain *sc)
             warpAhead = 0.0;
         }
         else if (cycleStartW)
-            warpAhead = warpClock.Cycle(true, pickId, pickTime, Now(), (double)s.frames * sc->period.load(),
+            warpAhead = warpClock.Cycle((s.warpEven && s.warpGame && gvk::State() > 0 && (std::max(1, g_vkFgFactor.load()) <= 1 || s.warpGameFg)) ? 2 : 1,
+                                        pickId, pickTime, Now(), (double)s.frames * sc->period.load(),
                                         (double)s.warpMax, (double)s.warpMinRate / 100.0);
         uint64_t warpOld = 0;
-        c.warp = 0.0f;
+        c.warp = 0.0f; c.warpSrc = 0; c.warpPrevN = 0.0f; c.warpLag = 0.0f;
+        c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
         if (warpAhead > 0.0 && s.frameWarp && R.warp.ok && !copyMode && (warpOld = R.warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrevReady && warpPrevId == warpOld)
-            c.warp = (float)(std::floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
-        if (cycleStartW && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; }
+        {
+            // The game's own motion (where it hands DLSS its motion vectors and depth, gvk): one game frame's motion,
+            // warpAhead frames on. Otherwise the motion measured between this frame and the one shown before.
+            const int fgF = std::max(1, g_vkFgFactor.load());
+            const bool gOk = s.warpGame && (fgF <= 1 || s.warpGameFg) && sc->gSlotId[pick] == pickId && pickId != 0;
+            if (gOk)
+            {
+                const double ahead = fgF > 1 ? std::min(warpAhead, (double)s.warpMaxGameFg) : warpAhead;
+                c.warp = (float)(std::floor(ahead * 256.0 + 0.5) / 256.0);
+                c.warpPrevN = (float)(pickId - warpOld);
+                c.warpSrc = sc->gSlotDepth[pick] ? 1u : 2u;
+                c.warpLag = fgF > 1 ? sc->gSlotLag[pick] : 0.0f;
+                if (fgF > 1 && s.warpEase) c.flags |= 2048u;          // moves past the rendered frame ease off (as DX: with frame generation)
+            }
+            // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
+            else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
+            else c.warp = (float)(std::floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
+            // Around a camera cut the game flags: shown as rendered (no motion connects two shots), for 3 rendered frames.
+            const uint64_t cut = sc->gCutId;
+            if (c.warp != 0.0f && cut && pickId >= cut && pickId < cut + 3 * (uint64_t)fgF)
+            {
+                c.warp = 0.0f; c.warpSrc = 0;
+                if (cycleStartW) secWarpCut++;
+            }
+            // A cutscene letterboxed through DLSS: shown as rendered (its quick cuts have no motion to follow).
+            if (c.warp != 0.0f && s.warpPauseLb && gvk::Letterboxed())
+            {
+                c.warp = 0.0f; c.warpSrc = 0;
+                if (cycleStartW) secWarpLb++;
+            }
+            // The warp guard: repeats shown as they are while it holds.
+            if (c.warp != 0.0f && cycRepeatW && s.warpGuard && Now() < warpRepHoldT)
+            {
+                c.warp = 0.0f; c.warpSrc = 0;
+                if (cycleStartW) secWarpHeld++;
+            }
+            if (c.warp == 0.0f) c.flags &= ~2048u;
+        }
+        if (cycleStartW && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame += c.warpSrc != 0 ? 1 : 0; }
         if (sc->format == VK_FORMAT_R16G16B16A16_SFLOAT) c.flags |= 1024u;   // linear frames (frame warp's comparisons)
 
         bool dumpNow = false;
@@ -2715,7 +2906,7 @@ static void PresenterThread(Swapchain *sc)
                         R.warp.RecordLuma(d, cb, (uint32_t)pick, pickId, pickTime, (c.flags & 1024u) != 0);
                         warpTouched = true;
                     }
-                    if (c.warp != 0.0f && (R.warp.flowNew != pickId || R.warp.flowOld != warpOld)) { R.warp.RecordFlow(d, cb); warpTouched = true; }
+                    if (c.warp != 0.0f && c.warpSrc == 0 && (R.warp.flowNew != pickId || R.warp.flowOld != warpOld)) { R.warp.RecordFlow(d, cb); warpTouched = true; }
                     if (warpTouched) R.warp.ToShade(d, cb);
                 }
             }
@@ -2907,6 +3098,24 @@ static void PresenterThread(Swapchain *sc)
                 sc->status.store((int)sr);
                 break;
             }
+            if (cycleStartW && cycRepeatW && c.warp != 0.0f && s.warpGuard)
+            {
+                // The warp guard (as DX, ep10): a filled repeat is drawn anew, and in some games that waits behind the game's
+                // own late frame until the refresh is missed. 3 of the last 8 late: repeats shown as they are for a while.
+                const double tSub = Now();
+                const bool late = tSub - tFence > 0.4 * sc->period.load();
+                warpRepHist = (uint8_t)((warpRepHist << 1) | (late ? 1 : 0));
+                if (warpRepHistN < 8) warpRepHistN++;
+                int n = 0; for (int b = 0; b < 8; b++) n += (warpRepHist >> b) & 1;
+                if (warpRepHistN >= 5 && n >= 3)
+                {
+                    warpRepHoldT = tSub + warpRepHoldS;
+                    LOGI("BFI Presenter: frame warp guard: %d of the last %d filled repeats were drawn too late for their refresh (drawing one took "
+                         "%.1f ms) -- repeats are shown as they are for %.0f s", n, warpRepHistN, (tSub - tFence) * 1000.0, warpRepHoldS);
+                    warpRepHoldS = std::min(300.0, warpRepHoldS * 2.0);
+                    warpRepHist = 0; warpRepHistN = 0;
+                }
+            }
             bufFrame[idx] = pickId;
             bufFrame2[idx] = pickId2;
             bufConst[idx] = c;
@@ -3034,6 +3243,78 @@ static void PresenterThread(Swapchain *sc)
             }
         }
         else { soften = 0.0f; swapState = 0; gradPhase = 0.0; gradHold = -1.0; }
+        // QueueDarkRefresh: after the lit refresh of a 2+ refresh cycle, the next one (the same game frame) follows at once.
+        // Not with Queue one refresh ahead, the LCD savers, the hitch guard's steady picture, or fewer than 3 real images.
+        {
+            const double hzP = vb.modeHz > 1.0 ? vb.modeHz : 120.0;
+            const bool presOk = pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR;
+            if (pairIter)
+            {
+                // The queued present should return at once. Waited: half a refresh, and a quarter longer than the lit one.
+                const double prDur = tPres - tSub;
+                pairWaited = prDur > 0.5 / hzP && prDur - pairLitPresS > 0.25 / hzP;
+                if (hitchPaused) pairSeen = pairBlocked = pairBadWins = 0;
+                else if (!pairOff && tPres - pairStartT >= 5.0)
+                {
+                    pairSeen++;
+                    if (pairWaited) pairBlocked++;
+                    if (pairSeen >= 120)
+                    {
+                        pairBadWins = pairBlocked * 2 > pairSeen ? pairBadWins + 1 : 0;
+                        if (pairBadWins >= 2)
+                        {
+                            pairOff = true;
+                            const int retryS = pairRetries < 4 ? 60 << pairRetries : 0;
+                            pairRetryT = retryS > 0 ? tPres + retryS : 0.0;
+                            char again[64];
+                            if (retryS > 0) snprintf(again, sizeof(again), "off for %d min (tries again then)", retryS / 60);
+                            else snprintf(again, sizeof(again), "off for this session");
+                            LOGW("BFI Presenter: QueueDarkRefresh %s: the queued refresh's present waited in %d of %d pairs (the swap "
+                                 "chain took only one pending present, or a frame limiter holds the presenter's presents)",
+                                 again, pairBlocked, pairSeen);
+                        }
+                        else if (pairBlocked > 0 && ++pairLogs <= 20)
+                            LOGI("BFI Presenter: QueueDarkRefresh: the queued refresh's present waited in %d of the last %d pairs",
+                                 pairBlocked, pairSeen);
+                        pairSeen = pairBlocked = 0;
+                    }
+                }
+            }
+            else if (s.queueDark && pairOff && pairRetryT > 0.0 && tPres >= pairRetryT)
+            {
+                pairOff = false;
+                pairRetries++;
+                pairSeen = pairBlocked = pairBadWins = 0;
+                pairStartT = 0.0;
+                LOGI("BFI Presenter: QueueDarkRefresh: trying again (try %d of 4)", pairRetries);
+            }
+            else if (s.queueDark && !pairOff && vblank && s.pacing && !qa && sc->nReal >= 3 && s.enabled && s.frames >= 2 &&
+                     slotNow == 0 && !hitchPaused && swapState == 0 && soften <= 0.0f && !GradualSaverOn(s) && presOk)
+            {
+                pairNext = true;
+                pairVbT = tVb;
+                pairLitPresS = tPres - tSub;
+                if (pairStartT <= 0.0) pairStartT = tPres;
+                static bool pairLogged = false;
+                if (!pairLogged)
+                {
+                    pairLogged = true;
+                    LOGI("BFI Presenter: QueueDarkRefresh on: the refresh after the lit one is queued with it");
+                }
+            }
+            if (s.queueDark && s.enabled && s.frames >= 2 && !pairOff && !pairIter)
+            {
+                static bool pairWhyLogged = false;
+                const char *why = !s.pacing ? "Wait for vblank is off" : qa ? "Queue one refresh ahead is on" :
+                                  sc->nReal < 3 ? "fewer than 3 real swap chain images (presenter buffers)" :
+                                  GradualSaverOn(s) ? "an LCD saver is on" : nullptr;
+                if (why && !pairWhyLogged && presents > 600)
+                {
+                    pairWhyLogged = true;
+                    LOGI("BFI Presenter: QueueDarkRefresh not used: %s", why);
+                }
+            }
+        }
         if (!vblank && !primeIter)
         {
             sc->tickT.store(Now());
@@ -3065,9 +3346,15 @@ static void PresenterThread(Swapchain *sc)
             const double ang = 6.283185307179586 * (t - pickTime) * vb.modeHz;
             secPhC += cos(ang); secPhS += sin(ang); secPhN++;
         }
-        if (t - lastT > 1.5 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
+        if (!pairIter && t - lastT > 1.5 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
         {
-            secLate++;
+            secLate++; slowLate++;
+            lateTimes[lateIdx++ & 3] = t;
+        }
+        // A queued refresh is late only when it wasn't presented before the vblank it was meant for (two after its lit one's).
+        else if (pairIter && pairVbT > 0.0 && t > pairVbT + 1.9 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0))
+        {
+            secLate++; slowLate++;
             lateTimes[lateIdx++ & 3] = t;
         }
         if (s.hitchGuard && s.enabled)
@@ -3081,6 +3368,12 @@ static void PresenterThread(Swapchain *sc)
             if (now != hitchPaused)
             {
                 hitchPaused = now;
+                if (now)
+                {
+                    const int k = g_vkPauseN.fetch_add(1); g_vkPauseT[k % 8].store(Now());
+                    if (g_vkSleepLimitUs.load() > 0 && g_vkFgFactor.load() <= 1 && Now() - g_vkAtSleepOnT.load() >= 2.0)
+                    { const int j = g_vkAtSleepPauseN.fetch_add(1); g_vkAtSleepPauseT[j % 8].store(Now()); }
+                }
                 LOGI("BFI Presenter: hitch guard: BFI %s (%s)", now ? "paused" : "resumed",
                      now ? (stalled ? "game stalled" : "missed refreshes") : "steady again");
             }
@@ -3113,7 +3406,9 @@ static void PresenterThread(Swapchain *sc)
             // uncapped for a few seconds and fills the GPU, so images come back late for that reason
             // (RDR2: 20-30 slow returns a second during each try), which a rebuild can't fix.
             const bool capping = capProbe || t - capSwitchT < 3.0;
-            const bool bad = slowCount >= 8 && !capping;
+            // vp10: and only with refreshes missed in that second -- P.T.'s images came back 2.0-2.5 ms late all the time
+            // without a single refresh missed, and the rebuilds this set off (each a 1.5 s pause) were all that went wrong.
+            const bool bad = slowCount >= 8 && slowLate > 0 && !capping;
             slowRun = bad ? slowRun + 1 : 0;
             if (slowRun == 3)
             {
@@ -3128,7 +3423,7 @@ static void PresenterThread(Swapchain *sc)
             // A rebuild that didn't help (slow again within a minute: the game keeps the GPU busy, not
             // the desktop compositor) makes the next one wait twice as long; after 3 in a row automatic
             // recovery stops for the session (Indiana Jones with heavy settings: a rebuild every 20-30 s).
-            if (g_rebuildMisses > 0 && g_rebuildMisses < 3 && t - g_lastAutoRebuildT > 180.0) { g_rebuildMisses = 0; g_rebuildGap = 20.0; }
+            if (g_rebuildMisses > 0 && g_rebuildMisses < 2 && t - g_lastAutoRebuildT > 180.0) { g_rebuildMisses = 0; g_rebuildGap = 20.0; }
             // 5 s: with the game close to its video memory budget presentation slows for 2-3 s now and then and
             // recovers by itself (Indiana Jones); a rebuild there only adds a hitch.
             // The game's clock drifting against the display: the slow returns come and go with the drift (ICO), and a
@@ -3136,7 +3431,7 @@ static void PresenterThread(Swapchain *sc)
             if (s.vkAutoRecover && slowRun == 5 && drift.on)
                 LOGI("BFI Presenter: automatic recovery -- not rebuilding: the slow returns follow the game's clock drift (set the display to %.2f Hz)",
                      drift.suggestHz);
-            if (s.vkAutoRecover && slowRun >= 5 && !rebuildReq && g_rebuildMisses < 3 && !drift.on)
+            if (s.vkAutoRecover && slowRun >= 5 && !rebuildReq && g_rebuildMisses < 2 && !drift.on)
             {
                 if (t - g_lastRebuildT >= g_rebuildGap)
                 {
@@ -3145,8 +3440,10 @@ static void PresenterThread(Swapchain *sc)
                         g_rebuildMisses++;
                         g_rebuildGap = g_rebuildGap * 2.0 > 160.0 ? 160.0 : g_rebuildGap * 2.0;
                     }
-                    if (g_rebuildMisses >= 3)
-                        LOGI("BFI Presenter: automatic recovery stopped for this session -- 3 rebuilds in a row didn't help. The game "
+                    // vp5: 2, not 3 -- each rebuild costs about 10 s of missed refreshes while the presenter starts again
+                    // (Indiana Jones without frame generation: 110-120 in the first 10 s after each one).
+                    if (g_rebuildMisses >= 2)
+                        LOGI("BFI Presenter: automatic recovery stopped for this session -- 2 rebuilds in a row didn't help. The game "
                              "probably keeps the GPU busy: lower its settings, or start Steam / the game as administrator for a "
                              "realtime presenter queue. Ctrl+Shift+O still rebuilds by hand.");
                     else
@@ -3161,7 +3458,7 @@ static void PresenterThread(Swapchain *sc)
                     LOGI("BFI Presenter: automatic recovery -- waiting: the last rebuild was %.0f s ago (%.0f s apart)", t - g_lastRebuildT,
                          g_rebuildGap);
             }
-            lastSlow = slowCount; slowCount = 0;
+            lastSlow = slowCount; slowCount = 0; slowLate = 0;
         }
         if (rebuildReq)
         {
@@ -3231,7 +3528,31 @@ static void PresenterThread(Swapchain *sc)
                 g_status.warpCycles = secWarpCycles;
                 g_status.warpAvg = secWarpCycles ? secWarpSum / secWarpCycles : 0.0;
                 g_status.warpRate = warpClock.rate;
-                secWarpCycles = 0; secWarpSum = 0.0;
+                g_status.warpSrc = secWarpGame > 0 ? (gvk::State() == 1 ? 1 : 2) : 0;
+                g_status.warpGameState = gvk::State();
+                // which motion moves the picture, logged when it changes (as DX)
+                {
+                    static int srcWas = -1;
+                    const int src = secWarpCycles ? (secWarpGame * 2 >= secWarpCycles ? g_status.warpSrc : 0) : -1;
+                    if (src >= 0 && src != srcWas)
+                    {
+                        srcWas = src;
+                        LOGI("BFI Presenter: frame warp moves the picture with %s (%d of %d cycles in the last second)",
+                             src == 1 ? "the game's own motion vectors and depth" : src == 2 ? "the game's own motion vectors (no depth)"
+                             : "the motion measured from the picture", src ? secWarpGame : secWarpCycles - secWarpGame, secWarpCycles);
+                    }
+                }
+                winWarpCut += secWarpCut; winWarpLb += secWarpLb; winWarpHeld += secWarpHeld;
+                if (t - winCutT >= 10.0)
+                {
+                    static int cutLogs = 0;
+                    if ((winWarpCut || winWarpLb || winWarpHeld) && cutLogs++ < 60)
+                        LOGI("BFI Presenter: frame warp, last %.0f s: %d strobe cycles not filled (%d camera cuts flagged by the game, %d letterboxed "
+                             "cutscene), %d repeats shown as they are (the warp guard)", t - winCutT, winWarpCut + winWarpLb, winWarpCut, winWarpLb, winWarpHeld);
+                    winWarpCut = winWarpLb = winWarpHeld = 0; winCutT = t;
+                }
+                gvk::Tick(t);
+                secWarpCycles = 0; secWarpSum = 0.0; secWarpGame = 0; secWarpCut = 0; secWarpLb = 0; secWarpHeld = 0;
             }
             Osd::AddSecond(secFrameSkips, secFrameRepeats, secLate, Now());
             g_status.unevenRep    = secRepU;
@@ -3370,7 +3691,15 @@ static void PresenterThread(Swapchain *sc)
                     // few seconds and comes back by itself (Indiana Jones close to its video memory budget), so those
                     // seconds don't count either: the limit stays on instead of going off and on again.
                     const bool stallSec = hitchPaused || (sleeping && fpsA < 0.8 * rend) || lastSlow >= 8;
-                    if (stallSec) cand = fgCand;
+                    // Frame generation switched off in the game while presentation is slowed (vp2): presents and rendered
+                    // frames match second after second, but the slow image returns kept every second a "stall", so 2x
+                    // stayed -- and with it the limit for 2x, 30 rendered fps, through every swap chain rebuild (Indiana
+                    // Jones). 4 such seconds in a row count as frame generation off.
+                    static int noFgRun = 0;
+                    const bool oneToOne = sleeping && rend >= 20 && fpsA >= 0.8 * rend && fpsA <= 1.25 * rend;
+                    noFgRun = (stallSec && oneToOne && g_vkFgFactor.load() > 1) ? noFgRun + 1 : 0;
+                    if (noFgRun >= 4) { cand = 1; fgCand = 1; fgRun = 3; noFgRun = 0; }
+                    else if (stallSec) cand = fgCand;
                     else { fgRun = cand == fgCand ? fgRun + 1 : 1; fgCand = cand; }
                     // Slowed presentation in the last 3 seconds (slow image returns).
                     static int slowWin = 0;
@@ -3400,8 +3729,32 @@ static void PresenterThread(Swapchain *sc)
                                  "-- the Refresh rate cap stays (use 2x for the Reflex frame limit)", f, baseFps);
                         }
                     }
+                    // Without frame generation (ReflexLimitAtSleep, as the DX add-on since 1.0.35): once the automatic frame cap
+                    // has stepped down to one game frame per strobe cycle, a game that calls its Reflex sleep is paced there,
+                    // before it reads input for the next frame, instead of being held in its present with the finished frame
+                    // waiting. Not while the cap tries Refresh rate, and not for a game that presents each frame twice (RPCS3:
+                    // one sleep per emulated frame).
+                    else if (f == 1 && sleeping && s.reflexAtSleep && !g_vkAtSleepBad.load() && s.autoCap && userCap == 1 && s.frames >= 2 && s.enabled && hzA > 0.0 &&
+                             !g_vkRfxBad.load() && sc->autoCapDown.load() && !capProbe && !dupPresents)
+                        want = (int)(1e6 * s.frames / hzA + 0.5);
                     static double onT = 0.0, fpsOn = 0.0; static int badSecs = 0;
+                    // Back-off (vp3, vp4): without frame generation, a game that leaves the GPU no room (Indiana Jones at 60
+                    // of about 65 fps) has its frames lined up to finish just before the flash -- right when the presenter
+                    // draws. The presenter's refreshes then came late: 25 hitch-guard pauses in 100 s, against 1 with the
+                    // presenter's own cap. 3 pauses within 60 s while the limit was on switch it off for the session.
+                    if (f == 1 && want > 0 && !g_vkAtSleepBad.load())
+                    {
+                        const int np = VkAtSleepPausesSince(Now() - 60.0);
+                        if (np >= 3 && !g_vkAtSleepBad.exchange(true))
+                        {
+                            want = 0;
+                            LOGW("BFI Presenter: frame limit at the game's Reflex sleep: BFI paused %d times in the last 60 s while it was on "
+                                 "(missed refreshes: the GPU leaves the presenter too little room at the flash) -- off for this session; "
+                                 "the presenter's frame cap paces the game", np);
+                        }
+                    }
                     const int was = g_vkSleepLimitUs.exchange(want);
+                    if (was <= 0 && want > 0) g_vkAtSleepOnT.store(Now());
                     if ((was > 0) != (want > 0))
                     {
                         LOGI("BFI Presenter: frame limit at the game's Reflex sleep %s (%d us per rendered frame, frame generation %dx)",
@@ -3428,6 +3781,11 @@ static void PresenterThread(Swapchain *sc)
                     {
                         static double nudgeNextT = 0.0;
                         static int nudges = 0, tight = 0;
+                        // Every move of the frame start, summed, for the check that the alignment isn't going round the cycle.
+                        static double alignTot = 0.0;
+                        auto shiftBy = [&](int us) { g_vkSleepShiftUs.fetch_add(us); alignTot += us * 1e-6; };
+                        // ReflexAlign (as DX 1.0.39) steers without frame generation, at Lowest latency pacing.
+                        const bool alignSteers = s.reflexAlign && !g_vkAlignHunted.load() && f == 1 && s.pacingMode == 1;
                         const int rep = g_status.frameRepeats, skp = g_status.frameSkips;
                         double p10 = -1.0;
                         if (secReadyN >= 10)
@@ -3451,33 +3809,175 @@ static void PresenterThread(Swapchain *sc)
                             static bool coarseDone = false;
                             if (onT != coarseOnT) { coarseOnT = onT; coarseDone = false; coarseRun = 0; }
                             const bool enough = secReadyN >= (int)(0.8 * presCap);
-                            coarseRun = (on && s.alignCoarse && holds && !hitchPaused && enough && p10 > 8.0 && rep + skp < 5) ? coarseRun + 1 : 0;
+                            coarseRun = (on && s.alignCoarse && !alignSteers && !g_vkAlignHunted.load() && holds && !hitchPaused && enough && p10 > 8.0 && rep + skp < 5) ? coarseRun + 1 : 0;
                             if (coarseRun >= 3 && !coarseDone && t - coarseT >= 20.0)
                             {
                                 const int us = (int)((p10 - 5.0) * 1000.0);
-                                g_vkSleepShiftUs.fetch_add(us);
+                                shiftBy(us);
                                 coarseDone = true; coarseT = t; coarseRun = 0;
                                 LOGI("BFI Presenter: frame limit at the game's Reflex sleep: frames ready %.1f ms before the lit refresh's "
                                      "pick -- the frame start moves %.1f ms later, to 5 ms before it (ReflexAlignCoarse)", p10, us / 1000.0);
                             }
                         }
-                        if (on && rep >= 5 && skp >= 5 && t >= nudgeNextT)
+                        if (on && !alignSteers && rep >= 5 && skp >= 5 && t >= nudgeNextT)
                         {
                             nudgeNextT = t + 4.0; tight = 0;
-                            g_vkSleepShiftUs.fetch_sub(2000);
+                            shiftBy(-2000);
                             if (++nudges <= 5)
                                 LOGI("BFI Presenter: frame limit at the game's Reflex sleep: game frames arrive at the lit refresh's pick "
                                      "(%d repeated, %d skipped last second) -- 2 ms earlier", rep, skp);
                         }
                         else
                         {
-                            tight = (on && holds && p10 >= 0.0 && p10 < 1.0 && rep + skp >= 2) ? tight + 1 : 0;
+                            tight = (on && f > 1 && holds && p10 >= 0.0 && p10 < 1.0 && rep + skp >= 2) ? tight + 1 : 0;
                             if (tight >= 3)
                             {
                                 tight = 0;
-                                g_vkSleepShiftUs.fetch_sub(3000);
+                                shiftBy(-3000);
                                 LOGI("BFI Presenter: frame limit at the game's Reflex sleep (frame generation): frames ready %.1f ms before "
                                      "the lit refresh's pick, %d repeated -- 3 ms earlier", p10, rep);
+                            }
+                        }
+                        // ReflexAlign (as DX 1.0.39): without frame generation the limit's frame start is steered each second so the
+                        // 10th percentile of how long frames wait for the lit refresh's pick comes down to a small target (2 ms):
+                        // half the excess at a time, at most 3 ms, after 2 s in a row over it. A frame repeated close to the pick
+                        // (under 3 ms) moves it 2 ms earlier and widens the target by 1 ms (at most 5 ms; back down by 0.25 ms
+                        // every 30 clean seconds). A step that went past the pick (the wait grew by half a cycle) is undone.
+                        {
+                            static double alignTarget = 0.002, alignCoolT = 0.0, alignLastStep = 0.0, alignPrevP10 = -1.0, alignLastLog = -1.0;
+                            static int alignClean = 0, alignExcess = 0;
+                            const double cycA = hzA > 0.0 ? s.frames / hzA : 0.0;
+                            const double p10s = p10 >= 0.0 ? p10 * 0.001 : -1.0;
+                            const bool enoughA = secReadyN >= (int)(0.8 * presCap);
+                            // Going round the strobe cycle (1.5 cycles of moves within 90 s): the game's frames don't follow the
+                            // frame start (DX: Returnal). Both alignments stop for this session; the limit keeps its place.
+                            {
+                                static double hT[96] = {}, hS[96] = {};
+                                static int hN = 0;
+                                hT[hN % 96] = t; hS[hN % 96] = alignTot; hN++;
+                                double span = 0.0;
+                                for (int k = 0; k < 96 && k < hN; k++) if (t - hT[k] <= 90.0) span = std::max(span, fabs(alignTot - hS[k]));
+                                if (cycA > 0.0 && span >= 1.5 * cycA && !g_vkAlignHunted.exchange(true) &&
+                                    (g_vkHuntSteady.store(VkPausesSince(Now() - 90.0) <= 1), true))
+                                    LOGI("BFI Presenter: Reflex frame limit alignment went round the strobe cycle (%.0f ms within 90 s): "
+                                         "the game's frames don't follow its frame start -- alignment off for this session", span * 1000.0);
+                            }
+                            if (on && alignSteers && holds && t >= alignCoolT)
+                            {
+                                if (alignLastStep > 0.0 && p10s >= 0.0 && alignPrevP10 >= 0.0 && p10s - alignPrevP10 > 0.5 * cycA)
+                                {
+                                    shiftBy(-(int)((alignLastStep + 0.002) * 1e6));
+                                    alignTarget = std::min(0.005, alignTarget + 0.001);
+                                    alignClean = 0; alignCoolT = t + 2.0; alignLastStep = 0.0;
+                                    LOGI("BFI Presenter: Reflex frame limit alignment went past the pick (%.1f -> %.1f ms) -- moved back, "
+                                         "target %.1f ms", alignPrevP10 * 1000.0, p10s * 1000.0, alignTarget * 1000.0);
+                                }
+                                else if (rep >= 2 && (p10s < 0.0 || p10s < 0.003))
+                                {
+                                    alignLastStep = 0.0;
+                                    shiftBy(-2000);
+                                    alignTarget = std::min(0.005, alignTarget + 0.001);
+                                    alignClean = 0; alignCoolT = t + 2.0;
+                                }
+                                else if (p10s >= 0.0 && enoughA)
+                                {
+                                    if (rep == 0 && ++alignClean >= 30 && alignTarget > 0.002) { alignTarget = std::max(0.002, alignTarget - 0.00025); alignClean = 0; }
+                                    const double excess = p10s - alignTarget;
+                                    alignLastStep = 0.0;
+                                    alignExcess = excess > 0.001 ? alignExcess + 1 : 0;
+                                    if (alignExcess >= 2)
+                                    {
+                                        const double step = std::min(0.003, 0.5 * excess);
+                                        shiftBy((int)(step * 1e6)); alignLastStep = step;
+                                    }
+                                    if (alignLastLog < 0.0 || t - alignLastLog > 30.0)
+                                    {
+                                        alignLastLog = t;
+                                        LOGI("BFI Presenter: Reflex frame limit aligned to the flash: game frames ready %.1f ms before the "
+                                             "lit refresh's pick (10th percentile; target %.1f ms), wake-up moved %+.1f ms in all",
+                                             p10s * 1000.0, alignTarget * 1000.0, alignTot * 1000.0);
+                                    }
+                                }
+                            }
+                            else { alignClean = 0; alignLastStep = 0.0; alignExcess = 0; }
+                            alignPrevP10 = p10s;
+
+                            // Learned per game (LearnReflexStart, as DX 1.0.43): where the limit's frames settled in the strobe
+                            // cycle, and the margin, kept per game, refresh rate, frames per cycle and frame-generation factor; the
+                            // next session starts there 2 s after the limit comes on (the shorter way round), and the alignments
+                            // go on from there. Saved once the limit has been on for 60 s and its start still for 30 s.
+                            {
+                                static bool rlWas = false, rlApplied = false, rlGaveUpSaved = false;
+                                static double rlOnT = 0.0, rlMoveT = 0.0, rlLastPh = -1.0;
+                                static int rlQuiet = 0;
+                                if (s.learnPerGame && learnMine.frames <= 0 && hzA > 0.0)
+                                {
+                                    // With frame generation the cap's own learning doesn't run (capOn): the section is taken here.
+                                    if (learnRead.frames == s.frames && fabs(learnRead.hz - hzA) < 0.05) learnMine = learnRead;
+                                    else if (want > 0) { learnMine = LearnRec(); learnMine.hz = hzA; learnMine.frames = s.frames; }
+                                }
+                                const int fgF = std::max(1, std::min(4, f));
+                                const bool rlOn = s.learnPerGame && s.learnReflex && learnMine.frames > 0 && want > 0 && g_vkSleepGrid.load() && cycA > 0.0;
+                                const int phUs = g_vkSleepPhaseUs.load();
+                                const bool phOk = phUs >= 0 && t - g_vkSleepPhaseT.load() < 1.0;
+                                if (rlOn && !rlWas) { rlOnT = t; rlApplied = false; rlMoveT = t; rlLastPh = -1.0; rlQuiet = 0; }
+                                rlWas = rlOn;
+                                if (rlOn && phOk)
+                                {
+                                    const double ph = phUs * 1e-6;
+                                    if (!rlApplied && t - rlOnT >= 2.0)
+                                    {
+                                        rlApplied = true;
+                                        if (learnMine.rfxGaveUp && s.reflexAlign && !g_vkAlignHunted.exchange(true))
+                                        {
+                                            rlGaveUpSaved = true;
+                                            LOGI("BFI Presenter: ReflexAlign off for this session: in an earlier session this game's frames didn't "
+                                                 "follow it -- the limit keeps its place");
+                                        }
+                                        if (learnMine.rfxMs >= 0.0 && learnMine.rfxFg == fgF && learnMine.rfxMs < cycA * 1000.0)
+                                        {
+                                            double dd = learnMine.rfxMs * 0.001 - ph;
+                                            dd = std::fmod(dd + 1.5 * cycA, cycA) - 0.5 * cycA;
+                                            if ((int)(dd * 1e6)) shiftBy((int)(dd * 1e6));
+                                            if (fgF == 1 && learnMine.rfxMarginMs > 0.0) alignTarget = std::max(alignTarget, std::min(0.008, learnMine.rfxMarginMs * 0.001));
+                                            rlMoveT = t; rlLastPh = learnMine.rfxMs * 0.001;
+                                            LOGI("BFI Presenter: frame limit at the game's Reflex sleep: start time learned for this game in an earlier "
+                                                 "session (start +%.1f ms in the cycle, %.1f ms to spare; moved %+.1f ms)",
+                                                 learnMine.rfxMs, learnMine.rfxMarginMs, dd * 1000.0);
+                                        }
+                                    }
+                                    if (rlLastPh < 0.0 || fabs(std::fmod(ph - rlLastPh + 1.5 * cycA, cycA) - 0.5 * cycA) > 0.0003) { rlLastPh = ph; rlMoveT = t; }
+                                    rlQuiet = (holds && !hitchPaused && p10 >= 0.0 && rep + skp <= 1) ? rlQuiet + 1 : 0;
+                                    if (rlApplied && t - rlOnT >= 60.0 && t - rlMoveT >= 30.0 && rlQuiet >= 5)
+                                    {
+                                        const double margin = (fgF == 1 && alignSteers) ? alignTarget : 0.005;
+                                        const bool changed = learnMine.rfxFg != fgF || learnMine.rfxMs < 0.0 ||
+                                                             fabs(std::fmod(ph * 1000.0 - learnMine.rfxMs + 1.5 * cycA * 1000.0, cycA * 1000.0) - 0.5 * cycA * 1000.0) > 0.75 ||
+                                                             fabs(margin * 1000.0 - learnMine.rfxMarginMs) > 0.75;
+                                        if (changed)
+                                        {
+                                            learnMine.rfxMs = ph * 1000.0; learnMine.rfxMarginMs = margin * 1000.0; learnMine.rfxFg = fgF;
+                                            LearnPost(learnMine);
+                                            LOGI("BFI Presenter: frame limit at the game's Reflex sleep: start time kept for this game (start +%.1f ms "
+                                                 "in the cycle, %.1f ms to spare, frame generation %dx)", learnMine.rfxMs, learnMine.rfxMarginMs, fgF);
+                                        }
+                                    }
+                                }
+                                if (s.learnPerGame && s.learnReflex && learnMine.frames > 0 && g_vkAlignHunted.load() && !rlGaveUpSaved && !learnMine.rfxGaveUp &&
+                                    !g_vkHuntSteady.load())
+                                {
+                                    // Not from a session with missed refreshes: the frames went round because the presenter's
+                                    // refreshes were late, not because the game ignores its frame start (vp3, Indiana Jones).
+                                    rlGaveUpSaved = true;
+                                    LOGI("BFI Presenter: the alignment's give-up is not remembered for this game: BFI was paused for "
+                                         "missed refreshes meanwhile");
+                                }
+                                else if (s.learnPerGame && s.learnReflex && learnMine.frames > 0 && g_vkAlignHunted.load() && !rlGaveUpSaved && !learnMine.rfxGaveUp)
+                                {
+                                    rlGaveUpSaved = true;
+                                    learnMine.rfxGaveUp = 1;
+                                    LearnPost(learnMine);
+                                }
                             }
                         }
                     }
@@ -3865,7 +4365,7 @@ static void PresenterThread(Swapchain *sc)
                                     }
                                     else
                                     {
-                                        fsState = 3; fsBestMs = fsRelK[best];
+                                        fsState = 3; fsBestMs = fsRelK[best]; fsBackMs = 0.0;
                                         setLead(fsStart + best * cyc / fsN, true);
                                         learnFs(fsLeadCur * 1000.0, fsBestMs);
                                         LOGI("BFI Presenter: automatic frame cap at the frame start lined up with the flash: released %.1f ms "
@@ -3879,14 +4379,23 @@ static void PresenterThread(Swapchain *sc)
                     }
                     else if (fsState == 3)
                     {
-                        fsBad = (ok && (secRelN < (int)(0.9 * capFps) || (secRelN > 0 && relMs > fsBestMs + 6.0))) ? fsBad + 1 : 0;
-                        fsTight = (ok && secRepU >= 2 && p10 >= 0.0 && p10 < 0.0015) ? fsTight + 1 : 0;
-                        if (fsTight >= 3)
+                        // The steps back below don't count as slower.
+                        fsBad = (ok && (secRelN < (int)(0.9 * capFps) || (secRelN > 0 && relMs > fsBestMs + fsBackMs + 6.0))) ? fsBad + 1 : 0;
+                        // Frames repeating with little to spare (the scene got heavier): 2 ms earlier when 3 of the last 5
+                        // seconds had 2 or more repeats with under 6 ms to spare (the 10th percentile: the few frames that
+                        // miss are below it), at most 8 ms earlier than the start time found (DX 1.0.44: under 1.5 ms, 3 s in
+                        // a row never fired in Stray or Kena; with this, 1.6-1.7 repeats a second fell to 0.5 for 2 ms).
+                        const bool tight = ok && secRepU >= 2 && p10 >= 0.0 && p10 < 0.006;
+                        fsTight = ((fsTight << 1) | (tight ? 1 : 0)) & 0x1F;
+                        int nTight = 0; for (int k = 0; k < 5; k++) nTight += (fsTight >> k) & 1;
+                        if (nTight >= 3 && fsBackMs < 7.9)
                         {
                             fsTight = 0;
+                            fsBackMs += 2.0;
                             setLead(fsLeadCur + 0.002, true);
                             learnFs(fsLeadCur * 1000.0, fsBestMs);
-                            LOGI("BFI Presenter: automatic frame cap at the frame start: frames repeated close to their flash -- 2 ms earlier");
+                            LOGI("BFI Presenter: automatic frame cap at the frame start: frames repeated with %.1f ms to spare before their "
+                                 "flash -- 2 ms earlier (%.0f ms earlier than the start time found)", p10 * 1000.0, fsBackMs);
                         }
                         if (fsBad >= 5 && t - fsDoneT > 20.0) { fsState = 1; fsSecs = fsBaseN = 0; fsBaseRel = 0.0; fsBaseP10 = 1.0; sc->fsOn.store(false);
                             LOGI("BFI Presenter: automatic frame cap at the frame start: frames lost or slower for 5 s -- looking again"); }
@@ -3922,7 +4431,7 @@ static void PresenterThread(Swapchain *sc)
             tsPassMs = tsDrawMs = -1.0;
             if ((presents % 120) == 0) fflush(logf);
         }
-        lastT = t;
+        lastT = pairIter ? lastT + 1.0 / (vb.modeHz > 1.0 ? vb.modeHz : 120.0) : t;
         if (pickId != lastShownId)
         {
             lastNewFrameT = t;
@@ -4405,6 +4914,709 @@ static void ConsumeWaits(DeviceData *d, VkQueue queue, uint32_t n, const VkSemap
 // One game frame: copy the presented stand-in image into a free staging slot
 // (after the game's rendering, via its semaphores), then hold the game to the
 // frames-ahead limit and the frame cap.
+// ---------------------------------------------------------------------------------------------------------
+// Frame warp with the game's own motion, Vulkan (as the DX add-on's gmo / ngx namespaces, 1.0.44): where a Vulkan game
+// hands DLSS (NGX) its motion vectors and depth, they are copied on the game's command buffer at its DLSS call, and at
+// its present turned into a motion texture for the frame being staged (shaders/gameflow.comp), on the game's queue.
+// The presenter's BFI shader then moves each part of the picture by its own motion (bfi_shade.glsl, WarpShiftGame).
+// DLSS's Vulkan entry points in _nvngx.dll (and a nvngx.dll in the game's folder) are hooked; Streamline calls them
+// too, so games that go through Streamline are covered as well. 64-bit only.
+namespace gvk
+{
+#ifdef _WIN64
+typedef int (*PFN_Create)(VkCommandBuffer cb, int feature, void *params, void **out);
+typedef int (*PFN_Create1)(VkDevice dv, VkCommandBuffer cb, int feature, void *params, void **out);
+typedef int (*PFN_Eval)(VkCommandBuffer cb, const void *h, const void *params, void *cbk);
+typedef int (*PFN_Get)(const void *self, const char *name, void *out);
+// NVSDK_NGX_Resource_VK: the image view info (view, image, subresource range, format, width, height), its type and
+// whether it is written.
+struct ResVk { VkImageView view; VkImage image; VkImageSubresourceRange range; VkFormat format; unsigned w, h; int type; uint8_t rw; };
+static_assert(offsetof(ResVk, format) == 36 && offsetof(ResVk, w) == 40 && offsetof(ResVk, type) == 48, "NVSDK_NGX_Resource_VK layout");
+static const int kSuccess = 1;                         // NVSDK_NGX_Result_Success
+enum { kSR = 1, kRR = 13 };                            // NVSDK_NGX_Feature_SuperSampling, _RayReconstruction
+enum { kMVLowRes = 1 << 1, kDepthInverted = 1 << 3 };  // NVSDK_NGX_DLSS_Feature_Flags
+static PFN_Create o_Create[2] = {}; static PFN_Create1 o_Create1[2] = {}; static PFN_Eval o_Eval[2] = {}, o_EvalC[2] = {};
+static std::mutex lk;
+struct Feat { int feature, flags; unsigned w, h, ow = 0, oh = 0; };
+static std::map<uintptr_t, Feat> feats;                // by handle address (as DX)
+static bool tried[2] = {}, hooked = false;
+static thread_local int inside = 0;
+// The parameter object (as DX): MSVC's order has Get(void**) at slot 8 and Get(float*) at 14; declaration order 15 and 9.
+static int slotPtr = 0, slotF = 0;
+static uint32_t nEval = 0, nUsed = 0, nNoMv = 0, nOther = 0, nBad = 0, nSide = 0;
+// The main view: games can upscale more than one view a frame (e.g. a small second view as well); only the largest
+// is used, so the warp never mixes two views' motion and the copies never change size from call to call.
+static uint64_t mainArea = 0; static double mainSeen = -1.0; static uint32_t mainW = 0, mainH = 0;
+static double winT = 0.0; static int reports = 0;
+
+static bool Readable(const void *p, size_t n)
+{
+    if (!p || (uintptr_t)p < 0x10000) return false;
+    MEMORY_BASIC_INFORMATION mi = {};
+    if (!VirtualQuery(p, &mi, sizeof(mi)) || mi.State != MEM_COMMIT) return false;
+    if (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    return (const BYTE *)p + n <= (const BYTE *)mi.BaseAddress + mi.RegionSize;
+}
+static inline bool Plaus(const void *p) { const uintptr_t u = (uintptr_t)p; return u >= 0x10000 && u < 0x7FFFFFFF0000ull && !(u & 7); }
+static int Get(const void *p, int slot, const char *name, void *out) { return ((PFN_Get)(*(void ***)p)[slot])(p, name, out); }
+static bool GetU(const void *p, const char *name, unsigned &v)
+{
+    uint64_t x = 0;
+    if (Get(p, 11, name, &x) != kSuccess && Get(p, 12, name, &x) != kSuccess) return false;
+    v = (unsigned)x; return true;
+}
+static bool IsDepthFmt(VkFormat f) { return f == VK_FORMAT_D16_UNORM || f == VK_FORMAT_X8_D24_UNORM_PACK32 || f == VK_FORMAT_D32_SFLOAT ||
+                                            f == VK_FORMAT_D16_UNORM_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT; }
+static bool HasStencil(VkFormat f) { return f == VK_FORMAT_D16_UNORM_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT; }
+static bool ResOk(const ResVk *r, bool deep)
+{
+    if (!Plaus(r) || (deep && !Readable(r, sizeof(ResVk)))) return false;
+    return r->type == 0 && r->image && r->w >= 8 && r->h >= 8 && r->w <= 16384 && r->h <= 16384 && (int)r->format > 0 && (int)r->format < 200;
+}
+static const ResVk *GetRes(const void *p, const char *name, const char *enc)
+{
+    uint64_t v = 0;
+    if (Get(p, slotPtr, name, &v) == kSuccess && v) return (const ResVk *)(uintptr_t)v;
+    v = 0;
+    if (enc && Get(p, slotPtr, enc, &v) == kSuccess && v) return (const ResVk *)(uintptr_t)v;
+    return nullptr;
+}
+static bool Layout(const void *p)
+{
+    if (slotPtr) return slotPtr > 0;
+    const int tryPtr[2] = { 8, 15 };
+    for (int i = 0; i < 2 && !slotPtr; i++)
+        for (const char *nm : { "MotionVectors", "#\x27" })
+        {
+            uint64_t v = 0;
+            if (Get(p, tryPtr[i], nm, &v) == kSuccess && v && ResOk((const ResVk *)(uintptr_t)v, true))
+            { slotPtr = tryPtr[i]; slotF = tryPtr[i] == 8 ? 14 : 9; break; }
+        }
+    if (!slotPtr)
+    {
+        slotPtr = -1;
+        LOGW("BFI Presenter: frame warp, the game's own motion: DLSS's (Vulkan) parameter object isn't laid out as expected -- its calls are left alone");
+        return false;
+    }
+    LOGI("BFI Presenter: frame warp, the game's own motion: DLSS (Vulkan) parameters read in %s order", slotPtr == 8 ? "MSVC's" : "declaration");
+    return true;
+}
+
+struct Img { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; VkFormat fmt = VK_FORMAT_UNDEFINED;
+             uint32_t w = 0, h = 0; };
+struct Entry { Img mv, dp; bool hasDepth = false, reset = false, depthRev = false; float mvScale[2] = {}, mvMap[4] = {}, dMap[4] = {}; };
+static const int kRing = 3;
+static Entry ring[kRing];
+static uint64_t seq = 0;
+static int pend[2] = {}, pendN = 0, latest = -1;
+static DeviceData *ringDev = nullptr;
+struct Retired { Img i; double t; };
+static std::vector<Retired> retired;
+static uint64_t fgSeqSeen = 0; static int fgIdx = 0;
+// the motion pass, created on first use
+static VkDescriptorSetLayout dsl = VK_NULL_HANDLE; static VkPipelineLayout pl = VK_NULL_HANDLE; static VkShaderModule cs = VK_NULL_HANDLE;
+static VkPipeline pso = VK_NULL_HANDLE; static VkSampler nearest = VK_NULL_HANDLE; static VkDescriptorPool pool = VK_NULL_HANDLE;
+static VkDescriptorSet sets[kRing][kStage] = {};
+static VkImageView setMv[kRing][kStage] = {}, setDp[kRing][kStage] = {}, setOut[kRing][kStage] = {};
+static bool gpuFailed = false;
+static std::atomic<int> state{0};                      // 0 none seen, 1 vectors and depth, 2 vectors only (the panel)
+struct GPush { float outTexel[2], mvScale[2], mvMap[4], dMap[4]; uint32_t flags; float mvInvalid, perRendered, prevOk; };
+static VkImageView setPv[kRing][kStage] = {};
+// Letterboxed cutscenes (as DX, ep3): DLSS's output smaller than the screen, wider than tall against it. Only a letterbox
+// that follows full-screen output in this session counts, and one that lasts over 10 minutes is play.
+static std::atomic<uint32_t> screenW{0}, screenH{0};
+static std::atomic<bool> lbOn{false}, lbFullSeen{false};
+static std::atomic<double> lbT{0.0}, lbStartT{0.0};
+static void NoteLetterbox(bool lb, unsigned w, unsigned h, unsigned fw, unsigned fh)
+{
+    const bool was = lbOn.exchange(lb);
+    if (lb) lbT = Now();
+    else lbFullSeen = true;
+    if (lb && !was) lbStartT = Now();
+    static int logged = 0;
+    if (lb != was && logged++ < 40)
+    {
+        if (lb) LOGI("BFI Presenter: frame warp: letterboxed cutscene (DLSS (Vulkan) output %ux%u of %ux%u)", w, h, fw, fh);
+        else    LOGI("BFI Presenter: frame warp: the letterboxed cutscene ended (DLSS (Vulkan) output %ux%u)", w, h);
+    }
+}
+
+static bool On() { return g_shared.frameWarp && g_shared.warpGame && g_shared.dlssHooks; }
+
+static void FreeImg(DeviceData *d, Img &i)
+{
+    if (i.view) d->DestroyImageView(d->device, i.view, nullptr);
+    if (i.img) d->DestroyImage(d->device, i.img, nullptr);
+    if (i.mem) d->FreeMemory(d->device, i.mem, nullptr);
+    i = Img();
+}
+static bool MakeImg(DeviceData *d, Img &i, VkFormat fmt, uint32_t w, uint32_t h)
+{
+    VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = fmt;
+    ici.extent = { w, h, 1 };
+    ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.sharingMode = d->families.size() > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    ici.queueFamilyIndexCount = d->families.size() > 1 ? (uint32_t)d->families.size() : 0;
+    ici.pQueueFamilyIndices = d->families.size() > 1 ? d->families.data() : nullptr;
+    if (!CreateImageMem(d, ici, &i.img, &i.mem)) { i = Img(); return false; }
+    VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vci.image = i.img;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = fmt;
+    vci.subresourceRange = { (VkImageAspectFlags)(IsDepthFmt(fmt) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1 };
+    if (d->CreateImageView(d->device, &vci, nullptr, &i.view) != VK_SUCCESS) { FreeImg(d, i); return false; }
+    i.fmt = fmt; i.w = w; i.h = h;
+    return true;
+}
+// The copy, on the game's command buffer before DLSS reads its inputs: the source to TRANSFER_SRC and back to the
+// layout DLSS expects it in (DlssInputLayout, GENERAL by default), ours to SHADER_READ_ONLY for the motion pass.
+static bool Copy(DeviceData *d, VkCommandBuffer cb, const ResVk &r, Img &dst)
+{
+    const bool depth = IsDepthFmt(r.format);
+    if (!dst.img || dst.fmt != r.format || dst.w != r.w || dst.h != r.h)
+    {
+        if (dst.img) retired.push_back({ dst, Now() });
+        dst = Img();
+        if (!MakeImg(d, dst, r.format, r.w, r.h)) return false;
+    }
+    const VkImageLayout L = (VkImageLayout)g_shared.dlssLayout;
+    VkImageSubresourceRange sr = r.range;
+    sr.aspectMask = depth ? (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (HasStencil(r.format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
+    sr.levelCount = 1; sr.layerCount = 1;
+    VkImageMemoryBarrier b[2] = {};
+    b[0] = ImgBarrier(r.image, L, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    b[0].subresourceRange = sr;
+    b[1] = ImgBarrier(dst.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    if (depth) b[1].subresourceRange.aspectMask = sr.aspectMask;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+    VkImageCopy ic = {};
+    const VkImageAspectFlags a = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    ic.srcSubresource = { a, r.range.baseMipLevel, r.range.baseArrayLayer, 1 };
+    ic.dstSubresource = { a, 0, 0, 1 };
+    ic.extent = { r.w, r.h, 1 };
+    d->CmdCopyImage(cb, r.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    b[0] = ImgBarrier(r.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, L, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    b[0].subresourceRange = sr;
+    b[1] = ImgBarrier(dst.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT);
+    if (depth) b[1].subresourceRange.aspectMask = sr.aspectMask;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+    return true;
+}
+
+static void OnCreate(int feature, const void *params, void *h)
+{
+    if (!h || !Plaus(h) || !params || !Plaus(params)) return;
+    Feat f = { feature, -1, 0, 0, 0, 0 };
+    unsigned fl = 0;
+    if (GetU(params, "DLSS.Feature.Create.Flags", fl)) f.flags = (int)fl;
+    GetU(params, "Width", f.w); GetU(params, "Height", f.h); GetU(params, "OutWidth", f.ow); GetU(params, "OutHeight", f.oh);
+    std::lock_guard<std::mutex> l(lk);
+    feats[(uintptr_t)h] = f;
+    static int logged = 0;
+    if (logged++ < 8)
+        LOGI("BFI Presenter: DLSS (Vulkan) feature %d created: render size %ux%u, flags 0x%x%s", feature, f.w, f.h, fl, f.flags < 0 ? " (not stated)" : "");
+}
+
+static void OnEval(VkCommandBuffer cmd, const void *h, const void *params)
+{
+    if (!On() || !cmd || !params || !Plaus(params)) return;
+    DeviceData *d = GetDev(Key(cmd));
+    if (!d || !d->CmdCopyImage) return;
+    std::lock_guard<std::mutex> l(lk);
+    nEval++;
+    Feat f = { 0, -1, 0, 0, 0, 0 };
+    auto it = h ? feats.find((uintptr_t)h) : feats.end();
+    const bool known = it != feats.end();
+    if (known) f = it->second;
+    if (known && f.feature != kSR && f.feature != kRR) { nOther++; return; }
+    if (!Layout(params)) return;
+    const ResVk *mv = GetRes(params, "MotionVectors", "#\x27");
+    if (!mv) { nNoMv++; return; }                                  // not an upscaler call (frame generation has names of its own)
+    const ResVk *dp = GetRes(params, "Depth", "#\x3d");
+    static int deepN = 0;
+    const bool deep = (deepN++ % 120) == 0;                        // the pointers checked with a system call now and then
+    if (!ResOk(mv, deep)) { nBad++; return; }
+    if (dp && (!ResOk(dp, deep) || (!IsDepthFmt(dp->format) && dp->format != VK_FORMAT_R32_SFLOAT && dp->format != VK_FORMAT_R16_SFLOAT &&
+                                    dp->format != VK_FORMAT_R16_UNORM))) dp = nullptr;
+    float sx = 1.0f, sy = 1.0f;
+    if (Get(params, slotF, "MV.Scale.X", &sx) != kSuccess) Get(params, slotF, "#\x2c", &sx);
+    if (Get(params, slotF, "MV.Scale.Y", &sy) != kSuccess) Get(params, slotF, "#\x2d", &sy);
+    unsigned reset = 0, rw = 0, rh = 0, flags = 0, mvX = 0, mvY = 0, dX = 0, dY = 0;
+    GetU(params, "Reset", reset);
+    GetU(params, "DLSS.Render.Subrect.Dimensions.Width", rw); GetU(params, "DLSS.Render.Subrect.Dimensions.Height", rh);
+    GetU(params, "DLSS.Input.MV.Subrect.Base.X", mvX); GetU(params, "DLSS.Input.MV.Subrect.Base.Y", mvY);
+    GetU(params, "DLSS.Input.Depth.Subrect.Base.X", dX); GetU(params, "DLSS.Input.Depth.Subrect.Base.Y", dY);
+    if (!rw || !rh) { rw = f.w; rh = f.h; }
+    bool flagsGiven = f.flags >= 0;
+    if (flagsGiven) flags = (unsigned)f.flags;
+    else if (GetU(params, "DLSS.Feature.Create.Flags", flags)) flagsGiven = true;
+    else flags = kMVLowRes | kDepthInverted;                       // not stated: as most current engines
+    const bool low = (flags & kMVLowRes) != 0;
+    if (!rw || !rh) { rw = mv->w; rh = mv->h; }
+    {
+        // the output size: from the feature's creation, else from the call's parameters (usually the same block)
+        unsigned ow = f.ow, oh = f.oh;
+        if (!ow || !oh) { GetU(params, "OutWidth", ow); GetU(params, "OutHeight", oh); }
+        const uint32_t fw = screenW.load(), fh = screenH.load();
+        if (ow && oh && fw && fh && (uint64_t)mv->w * mv->h >= mainArea) NoteLetterbox(oh < 0.9 * fh && ow >= 0.9 * fw, ow, oh, fw, fh);
+    }
+    if (ringDev && ringDev != d) return;                           // one device
+    {
+        const double tn = Now();
+        const uint64_t area = (uint64_t)mv->w * mv->h;
+        if (area < mainArea && tn - mainSeen < 0.5) { nSide++; return; }   // a smaller view while the main one is current
+        if (area != mainArea && mainArea)
+        {
+            static int sideLogged = 0;
+            if (area > mainArea && sideLogged++ < 2)
+                LOGI("BFI Presenter: frame warp, the game's own motion: DLSS (Vulkan) upscales more than one view (%ux%u and %ux%u) -- only "
+                     "the largest is used", mainW, mainH, mv->w, mv->h);
+        }
+        mainArea = area; mainSeen = tn; mainW = mv->w; mainH = mv->h;
+    }
+    // copies retired after a size change wait for the GPU; if they pile up (sizes changing all the time) the call is skipped
+    if (retired.size() > 12) { nBad++; return; }
+    ringDev = d;
+    const int k = (int)(seq % kRing);
+    Entry &e = ring[k];
+    if (!Copy(d, cmd, *mv, e.mv)) { nBad++; return; }
+    e.hasDepth = dp && Copy(d, cmd, *dp, e.dp);
+    e.mvScale[0] = sx / (float)(low ? rw : mv->w);
+    e.mvScale[1] = sy / (float)(low ? rh : mv->h);
+    if (low) { e.mvMap[0] = (float)rw; e.mvMap[1] = (float)rh; e.mvMap[2] = (float)mvX; e.mvMap[3] = (float)mvY; }
+    else { e.mvMap[0] = (float)mv->w; e.mvMap[1] = (float)mv->h; e.mvMap[2] = e.mvMap[3] = 0.0f; }
+    if (e.hasDepth)
+    {
+        // depth at the render size (its subrect), or the whole texture when it is the output size
+        if (dp->w > rw + rw / 8) { e.dMap[0] = (float)dp->w; e.dMap[1] = (float)dp->h; e.dMap[2] = e.dMap[3] = 0.0f; }
+        else { e.dMap[0] = (float)rw; e.dMap[1] = (float)rh; e.dMap[2] = (float)dX; e.dMap[3] = (float)dY; }
+    }
+    e.depthRev = (flags & kDepthInverted) != 0;
+    e.reset = reset != 0;
+    if (pendN >= 2) { pend[0] = pend[1]; pendN = 1; }             // a present that never came: the older copy is dropped
+    pend[pendN++] = k;
+    latest = k;
+    seq++;
+    nUsed++;
+    const int st = e.hasDepth ? 1 : 2;
+    if (state.exchange(st) != st)
+        LOGI("BFI Presenter: frame warp, the game's own motion: the game's motion vectors (%ux%u)%s from DLSS (Vulkan) are used", mv->w, mv->h,
+             e.hasDepth ? " and depth" : ", without depth");
+    static int logged = 0;
+    if (logged < 4)
+    {
+        logged++;
+        LOGI("BFI Presenter: DLSS (Vulkan) call (feature %d%s): vectors %ux%u format %d%s, scale %.3g x %.3g, render %ux%u, depth %s (format %d), "
+             "flags 0x%x%s", known ? f.feature : -1, known ? "" : ", created before the hook", mv->w, mv->h, (int)mv->format,
+             low ? " (render size)" : " (output size)", sx, sy, rw, rh, e.hasDepth ? ((flags & kDepthInverted) ? "reversed" : "standard") : "none",
+             dp ? (int)dp->format : -1, flags, flagsGiven ? "" : " (assumed: not stated)");
+    }
+}
+
+static bool EnsureGpu(DeviceData *d)
+{
+    if (pso) return true;
+    if (gpuFailed || !d->CreateComputePipelines || !d->CmdDispatch) return false;
+    VkDevice dv = d->device;
+    VkSamplerCreateInfo smi = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    smi.magFilter = smi.minFilter = VK_FILTER_NEAREST;
+    smi.addressModeU = smi.addressModeV = smi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    bool ok = d->CreateSampler(dv, &smi, nullptr, &nearest) == VK_SUCCESS;
+    VkDescriptorSetLayoutBinding b[4] = {};
+    for (int i = 0; i < 4; i++)
+    {
+        b[i].binding = (uint32_t)i;
+        b[i].descriptorType = i != 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    dli.bindingCount = 4; dli.pBindings = b;
+    ok = ok && d->CreateDescriptorSetLayout(dv, &dli, nullptr, &dsl) == VK_SUCCESS;
+    VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GPush) };
+    VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pli.setLayoutCount = 1; pli.pSetLayouts = &dsl; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pr;
+    ok = ok && d->CreatePipelineLayout(dv, &pli, nullptr, &pl) == VK_SUCCESS;
+    if (ok) { cs = MakeShader(d, kGameFlowSpv, sizeof(kGameFlowSpv)); ok = cs != VK_NULL_HANDLE; }
+    VkPipeline p = ok ? MakeComputePipeline(d, pl, cs) : VK_NULL_HANDLE;
+    ok = p != VK_NULL_HANDLE;
+    if (ok)
+    {
+        VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * kRing * kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kRing * kStage } };
+        VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        dpi.maxSets = kRing * kStage; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
+        ok = d->CreateDescriptorPool(dv, &dpi, nullptr, &pool) == VK_SUCCESS;
+        VkDescriptorSetLayout l[kRing * kStage];
+        for (uint32_t i = 0; i < kRing * kStage; i++) l[i] = dsl;
+        VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dai.descriptorPool = pool; dai.descriptorSetCount = kRing * kStage; dai.pSetLayouts = l;
+        ok = ok && d->AllocateDescriptorSets(dv, &dai, &sets[0][0]) == VK_SUCCESS;
+    }
+    if (!ok)
+    {
+        gpuFailed = true;
+        if (p) d->DestroyPipeline(dv, p, nullptr);
+        LOGW("BFI Presenter: frame warp, the game's own motion: its motion pass could not be made (Vulkan) -- the measured motion is used");
+        return false;
+    }
+    pso = p;
+    return true;
+}
+
+// At the game's present, on the command buffer that copies its frame into staging slot `slot` (before it is ended):
+// the motion texture for that frame, from the vectors of the DLSS call that belongs to it.
+static void AtPresent(DeviceData *d, Swapchain *sc, uint32_t slot, VkCommandBuffer cb)
+{
+    if (slot >= kStage) return;
+    sc->gPend[slot] = false;
+    std::lock_guard<std::mutex> l(lk);
+    const double tn = Now();
+    for (size_t i = 0; i < retired.size();)
+    {
+        if (tn - retired[i].t > 1.0) { FreeImg(ringDev ? ringDev : d, retired[i].i); retired[i] = retired.back(); retired.pop_back(); }
+        else i++;
+    }
+    screenW = sc->extent.width; screenH = sc->extent.height;
+    if (!On() || d != ringDev || !sc->gFlow[slot]) { pendN = 0; latest = -1; return; }
+    const int f = std::max(1, g_vkFgFactor.load());
+    int k;
+    float scale = 1.0f, lag = 0.0f;
+    if (f > 1)
+    {
+        // frame generation: every present uses the latest vectors, at its share of a rendered frame's motion; the i-th
+        // present since the DLSS call is f-1-i shown frames behind it (generated frames come first)
+        pendN = 0;
+        if (!g_shared.warpGameFg || latest < 0) return;
+        k = latest;
+        scale = 1.0f / (float)f;
+        if (seq != fgSeqSeen) { fgSeqSeen = seq; fgIdx = 0; } else if (fgIdx < 8) fgIdx++;
+        const int lf = g_shared.warpFgLag;                         // FrameWarpGameMotionFGLag: 1 generated frames first, -1 after, 0 off
+        lag = lf > 0 ? (float)std::max(0, f - 1 - fgIdx) : lf < 0 ? -(float)std::min(fgIdx, f - 1) : 0.0f;
+    }
+    else
+    {
+        if (pendN == 0) return;                                    // no DLSS call since the last present (a menu, DLSS off)
+        k = pend[0];
+        for (int i = 1; i < pendN; i++) pend[i - 1] = pend[i];
+        pendN--;
+    }
+    const Entry &e = ring[k];
+    if (!e.mv.img || !EnsureGpu(d)) return;
+    // the rendered frame before's vectors (how much the motion kept up), where they are the same kind
+    const Entry &ep = ring[(k + kRing - 1) % kRing];
+    const bool prevOk = ep.mv.img && ep.mv.img != e.mv.img && ep.mv.w == e.mv.w && ep.mv.h == e.mv.h && ep.mv.fmt == e.mv.fmt && !e.reset;
+    const VkImageView pv = prevOk ? ep.mv.view : e.mv.view;
+    // the set for this ring entry and slot: rewritten when its images were made anew (only this slot's command buffer
+    // uses it, and its previous use is done: its fence was waited for before recording)
+    const VkImageView dv = e.hasDepth ? e.dp.view : e.mv.view;
+    if (setMv[k][slot] != e.mv.view || setDp[k][slot] != dv || setOut[k][slot] != sc->gFlowView[slot] || setPv[k][slot] != pv)
+    {
+        VkDescriptorImageInfo ii[4] = { { nearest, e.mv.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+                                        { nearest, dv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+                                        { VK_NULL_HANDLE, sc->gFlowView[slot], VK_IMAGE_LAYOUT_GENERAL },
+                                        { nearest, pv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } };
+        VkWriteDescriptorSet wr[4] = {};
+        for (int i = 0; i < 4; i++)
+        {
+            wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wr[i].dstSet = sets[k][slot]; wr[i].dstBinding = (uint32_t)i; wr[i].descriptorCount = 1;
+            wr[i].descriptorType = i != 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            wr[i].pImageInfo = &ii[i];
+        }
+        d->UpdateDescriptorSets(d->device, 4, wr, 0, nullptr);
+        setMv[k][slot] = e.mv.view; setDp[k][slot] = dv; setOut[k][slot] = sc->gFlowView[slot]; setPv[k][slot] = pv;
+    }
+    VkImageMemoryBarrier b = ImgBarrier(sc->gFlow[slot], sc->gFlowInit[slot] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                                        VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    GPush gp = {};
+    gp.outTexel[0] = 1.0f / (float)sc->gW; gp.outTexel[1] = 1.0f / (float)sc->gH;
+    gp.mvScale[0] = e.mvScale[0] * scale; gp.mvScale[1] = e.mvScale[1] * scale;
+    memcpy(gp.mvMap, e.mvMap, sizeof(gp.mvMap)); memcpy(gp.dMap, e.dMap, sizeof(gp.dMap));
+    gp.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u);
+    gp.mvInvalid = 3.402823466e38f;                                // DLSS has no marker for a missing vector
+    gp.perRendered = scale > 0.0f ? 1.0f / scale : 1.0f;            // shown frames per rendered one: back to a whole rendered frame's motion
+    gp.prevOk = prevOk ? 1.0f : 0.0f;
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pso);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &sets[k][slot], 0, nullptr);
+    d->CmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gp), &gp);
+    d->CmdDispatch(cb, (sc->gW + 7) / 8, (sc->gH + 7) / 8, 1);
+    b = ImgBarrier(sc->gFlow[slot], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    sc->gFlowInit[slot] = true;
+    sc->gPend[slot] = true;
+    sc->gSlotDepth[slot] = e.hasDepth;
+    sc->gSlotLag[slot] = lag;
+    sc->gPendCut[slot] = e.reset;
+}
+
+template <int I> static int hk_Create(VkCommandBuffer cb, int feature, void *params, void **out)
+{
+    inside++;
+    const int r = o_Create[I](cb, feature, params, out);
+    inside--;
+    if (r == kSuccess && out && Plaus(out) && inside == 0) OnCreate(feature, params, *out);
+    return r;
+}
+template <int I> static int hk_Create1(VkDevice dv, VkCommandBuffer cb, int feature, void *params, void **out)
+{
+    inside++;
+    const int r = o_Create1[I](dv, cb, feature, params, out);
+    inside--;
+    if (r == kSuccess && out && Plaus(out) && inside == 0) OnCreate(feature, params, *out);
+    return r;
+}
+template <int I> static int hk_Eval(VkCommandBuffer cb, const void *h, const void *params, void *cbk)
+{
+    if (inside == 0) OnEval(cb, h, params);
+    inside++;
+    const int r = o_Eval[I](cb, h, params, cbk);
+    inside--;
+    return r;
+}
+template <int I> static int hk_EvalC(VkCommandBuffer cb, const void *h, const void *params, void *cbk)
+{
+    if (inside == 0) OnEval(cb, h, params);
+    inside++;
+    const int r = o_EvalC[I](cb, h, params, cbk);
+    inside--;
+    return r;
+}
+
+// Once a second from the presenter: hooks DLSS's Vulkan exports once a module with them is loaded; reports every 10 s.
+// Streamline probe (Vulkan, test): what a game tags for Streamline each frame -- above all whether it hands over a
+// picture without its HUD (buffer type 2), which DX uses to keep the HUD still (FrameWarpGameHud). Only
+// sl.interposer.dll's slSetTag, slSetTagForFrame and slEvaluateFeature are hooked; nothing is changed. Layouts as the
+// DX probe (Streamline SDK 2.x); for Vulkan the resource's native is a VkImage, state its VkImageLayout and
+// nativeFormat its VkFormat. Every pointer is checked before it is read.
+namespace sl
+{
+struct Base { void *next; uint8_t type[16]; size_t version; };
+struct Res  { Base b; uint32_t type; uint32_t pad; void *native; void *mem; void *view; uint32_t state;
+              uint32_t width, height, nativeFormat, mips, layers; };
+struct Ext  { uint32_t top, left, width, height; };
+struct Tag  { Base b; Res *res; uint32_t bufType; uint32_t lifecycle; Ext ext; };
+static_assert(sizeof(Tag) == 64, "sl::ResourceTag layout");
+typedef int (*PFN_SetTag)(const void *vp, const Tag *tags, uint32_t n, void *cmd);
+typedef int (*PFN_SetTagForFrame)(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd);
+typedef int (*PFN_Evaluate)(uint32_t feature, const void *frame, const Base **inputs, uint32_t n, void *cmd);
+static PFN_SetTag o_SetTag; static PFN_SetTagForFrame o_SetTagForFrame; static PFN_Evaluate o_Evaluate;
+static const uint8_t kTagGuid[16] = { 0xad,0x5a,0x6a,0x4c, 0x45,0xb4, 0x6c,0x49, 0x87,0xff,0x1a,0xf3,0x84,0x5b,0xe6,0x53 };
+struct Stat { uint32_t calls = 0, w = 0, h = 0, fmt = 0, layout = 0, extW = 0, extH = 0, life = 0, noRes = 0, bad = 0; };
+static std::mutex lk;
+static std::map<uint32_t, Stat> tagsSet, tagsEval;
+static std::map<uint32_t, uint32_t> evals;
+static uint32_t badCalls = 0;
+static bool tried = false, hooked = false;
+static double winT = 0.0; static int reports = 0;
+
+static const char *TagName(uint32_t t)
+{
+    switch (t)
+    {
+    case 0: return "depth"; case 1: return "motion vectors"; case 2: return "HUD-less colour"; case 3: return "upscaler input colour";
+    case 4: return "upscaler output colour"; case 5: return "normals"; case 6: return "roughness"; case 7: return "albedo";
+    case 9: return "UI colour and alpha"; case 15: return "backbuffer"; default: return nullptr;
+    }
+}
+static const char *FeatureName(uint32_t f)
+{
+    switch (f)
+    {
+    case 0: return "DLSS"; case 1: return "NRD"; case 2: return "NIS"; case 3: return "Reflex"; case 4: return "PCL";
+    case 1000: return "DLSS frame generation"; case 1001: return "DLSS ray reconstruction"; default: return nullptr;
+    }
+}
+static void NoteOne(const Tag &tg, std::map<uint32_t, Stat> &into)
+{
+    if (tg.b.version > 64 || tg.bufType > 255) { badCalls++; return; }
+    Stat &st = into[tg.bufType];
+    st.calls++;
+    st.life = tg.lifecycle;
+    if (tg.ext.width) { st.extW = tg.ext.width; st.extH = tg.ext.height; }
+    const Res *r = tg.res;
+    if (!r) { st.noRes++; return; }
+    if (!Plaus(r)) { st.bad++; return; }
+    if (r->width && r->width < 32768 && r->height < 32768) { st.w = r->width; st.h = r->height; st.fmt = r->nativeFormat; st.layout = r->state; }
+}
+static void NoteTags(const Tag *tags, uint32_t n)
+{
+    std::lock_guard<std::mutex> l(lk);
+    if (n == 0 || n > 64 || !Plaus(tags)) { badCalls++; return; }
+    for (uint32_t i = 0; i < n; i++) NoteOne(tags[i], tagsSet);
+}
+static void NoteInputs(const Base **in, uint32_t n)
+{
+    std::lock_guard<std::mutex> l(lk);
+    if (!in || n == 0 || n > 64 || !Plaus(in)) return;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        const Base *b = in[i];
+        for (int depth = 0; b && depth < 8; depth++)
+        {
+            if (!Plaus(b)) { badCalls++; break; }
+            if (memcmp(b->type, kTagGuid, 16) == 0) NoteOne(*(const Tag *)b, tagsEval);
+            b = (const Base *)b->next;
+        }
+    }
+}
+static int hk_SetTag(const void *vp, const Tag *tags, uint32_t n, void *cmd) { NoteTags(tags, n); return o_SetTag(vp, tags, n, cmd); }
+static int hk_SetTagForFrame(const void *frame, const void *vp, const Tag *tags, uint32_t n, void *cmd)
+{ NoteTags(tags, n); return o_SetTagForFrame(frame, vp, tags, n, cmd); }
+static int hk_Evaluate(uint32_t feature, const void *frame, const Base **inputs, uint32_t n, void *cmd)
+{
+    { std::lock_guard<std::mutex> l(lk); evals[feature]++; }
+    NoteInputs(inputs, n);
+    return o_Evaluate(feature, frame, inputs, n, cmd);
+}
+// Once a second (from gvk::Tick): hooks Streamline when it is loaded, and reports every 10 s (the first minute).
+static void Tick(double t)
+{
+    if (!tried)
+    {
+        HMODULE m = GetModuleHandleA("sl.interposer.dll");
+        if (!m) return;
+        tried = true;
+        char path[MAX_PATH] = "";
+        GetModuleFileNameA(m, path, MAX_PATH);
+        if (!GetProcAddress(m, "slSetTagForFrame"))
+        {
+            LOGI("BFI Presenter: Streamline (Vulkan): %s has no slSetTagForFrame -- not 2.x, left alone", path);
+            return;
+        }
+        struct { const char *name; void *hook; void **orig; } fns[] = {
+            { "slSetTag", (void *)&hk_SetTag, (void **)&o_SetTag },
+            { "slSetTagForFrame", (void *)&hk_SetTagForFrame, (void **)&o_SetTagForFrame },
+            { "slEvaluateFeature", (void *)&hk_Evaluate, (void **)&o_Evaluate },
+        };
+        char list[400] = "";
+        for (auto &f : fns)
+        {
+            void *p = (void *)GetProcAddress(m, f.name);
+            char why[96] = "not exported";
+            void *orig = p ? InlineHook64(p, f.hook, why, sizeof(why)) : nullptr;
+            if (orig) { *f.orig = orig; hooked = true; }
+            char one[160];
+            snprintf(one, sizeof(one), "%s%s %s%s%s", list[0] ? "; " : "", f.name, orig ? "hooked" : "not hooked", orig ? "" : " -- ", orig ? "" : why);
+            strncat(list, one, sizeof(list) - strlen(list) - 1);
+        }
+        LOGI("BFI Presenter: Streamline probe (Vulkan, test): %s: %s", path, list);
+        winT = t;
+        return;
+    }
+    if (!hooked || reports >= 6 || t - winT < 10.0) return;
+    std::map<uint32_t, Stat> ts, te; std::map<uint32_t, uint32_t> ev; uint32_t bad;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        ts.swap(tagsSet); te.swap(tagsEval); ev.swap(evals); bad = badCalls; badCalls = 0;
+    }
+    const double secs = t - winT;
+    winT = t;
+    reports++;
+    bool hudLess = false;
+    auto list = [&](std::map<uint32_t, Stat> &m, const char *from) {
+        for (auto &kv : m)
+        {
+            const Stat &st = kv.second;
+            if (kv.first == 2) hudLess = true;
+            const char *nm = TagName(kv.first);
+            char nb[24]; snprintf(nb, sizeof(nb), "type %u", kv.first);
+            LOGI("BFI Presenter: Streamline probe: %s tag %s %.0f/s: %ux%u format %u layout %u, used %ux%u, lifecycle %u [no resource %u, unreadable %u]",
+                 from, nm ? nm : nb, st.calls / secs, st.w, st.h, st.fmt, st.layout, st.extW, st.extH, st.life, st.noRes, st.bad);
+        }
+    };
+    list(ts, "slSetTag");
+    list(te, "slEvaluateFeature");
+    char evs[300] = "";
+    for (auto &kv : ev)
+    {
+        char one[80]; const char *nm = FeatureName(kv.first);
+        snprintf(one, sizeof(one), "%s%s%s %.0f/s", evs[0] ? ", " : "", nm ? nm : "feature ", nm ? "" : std::to_string(kv.first).c_str(), kv.second / secs);
+        strncat(evs, one, sizeof(evs) - strlen(evs) - 1);
+    }
+    LOGI("BFI Presenter: Streamline probe: last %.0f s: %u buffer types tagged, %u in evaluate calls, %u unreadable | evaluated: %s | HUD-less picture: %s",
+         secs, (unsigned)ts.size(), (unsigned)te.size(), bad, evs[0] ? evs : "none", hudLess ? "yes" : "no");
+}
+} // namespace sl
+
+static void Tick(double t)
+{
+    if (!g_shared.frameWarp || !g_shared.warpGame) return;      // nothing hooked until frame warp with the game's motion is on
+    sl::Tick(t);      // nothing hooked until frame warp with the game's motion is on
+    static const char *mods[2] = { "nvngx.dll", "_nvngx.dll" };
+    for (int i = 0; i < 2; i++)
+    {
+        if (tried[i]) continue;
+        HMODULE m = GetModuleHandleA(mods[i]);
+        if (!m) continue;
+        tried[i] = true;
+        if (!g_shared.dlssHooks) { LOGI("BFI Presenter: %s found, not hooked (DlssHooks=0)", mods[i]); continue; }
+        void *fC = (void *)GetProcAddress(m, "NVSDK_NGX_VULKAN_CreateFeature");
+        void *fC1 = (void *)GetProcAddress(m, "NVSDK_NGX_VULKAN_CreateFeature1");
+        void *fE = (void *)GetProcAddress(m, "NVSDK_NGX_VULKAN_EvaluateFeature");
+        void *fEC = (void *)GetProcAddress(m, "NVSDK_NGX_VULKAN_EvaluateFeature_C");
+        if (!fE && !fEC) { LOGI("BFI Presenter: %s has no Vulkan DLSS calls -- not hooked", mods[i]); continue; }
+        struct { const char *name; void *fn; void *hook; void **orig; } fns[4] = {
+            { "CreateFeature", fC, i ? (void *)&hk_Create<1> : (void *)&hk_Create<0>, (void **)&o_Create[i] },
+            { "CreateFeature1", fC1, i ? (void *)&hk_Create1<1> : (void *)&hk_Create1<0>, (void **)&o_Create1[i] },
+            { "EvaluateFeature", fE, i ? (void *)&hk_Eval<1> : (void *)&hk_Eval<0>, (void **)&o_Eval[i] },
+            { "EvaluateFeature_C", fEC, i ? (void *)&hk_EvalC<1> : (void *)&hk_EvalC<0>, (void **)&o_EvalC[i] },
+        };
+        char list[480] = "";
+        for (auto &fn : fns)
+        {
+            char why[96] = "not exported";
+            void *orig = fn.fn ? InlineHook64(fn.fn, fn.hook, why, sizeof(why)) : nullptr;
+            if (orig) { *fn.orig = orig; hooked = true; }
+            char one[160];
+            snprintf(one, sizeof(one), "%s%s %s%s%s", list[0] ? "; " : "", fn.name, orig ? "hooked" : "not hooked", orig ? "" : " -- ", orig ? "" : why);
+            strncat(list, one, sizeof(list) - strlen(list) - 1);
+        }
+        char path[MAX_PATH] = "";
+        GetModuleFileNameA(m, path, MAX_PATH);
+        LOGI("BFI Presenter: DLSS (Vulkan): %s: %s", path, list);
+        if (!winT) winT = t;
+    }
+    if (!hooked || reports >= 30 || t - winT < 10.0) return;
+    uint32_t e, u, nm, o, bd, sd;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        e = nEval; u = nUsed; nm = nNoMv; o = nOther; bd = nBad; sd = nSide;
+        nEval = nUsed = nNoMv = nOther = nBad = nSide = 0;
+    }
+    const double secs = t - winT;
+    winT = t;
+    if (!e) return;
+    reports++;
+    LOGI("BFI Presenter: DLSS (Vulkan): last %.0f s: %.0f calls/s, used %.0f/s, smaller views %.0f/s, other features %.0f/s, without vectors %.0f/s, "
+         "not usable %.0f/s", secs, e / secs, u / secs, sd / secs, o / secs, nm / secs, bd / secs);
+}
+static int State() { return state.load(); }
+// No frame warp: a cutscene letterboxed through DLSS (after full-screen output this session, for at most 10 minutes).
+static bool Letterboxed()
+{
+    if (!lbOn.load() || Now() - lbT.load() >= 1.0 || !lbFullSeen.load()) return false;
+    if (Now() - lbStartT.load() < 600.0) return true;
+    static double loggedFor = -1.0;
+    if (loggedFor != lbStartT.load())
+    {
+        loggedFor = lbStartT.load();
+        LOGI("BFI Presenter: frame warp: letterboxed for over 10 minutes -- taken as play, not a cutscene; frame warp works again");
+    }
+    return false;
+}
+#else
+static void AtPresent(DeviceData *, Swapchain *, uint32_t, VkCommandBuffer) {}
+static void Tick(double) {}
+static int State() { return 0; }
+static bool Letterboxed() { return false; }
+#endif
+} // namespace gvk
+
 static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const VkSemaphore *waits, uint32_t imageIndex,
                           uint64_t presentId, VkSemaphore chainSignal)
 {
@@ -4486,6 +5698,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
     br[1] = ImgBarrier(sc->stage[slot], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        VK_ACCESS_TRANSFER_WRITE_BIT, 0);   // the presenter reads it after the copy fence
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 2, br);
+    gvk::AtPresent(d, sc, (uint32_t)slot, cb);       // frame warp: the game's own motion for this frame
     d->EndCommandBuffer(cb);
 
     std::vector<VkPipelineStageFlags> stg(nWait, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -4515,6 +5728,8 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
         sc->copySubmitted[slot] = true;
         id = ++sc->frameId;
         sc->stageId[slot] = id;
+        sc->gSlotId[slot] = sc->gPend[slot] ? id : 0;
+        if (sc->gPend[slot] && sc->gPendCut[slot]) sc->gCutId = id;
         sc->stageTime[slot] = Now();
         sc->stagePresentId[slot] = presentId;
         sc->recentId[id % 8] = id;
@@ -4544,7 +5759,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
     // paces its own frames, and holding them (frames ahead, the Refresh cap's release) let a backlog build up in
     // Indiana Jones (frame start -> GPU done ~120 ms at 20 rendered fps against ~30 ms at 40).
     const bool rfxPaced = g_vkSleepLimitUs.load() > 0;
-    const int ahead = rfxPaced ? 0 : sc->maxAhead.load();
+    const int ahead = (rfxPaced && g_vkFgFactor.load() > 1) ? 0 : sc->maxAhead.load();   // without frame generation as at the cap
     if (ahead > 0 && id > (uint64_t)ahead)
     {
         const uint64_t need = id - (uint64_t)ahead;
@@ -4652,6 +5867,11 @@ static void DestroySCResources(Swapchain *sc)
         if (sc->stageMem[i]) d->FreeMemory(dev, sc->stageMem[i], nullptr);
         if (sc->copyFence[i]) d->DestroyFence(dev, sc->copyFence[i], nullptr);
         sc->stageView[i] = VK_NULL_HANDLE; sc->stage[i] = VK_NULL_HANDLE; sc->stageMem[i] = VK_NULL_HANDLE; sc->copyFence[i] = VK_NULL_HANDLE;
+        if (sc->gFlowView[i]) d->DestroyImageView(dev, sc->gFlowView[i], nullptr);
+        if (sc->gFlow[i]) d->DestroyImage(dev, sc->gFlow[i], nullptr);
+        if (sc->gFlowMem[i]) d->FreeMemory(dev, sc->gFlowMem[i], nullptr);
+        sc->gFlowView[i] = VK_NULL_HANDLE; sc->gFlow[i] = VK_NULL_HANDLE; sc->gFlowMem[i] = VK_NULL_HANDLE;
+        sc->gFlowInit[i] = false; sc->gSlotId[i] = 0; sc->gPend[i] = false;
     }
     for (uint32_t i = 0; i < kMaxImg; i++)
     {
@@ -4729,6 +5949,42 @@ static bool BuildSC(Swapchain *sc, const VkSwapchainCreateInfoKHR *ci)
         ok = ok && d->CreateFence(dev, &fci, nullptr, &sc->copyFence[i]) == VK_SUCCESS;
     }
     if (!ok) { LOGE("BFI Presenter: could not create the staging images"); DestroySCResources(sc); return false; }
+    // Frame warp with the game's own motion: a motion texture per staging slot at half the frame's size (rgba16f,
+    // written by a compute pass at the game's present, sampled by the presenter). Optional: without them the measured
+    // motion is used.
+    {
+        sc->gW = (sc->extent.width + 1) / 2; sc->gH = (sc->extent.height + 1) / 2;
+        VkImageCreateInfo gi = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        gi.imageType = VK_IMAGE_TYPE_2D;
+        gi.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        gi.extent = { sc->gW, sc->gH, 1 };
+        gi.mipLevels = 1; gi.arrayLayers = 1; gi.samples = VK_SAMPLE_COUNT_1_BIT; gi.tiling = VK_IMAGE_TILING_OPTIMAL;
+        gi.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        gi.sharingMode = sti.sharingMode; gi.queueFamilyIndexCount = sti.queueFamilyIndexCount; gi.pQueueFamilyIndices = sti.pQueueFamilyIndices;
+        bool gok = true;
+        for (uint32_t i = 0; gok && i < kStage; i++)
+        {
+            gok = CreateImageMem(d, gi, &sc->gFlow[i], &sc->gFlowMem[i]);
+            VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+            vci.image = sc->gFlow[i];
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            gok = gok && d->CreateImageView(dev, &vci, nullptr, &sc->gFlowView[i]) == VK_SUCCESS;
+            sc->gFlowInit[i] = false; sc->gSlotId[i] = 0; sc->gPend[i] = false;
+        }
+        if (!gok)
+        {
+            LOGW("BFI Presenter: frame warp, the game's own motion: its motion textures could not be made -- the measured motion is used");
+            for (uint32_t i = 0; i < kStage; i++)
+            {
+                if (sc->gFlowView[i]) d->DestroyImageView(dev, sc->gFlowView[i], nullptr);
+                if (sc->gFlow[i]) d->DestroyImage(dev, sc->gFlow[i], nullptr);
+                if (sc->gFlowMem[i]) d->FreeMemory(dev, sc->gFlowMem[i], nullptr);
+                sc->gFlowView[i] = VK_NULL_HANDLE; sc->gFlow[i] = VK_NULL_HANDLE; sc->gFlowMem[i] = VK_NULL_HANDLE;
+            }
+        }
+    }
 
     // Initial layouts: stand-ins as if presented, staging as shader input.
     VkCommandPool pool = VK_NULL_HANDLE;
@@ -5831,7 +7087,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_SetLatencySleepModeNV(VkDevice device,
     {
         loggedUs = us;
         LOGI("BFI Presenter: game Reflex (Vulkan): low latency %s%s, frame limit %d us%s", mode ? "on" : "off", boost ? " + Boost" : "", us,
-             us > 0 && g_active ? " -- taken out of the driver" : "");
+             us > 0 && g_active ? (g_vkOwnLimit.load() ? " -- applied at the game's Reflex sleep instead of in the driver" : " -- taken out of the driver") : "");
     }
     // The driver's limit counts the presenter's presents (it collapsed DX games to ~7 fps): taken out.
     if (info && info->minimumIntervalUs > 0 && g_active)
@@ -5851,7 +7107,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_LatencySleepNV(VkDevice device, VkSwap
     g_vkSleepLastT.store(Now());
     // Frame limit at the game's sleep, as in the DX add-on: one rendered frame per (limit), i.e. with frame
     // generation one presented frame per strobe cycle. The driver's own limit would count the presenter's presents.
-    const int us = g_vkSleepLimitUs.load();
+    int us = g_vkSleepLimitUs.load();
+    // ReflexOwnLimit (test): the game's own Reflex frame limit (an in-game frame cap that goes through Reflex) is taken
+    // out of the driver above, which would count the presenter's presents, and until 1.0.41 it was applied nowhere: the
+    // game ran up to the presenter's cap instead. As in the DX add-on it is applied here, at the game's sleep; not with
+    // frame generation (the automatic frame cap's limit paces that), and not after the game collapsed under a limit.
+    if (us <= 0 && g_active && g_vkOwnLimit.load() && g_vkFgFactor.load() <= 1 && !g_vkRfxBad.load())
+    {
+        const int own = g_vkLlMinUs.load();
+        if (own > 0) us = own;
+        static int ownWas = 0;
+        if ((own > 0) != (ownWas > 0) || (own > 0 && std::abs(own - ownWas) * 4 > std::max(ownWas, 1)))
+        {
+            ownWas = own;
+            if (own > 0) LOGI("BFI Presenter: game Reflex (Vulkan): the game's own frame limit (%d us, %.1f fps) is applied at its Reflex sleep", own, 1e6 / own);
+            else LOGI("BFI Presenter: game Reflex (Vulkan): the game's own frame limit is off");
+        }
+    }
     if (us > 0)
     {
         static double nextT = 0.0, phase = 0.0;
@@ -5882,6 +7154,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Bfi_LatencySleepNV(VkDevice device, VkSwap
                 double ph = std::fmod(phase, cyc);
                 if (ph < 0.0) ph += cyc;
                 nextT = cycStart + ph + std::floor((nextT - cycStart - ph) / cyc + 0.5) * cyc;
+                g_vkSleepPhaseUs.store((int)(ph * 1e6)); g_vkSleepPhaseT.store(now);
             }
         }
         SleepUntil(nextT);
@@ -6558,7 +7831,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         ImGui::Spacing();
         ImGui::SeparatorText("Every cap");
         bool fw = s.frameWarp != 0;
-        if (ImGui::Checkbox("Frame warp: fill missing frames (test, Ctrl+Shift+W)", &fw)) s.frameWarp = fw ? 1 : 0;
+        if (ImGui::Checkbox("Frame warp: fill missing frames (Ctrl+Shift+W)", &fw)) s.frameWarp = fw ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("For games that run just under the strobe rate (50-59 fps against a 60 Hz strobe). A strobe\n"
                                                       "cycle without a new game frame normally lights the last one again: the picture stands\n"
                                                       "still for a flash, then jumps. Frame warp shows that frame moved part of the way along the\n"
@@ -6571,7 +7844,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "cap or frame generation); for hitches and loading stalls; for things that move on their own\n"
                                                       "(a character, a car), which keep their stutter. With frame generation it works, with less to fill.\n"
                                                       "A filled flash is a guess: edges of things moving against the background can smear for that\n"
-                                                      "flash, and a CRT shader's mask moves with the picture. Vulkan layer: test build, see the settings guide.");
+                                                      "flash, and a CRT shader's mask moves with the picture. Details: the settings guide.");
         if (s.frameWarp)
         {
             ImGui::Indent(16.0f);
@@ -6587,6 +7860,55 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
             else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else ImGui::Text("Waiting for the game's frame rate.");
+            bool gm = s.warpGame != 0;
+            if (ImGui::Checkbox("Use the game's own motion vectors and depth", &gm)) s.warpGame = gm ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (Vulkan, 64-bit) its motion vectors and depth, frame warp\n"
+                                                          "moves each part of the picture by the game's own motion for it, and where things overlap\n"
+                                                          "the nearer one stays in front -- instead of the motion it measures from the picture,\n"
+                                                          "which can only follow the camera. The line below says which one is in use.");
+            if (s.warpGame)
+            {
+                ImGui::SameLine();
+                bool gf = s.warpGameFg != 0;
+                if (ImGui::Checkbox("Also with frame generation", &gf)) s.warpGameFg = gf ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("The game's motion vectors are for the frames it renders, not the ones frame generation\n"
+                                                              "adds in between, so on those the edges of moving things double up. Off by default: with\n"
+                                                              "frame generation on, frame warp uses the motion measured from the picture.");
+                if (s.warpGameFg)
+                {
+                    ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
+                                                                  "further ahead than this (shown frames). Further out it overshoots and snaps back.");
+                }
+                bool ev = s.warpEven != 0;
+                if (ImGui::Checkbox("Even pacing", &ev)) s.warpEven = ev ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion only: every strobe cycle shows the picture where the game's motion\n"
+                                                              "is at that moment, not just the cycles without a new frame, so every step on screen is the same.\n"
+                                                              "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
+                                                              "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
+                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
+                ImGui::SameLine();
+                bool pl = s.warpPauseLb != 0;
+                if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
+                                                              "screen): its quick cuts between camera angles have no motion to follow. Only after\n"
+                                                              "full-screen play in the same session, and not once a letterbox has lasted 10 minutes\n"
+                                                              "(play, in a game letterboxed by design). Right after a camera cut the game flags,\n"
+                                                              "frames are never filled either way.");
+            }
+            {
+                const int src = st.warpCycles ? st.warpSrc : (s.warpGame ? st.warpGameState : 0);
+                ImGui::Text("Motion used: %s", src == 1 ? "the game's motion vectors and depth, from DLSS" : src == 2 ? "the game's motion vectors (no depth), from DLSS"
+                                                   : "measured from the picture");
+                if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("This game hasn't handed DLSS (Vulkan) any motion data (no DLSS call seen).");
+            }
+            ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader, set it\n"
+                                                          "to the mask's width so the mask stays in place. 0 = off. Ctrl+click to type a value.");
+            ImGui::SliderFloat("Snap moves up and down (px)", &s.warpSnapY, 0.0f, 16.0f, s.warpSnapY > 0.0f ? "%.2f" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader, set\n"
+                                                          "it to the scanline width. 0 = off. Ctrl+click to type a value.");
             ImGui::Unindent(16.0f);
         }
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
@@ -6646,6 +7968,16 @@ static void draw_overlay(reshade::api::effect_runtime *)
         }
         ImGui::SliderFloat("Just-in-time safety margin (ms)", &s.laterReleaseMs, 0.5f, 5.0f, "%.1f");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("How long before its refresh a game frame is due when the game is released just in time\n(just-in-time release below the refresh rate, later release at it). Widened by itself when frames miss.");
+        bool rs = s.reflexAtSleep != 0, ra = s.reflexAlign != 0;
+        if (ImGui::Checkbox("Pace Reflex games at their Reflex sleep (without frame generation)", &rs)) s.reflexAtSleep = rs ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("When the automatic frame cap holds a game with Reflex to one frame per strobe cycle, the game\n"
+                                                      "waits in its Reflex sleep, before it reads input, instead of in its present with the finished\n"
+                                                      "frame waiting (as the DX add-on, ReflexLimitAtSleep). With frame generation that limit is always used.");
+        if (ImGui::Checkbox("Line Reflex's frame limit up with the flash", &ra)) s.reflexAlign = ra ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Without frame generation, at Lowest latency pacing: the moment the game starts each frame is\n"
+                                                      "moved so the frame is ready just before the lit refresh picks it, instead of waiting there for\n"
+                                                      "up to a whole strobe cycle (as the DX add-on, ReflexAlign). With it off, frames ready more than\n"
+                                                      "8 ms before the pick are still moved to 5 ms before it once (ReflexAlignCoarse=1 in the ini).");
         ImGui::SeparatorText("Presenter");
         bool vb = s.pacing != 0;
         if (ImGui::Checkbox("Wait for vblank", &vb)) s.pacing = vb ? 1 : 0;
@@ -6668,6 +8000,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "(~8 ms) of latency. For GPU-heavy games that flash (Indiana Jones).");
         if (s.queueAhead && st.managed)
             ImGui::Text("Queue ahead: %d re-primed, %d drained per second", st.qaPrimes, st.qaSkips);
+        bool qd = s.queueDark != 0;
+        if (ImGui::Checkbox("Queue the dark refresh with the lit one (Wait for vblank on, 3 presenter buffers)", &qd)) s.queueDark = qd ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The refresh after the lit one shows the same game frame, so it is drawn and queued right after\n"
+                                                      "the lit one: a stall while it is drawn has two refreshes of room instead of one. No added\n"
+                                                      "latency. Switches itself off if the queued present keeps waiting. Not with Queue one refresh ahead.");
         ImGui::SliderInt("Presenter buffers (applies when the swap chain is next created)", &s.presBuffers, 2, 4);
         {
             bool fx = s.vkExclusive != 0;

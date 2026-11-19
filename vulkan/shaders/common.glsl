@@ -9,7 +9,7 @@ layout(push_constant) uniform C
     float dfloor;
     float knee;
     float ceilLin;    // panel ceiling, linear (1.0 = SDR white / 80 nits)
-    uint  flags;      // 1 roll-off, 2 sine, 4 invert, 8 rolling scan, 1024 the game's frames are linear (scRGB; frame warp)
+    uint  flags;      // 1 roll-off, 2 sine, 4 invert, 8 rolling scan, 1024 the game's frames are linear (scRGB; frame warp), 2048 frame warp eases off moves past the rendered frame
     float sdrScale;   // outType 4/5 (SDR game shown as HDR10): SDR white in 80-nit units
     float sdrKnee;    // highlight expansion starts here (linear, 1.0 = SDR white)
     float sdrPeak;    // SDR white highlights expand to this (80-nit units); <= sdrScale = off
@@ -25,7 +25,13 @@ layout(push_constant) uniform C
     float rfxRamp;    // SDR to HDR, RenoFX HDR Boost (flags & 256): Ramp Intensity
     float rfxColor;   // its colour blend, 0..1 (0 = brightness only)
     float rfxApl;     // its APL Limiter: 1 = on (the scene average is in aplImg, measured from this frame)
-    float warp;       // frame warp: the frame is shown this share of its measured motion further on (0 = as rendered)
+    float warp;       // frame warp: the frame is shown this share of its measured motion further on (0 = as rendered);
+                      // with the game's own motion (warpSrc != 0): this many game frames further on
+    uint  warpSrc;    // 0 motion measured from the picture; 1 the game's motion vectors and depth; 2 its motion vectors only
+    float warpPrevN;  // the game's own motion: game frames between this frame and the one shown before
+    float warpSnapX;  // moves rounded to whole steps of this many game-frame pixels (0 = off)
+    float warpSnapY;
+    float warpLag;    // the game's motion with frame generation: shown frames this one is behind its vectors' frame
 } pc;
 layout(set = 0, binding = 0) uniform sampler2D src;
 // RenoFX APL Limiter: the frame's average SDR brightness (1x1), written by apl.comp before the frame's first refresh
