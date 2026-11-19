@@ -2280,7 +2280,7 @@ static void PresenterThread(Swapchain *sc)
     int autoAhead = 1, missSecs = 0, spareSecs = 0;
     double fseRetryT = 0.0; int fseShown = -2;
     // presentation health: slow image returns per second, automatic rebuild
-    int slowCount = 0, slowRun = 0, goodRun = 0, lastSlow = 0; bool kMark = false, markReq = false;
+    int slowCount = 0, slowLate = 0, slowRun = 0, goodRun = 0, lastSlow = 0; bool kMark = false, markReq = false;
     bool afterRebuild = Now() - g_lastRebuildT < 20.0, rebuildReq = false, kRebuild = false;
     double slowSecT = Now();
     // Uneven strobe cycles over the last 30 seconds (one count per second), so
@@ -3348,13 +3348,13 @@ static void PresenterThread(Swapchain *sc)
         }
         if (!pairIter && t - lastT > 1.5 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
         {
-            secLate++;
+            secLate++; slowLate++;
             lateTimes[lateIdx++ & 3] = t;
         }
         // A queued refresh is late only when it wasn't presented before the vblank it was meant for (two after its lit one's).
         else if (pairIter && pairVbT > 0.0 && t > pairVbT + 1.9 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0))
         {
-            secLate++;
+            secLate++; slowLate++;
             lateTimes[lateIdx++ & 3] = t;
         }
         if (s.hitchGuard && s.enabled)
@@ -3406,7 +3406,9 @@ static void PresenterThread(Swapchain *sc)
             // uncapped for a few seconds and fills the GPU, so images come back late for that reason
             // (RDR2: 20-30 slow returns a second during each try), which a rebuild can't fix.
             const bool capping = capProbe || t - capSwitchT < 3.0;
-            const bool bad = slowCount >= 8 && !capping;
+            // vp10: and only with refreshes missed in that second -- P.T.'s images came back 2.0-2.5 ms late all the time
+            // without a single refresh missed, and the rebuilds this set off (each a 1.5 s pause) were all that went wrong.
+            const bool bad = slowCount >= 8 && slowLate > 0 && !capping;
             slowRun = bad ? slowRun + 1 : 0;
             if (slowRun == 3)
             {
@@ -3456,7 +3458,7 @@ static void PresenterThread(Swapchain *sc)
                     LOGI("BFI Presenter: automatic recovery -- waiting: the last rebuild was %.0f s ago (%.0f s apart)", t - g_lastRebuildT,
                          g_rebuildGap);
             }
-            lastSlow = slowCount; slowCount = 0;
+            lastSlow = slowCount; slowCount = 0; slowLate = 0;
         }
         if (rebuildReq)
         {
