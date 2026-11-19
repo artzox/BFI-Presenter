@@ -4889,7 +4889,10 @@ static bool tried[2] = {}, hooked = false;
 static thread_local int inside = 0;
 // The parameter object (as DX): MSVC's order has Get(void**) at slot 8 and Get(float*) at 14; declaration order 15 and 9.
 static int slotPtr = 0, slotF = 0;
-static uint32_t nEval = 0, nUsed = 0, nNoMv = 0, nOther = 0, nBad = 0;
+static uint32_t nEval = 0, nUsed = 0, nNoMv = 0, nOther = 0, nBad = 0, nSide = 0;
+// The main view: games can upscale more than one view a frame (e.g. a small second view as well); only the largest
+// is used, so the warp never mixes two views' motion and the copies never change size from call to call.
+static uint64_t mainArea = 0; static double mainSeen = -1.0; static uint32_t mainW = 0, mainH = 0;
 static double winT = 0.0; static int reports = 0;
 
 static bool Readable(const void *p, size_t n)
@@ -5082,6 +5085,21 @@ static void OnEval(VkCommandBuffer cmd, const void *h, const void *params)
     const bool low = (flags & kMVLowRes) != 0;
     if (!rw || !rh) { rw = mv->w; rh = mv->h; }
     if (ringDev && ringDev != d) return;                           // one device
+    {
+        const double tn = Now();
+        const uint64_t area = (uint64_t)mv->w * mv->h;
+        if (area < mainArea && tn - mainSeen < 0.5) { nSide++; return; }   // a smaller view while the main one is current
+        if (area != mainArea && mainArea)
+        {
+            static int sideLogged = 0;
+            if (area > mainArea && sideLogged++ < 2)
+                LOGI("BFI Presenter: frame warp, the game's own motion: DLSS (Vulkan) upscales more than one view (%ux%u and %ux%u) -- only "
+                     "the largest is used", mainW, mainH, mv->w, mv->h);
+        }
+        mainArea = area; mainSeen = tn; mainW = mv->w; mainH = mv->h;
+    }
+    // copies retired after a size change wait for the GPU; if they pile up (sizes changing all the time) the call is skipped
+    if (retired.size() > 12) { nBad++; return; }
     ringDev = d;
     const int k = (int)(seq % kRing);
     Entry &e = ring[k];
@@ -5179,7 +5197,7 @@ static void AtPresent(DeviceData *d, Swapchain *sc, uint32_t slot, VkCommandBuff
     const double tn = Now();
     for (size_t i = 0; i < retired.size();)
     {
-        if (tn - retired[i].t > 3.0) { FreeImg(ringDev ? ringDev : d, retired[i].i); retired[i] = retired.back(); retired.pop_back(); }
+        if (tn - retired[i].t > 1.0) { FreeImg(ringDev ? ringDev : d, retired[i].i); retired[i] = retired.back(); retired.pop_back(); }
         else i++;
     }
     if (!On() || d != ringDev || !sc->gFlow[slot]) { pendN = 0; latest = -1; return; }
@@ -5319,18 +5337,18 @@ static void Tick(double t)
         if (!winT) winT = t;
     }
     if (!hooked || reports >= 30 || t - winT < 10.0) return;
-    uint32_t e, u, nm, o, bd;
+    uint32_t e, u, nm, o, bd, sd;
     {
         std::lock_guard<std::mutex> l(lk);
-        e = nEval; u = nUsed; nm = nNoMv; o = nOther; bd = nBad;
-        nEval = nUsed = nNoMv = nOther = nBad = 0;
+        e = nEval; u = nUsed; nm = nNoMv; o = nOther; bd = nBad; sd = nSide;
+        nEval = nUsed = nNoMv = nOther = nBad = nSide = 0;
     }
     const double secs = t - winT;
     winT = t;
     if (!e) return;
     reports++;
-    LOGI("BFI Presenter: DLSS (Vulkan): last %.0f s: %.0f calls/s, used %.0f/s, other features %.0f/s, without vectors %.0f/s, not usable %.0f/s",
-         secs, e / secs, u / secs, o / secs, nm / secs, bd / secs);
+    LOGI("BFI Presenter: DLSS (Vulkan): last %.0f s: %.0f calls/s, used %.0f/s, smaller views %.0f/s, other features %.0f/s, without vectors %.0f/s, "
+         "not usable %.0f/s", secs, e / secs, u / secs, sd / secs, o / secs, nm / secs, bd / secs);
 }
 static int State() { return state.load(); }
 #else
