@@ -269,7 +269,7 @@ struct Settings
     int   osdGraph = 1;       // OsdGraph: frame-time graph
     int   osdLoads = 1;       // OsdLoads: CPU / GPU load
     float osdScale = 1.0f;    // OsdScale: text size
-    int   frameWarp = 0;      // FrameWarp (test): a strobe cycle without a new game frame shows the last one moved ahead
+    int   frameWarp = 0;      // FrameWarp: a strobe cycle without a new game frame shows the last one moved ahead
                               // along the camera's motion instead of lit again (as in the DX add-on, v1.0.41)
     float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
@@ -6761,7 +6761,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         ImGui::Spacing();
         ImGui::SeparatorText("Every cap");
         bool fw = s.frameWarp != 0;
-        if (ImGui::Checkbox("Frame warp: fill missing frames (test, Ctrl+Shift+W)", &fw)) s.frameWarp = fw ? 1 : 0;
+        if (ImGui::Checkbox("Frame warp: fill missing frames (Ctrl+Shift+W)", &fw)) s.frameWarp = fw ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("For games that run just under the strobe rate (50-59 fps against a 60 Hz strobe). A strobe\n"
                                                       "cycle without a new game frame normally lights the last one again: the picture stands\n"
                                                       "still for a flash, then jumps. Frame warp shows that frame moved part of the way along the\n"
@@ -6774,7 +6774,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "cap or frame generation); for hitches and loading stalls; for things that move on their own\n"
                                                       "(a character, a car), which keep their stutter. With frame generation it works, with less to fill.\n"
                                                       "A filled flash is a guess: edges of things moving against the background can smear for that\n"
-                                                      "flash, and a CRT shader's mask moves with the picture. Vulkan layer: test build, see the settings guide.");
+                                                      "flash, and a CRT shader's mask moves with the picture. Details: the settings guide.");
         if (s.frameWarp)
         {
             ImGui::Indent(16.0f);
