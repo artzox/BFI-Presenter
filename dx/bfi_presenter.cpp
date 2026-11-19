@@ -147,7 +147,7 @@ struct Settings
     int   splitSide = 0;      // 0 = the left side without BFI, 1 = the right side
     int   splitPos = 50;      // the seam, percent of the width from the left
     int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
-    int   frameWarp = 0;      // FrameWarp (test): a strobe cycle without a new game frame shows the last one moved ahead
+    int   frameWarp = 0;      // FrameWarp: a strobe cycle without a new game frame shows the last one moved ahead
                               // along the camera's motion instead of lit again (no frame is held back: no added latency)
     float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
@@ -13496,7 +13496,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
         ImGui::TextDisabled("Fine-tuning (later release at Refresh rate, the just-in-time margin, lining Reflex's limit up): Advanced.");
         ImGui::Spacing();
         bool fw = s.frameWarp != 0;
-        if (ImGui::Checkbox("Frame warp: fill missing frames (test, Ctrl+Shift+W)", &fw)) s.frameWarp = fw ? 1 : 0;
+        if (ImGui::Checkbox("Frame warp: fill missing frames (Ctrl+Shift+W)", &fw)) s.frameWarp = fw ? 1 : 0;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("For games that run just under the strobe rate (50-59 fps against a 60 Hz strobe). A strobe\n"
                                                       "cycle without a new game frame normally lights the last one again: the picture stands\n"
                                                       "still for a flash, then jumps. Frame warp shows that frame moved part of the way along the\n"
@@ -13509,7 +13509,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "cap or frame generation); for hitches and loading stalls; for things that move on their own\n"
                                                       "(a character, a car), which keep their stutter. With frame generation it works, with less to fill.\n"
                                                       "A filled flash is a guess: edges of things moving against the background can smear for that\n"
-                                                      "flash, and a CRT shader's mask moves with the picture. Test build: see the settings guide.");
+                                                      "flash, and a CRT shader's mask moves with the picture (see Snap below). Details: the settings guide.");
         if (s.frameWarp)
         {
             ImGui::Indent(16.0f);
@@ -13526,7 +13526,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
             else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else ImGui::Text("Waiting for the game's frame rate.");
             bool gm = s.warpGame != 0;
-            if (ImGui::Checkbox("Use the game's own motion vectors and depth (test)", &gm)) s.warpGame = gm ? 1 : 0;
+            if (ImGui::Checkbox("Use the game's own motion vectors and depth", &gm)) s.warpGame = gm ? 1 : 0;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (through Streamline or directly, DX12) its motion vectors and\n"
                                                           "depth, frame warp moves each part of the picture by the game's own motion for it, and\n"
                                                           "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
