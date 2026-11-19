@@ -8288,10 +8288,16 @@ static std::atomic<UINT64> cutId{0};
 static std::atomic<int> cutsSec{0};
 static std::atomic<bool> lbOn{false};
 static std::atomic<double> lbT{0.0};
+// Only a letterbox that follows full-screen output in this session counts as a cutscene, and one that lasts over 10
+// minutes in a row is play (a game letterboxed throughout, by design): frame warp works there as usual.
+static std::atomic<bool> lbFullSeen{false};
+static std::atomic<double> lbStartT{0.0};
 static void NoteLetterbox(bool lb, unsigned w, unsigned h, unsigned fw, unsigned fh, const char *from)
 {
     const bool was = lbOn.exchange(lb);
     if (lb) lbT = Now();
+    if (!lb) lbFullSeen = true;
+    if (lb && !was) lbStartT = Now();
     if (lb != was)
     {
         static int logged = 0;
@@ -8977,7 +8983,16 @@ static bool PauseNow(UINT64 id, bool letterbox, const char **why)
     const UINT64 c = cutId.load();
     const UINT64 k = (UINT64)std::max(1, g_status.fgActive ? fgK : 1);
     if (c && id >= c && id < c + 3 * k) { *why = "camera cut"; return true; }
-    if (letterbox && lbOn.load() && Now() - lbT.load() < 1.0) { *why = "letterboxed cutscene"; return true; }
+    if (letterbox && lbOn.load() && Now() - lbT.load() < 1.0 && lbFullSeen.load())
+    {
+        if (Now() - lbStartT.load() < 600.0) { *why = "letterboxed cutscene"; return true; }
+        static double loggedFor = -1.0;
+        if (loggedFor != lbStartT.load())
+        {
+            loggedFor = lbStartT.load();
+            LOGI("BFI Presenter: frame warp: letterboxed for over 10 minutes -- taken as play, not a cutscene; frame warp works again");
+        }
+    }
     return false;
 }
 
@@ -13690,7 +13705,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
                                                           "screen, e.g. Townfall): its quick cuts between camera angles have no motion to follow.\n"
-                                                          "Right after a camera cut the game flags, frames are never filled either way.");
+                                                          "Only after full-screen play in the same session, and not once a letterbox has lasted\n"
+                                                          "10 minutes (play, in a game letterboxed by design). Turn it off for a game whose play\n"
+                                                          "switches in and out of letterbox. Right after a camera cut the game flags, frames are\n"
+                                                          "never filled either way.");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (through Streamline or directly, DX12) its motion vectors and\n"
                                                           "depth, frame warp moves each part of the picture by the game's own motion for it, and\n"
                                                           "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
