@@ -8,11 +8,43 @@ layout(set = 1, binding = 0) uniform sampler2D srcNew;
 layout(set = 2, binding = 0) uniform sampler2D flowTex;   // xy = how far the picture moved since the frame before (uv), z = confidence
 layout(set = 2, binding = 1) uniform sampler2D srcPrev;
 layout(set = 2, binding = 2) uniform sampler2D srcLin;
+layout(set = 2, binding = 3) uniform sampler2D gameFlow;   // the game's own motion for this frame (gameflow.comp), half size
+
+// The game's own motion (as dx/bfi_presenter.cpp, WarpShiftGame): the place the output pixel comes from is found in up
+// to three steps along the motion, and each step checked -- does the point found really move onto this pixel? Of the
+// steps that do, the nearest point wins; where none does, the background's motion (the farthest point) fills it.
+// With frame generation, the vectors are read warpLag shown frames further along each point's motion.
+vec4 GameFlow(vec2 uv)
+{
+    ivec2 s = textureSize(gameFlow, 0);
+    return texelFetch(gameFlow, clamp(ivec2(uv * vec2(s)), ivec2(0), s - 1), 0);
+}
+vec2 WarpShiftGame(vec2 uv)
+{
+    vec2 osz = vec2(textureSize(src, 0));
+    float L = pc.warp - pc.warpLag;
+    vec2 m[3];
+    m[0] = GameFlow(uv).xy;
+    m[1] = GameFlow(uv - m[0] * L).xy;
+    m[2] = GameFlow(uv - m[1] * L).xy;
+    vec2 best = vec2(0.0), back = vec2(0.0);
+    float bestNear = -1.0, backNear = 2.0;
+    for (int i = 0; i < 3; i++)
+    {
+        vec4 g = GameFlow(uv - m[i] * L);
+        if (g.z < 0.5) continue;
+        if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; }
+        if (g.w < backNear) { backNear = g.w; back = m[i]; }
+    }
+    if (bestNear < 0.0) best = backNear <= 1.0 ? back : vec2(0.0);
+    return clamp(best * pc.warp, -0.08, 0.08);
+}
 
 // How far back along its motion the picture shown at uv is taken from, in uv (read where the picture comes from, so a
 // moving area's own motion is used); at most 8% of the screen.
 vec2 WarpShift(vec2 uv)
 {
+    if (pc.warpSrc != 0u) return WarpShiftGame(uv);
     vec4 f = textureLod(flowTex, uv, 0.0);
     vec2 d = f.xy * (f.z * pc.warp);
     f = textureLod(flowTex, uv - d, 0.0);
@@ -38,8 +70,8 @@ bool Still(ivec2 q, vec2 size)
     if (n >= 5) return true;
     if (n < 1) return false;
     vec2 c = vec2(q) + 0.5;
-    vec4 f = textureLod(flowTex, c / size, 0.0);
-    vec2 step = f.xy * f.z * size;
+    vec4 f = pc.warpSrc != 0u ? textureLod(gameFlow, c / size, 0.0) : textureLod(flowTex, c / size, 0.0);
+    vec2 step = f.xy * size * (pc.warpSrc != 0u ? min(f.z, 1.0) * pc.warpPrevN : f.z);
     if (dot(step, step) < 2.25) return true;
     vec3 a = texelFetch(src, q, 0).rgb;
     vec3 d = abs(a - textureLod(srcPrev, (c - step) / size, 0.0).rgb);
@@ -53,6 +85,8 @@ bool FetchWarped(vec2 fc, out vec3 c)
     vec2 size = vec2(textureSize(src, 0));
     vec2 inv = 1.0 / size;
     vec2 d = WarpShift(fc * inv) * size;
+    if (pc.warpSnapX > 0.0) d.x = round(d.x / pc.warpSnapX) * pc.warpSnapX;
+    if (pc.warpSnapY > 0.0) d.y = round(d.y / pc.warpSnapY) * pc.warpSnapY;
     if (dot(d, d) < 0.0004) return false;
     if (Still(ivec2(fc), size)) return false;
     vec2 p = clamp(fc - d, vec2(0.5), size - 0.5);

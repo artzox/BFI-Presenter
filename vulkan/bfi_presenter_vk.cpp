@@ -58,6 +58,9 @@
 
 #include "shaders_spv.h"
 #include "../common/bfi_warpclock.h"   // frame warp: how far ahead each strobe cycle shows its frame (shared with DX)
+#include "../common/bfi_inlinehook.h"  // x64 inline hooks (DLSS calls for the game's motion; shared with DX)
+struct Swapchain; struct DeviceData;
+namespace gvk { static void Tick(double t); static int State(); }
 
 #define BFI_VERSION "1.0.44"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
@@ -273,6 +276,12 @@ struct Settings
                               // along the camera's motion instead of lit again (as in the DX add-on, v1.0.41)
     float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
+    int   warpGame = 1;       // FrameWarpGameMotion (as DX 1.0.44): the game's own motion vectors and depth where it hands them to DLSS
+    int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: also while frame generation is on (edges double up on generated frames)
+    float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this many shown frames
+    float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many pixels
+    int   dlssHooks = 1;      // DlssHooks: DLSS's Vulkan calls are hooked for the game's motion (0 = left alone)
+    int   dlssLayout = 1;     // DlssInputLayout (ini only): the layout DLSS's inputs are in at its call (VkImageLayout, 1 = GENERAL)
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
                               // refreshes alternate between the panel's + and - drive polarity (no image retention)
     int   lcdSwapSec = 5;    // seconds of full strobe between phase shifts (1-300)
@@ -388,6 +397,13 @@ static void LoadSettings(Settings &s)
     s.frameWarp = KvInt(kv, "FrameWarp", 0) != 0 ? 1 : 0;
     s.warpMax = Clamp(KvFloat(kv, "FrameWarpMaxAhead", 1.0f), 0.25f, 1.5f);
     s.warpMinRate = Clamp(KvInt(kv, "FrameWarpMinRate", 75), 40, 95);
+    s.warpGame = KvInt(kv, "FrameWarpGameMotion", 1) ? 1 : 0;
+    s.warpGameFg = KvInt(kv, "FrameWarpGameMotionWithFG", 0) ? 1 : 0;
+    s.warpMaxGameFg = Clamp(KvFloat(kv, "FrameWarpGameMotionMaxAheadFG", 0.10f), 0.1f, 1.5f);
+    s.warpSnapX = Clamp(KvFloat(kv, "FrameWarpSnapX", 0.0f), 0.0f, 16.0f);
+    s.warpSnapY = Clamp(KvFloat(kv, "FrameWarpSnapY", 0.0f), 0.0f, 16.0f);
+    s.dlssHooks = KvInt(kv, "DlssHooks", 1) ? 1 : 0;
+    s.dlssLayout = KvInt(kv, "DlssInputLayout", 1);
     s.osdCorner = std::max(0, std::min(3, KvInt(kv, "OsdCorner", 1)));
     s.osdGraph = KvInt(kv, "OsdGraph", 1) ? 1 : 0;
     s.osdLoads = KvInt(kv, "OsdLoads", 1) ? 1 : 0;
@@ -468,7 +484,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexLimitAtSleep", s.reflexAtSleep); I("ReflexAlign", s.reflexAlign); I("LearnReflexStart", s.learnReflex); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -506,6 +522,8 @@ struct Status
     int    warpOn = 0;                      // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
     int    warpCycles = 0;                  // per second: strobe cycles shown moved ahead
     double warpAvg = 0.0, warpRate = 0.0;   // their average offset (game frames); the game's frames per strobe cycle
+    int    warpSrc = 0;                     // what moved them: 0 the measured motion, 1 the game's vectors and depth, 2 its vectors only
+    int    warpGameState = 0;               // the game's motion: 0 no DLSS call seen, 1 vectors and depth, 2 vectors only
     int    lrState = 0;                     // just-in-time release: 0 off, 1 measuring, 2 active, 3 at its limit
     double lrEst = 0.0, lrMargin = 0.0;
     int    lrMisses = 0;
@@ -698,8 +716,14 @@ struct Constants
     uint32_t splitMode;           // 0 off, 1 left side without BFI, 2 right side
     float    rfxRamp, rfxColor;         // SDR to HDR with RenoFX's HDR Boost: Ramp Intensity, colour blend 0..1
     float    rfxApl;                    // its APL Limiter: 1 = on (GPU-measured from the frame being shown)
-    float    warp;                      // frame warp: share of the measured motion the frame is moved ahead (0 = off)
+    float    warp;                      // frame warp: share of the measured motion the frame is moved ahead (0 = off);
+                                        // with the game's own motion (warpSrc != 0): game frames ahead
+    uint32_t warpSrc;                   // 0 motion from the picture, 1 the game's motion vectors and depth, 2 its vectors only
+    float    warpPrevN;                 // the game's own motion: game frames back to the frame shown before
+    float    warpSnapX, warpSnapY;      // moves rounded to whole steps of this many game-frame pixels (0 = off)
+    float    warpLag;                   // the game's motion with frame generation: shown frames behind its vectors' frame
 };
+static_assert(sizeof(Constants) <= 128, "push constants: 128 bytes is the most every GPU offers");
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
 // every 32x18 cell's lit value is capped at C. Plain strobe: the lit refresh.
@@ -855,6 +879,19 @@ struct Swapchain
     double         stageTime[kStage] = {};
     uint64_t       stagePresentId[kStage] = {};
     uint64_t       slotReadSub[kStage] = {};    // presenter submission that last read the slot
+    // Frame warp with the game's own motion (gvk): a motion texture per staging slot at half the frame's size, written at
+    // the game's present from the vectors and depth it handed DLSS for that frame.
+    VkImage        gFlow[kStage] = {};
+    VkDeviceMemory gFlowMem[kStage] = {};
+    VkImageView    gFlowView[kStage] = {};
+    uint32_t       gW = 0, gH = 0;
+    bool           gFlowInit[kStage] = {};      // in GENERAL
+    bool           gPend[kStage] = {};          // written for the frame being staged in the slot
+    uint64_t       gSlotId[kStage] = {};        // the game frame its motion texture is for (0 = none)
+    bool           gSlotDepth[kStage] = {};
+    float          gSlotLag[kStage] = {};
+    bool           gPendCut[kStage] = {};
+    uint64_t       gCutId = 0;                  // the last frame the game flagged as a camera cut
     int            presCurSlot = -1;
     int            presCurSlot2 = -1;           // split comparison: the newer frame its side without BFI shows
     int            presPrevSlot = -1;           // frame warp: the frame shown before the current one (kept in the ring)
@@ -1740,7 +1777,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     if (p)
     {
         // Frame warp: set 2 is needed by the BFI pipelines; its passes are optional.
-        p = R.warp.Init(d, sc->stageView, sc->extent.width, sc->extent.height);
+        p = R.warp.Init(d, sc->stageView, sc->gFlowView, sc->extent.width, sc->extent.height);
         if (p && !R.warp.ok) LOGW("BFI Presenter: frame warp unavailable (its compute passes could not be created)");
     }
     if (!p)
@@ -2276,8 +2313,9 @@ static void PresenterThread(Swapchain *sc)
     int      warpPrev = -1;
     uint64_t warpPrevId = 0;
     bool     warpPrevReady = false, cycleStartW = false;
-    int      secWarpCycles = 0;
+    int      secWarpCycles = 0, secWarpGame = 0, secWarpCut = 0;   // per second: cycles moved, of them with the game's motion; paused at cuts
     double   secWarpSum = 0.0;
+    int      winWarpCut = 0; double winCutT = 0.0;
     double   tsPassMs = -1.0, tsDrawMs = -1.0;   // the last GPU times read back (timing log)
     int      tsDrawWarped = 0;
     FILE *logf = nullptr;
@@ -2734,11 +2772,33 @@ static void PresenterThread(Swapchain *sc)
             warpAhead = warpClock.Cycle(true, pickId, pickTime, Now(), (double)s.frames * sc->period.load(),
                                         (double)s.warpMax, (double)s.warpMinRate / 100.0);
         uint64_t warpOld = 0;
-        c.warp = 0.0f;
+        c.warp = 0.0f; c.warpSrc = 0; c.warpPrevN = 0.0f; c.warpLag = 0.0f;
+        c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
         if (warpAhead > 0.0 && s.frameWarp && R.warp.ok && !copyMode && (warpOld = R.warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrevReady && warpPrevId == warpOld)
-            c.warp = (float)(std::floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
-        if (cycleStartW && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; }
+        {
+            // The game's own motion (where it hands DLSS its motion vectors and depth, gvk): one game frame's motion,
+            // warpAhead frames on. Otherwise the motion measured between this frame and the one shown before.
+            const int fgF = std::max(1, g_vkFgFactor.load());
+            const bool gOk = s.warpGame && (fgF <= 1 || s.warpGameFg) && sc->gSlotId[pick] == pickId && pickId != 0;
+            if (gOk)
+            {
+                const double ahead = fgF > 1 ? std::min(warpAhead, (double)s.warpMaxGameFg) : warpAhead;
+                c.warp = (float)(std::floor(ahead * 256.0 + 0.5) / 256.0);
+                c.warpPrevN = (float)(pickId - warpOld);
+                c.warpSrc = sc->gSlotDepth[pick] ? 1u : 2u;
+                c.warpLag = fgF > 1 ? sc->gSlotLag[pick] : 0.0f;
+            }
+            else c.warp = (float)(std::floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
+            // Around a camera cut the game flags: shown as rendered (no motion connects two shots), for 3 rendered frames.
+            const uint64_t cut = sc->gCutId;
+            if (c.warp != 0.0f && cut && pickId >= cut && pickId < cut + 3 * (uint64_t)fgF)
+            {
+                c.warp = 0.0f; c.warpSrc = 0;
+                if (cycleStartW) secWarpCut++;
+            }
+        }
+        if (cycleStartW && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame += c.warpSrc != 0 ? 1 : 0; }
         if (sc->format == VK_FORMAT_R16G16B16A16_SFLOAT) c.flags |= 1024u;   // linear frames (frame warp's comparisons)
 
         bool dumpNow = false;
@@ -2813,7 +2873,7 @@ static void PresenterThread(Swapchain *sc)
                         R.warp.RecordLuma(d, cb, (uint32_t)pick, pickId, pickTime, (c.flags & 1024u) != 0);
                         warpTouched = true;
                     }
-                    if (c.warp != 0.0f && (R.warp.flowNew != pickId || R.warp.flowOld != warpOld)) { R.warp.RecordFlow(d, cb); warpTouched = true; }
+                    if (c.warp != 0.0f && c.warpSrc == 0 && (R.warp.flowNew != pickId || R.warp.flowOld != warpOld)) { R.warp.RecordFlow(d, cb); warpTouched = true; }
                     if (warpTouched) R.warp.ToShade(d, cb);
                 }
             }
@@ -3415,7 +3475,30 @@ static void PresenterThread(Swapchain *sc)
                 g_status.warpCycles = secWarpCycles;
                 g_status.warpAvg = secWarpCycles ? secWarpSum / secWarpCycles : 0.0;
                 g_status.warpRate = warpClock.rate;
-                secWarpCycles = 0; secWarpSum = 0.0;
+                g_status.warpSrc = secWarpGame > 0 ? (gvk::State() == 1 ? 1 : 2) : 0;
+                g_status.warpGameState = gvk::State();
+                // which motion moves the picture, logged when it changes (as DX)
+                {
+                    static int srcWas = -1;
+                    const int src = secWarpCycles ? (secWarpGame * 2 >= secWarpCycles ? g_status.warpSrc : 0) : -1;
+                    if (src >= 0 && src != srcWas)
+                    {
+                        srcWas = src;
+                        LOGI("BFI Presenter: frame warp moves the picture with %s (%d of %d cycles in the last second)",
+                             src == 1 ? "the game's own motion vectors and depth" : src == 2 ? "the game's own motion vectors (no depth)"
+                             : "the motion measured from the picture", src ? secWarpGame : secWarpCycles - secWarpGame, secWarpCycles);
+                    }
+                }
+                winWarpCut += secWarpCut;
+                if (t - winCutT >= 10.0)
+                {
+                    static int cutLogs = 0;
+                    if (winWarpCut && cutLogs++ < 60)
+                        LOGI("BFI Presenter: frame warp, last %.0f s: %d strobe cycles not filled (camera cuts flagged by the game)", t - winCutT, winWarpCut);
+                    winWarpCut = 0; winCutT = t;
+                }
+                gvk::Tick(t);
+                secWarpCycles = 0; secWarpSum = 0.0; secWarpGame = 0; secWarpCut = 0;
             }
             Osd::AddSecond(secFrameSkips, secFrameRepeats, secLate, Now());
             g_status.unevenRep    = secRepU;
@@ -4777,6 +4860,486 @@ static void ConsumeWaits(DeviceData *d, VkQueue queue, uint32_t n, const VkSemap
 // One game frame: copy the presented stand-in image into a free staging slot
 // (after the game's rendering, via its semaphores), then hold the game to the
 // frames-ahead limit and the frame cap.
+// ---------------------------------------------------------------------------------------------------------
+// Frame warp with the game's own motion, Vulkan (as the DX add-on's gmo / ngx namespaces, 1.0.44): where a Vulkan game
+// hands DLSS (NGX) its motion vectors and depth, they are copied on the game's command buffer at its DLSS call, and at
+// its present turned into a motion texture for the frame being staged (shaders/gameflow.comp), on the game's queue.
+// The presenter's BFI shader then moves each part of the picture by its own motion (bfi_shade.glsl, WarpShiftGame).
+// DLSS's Vulkan entry points in _nvngx.dll (and a nvngx.dll in the game's folder) are hooked; Streamline calls them
+// too, so games that go through Streamline are covered as well. 64-bit only.
+namespace gvk
+{
+#ifdef _WIN64
+typedef int (*PFN_Create)(VkCommandBuffer cb, int feature, void *params, void **out);
+typedef int (*PFN_Create1)(VkDevice dv, VkCommandBuffer cb, int feature, void *params, void **out);
+typedef int (*PFN_Eval)(VkCommandBuffer cb, const void *h, const void *params, void *cbk);
+typedef int (*PFN_Get)(const void *self, const char *name, void *out);
+// NVSDK_NGX_Resource_VK: the image view info (view, image, subresource range, format, width, height), its type and
+// whether it is written.
+struct ResVk { VkImageView view; VkImage image; VkImageSubresourceRange range; VkFormat format; unsigned w, h; int type; uint8_t rw; };
+static_assert(offsetof(ResVk, format) == 36 && offsetof(ResVk, w) == 40 && offsetof(ResVk, type) == 48, "NVSDK_NGX_Resource_VK layout");
+static const int kSuccess = 1;                         // NVSDK_NGX_Result_Success
+enum { kSR = 1, kRR = 13 };                            // NVSDK_NGX_Feature_SuperSampling, _RayReconstruction
+enum { kMVLowRes = 1 << 1, kDepthInverted = 1 << 3 };  // NVSDK_NGX_DLSS_Feature_Flags
+static PFN_Create o_Create[2] = {}; static PFN_Create1 o_Create1[2] = {}; static PFN_Eval o_Eval[2] = {}, o_EvalC[2] = {};
+static std::mutex lk;
+struct Feat { int feature, flags; unsigned w, h; };
+static std::map<uintptr_t, Feat> feats;                // by handle address (as DX)
+static bool tried[2] = {}, hooked = false;
+static thread_local int inside = 0;
+// The parameter object (as DX): MSVC's order has Get(void**) at slot 8 and Get(float*) at 14; declaration order 15 and 9.
+static int slotPtr = 0, slotF = 0;
+static uint32_t nEval = 0, nUsed = 0, nNoMv = 0, nOther = 0, nBad = 0;
+static double winT = 0.0; static int reports = 0;
+
+static bool Readable(const void *p, size_t n)
+{
+    if (!p || (uintptr_t)p < 0x10000) return false;
+    MEMORY_BASIC_INFORMATION mi = {};
+    if (!VirtualQuery(p, &mi, sizeof(mi)) || mi.State != MEM_COMMIT) return false;
+    if (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    return (const BYTE *)p + n <= (const BYTE *)mi.BaseAddress + mi.RegionSize;
+}
+static inline bool Plaus(const void *p) { const uintptr_t u = (uintptr_t)p; return u >= 0x10000 && u < 0x7FFFFFFF0000ull && !(u & 7); }
+static int Get(const void *p, int slot, const char *name, void *out) { return ((PFN_Get)(*(void ***)p)[slot])(p, name, out); }
+static bool GetU(const void *p, const char *name, unsigned &v)
+{
+    uint64_t x = 0;
+    if (Get(p, 11, name, &x) != kSuccess && Get(p, 12, name, &x) != kSuccess) return false;
+    v = (unsigned)x; return true;
+}
+static bool IsDepthFmt(VkFormat f) { return f == VK_FORMAT_D16_UNORM || f == VK_FORMAT_X8_D24_UNORM_PACK32 || f == VK_FORMAT_D32_SFLOAT ||
+                                            f == VK_FORMAT_D16_UNORM_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT; }
+static bool HasStencil(VkFormat f) { return f == VK_FORMAT_D16_UNORM_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT; }
+static bool ResOk(const ResVk *r, bool deep)
+{
+    if (!Plaus(r) || (deep && !Readable(r, sizeof(ResVk)))) return false;
+    return r->type == 0 && r->image && r->w >= 8 && r->h >= 8 && r->w <= 16384 && r->h <= 16384 && (int)r->format > 0 && (int)r->format < 200;
+}
+static const ResVk *GetRes(const void *p, const char *name, const char *enc)
+{
+    uint64_t v = 0;
+    if (Get(p, slotPtr, name, &v) == kSuccess && v) return (const ResVk *)(uintptr_t)v;
+    v = 0;
+    if (enc && Get(p, slotPtr, enc, &v) == kSuccess && v) return (const ResVk *)(uintptr_t)v;
+    return nullptr;
+}
+static bool Layout(const void *p)
+{
+    if (slotPtr) return slotPtr > 0;
+    const int tryPtr[2] = { 8, 15 };
+    for (int i = 0; i < 2 && !slotPtr; i++)
+        for (const char *nm : { "MotionVectors", "#\x27" })
+        {
+            uint64_t v = 0;
+            if (Get(p, tryPtr[i], nm, &v) == kSuccess && v && ResOk((const ResVk *)(uintptr_t)v, true))
+            { slotPtr = tryPtr[i]; slotF = tryPtr[i] == 8 ? 14 : 9; break; }
+        }
+    if (!slotPtr)
+    {
+        slotPtr = -1;
+        LOGW("BFI Presenter: frame warp, the game's own motion: DLSS's (Vulkan) parameter object isn't laid out as expected -- its calls are left alone");
+        return false;
+    }
+    LOGI("BFI Presenter: frame warp, the game's own motion: DLSS (Vulkan) parameters read in %s order", slotPtr == 8 ? "MSVC's" : "declaration");
+    return true;
+}
+
+struct Img { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; VkFormat fmt = VK_FORMAT_UNDEFINED;
+             uint32_t w = 0, h = 0; };
+struct Entry { Img mv, dp; bool hasDepth = false, reset = false, depthRev = false; float mvScale[2] = {}, mvMap[4] = {}, dMap[4] = {}; };
+static const int kRing = 3;
+static Entry ring[kRing];
+static uint64_t seq = 0;
+static int pend[2] = {}, pendN = 0, latest = -1;
+static DeviceData *ringDev = nullptr;
+struct Retired { Img i; double t; };
+static std::vector<Retired> retired;
+static uint64_t fgSeqSeen = 0; static int fgIdx = 0;
+// the motion pass, created on first use
+static VkDescriptorSetLayout dsl = VK_NULL_HANDLE; static VkPipelineLayout pl = VK_NULL_HANDLE; static VkShaderModule cs = VK_NULL_HANDLE;
+static VkPipeline pso = VK_NULL_HANDLE; static VkSampler nearest = VK_NULL_HANDLE; static VkDescriptorPool pool = VK_NULL_HANDLE;
+static VkDescriptorSet sets[kRing][kStage] = {};
+static VkImageView setMv[kRing][kStage] = {}, setDp[kRing][kStage] = {}, setOut[kRing][kStage] = {};
+static bool gpuFailed = false;
+static std::atomic<int> state{0};                      // 0 none seen, 1 vectors and depth, 2 vectors only (the panel)
+struct GPush { float outTexel[2], mvScale[2], mvMap[4], dMap[4]; uint32_t flags; float mvInvalid; };
+
+static bool On() { return g_shared.frameWarp && g_shared.warpGame && g_shared.dlssHooks; }
+
+static void FreeImg(DeviceData *d, Img &i)
+{
+    if (i.view) d->DestroyImageView(d->device, i.view, nullptr);
+    if (i.img) d->DestroyImage(d->device, i.img, nullptr);
+    if (i.mem) d->FreeMemory(d->device, i.mem, nullptr);
+    i = Img();
+}
+static bool MakeImg(DeviceData *d, Img &i, VkFormat fmt, uint32_t w, uint32_t h)
+{
+    VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = fmt;
+    ici.extent = { w, h, 1 };
+    ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.sharingMode = d->families.size() > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    ici.queueFamilyIndexCount = d->families.size() > 1 ? (uint32_t)d->families.size() : 0;
+    ici.pQueueFamilyIndices = d->families.size() > 1 ? d->families.data() : nullptr;
+    if (!CreateImageMem(d, ici, &i.img, &i.mem)) { i = Img(); return false; }
+    VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vci.image = i.img;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = fmt;
+    vci.subresourceRange = { (VkImageAspectFlags)(IsDepthFmt(fmt) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1 };
+    if (d->CreateImageView(d->device, &vci, nullptr, &i.view) != VK_SUCCESS) { FreeImg(d, i); return false; }
+    i.fmt = fmt; i.w = w; i.h = h;
+    return true;
+}
+// The copy, on the game's command buffer before DLSS reads its inputs: the source to TRANSFER_SRC and back to the
+// layout DLSS expects it in (DlssInputLayout, GENERAL by default), ours to SHADER_READ_ONLY for the motion pass.
+static bool Copy(DeviceData *d, VkCommandBuffer cb, const ResVk &r, Img &dst)
+{
+    const bool depth = IsDepthFmt(r.format);
+    if (!dst.img || dst.fmt != r.format || dst.w != r.w || dst.h != r.h)
+    {
+        if (dst.img) retired.push_back({ dst, Now() });
+        dst = Img();
+        if (!MakeImg(d, dst, r.format, r.w, r.h)) return false;
+    }
+    const VkImageLayout L = (VkImageLayout)g_shared.dlssLayout;
+    VkImageSubresourceRange sr = r.range;
+    sr.aspectMask = depth ? (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (HasStencil(r.format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : VK_IMAGE_ASPECT_COLOR_BIT;
+    sr.levelCount = 1; sr.layerCount = 1;
+    VkImageMemoryBarrier b[2] = {};
+    b[0] = ImgBarrier(r.image, L, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    b[0].subresourceRange = sr;
+    b[1] = ImgBarrier(dst.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    if (depth) b[1].subresourceRange.aspectMask = sr.aspectMask;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+    VkImageCopy ic = {};
+    const VkImageAspectFlags a = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    ic.srcSubresource = { a, r.range.baseMipLevel, r.range.baseArrayLayer, 1 };
+    ic.dstSubresource = { a, 0, 0, 1 };
+    ic.extent = { r.w, r.h, 1 };
+    d->CmdCopyImage(cb, r.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    b[0] = ImgBarrier(r.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, L, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    b[0].subresourceRange = sr;
+    b[1] = ImgBarrier(dst.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT);
+    if (depth) b[1].subresourceRange.aspectMask = sr.aspectMask;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+    return true;
+}
+
+static void OnCreate(int feature, const void *params, void *h)
+{
+    if (!h || !Plaus(h) || !params || !Plaus(params)) return;
+    Feat f = { feature, -1, 0, 0 };
+    unsigned fl = 0;
+    if (GetU(params, "DLSS.Feature.Create.Flags", fl)) f.flags = (int)fl;
+    GetU(params, "Width", f.w); GetU(params, "Height", f.h);
+    std::lock_guard<std::mutex> l(lk);
+    feats[(uintptr_t)h] = f;
+    static int logged = 0;
+    if (logged++ < 8)
+        LOGI("BFI Presenter: DLSS (Vulkan) feature %d created: render size %ux%u, flags 0x%x%s", feature, f.w, f.h, fl, f.flags < 0 ? " (not stated)" : "");
+}
+
+static void OnEval(VkCommandBuffer cmd, const void *h, const void *params)
+{
+    if (!On() || !cmd || !params || !Plaus(params)) return;
+    DeviceData *d = GetDev(Key(cmd));
+    if (!d || !d->CmdCopyImage) return;
+    std::lock_guard<std::mutex> l(lk);
+    nEval++;
+    Feat f = { 0, -1, 0, 0 };
+    auto it = h ? feats.find((uintptr_t)h) : feats.end();
+    const bool known = it != feats.end();
+    if (known) f = it->second;
+    if (known && f.feature != kSR && f.feature != kRR) { nOther++; return; }
+    if (!Layout(params)) return;
+    const ResVk *mv = GetRes(params, "MotionVectors", "#\x27");
+    if (!mv) { nNoMv++; return; }                                  // not an upscaler call (frame generation has names of its own)
+    const ResVk *dp = GetRes(params, "Depth", "#\x3d");
+    static int deepN = 0;
+    const bool deep = (deepN++ % 120) == 0;                        // the pointers checked with a system call now and then
+    if (!ResOk(mv, deep)) { nBad++; return; }
+    if (dp && (!ResOk(dp, deep) || (!IsDepthFmt(dp->format) && dp->format != VK_FORMAT_R32_SFLOAT && dp->format != VK_FORMAT_R16_SFLOAT &&
+                                    dp->format != VK_FORMAT_R16_UNORM))) dp = nullptr;
+    float sx = 1.0f, sy = 1.0f;
+    if (Get(params, slotF, "MV.Scale.X", &sx) != kSuccess) Get(params, slotF, "#\x2c", &sx);
+    if (Get(params, slotF, "MV.Scale.Y", &sy) != kSuccess) Get(params, slotF, "#\x2d", &sy);
+    unsigned reset = 0, rw = 0, rh = 0, flags = 0, mvX = 0, mvY = 0, dX = 0, dY = 0;
+    GetU(params, "Reset", reset);
+    GetU(params, "DLSS.Render.Subrect.Dimensions.Width", rw); GetU(params, "DLSS.Render.Subrect.Dimensions.Height", rh);
+    GetU(params, "DLSS.Input.MV.Subrect.Base.X", mvX); GetU(params, "DLSS.Input.MV.Subrect.Base.Y", mvY);
+    GetU(params, "DLSS.Input.Depth.Subrect.Base.X", dX); GetU(params, "DLSS.Input.Depth.Subrect.Base.Y", dY);
+    if (!rw || !rh) { rw = f.w; rh = f.h; }
+    bool flagsGiven = f.flags >= 0;
+    if (flagsGiven) flags = (unsigned)f.flags;
+    else if (GetU(params, "DLSS.Feature.Create.Flags", flags)) flagsGiven = true;
+    else flags = kMVLowRes | kDepthInverted;                       // not stated: as most current engines
+    const bool low = (flags & kMVLowRes) != 0;
+    if (!rw || !rh) { rw = mv->w; rh = mv->h; }
+    if (ringDev && ringDev != d) return;                           // one device
+    ringDev = d;
+    const int k = (int)(seq % kRing);
+    Entry &e = ring[k];
+    if (!Copy(d, cmd, *mv, e.mv)) { nBad++; return; }
+    e.hasDepth = dp && Copy(d, cmd, *dp, e.dp);
+    e.mvScale[0] = sx / (float)(low ? rw : mv->w);
+    e.mvScale[1] = sy / (float)(low ? rh : mv->h);
+    if (low) { e.mvMap[0] = (float)rw; e.mvMap[1] = (float)rh; e.mvMap[2] = (float)mvX; e.mvMap[3] = (float)mvY; }
+    else { e.mvMap[0] = (float)mv->w; e.mvMap[1] = (float)mv->h; e.mvMap[2] = e.mvMap[3] = 0.0f; }
+    if (e.hasDepth)
+    {
+        // depth at the render size (its subrect), or the whole texture when it is the output size
+        if (dp->w > rw + rw / 8) { e.dMap[0] = (float)dp->w; e.dMap[1] = (float)dp->h; e.dMap[2] = e.dMap[3] = 0.0f; }
+        else { e.dMap[0] = (float)rw; e.dMap[1] = (float)rh; e.dMap[2] = (float)dX; e.dMap[3] = (float)dY; }
+    }
+    e.depthRev = (flags & kDepthInverted) != 0;
+    e.reset = reset != 0;
+    if (pendN >= 2) { pend[0] = pend[1]; pendN = 1; }             // a present that never came: the older copy is dropped
+    pend[pendN++] = k;
+    latest = k;
+    seq++;
+    nUsed++;
+    const int st = e.hasDepth ? 1 : 2;
+    if (state.exchange(st) != st)
+        LOGI("BFI Presenter: frame warp, the game's own motion: the game's motion vectors (%ux%u)%s from DLSS (Vulkan) are used", mv->w, mv->h,
+             e.hasDepth ? " and depth" : ", without depth");
+    static int logged = 0;
+    if (logged < 4)
+    {
+        logged++;
+        LOGI("BFI Presenter: DLSS (Vulkan) call (feature %d%s): vectors %ux%u format %d%s, scale %.3g x %.3g, render %ux%u, depth %s (format %d), "
+             "flags 0x%x%s", known ? f.feature : -1, known ? "" : ", created before the hook", mv->w, mv->h, (int)mv->format,
+             low ? " (render size)" : " (output size)", sx, sy, rw, rh, e.hasDepth ? ((flags & kDepthInverted) ? "reversed" : "standard") : "none",
+             dp ? (int)dp->format : -1, flags, flagsGiven ? "" : " (assumed: not stated)");
+    }
+}
+
+static bool EnsureGpu(DeviceData *d)
+{
+    if (pso) return true;
+    if (gpuFailed || !d->CreateComputePipelines || !d->CmdDispatch) return false;
+    VkDevice dv = d->device;
+    VkSamplerCreateInfo smi = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    smi.magFilter = smi.minFilter = VK_FILTER_NEAREST;
+    smi.addressModeU = smi.addressModeV = smi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    bool ok = d->CreateSampler(dv, &smi, nullptr, &nearest) == VK_SUCCESS;
+    VkDescriptorSetLayoutBinding b[3] = {};
+    for (int i = 0; i < 3; i++)
+    {
+        b[i].binding = (uint32_t)i;
+        b[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    dli.bindingCount = 3; dli.pBindings = b;
+    ok = ok && d->CreateDescriptorSetLayout(dv, &dli, nullptr, &dsl) == VK_SUCCESS;
+    VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GPush) };
+    VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pli.setLayoutCount = 1; pli.pSetLayouts = &dsl; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pr;
+    ok = ok && d->CreatePipelineLayout(dv, &pli, nullptr, &pl) == VK_SUCCESS;
+    if (ok) { cs = MakeShader(d, kGameFlowSpv, sizeof(kGameFlowSpv)); ok = cs != VK_NULL_HANDLE; }
+    VkPipeline p = ok ? MakeComputePipeline(d, pl, cs) : VK_NULL_HANDLE;
+    ok = p != VK_NULL_HANDLE;
+    if (ok)
+    {
+        VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kRing * kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kRing * kStage } };
+        VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        dpi.maxSets = kRing * kStage; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
+        ok = d->CreateDescriptorPool(dv, &dpi, nullptr, &pool) == VK_SUCCESS;
+        VkDescriptorSetLayout l[kRing * kStage];
+        for (uint32_t i = 0; i < kRing * kStage; i++) l[i] = dsl;
+        VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dai.descriptorPool = pool; dai.descriptorSetCount = kRing * kStage; dai.pSetLayouts = l;
+        ok = ok && d->AllocateDescriptorSets(dv, &dai, &sets[0][0]) == VK_SUCCESS;
+    }
+    if (!ok)
+    {
+        gpuFailed = true;
+        if (p) d->DestroyPipeline(dv, p, nullptr);
+        LOGW("BFI Presenter: frame warp, the game's own motion: its motion pass could not be made (Vulkan) -- the measured motion is used");
+        return false;
+    }
+    pso = p;
+    return true;
+}
+
+// At the game's present, on the command buffer that copies its frame into staging slot `slot` (before it is ended):
+// the motion texture for that frame, from the vectors of the DLSS call that belongs to it.
+static void AtPresent(DeviceData *d, Swapchain *sc, uint32_t slot, VkCommandBuffer cb)
+{
+    if (slot >= kStage) return;
+    sc->gPend[slot] = false;
+    std::lock_guard<std::mutex> l(lk);
+    const double tn = Now();
+    for (size_t i = 0; i < retired.size();)
+    {
+        if (tn - retired[i].t > 3.0) { FreeImg(ringDev ? ringDev : d, retired[i].i); retired[i] = retired.back(); retired.pop_back(); }
+        else i++;
+    }
+    if (!On() || d != ringDev || !sc->gFlow[slot]) { pendN = 0; latest = -1; return; }
+    const int f = std::max(1, g_vkFgFactor.load());
+    int k;
+    float scale = 1.0f, lag = 0.0f;
+    if (f > 1)
+    {
+        // frame generation: every present uses the latest vectors, at its share of a rendered frame's motion; the i-th
+        // present since the DLSS call is f-1-i shown frames behind it (generated frames come first)
+        pendN = 0;
+        if (!g_shared.warpGameFg || latest < 0) return;
+        k = latest;
+        scale = 1.0f / (float)f;
+        if (seq != fgSeqSeen) { fgSeqSeen = seq; fgIdx = 0; } else if (fgIdx < 8) fgIdx++;
+        lag = (float)std::max(0, f - 1 - fgIdx);
+    }
+    else
+    {
+        if (pendN == 0) return;                                    // no DLSS call since the last present (a menu, DLSS off)
+        k = pend[0];
+        for (int i = 1; i < pendN; i++) pend[i - 1] = pend[i];
+        pendN--;
+    }
+    const Entry &e = ring[k];
+    if (!e.mv.img || !EnsureGpu(d)) return;
+    // the set for this ring entry and slot: rewritten when its images were made anew (only this slot's command buffer
+    // uses it, and its previous use is done: its fence was waited for before recording)
+    const VkImageView dv = e.hasDepth ? e.dp.view : e.mv.view;
+    if (setMv[k][slot] != e.mv.view || setDp[k][slot] != dv || setOut[k][slot] != sc->gFlowView[slot])
+    {
+        VkDescriptorImageInfo ii[3] = { { nearest, e.mv.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+                                        { nearest, dv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+                                        { VK_NULL_HANDLE, sc->gFlowView[slot], VK_IMAGE_LAYOUT_GENERAL } };
+        VkWriteDescriptorSet wr[3] = {};
+        for (int i = 0; i < 3; i++)
+        {
+            wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wr[i].dstSet = sets[k][slot]; wr[i].dstBinding = (uint32_t)i; wr[i].descriptorCount = 1;
+            wr[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            wr[i].pImageInfo = &ii[i];
+        }
+        d->UpdateDescriptorSets(d->device, 3, wr, 0, nullptr);
+        setMv[k][slot] = e.mv.view; setDp[k][slot] = dv; setOut[k][slot] = sc->gFlowView[slot];
+    }
+    VkImageMemoryBarrier b = ImgBarrier(sc->gFlow[slot], sc->gFlowInit[slot] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                                        VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    GPush gp = {};
+    gp.outTexel[0] = 1.0f / (float)sc->gW; gp.outTexel[1] = 1.0f / (float)sc->gH;
+    gp.mvScale[0] = e.mvScale[0] * scale; gp.mvScale[1] = e.mvScale[1] * scale;
+    memcpy(gp.mvMap, e.mvMap, sizeof(gp.mvMap)); memcpy(gp.dMap, e.dMap, sizeof(gp.dMap));
+    gp.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u);
+    gp.mvInvalid = 3.402823466e38f;                                // DLSS has no marker for a missing vector
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pso);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &sets[k][slot], 0, nullptr);
+    d->CmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gp), &gp);
+    d->CmdDispatch(cb, (sc->gW + 7) / 8, (sc->gH + 7) / 8, 1);
+    b = ImgBarrier(sc->gFlow[slot], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    sc->gFlowInit[slot] = true;
+    sc->gPend[slot] = true;
+    sc->gSlotDepth[slot] = e.hasDepth;
+    sc->gSlotLag[slot] = lag;
+    sc->gPendCut[slot] = e.reset;
+}
+
+template <int I> static int hk_Create(VkCommandBuffer cb, int feature, void *params, void **out)
+{
+    inside++;
+    const int r = o_Create[I](cb, feature, params, out);
+    inside--;
+    if (r == kSuccess && out && Plaus(out) && inside == 0) OnCreate(feature, params, *out);
+    return r;
+}
+template <int I> static int hk_Create1(VkDevice dv, VkCommandBuffer cb, int feature, void *params, void **out)
+{
+    inside++;
+    const int r = o_Create1[I](dv, cb, feature, params, out);
+    inside--;
+    if (r == kSuccess && out && Plaus(out) && inside == 0) OnCreate(feature, params, *out);
+    return r;
+}
+template <int I> static int hk_Eval(VkCommandBuffer cb, const void *h, const void *params, void *cbk)
+{
+    if (inside == 0) OnEval(cb, h, params);
+    inside++;
+    const int r = o_Eval[I](cb, h, params, cbk);
+    inside--;
+    return r;
+}
+template <int I> static int hk_EvalC(VkCommandBuffer cb, const void *h, const void *params, void *cbk)
+{
+    if (inside == 0) OnEval(cb, h, params);
+    inside++;
+    const int r = o_EvalC[I](cb, h, params, cbk);
+    inside--;
+    return r;
+}
+
+// Once a second from the presenter: hooks DLSS's Vulkan exports once a module with them is loaded; reports every 10 s.
+static void Tick(double t)
+{
+    if (!g_shared.frameWarp || !g_shared.warpGame) return;      // nothing hooked until frame warp with the game's motion is on
+    static const char *mods[2] = { "nvngx.dll", "_nvngx.dll" };
+    for (int i = 0; i < 2; i++)
+    {
+        if (tried[i]) continue;
+        HMODULE m = GetModuleHandleA(mods[i]);
+        if (!m) continue;
+        tried[i] = true;
+        if (!g_shared.dlssHooks) { LOGI("BFI Presenter: %s found, not hooked (DlssHooks=0)", mods[i]); continue; }
+        void *fC = (void *)GetProcAddress(m, "NVSDK_NGX_VULKAN_CreateFeature");
+        void *fC1 = (void *)GetProcAddress(m, "NVSDK_NGX_VULKAN_CreateFeature1");
+        void *fE = (void *)GetProcAddress(m, "NVSDK_NGX_VULKAN_EvaluateFeature");
+        void *fEC = (void *)GetProcAddress(m, "NVSDK_NGX_VULKAN_EvaluateFeature_C");
+        if (!fE && !fEC) { LOGI("BFI Presenter: %s has no Vulkan DLSS calls -- not hooked", mods[i]); continue; }
+        struct { const char *name; void *fn; void *hook; void **orig; } fns[4] = {
+            { "CreateFeature", fC, i ? (void *)&hk_Create<1> : (void *)&hk_Create<0>, (void **)&o_Create[i] },
+            { "CreateFeature1", fC1, i ? (void *)&hk_Create1<1> : (void *)&hk_Create1<0>, (void **)&o_Create1[i] },
+            { "EvaluateFeature", fE, i ? (void *)&hk_Eval<1> : (void *)&hk_Eval<0>, (void **)&o_Eval[i] },
+            { "EvaluateFeature_C", fEC, i ? (void *)&hk_EvalC<1> : (void *)&hk_EvalC<0>, (void **)&o_EvalC[i] },
+        };
+        char list[480] = "";
+        for (auto &fn : fns)
+        {
+            char why[96] = "not exported";
+            void *orig = fn.fn ? InlineHook64(fn.fn, fn.hook, why, sizeof(why)) : nullptr;
+            if (orig) { *fn.orig = orig; hooked = true; }
+            char one[160];
+            snprintf(one, sizeof(one), "%s%s %s%s%s", list[0] ? "; " : "", fn.name, orig ? "hooked" : "not hooked", orig ? "" : " -- ", orig ? "" : why);
+            strncat(list, one, sizeof(list) - strlen(list) - 1);
+        }
+        char path[MAX_PATH] = "";
+        GetModuleFileNameA(m, path, MAX_PATH);
+        LOGI("BFI Presenter: DLSS (Vulkan): %s: %s", path, list);
+        if (!winT) winT = t;
+    }
+    if (!hooked || reports >= 30 || t - winT < 10.0) return;
+    uint32_t e, u, nm, o, bd;
+    {
+        std::lock_guard<std::mutex> l(lk);
+        e = nEval; u = nUsed; nm = nNoMv; o = nOther; bd = nBad;
+        nEval = nUsed = nNoMv = nOther = nBad = 0;
+    }
+    const double secs = t - winT;
+    winT = t;
+    if (!e) return;
+    reports++;
+    LOGI("BFI Presenter: DLSS (Vulkan): last %.0f s: %.0f calls/s, used %.0f/s, other features %.0f/s, without vectors %.0f/s, not usable %.0f/s",
+         secs, e / secs, u / secs, o / secs, nm / secs, bd / secs);
+}
+static int State() { return state.load(); }
+#else
+static void AtPresent(DeviceData *, Swapchain *, uint32_t, VkCommandBuffer) {}
+static void Tick(double) {}
+static int State() { return 0; }
+#endif
+} // namespace gvk
+
 static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const VkSemaphore *waits, uint32_t imageIndex,
                           uint64_t presentId, VkSemaphore chainSignal)
 {
@@ -4858,6 +5421,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
     br[1] = ImgBarrier(sc->stage[slot], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        VK_ACCESS_TRANSFER_WRITE_BIT, 0);   // the presenter reads it after the copy fence
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 2, br);
+    gvk::AtPresent(d, sc, (uint32_t)slot, cb);       // frame warp: the game's own motion for this frame
     d->EndCommandBuffer(cb);
 
     std::vector<VkPipelineStageFlags> stg(nWait, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -4887,6 +5451,8 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
         sc->copySubmitted[slot] = true;
         id = ++sc->frameId;
         sc->stageId[slot] = id;
+        sc->gSlotId[slot] = sc->gPend[slot] ? id : 0;
+        if (sc->gPend[slot] && sc->gPendCut[slot]) sc->gCutId = id;
         sc->stageTime[slot] = Now();
         sc->stagePresentId[slot] = presentId;
         sc->recentId[id % 8] = id;
@@ -5024,6 +5590,11 @@ static void DestroySCResources(Swapchain *sc)
         if (sc->stageMem[i]) d->FreeMemory(dev, sc->stageMem[i], nullptr);
         if (sc->copyFence[i]) d->DestroyFence(dev, sc->copyFence[i], nullptr);
         sc->stageView[i] = VK_NULL_HANDLE; sc->stage[i] = VK_NULL_HANDLE; sc->stageMem[i] = VK_NULL_HANDLE; sc->copyFence[i] = VK_NULL_HANDLE;
+        if (sc->gFlowView[i]) d->DestroyImageView(dev, sc->gFlowView[i], nullptr);
+        if (sc->gFlow[i]) d->DestroyImage(dev, sc->gFlow[i], nullptr);
+        if (sc->gFlowMem[i]) d->FreeMemory(dev, sc->gFlowMem[i], nullptr);
+        sc->gFlowView[i] = VK_NULL_HANDLE; sc->gFlow[i] = VK_NULL_HANDLE; sc->gFlowMem[i] = VK_NULL_HANDLE;
+        sc->gFlowInit[i] = false; sc->gSlotId[i] = 0; sc->gPend[i] = false;
     }
     for (uint32_t i = 0; i < kMaxImg; i++)
     {
@@ -5101,6 +5672,42 @@ static bool BuildSC(Swapchain *sc, const VkSwapchainCreateInfoKHR *ci)
         ok = ok && d->CreateFence(dev, &fci, nullptr, &sc->copyFence[i]) == VK_SUCCESS;
     }
     if (!ok) { LOGE("BFI Presenter: could not create the staging images"); DestroySCResources(sc); return false; }
+    // Frame warp with the game's own motion: a motion texture per staging slot at half the frame's size (rgba16f,
+    // written by a compute pass at the game's present, sampled by the presenter). Optional: without them the measured
+    // motion is used.
+    {
+        sc->gW = (sc->extent.width + 1) / 2; sc->gH = (sc->extent.height + 1) / 2;
+        VkImageCreateInfo gi = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        gi.imageType = VK_IMAGE_TYPE_2D;
+        gi.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        gi.extent = { sc->gW, sc->gH, 1 };
+        gi.mipLevels = 1; gi.arrayLayers = 1; gi.samples = VK_SAMPLE_COUNT_1_BIT; gi.tiling = VK_IMAGE_TILING_OPTIMAL;
+        gi.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        gi.sharingMode = sti.sharingMode; gi.queueFamilyIndexCount = sti.queueFamilyIndexCount; gi.pQueueFamilyIndices = sti.pQueueFamilyIndices;
+        bool gok = true;
+        for (uint32_t i = 0; gok && i < kStage; i++)
+        {
+            gok = CreateImageMem(d, gi, &sc->gFlow[i], &sc->gFlowMem[i]);
+            VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+            vci.image = sc->gFlow[i];
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            gok = gok && d->CreateImageView(dev, &vci, nullptr, &sc->gFlowView[i]) == VK_SUCCESS;
+            sc->gFlowInit[i] = false; sc->gSlotId[i] = 0; sc->gPend[i] = false;
+        }
+        if (!gok)
+        {
+            LOGW("BFI Presenter: frame warp, the game's own motion: its motion textures could not be made -- the measured motion is used");
+            for (uint32_t i = 0; i < kStage; i++)
+            {
+                if (sc->gFlowView[i]) d->DestroyImageView(dev, sc->gFlowView[i], nullptr);
+                if (sc->gFlow[i]) d->DestroyImage(dev, sc->gFlow[i], nullptr);
+                if (sc->gFlowMem[i]) d->FreeMemory(dev, sc->gFlowMem[i], nullptr);
+                sc->gFlowView[i] = VK_NULL_HANDLE; sc->gFlow[i] = VK_NULL_HANDLE; sc->gFlowMem[i] = VK_NULL_HANDLE;
+            }
+        }
+    }
 
     // Initial layouts: stand-ins as if presented, staging as shader input.
     VkCommandPool pool = VK_NULL_HANDLE;
@@ -6976,6 +7583,40 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
             else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else ImGui::Text("Waiting for the game's frame rate.");
+            bool gm = s.warpGame != 0;
+            if (ImGui::Checkbox("Use the game's own motion vectors and depth", &gm)) s.warpGame = gm ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (Vulkan, 64-bit) its motion vectors and depth, frame warp\n"
+                                                          "moves each part of the picture by the game's own motion for it, and where things overlap\n"
+                                                          "the nearer one stays in front -- instead of the motion it measures from the picture,\n"
+                                                          "which can only follow the camera. The line below says which one is in use.");
+            if (s.warpGame)
+            {
+                ImGui::SameLine();
+                bool gf = s.warpGameFg != 0;
+                if (ImGui::Checkbox("Also with frame generation", &gf)) s.warpGameFg = gf ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("The game's motion vectors are for the frames it renders, not the ones frame generation\n"
+                                                              "adds in between, so on those the edges of moving things double up. Off by default: with\n"
+                                                              "frame generation on, frame warp uses the motion measured from the picture.");
+                if (s.warpGameFg)
+                {
+                    ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
+                                                                  "further ahead than this (shown frames). Further out it overshoots and snaps back.");
+                }
+            }
+            {
+                const int src = st.warpCycles ? st.warpSrc : (s.warpGame ? st.warpGameState : 0);
+                ImGui::Text("Motion used: %s", src == 1 ? "the game's motion vectors and depth, from DLSS" : src == 2 ? "the game's motion vectors (no depth), from DLSS"
+                                                   : "measured from the picture");
+                if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("This game hasn't handed DLSS (Vulkan) any motion data (no DLSS call seen).");
+            }
+            ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader, set it\n"
+                                                          "to the mask's width so the mask stays in place. 0 = off. Ctrl+click to type a value.");
+            ImGui::SliderFloat("Snap moves up and down (px)", &s.warpSnapY, 0.0f, 16.0f, s.warpSnapY > 0.0f ? "%.2f" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader, set\n"
+                                                          "it to the scanline width. 0 = off. Ctrl+click to type a value.");
             ImGui::Unindent(16.0f);
         }
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");
