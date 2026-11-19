@@ -2769,7 +2769,7 @@ static void PresenterThread(Swapchain *sc)
             warpAhead = 0.0;
         }
         else if (cycleStartW)
-            warpAhead = warpClock.Cycle(true, pickId, pickTime, Now(), (double)s.frames * sc->period.load(),
+            warpAhead = warpClock.Cycle(1, pickId, pickTime, Now(), (double)s.frames * sc->period.load(),
                                         (double)s.warpMax, (double)s.warpMinRate / 100.0);
         uint64_t warpOld = 0;
         c.warp = 0.0f; c.warpSrc = 0; c.warpPrevN = 0.0f; c.warpLag = 0.0f;
