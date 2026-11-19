@@ -318,6 +318,7 @@ struct Settings
     int   hitchGapMs = 1000;  // no new game frame for this long counts as loading
     int   pacing   = 1;       // wait for vblank before each present
     int   queueAhead = 0;     // keep one extra refresh queued (covers a late draw; +1 refresh latency)
+    int   queueDark = 1;      // QueueDarkRefresh (as DX 1.0.43): the cycle's second refresh is drawn and queued right after the lit one
     int   log      = 0;
     int   ownQueue = 1;       // present on a queue of the layer's own (else share the game's)
     int   queuePriority = 2;  // PresenterQueuePriority (applies at the next start): 0 off, 1 high, 2 realtime if allowed else high --
@@ -436,6 +437,7 @@ static void LoadSettings(Settings &s)
     s.hitchGapMs = Clamp(KvInt(kv, "HitchGuardLoadingMs", 1000), 150, 5000);
     s.pacing   = KvInt(kv, "WaitForVBlank", 1);
     s.queueAhead = KvInt(kv, "QueueAhead", 0) ? 1 : 0;
+    s.queueDark = KvInt(kv, "QueueDarkRefresh", 1) ? 1 : 0;
     s.log      = KvInt(kv, "Log", 0);
     s.ownQueue = KvInt(kv, "VulkanOwnQueue", 1) ? 1 : 0;
     s.queuePriority = Clamp(KvInt(kv, "PresenterQueuePriority", 2), 0, 2);
@@ -473,7 +475,7 @@ static void LoadSettings(Settings &s)
     I("CapGameToRefresh", s.gameCap); I("CapDivisor", s.capDivisor); I("FramePacing", s.pacingMode); I("MaxFramesAhead", s.maxAhead);
     I("AutoFramesAhead", s.autoAhead); I("SmoothCatchUp", s.smoothCatchUp); I("PresenterBuffers", s.presBuffers); I("VulkanExclusiveFullscreen", s.vkExclusive); I("VulkanAutoRecover", s.vkAutoRecover); I("AblGuard", s.ablGuard);
     I("AblGuardBudgetNits", s.ablBudget); k.push_back({"AblCurve", s.ablCurve}); I("HitchGuard", s.hitchGuard); I("HitchGuardLoadingMs", s.hitchGapMs); I("FlashHints", s.flashHints);
-    I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue); I("PresenterQueuePriority", s.queuePriority);
+    I("WaitForVBlank", s.pacing); I("QueueAhead", s.queueAhead); I("QueueDarkRefresh", s.queueDark); I("Log", s.log); I("VulkanOwnQueue", s.ownQueue); I("PresenterQueuePriority", s.queuePriority);
     I("SdrToHdr", s.sdrToHdr); F("SdrWhiteNits", s.sdrWhite); F("SdrHighlightNits", s.sdrHiNits);
     F("SdrHighlightKnee", s.sdrKnee); I("SdrGamma", s.sdrGamma); I("SdrHighlightMethod", s.sdrMethod); F("SdrBoostStart", s.sdrBoostStart); F("SdrBoostRamp", s.sdrBoostRamp); I("SdrBoostSpace", s.sdrBoostSpace); F("SdrBoostColor", s.sdrBoostColor); I("SdrBoostAplLimiter", s.sdrBoostApl); F("SdrGamutExpansion", s.sdrGamut);
     return k;
@@ -2220,6 +2222,12 @@ static void PresenterThread(Swapchain *sc)
     // present blocks anyway the queue is deeper than wanted and one tick is
     // skipped, and after a missed tick the extra refresh is primed again.
     bool qaPrimed = false, qaSkipWait = false, qaSkipNext = false;
+    // QueueDarkRefresh (as the DX add-on, 1.0.43): the refresh after the lit one shows the same game frame, so it is drawn
+    // and presented right after the lit refresh instead of one vblank later. A stall while it is drawn then has two
+    // refreshes of room instead of one, and the lit refresh's pick doesn't move: no added latency.
+    bool pairNext = false, pairWaited = false, pairOff = false;
+    double pairVbT = 0.0, pairLitPresS = 0.0, pairStartT = 0.0, pairRetryT = 0.0, pairDrainT = -10.0;
+    int pairBlocked = 0, pairSeen = 0, pairLogs = 0, pairBadWins = 0, pairRetries = 0, pairDrains = 0;
     int  secQaSkips = 0, secQaPrimes = 0;
     int autoAhead = 1, missSecs = 0, spareSecs = 0;
     double fseRetryT = 0.0; int fseShown = -2;
@@ -2375,22 +2383,54 @@ static void PresenterThread(Swapchain *sc)
         bool vblank = false;
         const bool qa = s.queueAhead && s.pacing;
         if (!qa) { qaPrimed = false; qaSkipWait = false; qaSkipNext = false; }
-        const bool primeIter = qaSkipWait;
+        const bool pairIter = pairNext;      // the refresh queued behind the lit one: drawn now, no vblank wait, no tick
+        pairNext = false;
+        const bool primeIter = qaSkipWait || pairIter;
         qaSkipWait = false;
-        if (s.pacing && !primeIter) vblank = vb.Wait();
-        // Release the game's frame cap at the vblank itself, not after this
-        // refresh's present: the present's varying length shifted each release
-        // and games timed their animation to the uneven gaps (DX12 add-on v0.67).
-        if (vblank)
-        {
+        auto tickAt = [&](uint64_t pres, double tt) {
             sc->strobeFrames.store(s.frames);
             g_vkSleepGrid.store(s.sleepGrid);
             g_vkOwnLimit.store(s.reflexOwn);
-            sc->tickSlot.store((int)((presents - phaseShift) % (uint64_t)s.frames));
-            sc->tickT.store(Now());
+            sc->tickSlot.store((int)((pres - phaseShift) % (uint64_t)s.frames));
+            sc->tickT.store(tt);
             sc->ticks.fetch_add(1);
             sc->tickCv.notify_all();
+        };
+        if (s.pacing && !primeIter)
+        {
+            vblank = vb.Wait();
+            if (vblank && pairVbT > 0.0)
+            {
+                // After a pair two refreshes are queued: this is the vblank the queued one would have been drawn at, and
+                // the next lit refresh is drawn one vblank later (as DX).
+                const double perP = 1.0 / (vb.modeHz > 1.0 ? vb.modeHz : 120.0);
+                const double tw = Now();
+                if (tw < pairVbT + 1.5 * perP)
+                {
+                    tickAt(presents - 1, tw);
+                    vb.Wait();
+                }
+                else
+                {
+                    tickAt(presents - 1, tw - perP);
+                    // The queued present waited for a flip: one more vblank empties the queue (at most once in 0.5 s).
+                    if (pairWaited && tw - pairDrainT >= 0.5)
+                    {
+                        tickAt(presents, tw);
+                        vb.Wait();
+                        pairDrainT = Now();
+                        if (++pairDrains <= 20)
+                            LOGI("BFI Presenter: QueueDarkRefresh: a flip was still pending after the pair -- skipped one vblank "
+                                 "to empty the queue (%d so far)", pairDrains);
+                    }
+                }
+                pairVbT = 0.0;
+            }
         }
+        // Release the game's frame cap at the vblank itself, not after this
+        // refresh's present: the present's varying length shifted each release
+        // and games timed their animation to the uneven gaps (DX12 add-on v0.67).
+        if (vblank) tickAt(presents, Now());
         const double tVb = Now();
         {
             // Just-in-time release: Half / Quarter cap (any pacing) when the
@@ -3092,6 +3132,78 @@ static void PresenterThread(Swapchain *sc)
             }
         }
         else { soften = 0.0f; swapState = 0; gradPhase = 0.0; gradHold = -1.0; }
+        // QueueDarkRefresh: after the lit refresh of a 2+ refresh cycle, the next one (the same game frame) follows at once.
+        // Not with Queue one refresh ahead, the LCD savers, the hitch guard's steady picture, or fewer than 3 real images.
+        {
+            const double hzP = vb.modeHz > 1.0 ? vb.modeHz : 120.0;
+            const bool presOk = pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR;
+            if (pairIter)
+            {
+                // The queued present should return at once. Waited: half a refresh, and a quarter longer than the lit one.
+                const double prDur = tPres - tSub;
+                pairWaited = prDur > 0.5 / hzP && prDur - pairLitPresS > 0.25 / hzP;
+                if (hitchPaused) pairSeen = pairBlocked = pairBadWins = 0;
+                else if (!pairOff && tPres - pairStartT >= 5.0)
+                {
+                    pairSeen++;
+                    if (pairWaited) pairBlocked++;
+                    if (pairSeen >= 120)
+                    {
+                        pairBadWins = pairBlocked * 2 > pairSeen ? pairBadWins + 1 : 0;
+                        if (pairBadWins >= 2)
+                        {
+                            pairOff = true;
+                            const int retryS = pairRetries < 4 ? 60 << pairRetries : 0;
+                            pairRetryT = retryS > 0 ? tPres + retryS : 0.0;
+                            char again[64];
+                            if (retryS > 0) snprintf(again, sizeof(again), "off for %d min (tries again then)", retryS / 60);
+                            else snprintf(again, sizeof(again), "off for this session");
+                            LOGW("BFI Presenter: QueueDarkRefresh %s: the queued refresh's present waited in %d of %d pairs (the swap "
+                                 "chain took only one pending present, or a frame limiter holds the presenter's presents)",
+                                 again, pairBlocked, pairSeen);
+                        }
+                        else if (pairBlocked > 0 && ++pairLogs <= 20)
+                            LOGI("BFI Presenter: QueueDarkRefresh: the queued refresh's present waited in %d of the last %d pairs",
+                                 pairBlocked, pairSeen);
+                        pairSeen = pairBlocked = 0;
+                    }
+                }
+            }
+            else if (s.queueDark && pairOff && pairRetryT > 0.0 && tPres >= pairRetryT)
+            {
+                pairOff = false;
+                pairRetries++;
+                pairSeen = pairBlocked = pairBadWins = 0;
+                pairStartT = 0.0;
+                LOGI("BFI Presenter: QueueDarkRefresh: trying again (try %d of 4)", pairRetries);
+            }
+            else if (s.queueDark && !pairOff && vblank && s.pacing && !qa && sc->nReal >= 3 && s.enabled && s.frames >= 2 &&
+                     slotNow == 0 && !hitchPaused && swapState == 0 && soften <= 0.0f && !GradualSaverOn(s) && presOk)
+            {
+                pairNext = true;
+                pairVbT = tVb;
+                pairLitPresS = tPres - tSub;
+                if (pairStartT <= 0.0) pairStartT = tPres;
+                static bool pairLogged = false;
+                if (!pairLogged)
+                {
+                    pairLogged = true;
+                    LOGI("BFI Presenter: QueueDarkRefresh on: the refresh after the lit one is queued with it");
+                }
+            }
+            if (s.queueDark && s.enabled && s.frames >= 2 && !pairOff && !pairIter)
+            {
+                static bool pairWhyLogged = false;
+                const char *why = !s.pacing ? "Wait for vblank is off" : qa ? "Queue one refresh ahead is on" :
+                                  sc->nReal < 3 ? "fewer than 3 real swap chain images (presenter buffers)" :
+                                  GradualSaverOn(s) ? "an LCD saver is on" : nullptr;
+                if (why && !pairWhyLogged && presents > 600)
+                {
+                    pairWhyLogged = true;
+                    LOGI("BFI Presenter: QueueDarkRefresh not used: %s", why);
+                }
+            }
+        }
         if (!vblank && !primeIter)
         {
             sc->tickT.store(Now());
@@ -3123,7 +3235,13 @@ static void PresenterThread(Swapchain *sc)
             const double ang = 6.283185307179586 * (t - pickTime) * vb.modeHz;
             secPhC += cos(ang); secPhS += sin(ang); secPhN++;
         }
-        if (t - lastT > 1.5 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
+        if (!pairIter && t - lastT > 1.5 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0) && presents > 1)   // a missed refresh at the display's own rate
+        {
+            secLate++;
+            lateTimes[lateIdx++ & 3] = t;
+        }
+        // A queued refresh is late only when it wasn't presented before the vblank it was meant for (two after its lit one's).
+        else if (pairIter && pairVbT > 0.0 && t > pairVbT + 1.9 / (vb.modeHz > 0.0 ? vb.modeHz : 120.0))
         {
             secLate++;
             lateTimes[lateIdx++ & 3] = t;
@@ -3192,7 +3310,7 @@ static void PresenterThread(Swapchain *sc)
             // A rebuild that didn't help (slow again within a minute: the game keeps the GPU busy, not
             // the desktop compositor) makes the next one wait twice as long; after 3 in a row automatic
             // recovery stops for the session (Indiana Jones with heavy settings: a rebuild every 20-30 s).
-            if (g_rebuildMisses > 0 && g_rebuildMisses < 3 && t - g_lastAutoRebuildT > 180.0) { g_rebuildMisses = 0; g_rebuildGap = 20.0; }
+            if (g_rebuildMisses > 0 && g_rebuildMisses < 2 && t - g_lastAutoRebuildT > 180.0) { g_rebuildMisses = 0; g_rebuildGap = 20.0; }
             // 5 s: with the game close to its video memory budget presentation slows for 2-3 s now and then and
             // recovers by itself (Indiana Jones); a rebuild there only adds a hitch.
             // The game's clock drifting against the display: the slow returns come and go with the drift (ICO), and a
@@ -3200,7 +3318,7 @@ static void PresenterThread(Swapchain *sc)
             if (s.vkAutoRecover && slowRun == 5 && drift.on)
                 LOGI("BFI Presenter: automatic recovery -- not rebuilding: the slow returns follow the game's clock drift (set the display to %.2f Hz)",
                      drift.suggestHz);
-            if (s.vkAutoRecover && slowRun >= 5 && !rebuildReq && g_rebuildMisses < 3 && !drift.on)
+            if (s.vkAutoRecover && slowRun >= 5 && !rebuildReq && g_rebuildMisses < 2 && !drift.on)
             {
                 if (t - g_lastRebuildT >= g_rebuildGap)
                 {
@@ -3209,8 +3327,10 @@ static void PresenterThread(Swapchain *sc)
                         g_rebuildMisses++;
                         g_rebuildGap = g_rebuildGap * 2.0 > 160.0 ? 160.0 : g_rebuildGap * 2.0;
                     }
-                    if (g_rebuildMisses >= 3)
-                        LOGI("BFI Presenter: automatic recovery stopped for this session -- 3 rebuilds in a row didn't help. The game "
+                    // vp5: 2, not 3 -- each rebuild costs about 10 s of missed refreshes while the presenter starts again
+                    // (Indiana Jones without frame generation: 110-120 in the first 10 s after each one).
+                    if (g_rebuildMisses >= 2)
+                        LOGI("BFI Presenter: automatic recovery stopped for this session -- 2 rebuilds in a row didn't help. The game "
                              "probably keeps the GPU busy: lower its settings, or start Steam / the game as administrator for a "
                              "realtime presenter queue. Ctrl+Shift+O still rebuilds by hand.");
                     else
@@ -4174,7 +4294,7 @@ static void PresenterThread(Swapchain *sc)
             tsPassMs = tsDrawMs = -1.0;
             if ((presents % 120) == 0) fflush(logf);
         }
-        lastT = t;
+        lastT = pairIter ? lastT + 1.0 / (vb.modeHz > 1.0 ? vb.modeHz : 120.0) : t;
         if (pickId != lastShownId)
         {
             lastNewFrameT = t;
@@ -6947,6 +7067,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "(~8 ms) of latency. For GPU-heavy games that flash (Indiana Jones).");
         if (s.queueAhead && st.managed)
             ImGui::Text("Queue ahead: %d re-primed, %d drained per second", st.qaPrimes, st.qaSkips);
+        bool qd = s.queueDark != 0;
+        if (ImGui::Checkbox("Queue the dark refresh with the lit one (Wait for vblank on, 3 presenter buffers)", &qd)) s.queueDark = qd ? 1 : 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The refresh after the lit one shows the same game frame, so it is drawn and queued right after\n"
+                                                      "the lit one: a stall while it is drawn has two refreshes of room instead of one. No added\n"
+                                                      "latency. Switches itself off if the queued present keeps waiting. Not with Queue one refresh ahead.");
         ImGui::SliderInt("Presenter buffers (applies when the swap chain is next created)", &s.presBuffers, 2, 4);
         {
             bool fx = s.vkExclusive != 0;
