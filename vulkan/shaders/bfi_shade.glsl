@@ -28,16 +28,20 @@ vec2 WarpShiftGame(vec2 uv)
     m[1] = GameFlow(uv - m[0] * L).xy;
     m[2] = GameFlow(uv - m[1] * L).xy;
     vec2 best = vec2(0.0), back = vec2(0.0);
-    float bestNear = -1.0, backNear = 2.0;
+    float bestNear = -1.0, backNear = 2.0, bestK = 1.0, backK = 1.0;
     for (int i = 0; i < 3; i++)
     {
         vec4 g = GameFlow(uv - m[i] * L);
         if (g.z < 0.5) continue;
-        if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; }
-        if (g.w < backNear) { backNear = g.w; back = m[i]; }
+        if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; bestK = clamp(g.z - 1.0, 0.0, 1.0); }
+        if (g.w < backNear) { backNear = g.w; back = m[i]; backK = clamp(g.z - 1.0, 0.0, 1.0); }
     }
-    if (bestNear < 0.0) best = backNear <= 1.0 ? back : vec2(0.0);
-    return clamp(best * pc.warp, -0.08, 0.08);
+    if (bestNear < 0.0) { best = backNear <= 1.0 ? back : vec2(0.0); bestK = backK; }
+    // Up to the rendered frame the motion is known (a generated frame); past it, it's a guess that it carries on: that part
+    // eases off as the motion slows (flags & 2048), so a camera coming to a stop isn't pushed past where it stops (as DX ep9).
+    float known = clamp(pc.warpLag, 0.0, pc.warp);
+    float k = (pc.flags & 2048u) != 0u ? bestK : 1.0;
+    return clamp(best * (known + (pc.warp - known) * k), -0.08, 0.08);
 }
 
 // How far back along its motion the picture shown at uv is taken from, in uv (read where the picture comes from, so a

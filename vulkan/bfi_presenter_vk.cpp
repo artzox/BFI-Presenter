@@ -60,7 +60,7 @@
 #include "../common/bfi_warpclock.h"   // frame warp: how far ahead each strobe cycle shows its frame (shared with DX)
 #include "../common/bfi_inlinehook.h"  // x64 inline hooks (DLSS calls for the game's motion; shared with DX)
 struct Swapchain; struct DeviceData;
-namespace gvk { static void Tick(double t); static int State(); }
+namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
 #define BFI_VERSION "1.0.44"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
@@ -280,6 +280,12 @@ struct Settings
     int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: also while frame generation is on (edges double up on generated frames)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this many shown frames
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many pixels
+    int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
+    int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
+                              // is in the rendered frame: 1 generated frames before the rendered one, -1 after it, 0 off
+    int   warpEase = 1;       // FrameWarpGameMotionEase (ini only, as DX): moves past the rendered frame ease off as the motion slows
+    int   warpGuard = 1;      // FrameWarpGuard (ini only, as DX): filled repeats that keep making their refresh late are shown as they are
+    int   warpPauseLb = 1;    // FrameWarpPauseCutscenes (as DX): no frame warp while a cutscene is letterboxed through DLSS
     int   dlssHooks = 1;      // DlssHooks: DLSS's Vulkan calls are hooked for the game's motion (0 = left alone)
     int   dlssLayout = 1;     // DlssInputLayout (ini only): the layout DLSS's inputs are in at its call (VkImageLayout, 1 = GENERAL)
     int   lcdSwap  = 0;       // LCD: shift the strobe by one refresh now and then (even cycles), so the lit
@@ -402,6 +408,11 @@ static void LoadSettings(Settings &s)
     s.warpMaxGameFg = Clamp(KvFloat(kv, "FrameWarpGameMotionMaxAheadFG", 0.10f), 0.1f, 1.5f);
     s.warpSnapX = Clamp(KvFloat(kv, "FrameWarpSnapX", 0.0f), 0.0f, 16.0f);
     s.warpSnapY = Clamp(KvFloat(kv, "FrameWarpSnapY", 0.0f), 0.0f, 16.0f);
+    s.warpEven = KvInt(kv, "FrameWarpEvenPacing", 0) ? 1 : 0;
+    s.warpFgLag = Clamp(KvInt(kv, "FrameWarpGameMotionFGLag", 1), -1, 1);
+    s.warpEase = KvInt(kv, "FrameWarpGameMotionEase", 1) ? 1 : 0;
+    s.warpGuard = KvInt(kv, "FrameWarpGuard", 1) ? 1 : 0;
+    s.warpPauseLb = KvInt(kv, "FrameWarpPauseCutscenes", 1) ? 1 : 0;
     s.dlssHooks = KvInt(kv, "DlssHooks", 1) ? 1 : 0;
     s.dlssLayout = KvInt(kv, "DlssInputLayout", 1);
     s.osdCorner = std::max(0, std::min(3, KvInt(kv, "OsdCorner", 1)));
@@ -484,7 +495,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexLimitAtSleep", s.reflexAtSleep); I("ReflexAlign", s.reflexAlign); I("LearnReflexStart", s.learnReflex); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -2314,6 +2325,10 @@ static void PresenterThread(Swapchain *sc)
     uint64_t warpPrevId = 0;
     bool     warpPrevReady = false, cycleStartW = false;
     int      secWarpCycles = 0, secWarpGame = 0, secWarpCut = 0;   // per second: cycles moved, of them with the game's motion; paused at cuts
+    int      secWarpLb = 0, secWarpHeld = 0, winWarpLb = 0, winWarpHeld = 0;   // ... in letterboxed cutscenes; repeats held by the guard
+    bool     cycRepeatW = false;          // this strobe cycle repeats the frame shown before
+    uint8_t  warpRepHist = 0; int warpRepHistN = 0;   // the warp guard: the last 8 filled repeats, bit set = drawn too late for its refresh
+    double   warpRepHoldT = -1.0, warpRepHoldS = 30.0;
     double   secWarpSum = 0.0;
     int      winWarpCut = 0; double winCutT = 0.0;
     double   tsPassMs = -1.0, tsDrawMs = -1.0;   // the last GPU times read back (timing log)
@@ -2611,6 +2626,7 @@ static void PresenterThread(Swapchain *sc)
             // Frame warp keeps the frame shown before this one in the ring: what is the same in both stands still on
             // the screen (a HUD) and is not moved.
             cycleStartW = cycleStart;
+            if (cycleStart) cycRepeatW = lastShownId && pickId == lastShownId;
             if (!s.frameWarp || !R.warp.ok) { warpPrev = -1; warpPrevId = 0; }
             else if (pick >= 0 && lastShown >= 0 && lastShownId && pickId != lastShownId)
             {
@@ -2769,7 +2785,8 @@ static void PresenterThread(Swapchain *sc)
             warpAhead = 0.0;
         }
         else if (cycleStartW)
-            warpAhead = warpClock.Cycle(1, pickId, pickTime, Now(), (double)s.frames * sc->period.load(),
+            warpAhead = warpClock.Cycle((s.warpEven && s.warpGame && gvk::State() > 0 && (std::max(1, g_vkFgFactor.load()) <= 1 || s.warpGameFg)) ? 2 : 1,
+                                        pickId, pickTime, Now(), (double)s.frames * sc->period.load(),
                                         (double)s.warpMax, (double)s.warpMinRate / 100.0);
         uint64_t warpOld = 0;
         c.warp = 0.0f; c.warpSrc = 0; c.warpPrevN = 0.0f; c.warpLag = 0.0f;
@@ -2788,7 +2805,10 @@ static void PresenterThread(Swapchain *sc)
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = sc->gSlotDepth[pick] ? 1u : 2u;
                 c.warpLag = fgF > 1 ? sc->gSlotLag[pick] : 0.0f;
+                if (fgF > 1 && s.warpEase) c.flags |= 2048u;          // moves past the rendered frame ease off (as DX: with frame generation)
             }
+            // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
+            else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
             else c.warp = (float)(std::floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
             // Around a camera cut the game flags: shown as rendered (no motion connects two shots), for 3 rendered frames.
             const uint64_t cut = sc->gCutId;
@@ -2797,6 +2817,19 @@ static void PresenterThread(Swapchain *sc)
                 c.warp = 0.0f; c.warpSrc = 0;
                 if (cycleStartW) secWarpCut++;
             }
+            // A cutscene letterboxed through DLSS: shown as rendered (its quick cuts have no motion to follow).
+            if (c.warp != 0.0f && s.warpPauseLb && gvk::Letterboxed())
+            {
+                c.warp = 0.0f; c.warpSrc = 0;
+                if (cycleStartW) secWarpLb++;
+            }
+            // The warp guard: repeats shown as they are while it holds.
+            if (c.warp != 0.0f && cycRepeatW && s.warpGuard && Now() < warpRepHoldT)
+            {
+                c.warp = 0.0f; c.warpSrc = 0;
+                if (cycleStartW) secWarpHeld++;
+            }
+            if (c.warp == 0.0f) c.flags &= ~2048u;
         }
         if (cycleStartW && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame += c.warpSrc != 0 ? 1 : 0; }
         if (sc->format == VK_FORMAT_R16G16B16A16_SFLOAT) c.flags |= 1024u;   // linear frames (frame warp's comparisons)
@@ -3064,6 +3097,24 @@ static void PresenterThread(Swapchain *sc)
                 LOGE("BFI Presenter: presenter submit failed (%d)", (int)sr);
                 sc->status.store((int)sr);
                 break;
+            }
+            if (cycleStartW && cycRepeatW && c.warp != 0.0f && s.warpGuard)
+            {
+                // The warp guard (as DX, ep10): a filled repeat is drawn anew, and in some games that waits behind the game's
+                // own late frame until the refresh is missed. 3 of the last 8 late: repeats shown as they are for a while.
+                const double tSub = Now();
+                const bool late = tSub - tFence > 0.4 * sc->period.load();
+                warpRepHist = (uint8_t)((warpRepHist << 1) | (late ? 1 : 0));
+                if (warpRepHistN < 8) warpRepHistN++;
+                int n = 0; for (int b = 0; b < 8; b++) n += (warpRepHist >> b) & 1;
+                if (warpRepHistN >= 5 && n >= 3)
+                {
+                    warpRepHoldT = tSub + warpRepHoldS;
+                    LOGI("BFI Presenter: frame warp guard: %d of the last %d filled repeats were drawn too late for their refresh (drawing one took "
+                         "%.1f ms) -- repeats are shown as they are for %.0f s", n, warpRepHistN, (tSub - tFence) * 1000.0, warpRepHoldS);
+                    warpRepHoldS = std::min(300.0, warpRepHoldS * 2.0);
+                    warpRepHist = 0; warpRepHistN = 0;
+                }
             }
             bufFrame[idx] = pickId;
             bufFrame2[idx] = pickId2;
@@ -3489,16 +3540,17 @@ static void PresenterThread(Swapchain *sc)
                              : "the motion measured from the picture", src ? secWarpGame : secWarpCycles - secWarpGame, secWarpCycles);
                     }
                 }
-                winWarpCut += secWarpCut;
+                winWarpCut += secWarpCut; winWarpLb += secWarpLb; winWarpHeld += secWarpHeld;
                 if (t - winCutT >= 10.0)
                 {
                     static int cutLogs = 0;
-                    if (winWarpCut && cutLogs++ < 60)
-                        LOGI("BFI Presenter: frame warp, last %.0f s: %d strobe cycles not filled (camera cuts flagged by the game)", t - winCutT, winWarpCut);
-                    winWarpCut = 0; winCutT = t;
+                    if ((winWarpCut || winWarpLb || winWarpHeld) && cutLogs++ < 60)
+                        LOGI("BFI Presenter: frame warp, last %.0f s: %d strobe cycles not filled (%d camera cuts flagged by the game, %d letterboxed "
+                             "cutscene), %d repeats shown as they are (the warp guard)", t - winCutT, winWarpCut + winWarpLb, winWarpCut, winWarpLb, winWarpHeld);
+                    winWarpCut = winWarpLb = winWarpHeld = 0; winCutT = t;
                 }
                 gvk::Tick(t);
-                secWarpCycles = 0; secWarpSum = 0.0; secWarpGame = 0; secWarpCut = 0;
+                secWarpCycles = 0; secWarpSum = 0.0; secWarpGame = 0; secWarpCut = 0; secWarpLb = 0; secWarpHeld = 0;
             }
             Osd::AddSecond(secFrameSkips, secFrameRepeats, secLate, Now());
             g_status.unevenRep    = secRepU;
@@ -4883,7 +4935,7 @@ enum { kSR = 1, kRR = 13 };                            // NVSDK_NGX_Feature_Supe
 enum { kMVLowRes = 1 << 1, kDepthInverted = 1 << 3 };  // NVSDK_NGX_DLSS_Feature_Flags
 static PFN_Create o_Create[2] = {}; static PFN_Create1 o_Create1[2] = {}; static PFN_Eval o_Eval[2] = {}, o_EvalC[2] = {};
 static std::mutex lk;
-struct Feat { int feature, flags; unsigned w, h; };
+struct Feat { int feature, flags; unsigned w, h, ow = 0, oh = 0; };
 static std::map<uintptr_t, Feat> feats;                // by handle address (as DX)
 static bool tried[2] = {}, hooked = false;
 static thread_local int inside = 0;
@@ -4966,7 +5018,26 @@ static VkDescriptorSet sets[kRing][kStage] = {};
 static VkImageView setMv[kRing][kStage] = {}, setDp[kRing][kStage] = {}, setOut[kRing][kStage] = {};
 static bool gpuFailed = false;
 static std::atomic<int> state{0};                      // 0 none seen, 1 vectors and depth, 2 vectors only (the panel)
-struct GPush { float outTexel[2], mvScale[2], mvMap[4], dMap[4]; uint32_t flags; float mvInvalid; };
+struct GPush { float outTexel[2], mvScale[2], mvMap[4], dMap[4]; uint32_t flags; float mvInvalid, perRendered, prevOk; };
+static VkImageView setPv[kRing][kStage] = {};
+// Letterboxed cutscenes (as DX, ep3): DLSS's output smaller than the screen, wider than tall against it. Only a letterbox
+// that follows full-screen output in this session counts, and one that lasts over 10 minutes is play.
+static std::atomic<uint32_t> screenW{0}, screenH{0};
+static std::atomic<bool> lbOn{false}, lbFullSeen{false};
+static std::atomic<double> lbT{0.0}, lbStartT{0.0};
+static void NoteLetterbox(bool lb, unsigned w, unsigned h, unsigned fw, unsigned fh)
+{
+    const bool was = lbOn.exchange(lb);
+    if (lb) lbT = Now();
+    else lbFullSeen = true;
+    if (lb && !was) lbStartT = Now();
+    static int logged = 0;
+    if (lb != was && logged++ < 40)
+    {
+        if (lb) LOGI("BFI Presenter: frame warp: letterboxed cutscene (DLSS (Vulkan) output %ux%u of %ux%u)", w, h, fw, fh);
+        else    LOGI("BFI Presenter: frame warp: the letterboxed cutscene ended (DLSS (Vulkan) output %ux%u)", w, h);
+    }
+}
 
 static bool On() { return g_shared.frameWarp && g_shared.warpGame && g_shared.dlssHooks; }
 
@@ -5037,10 +5108,10 @@ static bool Copy(DeviceData *d, VkCommandBuffer cb, const ResVk &r, Img &dst)
 static void OnCreate(int feature, const void *params, void *h)
 {
     if (!h || !Plaus(h) || !params || !Plaus(params)) return;
-    Feat f = { feature, -1, 0, 0 };
+    Feat f = { feature, -1, 0, 0, 0, 0 };
     unsigned fl = 0;
     if (GetU(params, "DLSS.Feature.Create.Flags", fl)) f.flags = (int)fl;
-    GetU(params, "Width", f.w); GetU(params, "Height", f.h);
+    GetU(params, "Width", f.w); GetU(params, "Height", f.h); GetU(params, "OutWidth", f.ow); GetU(params, "OutHeight", f.oh);
     std::lock_guard<std::mutex> l(lk);
     feats[(uintptr_t)h] = f;
     static int logged = 0;
@@ -5055,7 +5126,7 @@ static void OnEval(VkCommandBuffer cmd, const void *h, const void *params)
     if (!d || !d->CmdCopyImage) return;
     std::lock_guard<std::mutex> l(lk);
     nEval++;
-    Feat f = { 0, -1, 0, 0 };
+    Feat f = { 0, -1, 0, 0, 0, 0 };
     auto it = h ? feats.find((uintptr_t)h) : feats.end();
     const bool known = it != feats.end();
     if (known) f = it->second;
@@ -5084,6 +5155,13 @@ static void OnEval(VkCommandBuffer cmd, const void *h, const void *params)
     else flags = kMVLowRes | kDepthInverted;                       // not stated: as most current engines
     const bool low = (flags & kMVLowRes) != 0;
     if (!rw || !rh) { rw = mv->w; rh = mv->h; }
+    {
+        // the output size: from the feature's creation, else from the call's parameters (usually the same block)
+        unsigned ow = f.ow, oh = f.oh;
+        if (!ow || !oh) { GetU(params, "OutWidth", ow); GetU(params, "OutHeight", oh); }
+        const uint32_t fw = screenW.load(), fh = screenH.load();
+        if (ow && oh && fw && fh && (uint64_t)mv->w * mv->h >= mainArea) NoteLetterbox(oh < 0.9 * fh && ow >= 0.9 * fw, ow, oh, fw, fh);
+    }
     if (ringDev && ringDev != d) return;                           // one device
     {
         const double tn = Now();
@@ -5146,16 +5224,16 @@ static bool EnsureGpu(DeviceData *d)
     smi.magFilter = smi.minFilter = VK_FILTER_NEAREST;
     smi.addressModeU = smi.addressModeV = smi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     bool ok = d->CreateSampler(dv, &smi, nullptr, &nearest) == VK_SUCCESS;
-    VkDescriptorSetLayoutBinding b[3] = {};
-    for (int i = 0; i < 3; i++)
+    VkDescriptorSetLayoutBinding b[4] = {};
+    for (int i = 0; i < 4; i++)
     {
         b[i].binding = (uint32_t)i;
-        b[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[i].descriptorType = i != 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dli.bindingCount = 3; dli.pBindings = b;
+    dli.bindingCount = 4; dli.pBindings = b;
     ok = ok && d->CreateDescriptorSetLayout(dv, &dli, nullptr, &dsl) == VK_SUCCESS;
     VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GPush) };
     VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -5166,7 +5244,7 @@ static bool EnsureGpu(DeviceData *d)
     ok = p != VK_NULL_HANDLE;
     if (ok)
     {
-        VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kRing * kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kRing * kStage } };
+        VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * kRing * kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kRing * kStage } };
         VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         dpi.maxSets = kRing * kStage; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
         ok = d->CreateDescriptorPool(dv, &dpi, nullptr, &pool) == VK_SUCCESS;
@@ -5200,6 +5278,7 @@ static void AtPresent(DeviceData *d, Swapchain *sc, uint32_t slot, VkCommandBuff
         if (tn - retired[i].t > 1.0) { FreeImg(ringDev ? ringDev : d, retired[i].i); retired[i] = retired.back(); retired.pop_back(); }
         else i++;
     }
+    screenW = sc->extent.width; screenH = sc->extent.height;
     if (!On() || d != ringDev || !sc->gFlow[slot]) { pendN = 0; latest = -1; return; }
     const int f = std::max(1, g_vkFgFactor.load());
     int k;
@@ -5213,7 +5292,8 @@ static void AtPresent(DeviceData *d, Swapchain *sc, uint32_t slot, VkCommandBuff
         k = latest;
         scale = 1.0f / (float)f;
         if (seq != fgSeqSeen) { fgSeqSeen = seq; fgIdx = 0; } else if (fgIdx < 8) fgIdx++;
-        lag = (float)std::max(0, f - 1 - fgIdx);
+        const int lf = g_shared.warpFgLag;                         // FrameWarpGameMotionFGLag: 1 generated frames first, -1 after, 0 off
+        lag = lf > 0 ? (float)std::max(0, f - 1 - fgIdx) : lf < 0 ? -(float)std::min(fgIdx, f - 1) : 0.0f;
     }
     else
     {
@@ -5224,24 +5304,29 @@ static void AtPresent(DeviceData *d, Swapchain *sc, uint32_t slot, VkCommandBuff
     }
     const Entry &e = ring[k];
     if (!e.mv.img || !EnsureGpu(d)) return;
+    // the rendered frame before's vectors (how much the motion kept up), where they are the same kind
+    const Entry &ep = ring[(k + kRing - 1) % kRing];
+    const bool prevOk = ep.mv.img && ep.mv.img != e.mv.img && ep.mv.w == e.mv.w && ep.mv.h == e.mv.h && ep.mv.fmt == e.mv.fmt && !e.reset;
+    const VkImageView pv = prevOk ? ep.mv.view : e.mv.view;
     // the set for this ring entry and slot: rewritten when its images were made anew (only this slot's command buffer
     // uses it, and its previous use is done: its fence was waited for before recording)
     const VkImageView dv = e.hasDepth ? e.dp.view : e.mv.view;
-    if (setMv[k][slot] != e.mv.view || setDp[k][slot] != dv || setOut[k][slot] != sc->gFlowView[slot])
+    if (setMv[k][slot] != e.mv.view || setDp[k][slot] != dv || setOut[k][slot] != sc->gFlowView[slot] || setPv[k][slot] != pv)
     {
-        VkDescriptorImageInfo ii[3] = { { nearest, e.mv.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+        VkDescriptorImageInfo ii[4] = { { nearest, e.mv.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
                                         { nearest, dv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-                                        { VK_NULL_HANDLE, sc->gFlowView[slot], VK_IMAGE_LAYOUT_GENERAL } };
-        VkWriteDescriptorSet wr[3] = {};
-        for (int i = 0; i < 3; i++)
+                                        { VK_NULL_HANDLE, sc->gFlowView[slot], VK_IMAGE_LAYOUT_GENERAL },
+                                        { nearest, pv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } };
+        VkWriteDescriptorSet wr[4] = {};
+        for (int i = 0; i < 4; i++)
         {
             wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             wr[i].dstSet = sets[k][slot]; wr[i].dstBinding = (uint32_t)i; wr[i].descriptorCount = 1;
-            wr[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            wr[i].descriptorType = i != 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             wr[i].pImageInfo = &ii[i];
         }
-        d->UpdateDescriptorSets(d->device, 3, wr, 0, nullptr);
-        setMv[k][slot] = e.mv.view; setDp[k][slot] = dv; setOut[k][slot] = sc->gFlowView[slot];
+        d->UpdateDescriptorSets(d->device, 4, wr, 0, nullptr);
+        setMv[k][slot] = e.mv.view; setDp[k][slot] = dv; setOut[k][slot] = sc->gFlowView[slot]; setPv[k][slot] = pv;
     }
     VkImageMemoryBarrier b = ImgBarrier(sc->gFlow[slot], sc->gFlowInit[slot] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
                                         VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT);
@@ -5252,6 +5337,8 @@ static void AtPresent(DeviceData *d, Swapchain *sc, uint32_t slot, VkCommandBuff
     memcpy(gp.mvMap, e.mvMap, sizeof(gp.mvMap)); memcpy(gp.dMap, e.dMap, sizeof(gp.dMap));
     gp.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u);
     gp.mvInvalid = 3.402823466e38f;                                // DLSS has no marker for a missing vector
+    gp.perRendered = scale > 0.0f ? 1.0f / scale : 1.0f;            // shown frames per rendered one: back to a whole rendered frame's motion
+    gp.prevOk = prevOk ? 1.0f : 0.0f;
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pso);
     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &sets[k][slot], 0, nullptr);
     d->CmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gp), &gp);
@@ -5351,10 +5438,24 @@ static void Tick(double t)
          "not usable %.0f/s", secs, e / secs, u / secs, sd / secs, o / secs, nm / secs, bd / secs);
 }
 static int State() { return state.load(); }
+// No frame warp: a cutscene letterboxed through DLSS (after full-screen output this session, for at most 10 minutes).
+static bool Letterboxed()
+{
+    if (!lbOn.load() || Now() - lbT.load() >= 1.0 || !lbFullSeen.load()) return false;
+    if (Now() - lbStartT.load() < 600.0) return true;
+    static double loggedFor = -1.0;
+    if (loggedFor != lbStartT.load())
+    {
+        loggedFor = lbStartT.load();
+        LOGI("BFI Presenter: frame warp: letterboxed for over 10 minutes -- taken as play, not a cutscene; frame warp works again");
+    }
+    return false;
+}
 #else
 static void AtPresent(DeviceData *, Swapchain *, uint32_t, VkCommandBuffer) {}
 static void Tick(double) {}
 static int State() { return 0; }
+static bool Letterboxed() { return false; }
 #endif
 } // namespace gvk
 
@@ -7621,6 +7722,21 @@ static void draw_overlay(reshade::api::effect_runtime *)
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
                                                                   "further ahead than this (shown frames). Further out it overshoots and snaps back.");
                 }
+                bool ev = s.warpEven != 0;
+                if (ImGui::Checkbox("Even pacing", &ev)) s.warpEven = ev ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion only: every strobe cycle shows the picture where the game's motion\n"
+                                                              "is at that moment, not just the cycles without a new frame, so every step on screen is the same.\n"
+                                                              "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
+                                                              "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
+                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
+                ImGui::SameLine();
+                bool pl = s.warpPauseLb != 0;
+                if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
+                                                              "screen): its quick cuts between camera angles have no motion to follow. Only after\n"
+                                                              "full-screen play in the same session, and not once a letterbox has lasted 10 minutes\n"
+                                                              "(play, in a game letterboxed by design). Right after a camera cut the game flags,\n"
+                                                              "frames are never filled either way.");
             }
             {
                 const int src = st.warpCycles ? st.warpSrc : (s.warpGame ? st.warpGameState : 0);
