@@ -3402,7 +3402,15 @@ static void PresenterThread(Swapchain *sc)
                     // few seconds and comes back by itself (Indiana Jones close to its video memory budget), so those
                     // seconds don't count either: the limit stays on instead of going off and on again.
                     const bool stallSec = hitchPaused || (sleeping && fpsA < 0.8 * rend) || lastSlow >= 8;
-                    if (stallSec) cand = fgCand;
+                    // Frame generation switched off in the game while presentation is slowed (vp2): presents and rendered
+                    // frames match second after second, but the slow image returns kept every second a "stall", so 2x
+                    // stayed -- and with it the limit for 2x, 30 rendered fps, through every swap chain rebuild (Indiana
+                    // Jones). 4 such seconds in a row count as frame generation off.
+                    static int noFgRun = 0;
+                    const bool oneToOne = sleeping && rend >= 20 && fpsA >= 0.8 * rend && fpsA <= 1.25 * rend;
+                    noFgRun = (stallSec && oneToOne && g_vkFgFactor.load() > 1) ? noFgRun + 1 : 0;
+                    if (noFgRun >= 4) { cand = 1; fgCand = 1; fgRun = 3; noFgRun = 0; }
+                    else if (stallSec) cand = fgCand;
                     else { fgRun = cand == fgCand ? fgRun + 1 : 1; fgCand = cand; }
                     // Slowed presentation in the last 3 seconds (slow image returns).
                     static int slowWin = 0;
