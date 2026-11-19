@@ -70,6 +70,7 @@ static ID3D12Resource *FlowRes(int s);
 static void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride);
 static UINT FlowGenNow();
 static int  StateNow(char *why, size_t n);
+static int  StateFast();
 static int  ViaNow();
 static int  HudNow();
 static void HudBad(double pct);
@@ -85,6 +86,7 @@ static inline ID3D12Resource *FlowRes(int) { return nullptr; }
 static inline void WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE, UINT) {}
 static inline UINT FlowGenNow() { return 0; }
 static inline int  StateNow(char *why, size_t n) { if (n) why[0] = 0; return 0; }
+static inline int  StateFast() { return 0; }
 static inline int  ViaNow() { return 0; }
 static inline int  HudNow() { return 0; }
 static inline void HudBad(double) {}
@@ -154,6 +156,8 @@ struct Settings
     int   warpGame = 1;       // FrameWarpGameMotion: use the game's own motion vectors and depth where it hands them to
                               // its upscaler (Streamline / DLSS, D3D12, 64-bit); otherwise the motion measured from the picture
     int   warpGameHud = 1;    // FrameWarpGameHud: keep the HUD still with the game's HUD-less picture, where it gives one
+    int   warpEven = 0;       // FrameWarpEvenPacing (test): every strobe cycle moved to where the game's motion is, where the game's
+                              // own motion is used; elsewhere missing frames are filled as usual
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many
                               // pixels of the game frame (0 = off) -- a CRT shader's scanlines and mask stay in place
     float warpMaxGameFg = 0.25f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
@@ -340,6 +344,7 @@ static void LoadSettings(Settings &s)
     s.warpGameCheck = IniInt("FrameWarpGameMotionCheck", 1) != 0 ? 1 : 0;
     s.warpGameHud = IniInt("FrameWarpGameHud", 1) != 0 ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.25f)));
+    s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
     s.warpSnapX = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapX", 0.0f)));
     s.warpSnapY = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapY", 0.0f)));
     s.osd = IniInt("Osd", 0) ? 1 : 0;
@@ -574,6 +579,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarpGameMotion", s.warpGame);
     IniWriteInt("FrameWarpGameHud", s.warpGameHud);
     IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
+    IniWriteInt("FrameWarpEvenPacing", s.warpEven);
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
     IniWriteInt("Osd", s.osd);
@@ -4381,7 +4387,7 @@ static DWORD WINAPI PresenterThread(void *)
             warpAhead = 0.0;
         }
         else if (cycleStart)
-            warpAhead = warpClock.Cycle(s.frameWarp, pickId, pickTime, tVb, (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0),
+            warpAhead = warpClock.Cycle((s.warpEven && s.warpGame && gmo::StateFast() > 0) ? 2 : 1, pickId, pickTime, tVb, (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0),
                                         (double)s.warpMax, (double)s.warpMinRate / 100.0);
         pickNew = cycleStart && pickId != lastShownId;
         pickRelT = (pickNew && g_relId[pickId % kRel] == pickId) ? g_relT[pickId % kRel] : 0.0;
@@ -4558,6 +4564,8 @@ static DWORD WINAPI PresenterThread(void *)
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = (uint32_t)gsrc;
             }
+            // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
+            else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
             else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
         }
@@ -8878,6 +8886,7 @@ static ID3D12Resource *FlowRes(int s) { return s >= 0 && s < (int)kStage ? flow[
 static int StateNow(char *w, size_t n) { std::lock_guard<std::mutex> l(lk); snprintf(w, n, "%s", why); return state.load(); }
 static int HudNow() { return hudState.load(); }
 static int ViaNow() { return via.load(); }
+static int StateFast() { return state.load(); }
 // The check found the mask covering much of the picture: the HUD-less picture doesn't match the frame shown as it is
 // compared now. The next way of comparing is tried; after the last, the mask is switched off for the session (effects
 // drawn after the HUD-less picture -- ReShade's included -- or an encoding none of the modes undo).
@@ -13527,6 +13536,16 @@ static void draw_overlay(reshade::api::effect_runtime *)
             else ImGui::Text("Waiting for the game's frame rate.");
             bool gm = s.warpGame != 0;
             if (ImGui::Checkbox("Use the game's own motion vectors and depth", &gm)) s.warpGame = gm ? 1 : 0;
+            if (s.warpGame)
+            {
+                ImGui::SameLine();
+                bool ev = s.warpEven != 0;
+                if (ImGui::Checkbox("Even pacing (test)", &ev)) s.warpEven = ev ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion only: every strobe cycle shows the picture where the game's motion\n"
+                                                              "is at that moment, not just the cycles without a new frame, so every step on screen is the same.\n"
+                                                              "Frames are moved a little all the time: any error shows on every flash. Games without the\n"
+                                                              "game's motion fill missing frames as usual. Off by default.");
+            }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (through Streamline or directly, DX12) its motion vectors and\n"
                                                           "depth, frame warp moves each part of the picture by the game's own motion for it, and\n"
                                                           "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
