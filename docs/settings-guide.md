@@ -239,7 +239,7 @@ It costs latency: about 10–20 ms more than just-in-time release (Silent Hill 2
 **Frame warp** · `FrameWarp`, `FrameWarpMaxAhead`, `FrameWarpMinRate` · default: off, 1.0, 75 · DX add-on (v1.0.41) and Vulkan layer (v1.0.42)\
 Fills strobe cycles that have no new game frame. When a game misses the strobe rate now and then, e.g. 57 fps against a 60 Hz strobe, about three times a second the presenter has no new frame for a strobe cycle and lights the last one again. The picture stands still for one flash and jumps at the next: a stutter you can see especially in camera pans, because BFI makes motion sharp. With frame warp, that cycle shows the last frame **moved part of the way along the camera's motion** instead, half way to where the next frame is expected. Frames that arrive in time are shown exactly as rendered; only the missing ones are filled.
 
-The motion is measured on the GPU between the last two frames, from the finished picture, so it works in every game without motion vectors, depth or Reflex. Where a DX12 game hands DLSS its own motion vectors and depth, those are used instead (below). It is averaged over the whole picture, so it follows the camera (with its depth) and nothing tears.
+The motion is measured on the GPU between the last two frames, from the finished picture, so it works in every game without motion vectors, depth or Reflex. Where a DX12 or Vulkan game hands DLSS its own motion vectors and depth, those are used instead (below). It is averaged over the whole picture, so it follows the camera (with its depth) and nothing tears.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/frame-warp-dark.png">
