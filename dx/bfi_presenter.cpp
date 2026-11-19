@@ -66,6 +66,7 @@ namespace gmo                                    // frame warp from the game's o
 static void AtPresent(ID3D12GraphicsCommandList *list, UINT s);
 static void Published(UINT s, UINT64 id);
 static int  SlotFor(int s, UINT64 id);
+static float SlotLag(int s);
 static ID3D12Resource *FlowRes(int s);
 static UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride);
 static ID3D12Resource *FlowFor(int s, UINT gen);
@@ -85,6 +86,7 @@ namespace gmo                                    // 32-bit games: no Streamline,
 static inline void AtPresent(ID3D12GraphicsCommandList *, UINT) {}
 static inline void Published(UINT, UINT64) {}
 static inline int  SlotFor(int, UINT64) { return 0; }
+static inline float SlotLag(int) { return 0.0f; }
 static inline ID3D12Resource *FlowRes(int) { return nullptr; }
 static inline UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE, UINT) { return 0; }
 static inline ID3D12Resource *FlowFor(int, UINT) { return nullptr; }
@@ -171,6 +173,9 @@ struct Settings
     int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: the game's motion also while frame generation is on. Off by default:
                               // the game's vectors are for its rendered frames, so on generated ones edges double up (outlines
                               // around characters, e.g. 007 First Light, Directive 8020); the measured motion is used instead
+    int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (test, ini only): with the game's motion and frame generation, its
+                              // vectors read where each point is in the rendered frame: 1 = generated frames come before
+                              // the rendered one (DLSS frame generation), -1 = after it, 0 = off (read where shown, ep7)
     float warpMaxGameFg = 0.25f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
                               // many shown frames ahead (it overshot visibly from about 0.5 in 007 First Light)
     int   warpGameCheck = 1;  // FrameWarpGameMotionCheck (test, ini only): every 2 s the game's motion and the measured one in the log
@@ -355,6 +360,7 @@ static void LoadSettings(Settings &s)
     s.warpGameCheck = IniInt("FrameWarpGameMotionCheck", 1) != 0 ? 1 : 0;
     s.warpGameHud = IniInt("FrameWarpGameHud", 1) != 0 ? 1 : 0;
     s.warpGameFg = IniInt("FrameWarpGameMotionWithFG", 0) ? 1 : 0;
+    s.warpFgLag = std::max(-1, std::min(1, IniInt("FrameWarpGameMotionFGLag", 1)));
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.25f)));
     s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
     s.warpPauseLb = IniInt("FrameWarpPauseCutscenes", 1) ? 1 : 0;
@@ -1709,6 +1715,8 @@ cbuffer C : register(b0)
     uint  warpSrc;    // 0 motion measured from the picture; 1 the game's motion vectors and depth; 2 its motion vectors only
     float warpSnapX, warpSnapY;  // moves rounded to whole steps of this many game-frame pixels (0 = off): a CRT shader's scanlines
                       // and mask stay where they are instead of breaking up where parts of the picture move differently
+    float warpLag;    // the game's motion with frame generation: shown frames this frame is behind the rendered frame its
+                      // motion vectors are for (a generated frame sits between two rendered ones; 0 = the rendered frame)
 };
 Texture2D<float4> src : register(t0);
 Texture2D<float> aplTex : register(t1);
@@ -1732,22 +1740,26 @@ float4 GameFlow(float2 uv)
 // point found really move onto this pixel? Of the steps that do, the nearest point wins: what is in front covers
 // what is behind it. Where none does, the area is being uncovered, and the background's motion (the farthest of
 // the points found) fills it.
+// With frame generation, a generated frame shows everything warpLag shown frames short of where the vectors' (rendered)
+// frame has it, so the vectors are read where each point is in that frame: warpLag shown frames further along its
+// motion (ep8). The picture is still moved by warp.
 float2 WarpShiftGame(float2 uv)
 {
     uint w, h;
     src.GetDimensions(w, h);
     const float2 osz = float2(w, h);                      // the check below is to a pixel of the game frame
+    const float L = warp - warpLag;                       // where along its motion the vectors are read
     float2 m[3];
     m[0] = GameFlow(uv).xy;
-    m[1] = GameFlow(uv - m[0] * warp).xy;
-    m[2] = GameFlow(uv - m[1] * warp).xy;
+    m[1] = GameFlow(uv - m[0] * L).xy;
+    m[2] = GameFlow(uv - m[1] * L).xy;
     float2 best = float2(0.0, 0.0), back = float2(0.0, 0.0);
     float bestNear = -1.0, backNear = 2.0;
     [unroll] for (int i = 0; i < 3; i++)
     {
-        float4 g = GameFlow(uv - m[i] * warp);
+        float4 g = GameFlow(uv - m[i] * L);
         if (g.z < 0.5) continue;
-        if (length((g.xy - m[i]) * warp * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; }
+        if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; }
         if (g.w < backNear) { backNear = g.w; back = m[i]; }
     }
     if (bestNear < 0.0) best = backNear <= 1.0 ? back : float2(0.0, 0.0);
@@ -2389,7 +2401,9 @@ struct Constants
     float    warpPrevN;                 // frame warp with the game's own motion: game frames back to the frame shown before
     uint32_t warpSrc;                   // 0 motion from the picture, 1 the game's motion vectors and depth, 2 its vectors only
     float    warpSnapX, warpSnapY;      // frame warp: moves rounded to whole steps of this many game-frame pixels (0 = off)
+    float    warpLag;                   // the game's motion with frame generation: shown frames behind its vectors' frame
 };
+static_assert(sizeof(Constants) / 4 <= 63, "root constants: at most 64 DWORDs in the root signature");
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
 // every 32x18 cell's lit value is capped at C. Plain strobe: the lit refresh.
@@ -4581,6 +4595,7 @@ static DWORD WINAPI PresenterThread(void *)
                 c.warp = (float)(floor(ahead * 256.0 + 0.5) / 256.0);
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = (uint32_t)gsrc;
+                c.warpLag = g_status.fgActive ? gmo::SlotLag(pick) : 0.0f;
             }
             // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
             else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
@@ -8283,6 +8298,8 @@ static std::vector<RetiredRes> flowRetired;
 static UINT flowW = 0, flowH = 0;
 static std::atomic<UINT> flowGen{0};                     // bumped when the motion textures are made anew
 static bool slotPend[kStage] = {}, slotOk[kStage] = {}, slotDepth[kStage] = {};
+static float slotLag[kStage] = {};                       // frame generation: shown frames this one is behind its vectors' frame
+static uint64_t fgSeqSeen = 0; static int fgIdx = 0;     // which shown frame since the last upscaler call (0 = the first)
 static std::atomic<UINT64> slotId[kStage];
 // Camera cuts and letterboxed cutscenes (ep3): the frame after a cut (the game's reset flag, from Streamline or direct
 // DLSS calls) and the next ones aren't filled -- there is no motion connecting two shots, and the motion measured from
@@ -8805,7 +8822,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     if (!On()) { std::lock_guard<std::mutex> l(lk); pendN = 0; latest = -1; return; }
     Entry e;
     int k;
-    float scale = 1.0f;
+    float scale = 1.0f, lag = 0.0f;
     {
         std::lock_guard<std::mutex> l(lk);
         presSec++;
@@ -8830,7 +8847,12 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
             // covers. (A generated frame sits between two rendered ones: its picture is a little off from the vectors'.)
             pendN = 0;
             if (!g_shared.warpGameFg) return;             // the game's motion isn't used with frame generation (the default)
-            if (latest < 0 || fgK < 2) return;            // not settled yet (or not really generating): the picture's motion
+            if (latest < 0 || fgK < 2) return;
+            // DLSS frame generation shows the generated frames first, then the rendered one the latest vectors are for:
+            // the i-th Present since the upscaler call is fgK-1-i shown frames behind it.
+            if (seq != fgSeqSeen) { fgSeqSeen = seq; fgIdx = 0; } else if (fgIdx < 8) fgIdx++;
+            const int lf = g_shared.warpFgLag;
+            lag = lf > 0 ? (float)std::max(0, fgK - 1 - fgIdx) : lf < 0 ? -(float)std::min(fgIdx, fgK - 1) : 0.0f;            // not settled yet (or not really generating): the picture's motion
             k = latest;
             scale = 1.0f / (float)fgK;
         }
@@ -8971,7 +8993,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     b[1] = Transition(e.mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     if (e.hasDepth) b[2] = Transition(e.depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     list->ResourceBarrier(nb, b);
-    slotPend[s] = true; slotOk[s] = !e.reset; slotDepth[s] = e.hasDepth; slotCut[s] = e.reset;
+    slotPend[s] = true; slotOk[s] = !e.reset; slotDepth[s] = e.hasDepth; slotCut[s] = e.reset; slotLag[s] = lag;
 }
 
 // After the frame in slot s is published as game frame id.
@@ -9003,6 +9025,7 @@ static bool PauseNow(UINT64 id, bool letterbox, const char **why)
 }
 
 // The presenter: is frame `id` in slot s warped with the game's motion? 0 no, 1 vectors and depth, 2 vectors only.
+static float SlotLag(int s) { return (s >= 0 && s < (int)kStage) ? slotLag[s] : 0.0f; }
 static int SlotFor(int s, UINT64 id)
 {
     if (s < 0 || s >= (int)kStage || !id || slotId[s].load() != id || !slotOk[s]) return 0;
