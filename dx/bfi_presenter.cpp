@@ -2637,10 +2637,10 @@ static void Trace(const char *fmt, ...)
 // compile flags: from the second start of a version there is no compile at all.
 static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce",
                                          "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud",
-                                         "PSWarpHudScore", "PSWarpHudDilate" };   // the last eight: kWarpShader (dx/bfi_warp.h), in its order
+                                         "PSWarpHudScore", "PSWarpHudReduce", "PSWarpHudDilate" };   // the last nine: kWarpShader (dx/bfi_warp.h), in its order
 static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0",
-                                         "ps_5_0", "ps_5_0" };
-static const int kShN = 13;
+                                         "ps_5_0", "ps_5_0", "ps_5_0" };
+static const int kShN = 14;
 static const int kShWarpGame = 9;                // frame warp from the game's own motion vectors and depth
 static const int kShWarpHud = 10;                // and its HUD mask from the game's HUD-less picture
 static const int kShWarp = 5;                    // first of the frame warp shaders
@@ -13919,9 +13919,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
             bool hm = s.warpHudMask != 0;
             if (ImGui::Checkbox("Keep the HUD still: mask learned over time (test)", &hm)) s.warpHudMask = hm ? 1 : 0;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("What stays the same from frame to frame while the scene around it changes (a HUD, its text\n"
-                                                          "and markers) is learned in three frames and never moved, with a few pixels around it, so a\n"
+                                                          "and markers) is learned in three frames and never moved, with about 6 pixels around it, so a\n"
                                                           "HUD's soft edges don't split off. A HUD that goes away is forgotten in two frames. Not for a\n"
-                                                          "HUD that changes all the time (a turning minimap) or one you see the scene through.");
+                                                          "HUD that changes all the time (a turning minimap) or one you see the scene through (a compass bar).");
             bool pl = s.warpPauseLb != 0;
             if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
