@@ -181,6 +181,8 @@ struct Settings
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
+    int   warpHudMask = 1;    // FrameWarpHudMask (1.0.45 test): a HUD mask learned over time -- what stays the same while
+                              // the scene around it changes is never moved, with a few pixels around it
     int   warpEase = 1;       // FrameWarpGameMotionEase (test, ini only): with the game's motion and frame generation, the
                               // part of a move past the rendered frame eases off as the game's motion slows (1 = on)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
@@ -370,6 +372,7 @@ static void LoadSettings(Settings &s)
     s.warpFgLag = std::max(-1, std::min(1, IniInt("FrameWarpGameMotionFGLag", 1)));
     s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
+    s.warpHudMask = IniInt("FrameWarpHudMask", 1) ? 1 : 0;
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
     s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
@@ -624,6 +627,7 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
     IniWriteInt("FrameWarpEvenPacing", s.warpEven);
     IniWriteInt("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg);
+    IniWriteInt("FrameWarpHudMask", s.warpHudMask);
     IniWriteInt("FrameWarpPauseCutscenes", s.warpPauseLb);
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
@@ -1718,7 +1722,8 @@ cbuffer C : register(b0)
     float dfloor;
     float knee;
     float ceilLin;    // panel ceiling, linear (1.0 = SDR white / 80 nits)
-    uint  flags;      // 1 roll-off, 2 sine, 4 invert, 8 rolling scan, 1024 the game's frames are linear (scRGB; frame warp)
+    uint  flags;      // 1 roll-off, 2 sine, 4 invert, 8 rolling scan, 1024 the game's frames are linear (scRGB; frame warp),
+                      // 4096/8192 frame warp's screen edges mirrored/faded, 16384 its HUD mask learned over time (t5)
     float seam;       // rolling scan: blended zone between bands, fraction of the screen height
     float decay;      // rolling scan: phosphor decay time in sub-frames (0 = hard bands)
     float soften;     // 0..1: blend toward the steady average picture (LCD phase swap fade)
@@ -1750,6 +1755,7 @@ Texture2D<float> aplTex : register(t1);
 Texture2D<float4> srcNew : register(t2);  // split comparison: the newest game frame, for the side without BFI   // APL Limiter: the scene average (1x1); for its reduction pass, the 32x18 cells
 Texture2D<float4> srcPrev : register(t4); // frame warp: the game frame shown before this one (what stands still is not moved)
 Texture2D<float4> flowTex : register(t3); // frame warp: xy = how far the picture moved since the frame before (uv), z = confidence
+Texture2D<float>  hudMask : register(t5); // frame warp: the HUD mask learned over time (flags & 16384), half the frame's size
 SamplerState linClamp : register(s0);
 
 // Frame warp (dx/bfi_warp.h): how far back along its motion the picture shown at uv is taken from, in uv. The vector
@@ -1857,6 +1863,14 @@ bool Still(int2 q, float2 size)
     return max(max(d.r, d.g), d.b) > lim;
 }
 
+// The HUD mask learned over time (flags & 16384): 1 = HUD at game-frame pixel p.
+bool HudAt(float2 p)
+{
+    uint w, h;
+    hudMask.GetDimensions(w, h);
+    return hudMask.Load(int3(clamp(int2(p * 0.5), int2(0, 0), int2(w, h) - 1), 0)) > 0.5;
+}
+
 // The game's frame moved ahead: each output pixel is taken from where its part of the picture is in the frame.
 // False = show the pixel as rendered: what stands still on the screen is never moved, and nothing that stands
 // still is pulled over what moves next to it (the edge of a HUD stays clean; the scene coming out from behind it
@@ -1876,10 +1890,12 @@ bool FetchWarped(float2 pos, out float3 c)
     if (warpSnapX > 0.0) d.x = round(d.x / warpSnapX) * warpSnapX;
     if (warpSnapY > 0.0) d.y = round(d.y / warpSnapY) * warpSnapY;
     if (dot(d, d) < 0.0004) return false;                 // under 1/50 pixel
+    if ((flags & 16384) != 0 && HudAt(cp)) return false;  // the learned HUD mask: a HUD pixel is never moved
     if (Still(int2(cp), size)) return false;
     float2 p = cp - d;
     if ((flags & 4096) != 0) p = EdgeMirror(p, size);
     p = clamp(p, float2(0.5, 0.5), size - 0.5);
+    if ((flags & 16384) != 0 && HudAt(p)) return false;   // and no moved pixel is taken from the HUD
     // the game's HUD mask (w = -1): a HUD pixel is never moved, and no moved pixel is taken from the HUD
     if (warpSrc != 0 && (GameFlow(cp * inv).w < -0.5 || GameFlow(p * inv).w < -0.5)) return false;
     if (Still(int2(p), size)) return false;
@@ -2620,9 +2636,11 @@ static void Trace(const char *fmt, ...)
 // they are usually ready), and kept on disk in BFIPresenter_shaders.bin next to the ini, keyed to the exact source and
 // compile flags: from the second start of a version there is no compile at all.
 static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce",
-                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud" };   // the last six: kWarpShader (dx/bfi_warp.h)
-static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
-static const int kShN = 11;
+                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud",
+                                         "PSWarpHudScore", "PSWarpHudDilate" };   // the last eight: kWarpShader (dx/bfi_warp.h), in its order
+static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0",
+                                         "ps_5_0", "ps_5_0" };
+static const int kShN = 13;
 static const int kShWarpGame = 9;                // frame warp from the game's own motion vectors and depth
 static const int kShWarpHud = 10;                // and its HUD mask from the game's HUD-less picture
 static const int kShWarp = 5;                    // first of the frame warp shaders
@@ -3782,7 +3800,9 @@ static DWORD WINAPI PresenterThread(void *)
         rangeFlow.BaseShaderRegister = 3;                  // t3: frame warp's motion
         D3D12_DESCRIPTOR_RANGE rangePrev = range;
         rangePrev.BaseShaderRegister = 4;                  // t4: frame warp's frame shown before
-        D3D12_ROOT_PARAMETER params[6] = {};
+        D3D12_DESCRIPTOR_RANGE rangeHud = range;
+        rangeHud.BaseShaderRegister = 5;                   // t5: frame warp's HUD mask learned over time
+        D3D12_ROOT_PARAMETER params[7] = {};
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
         params[0].Constants.Num32BitValues = sizeof(Constants) / 4;
@@ -3799,6 +3819,8 @@ static DWORD WINAPI PresenterThread(void *)
         params[4].DescriptorTable.pDescriptorRanges   = &rangeFlow;
         params[5] = params[1];
         params[5].DescriptorTable.pDescriptorRanges   = &rangePrev;
+        params[6] = params[1];
+        params[6].DescriptorTable.pDescriptorRanges   = &rangeHud;
         D3D12_STATIC_SAMPLER_DESC samp = {};
         samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -3806,7 +3828,7 @@ static DWORD WINAPI PresenterThread(void *)
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 6;
+        rsd.NumParameters = 7;
         rsd.pParameters   = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers   = &samp;
@@ -4690,6 +4712,12 @@ static DWORD WINAPI PresenterThread(void *)
                 if (cycleStart) secWarpHeld++;
             }
         }
+        // The HUD mask learned over time (FrameWarpHudMask, test): brought up to date once per new frame, from it and
+        // the frame shown before -- also for frames shown as rendered, so it keeps learning while nothing is moved.
+        const bool hudUpd = s.warpHudMask && s.frameWarp && warp.ok && warp.hudOk && pick >= 0 && pickId != warp.hudId &&
+                            warpPrev >= 0 && warpPrev != pick && warpPrevId && g_stageId[warpPrev] == warpPrevId && g_stageFence[warpPrev] <= done;
+        const bool prevRead = c.warp != 0.0f || hudUpd;    // the frame shown before is read in this list
+        if (c.warp != 0.0f && s.warpHudMask && warp.hudOk && (warp.hudHave || hudUpd)) c.flags |= 16384u;
         if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame[c.warpSrc <= 2 ? c.warpSrc : 0]++; }
 
         if (pickNew2 < 0) pickNew2 = pick;                       // picked later (the wait above): the same frame
@@ -4701,7 +4729,7 @@ static DWORD WINAPI PresenterThread(void *)
             reserve = ++g_presFenceVal;
             g_readFence[pick] = reserve;
             if (pickNew2 != pick) g_readFence[pickNew2] = reserve;
-            if (c.warp != 0.0f) g_readFence[warpPrev] = reserve;
+            if (prevRead) g_readFence[warpPrev] = reserve;
         }
         // The game never copies into the slot being shown (g_presCurSlot), so
         // the lock can go before waiting on the GPU.
@@ -4747,7 +4775,7 @@ static DWORD WINAPI PresenterThread(void *)
             D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &b2);
         }
-        if (c.warp != 0.0f)
+        if (prevRead)
         {
             D3D12_RESOURCE_BARRIER b3 = Transition(g_stage[warpPrev], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &b3);
@@ -4855,6 +4883,13 @@ static DWORD WINAPI PresenterThread(void *)
                 warp.RecordLuma(list, srv, pickId, pickTime, StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT);
                 touched = true;
             }
+            if (hudUpd)
+            {
+                D3D12_GPU_DESCRIPTOR_HANDLE psrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                psrv.ptr += (UINT64)warpPrev * srvStride;
+                warp.RecordHud(list, srv, psrv, pickId, StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT);
+                touched = true;
+            }
             if (c.warp != 0.0f && c.warpSrc == 0 && (warp.flowNew != pickId || warp.flowOld != warpOld)) { warp.RecordFlow(list); touched = true; }
             // The check: the measured motion for this pair too, and both textures copied for reading back.
             if (s.warpGameCheck && c.warpSrc != 0 && cycleStart && !chkPending && Now() - chkT >= 2.0 && gFlow)
@@ -4928,6 +4963,7 @@ static DWORD WINAPI PresenterThread(void *)
             psrv.ptr += (UINT64)(c.warp != 0.0f ? warpPrev : pick) * srvStride;
             list->SetGraphicsRootDescriptorTable(5, psrv);                         // t4: the frame shown before (likewise)
         }
+        list->SetGraphicsRootDescriptorTable(6, warp.hudOk ? warp.HudMaskSrv() : srv);   // t5: the learned HUD mask (likewise)
         // RenoFX APL Limiter: measure the frame before its first refresh, so the boost uses its own average (as in
         // RenoFX). Its later refreshes reuse the value.
         if (aplOn && pickId != aplFrameId)
@@ -5026,7 +5062,7 @@ static DWORD WINAPI PresenterThread(void *)
             D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             list->ResourceBarrier(1, &b2);
         }
-        if (c.warp != 0.0f)
+        if (prevRead)
         {
             D3D12_RESOURCE_BARRIER b3 = Transition(g_stage[warpPrev], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             list->ResourceBarrier(1, &b3);
@@ -13880,6 +13916,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
                                                               "stop isn't carried past it and snapped back. With frame generation it is always on.");
             }
+            bool hm = s.warpHudMask != 0;
+            if (ImGui::Checkbox("Keep the HUD still: mask learned over time (test)", &hm)) s.warpHudMask = hm ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("What stays the same from frame to frame while the scene around it changes (a HUD, its text\n"
+                                                          "and markers) is learned in three frames and never moved, with a few pixels around it, so a\n"
+                                                          "HUD's soft edges don't split off. A HUD that goes away is forgotten in two frames. Not for a\n"
+                                                          "HUD that changes all the time (a turning minimap) or one you see the scene through.");
             bool pl = s.warpPauseLb != 0;
             if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
