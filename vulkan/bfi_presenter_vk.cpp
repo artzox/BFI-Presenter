@@ -3681,7 +3681,7 @@ static void PresenterThread(Swapchain *sc)
                         {
                             dupLogged = true;
                             LOGI("BFI Presenter: the game presents each frame twice (%.0f presents, %ld Reflex sleeps a second) -- "
-                                 "the automatic frame cap tries Refresh rate again every 20 s when it steps down", fpsA, rend);
+                                 "the automatic frame cap steps down only after 10 s below Refresh rate and tries it again every 10 s", fpsA, rend);
                         }
                     }
                     // A second with far fewer presents than rendered frames is a stall or a rebuilt swap chain (its first
@@ -4113,7 +4113,7 @@ static void PresenterThread(Swapchain *sc)
                                          "tries at Refresh rate every 5 minutes from now; set the cap to One game frame per strobe "
                                          "cycle to stop them", hzA / s.frames);
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
-                                     "at Refresh); next try in %.0f s", fpsA, hzA, dupSeen ? std::min(probeWait, 20.0) : probeWait);
+                                     "at Refresh); next try in %.0f s", fpsA, hzA, dupSeen ? std::min(probeWait, 10.0) : probeWait);
                             }
                         }
                     }
@@ -4121,7 +4121,12 @@ static void PresenterThread(Swapchain *sc)
                     {
                         // Not in the first 10 s after the presenter starts: the game is still warming up (as the DX add-on).
                         capDownSecs = (!hitchPaused && t - runStartT > 10.0 && fpsA > 0.3 * hzA / s.frames && fpsA < capHoldFrac * hzA) ? capDownSecs + 1 : 0;
-                        if (capDownSecs >= 3 && t - capSwitchT > 3.0)
+                        // 1.0.45: a game that presents each frame twice, or that held Refresh rate in an earlier session, steps
+                        // down only after 10 s below: a short dip (MotorStorm: Pacific Rift at each race start, 3-4 s at 36-41
+                        // frames a second) is loading, not a struggle, and stepping down there halved the race's first 20 s to
+                        // 30 game frames a second.
+                        const bool heldRefresh = dupSeen || (s.learnPerGame && learnMine.frames > 0 && learnSavedDown == 0);
+                        if (capDownSecs >= (heldRefresh ? 10 : 3) && t - capSwitchT > 3.0)
                         {
                             // Down again soon after going back up: the game is close to the limit, so the next try waits
                             // longer; well under the refresh rate, the first try waits a minute (as the DX add-on).
@@ -4134,7 +4139,7 @@ static void PresenterThread(Swapchain *sc)
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames, fpsA, hzA);
                         }
                     }
-                    else if (t - capSwitchT >= (dupSeen ? std::min(probeWait, 20.0) : probeWait) && !hitchPaused)
+                    else if (t - capSwitchT >= (dupSeen ? std::min(probeWait, 10.0) : probeWait) && !hitchPaused)
                     {
                         down = false; capProbe = true; probeSecs = probeGood = 0; capSwitchT = t;
                     }
