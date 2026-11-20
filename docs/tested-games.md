@@ -129,7 +129,7 @@ Also tested and working with the standard setup above. Their notes weren't recor
 | RiME | Standard setup |
 | Shadow Man Remastered | Standard setup |
 | Silent Hill 2 (2024) | Works with DLSS 5 and FG 2× (Refresh cap) |
-| South of Midnight | Refresh + automatic frame cap + Lowest latency (it can't hold 120; since v1.0.44 the frame start holds an even 60 with about 1 repeat every 15–20 s, 25 ms from release to flash); frame warp on with the game's motion vectors, `FrameWarpMinRate=75` (the default: its cutscenes run at 30 fps and are left as rendered; lower values filled them); HDR: `AblGuardBudgetNits=250` (the sky flashed at 300) |
+| South of Midnight | Refresh + automatic frame cap + Lowest latency (it can't hold 120; since v1.0.44 the frame start holds an even 60 with about 1 repeat every 15–20 s, 25 ms from release to flash); frame warp on with the game's motion vectors and Even pacing, `FrameWarpEvenPacing=1`, `FrameWarpMaxAhead=1.0`, `FrameWarpMinRate=60` (above 50, so its 30 fps cutscenes are left as rendered; lower values filled them); HDR: `AblGuardBudgetNits=250` (the sky flashed at 300) |
 | Split Fiction | Standard setup |
 | Spyro Reignited Trilogy | Standard setup |
 | Stray | Standard setup |
