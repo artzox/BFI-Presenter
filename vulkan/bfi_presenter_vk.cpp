@@ -3680,7 +3680,8 @@ static void PresenterThread(Swapchain *sc)
                         if (dupPresents && !dupLogged)
                         {
                             dupLogged = true;
-                            LOGI("BFI Presenter: the game presents each frame twice (%.0f presents, %ld Reflex sleeps a second) -- "
+                            LOGI("BFI Presenter: two presents per rendered frame (%.0f presents, %ld Reflex sleeps a second: the game presents each "
+                                 "frame twice, or NVIDIA Smooth Motion adds one) -- "
                                  "the automatic frame cap steps down only after 10 s below Refresh rate and tries it again every 10 s", fpsA, rend);
                         }
                     }
@@ -4121,7 +4122,8 @@ static void PresenterThread(Swapchain *sc)
                     {
                         // Not in the first 10 s after the presenter starts: the game is still warming up (as the DX add-on).
                         capDownSecs = (!hitchPaused && t - runStartT > 10.0 && fpsA > 0.3 * hzA / s.frames && fpsA < capHoldFrac * hzA) ? capDownSecs + 1 : 0;
-                        // 1.0.45: a game that presents each frame twice, or that held Refresh rate in an earlier session, steps
+                        // 1.0.45: a game with two presents per rendered frame (NVIDIA Smooth Motion in MotorStorm: Pacific Rift,
+                        // through RPCS3), or that held Refresh rate in an earlier session, steps
                         // down only after 10 s below: a short dip (MotorStorm: Pacific Rift at each race start, 3-4 s at 36-41
                         // frames a second) is loading, not a struggle, and stepping down there halved the race's first 20 s to
                         // 30 game frames a second.
