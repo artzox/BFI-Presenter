@@ -139,7 +139,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.44"
+#define BFI_ADDON_VERSION "1.0.45"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -159,7 +159,7 @@ struct Settings
     int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
     int   frameWarp = 0;      // FrameWarp: a strobe cycle without a new game frame shows the last one moved ahead
                               // along the camera's motion instead of lit again (no frame is held back: no added latency)
-    float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
+    float warpMax = 0.8f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5; 1.0 before 1.0.45)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
     int   warpGame = 1;       // FrameWarpGameMotion: use the game's own motion vectors and depth where it hands them to
                               // its upscaler (Streamline / DLSS, D3D12, 64-bit); otherwise the motion measured from the picture
@@ -168,6 +168,8 @@ struct Settings
                               // smaller than the screen, e.g. Townfall)
     int   warpEven = 0;       // FrameWarpEvenPacing: every strobe cycle moved to where the game's motion is, where the game's
                               // own motion is used; elsewhere missing frames are filled as usual
+    int   warpEdge = 0;       // FrameWarpEdge: the strip at the screen edge a moved flash has no picture for: 0 the move faded
+                              // out toward the edge, 1 the picture mirrored at the edge, 2 the edge repeated (stretched, before 1.0.45)
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many
                               // pixels of the game frame (0 = off) -- a CRT shader's scanlines and mask stay in place
     int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: the game's motion also while frame generation is on. Off by default:
@@ -178,6 +180,7 @@ struct Settings
                               // the rendered one (DLSS frame generation), -1 = after it, 0 = off (read where shown, ep7)
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
+    int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
     int   warpEase = 1;       // FrameWarpGameMotionEase (test, ini only): with the game's motion and frame generation, the
                               // part of a move past the rendered frame eases off as the game's motion slows (1 = on)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
@@ -354,7 +357,7 @@ static void LoadSettings(Settings &s)
     s.splitPos = std::max(5, std::min(95, IniInt("SplitComparePosition", 50)));
     s.splitSeam = std::max(0, std::min(400, IniInt("SplitCompareSeamPx", 0)));
     s.frameWarp = IniInt("FrameWarp", 0) != 0 ? 1 : 0;      // 2 (even pacing, test builds t1-t2) is gone: fill
-    s.warpMax = std::max(0.25f, std::min(1.5f, IniFloat("FrameWarpMaxAhead", 1.0f)));
+    s.warpMax = std::max(0.25f, std::min(1.5f, IniFloat("FrameWarpMaxAhead", 0.8f)));
     s.warpMinRate = std::max(40, std::min(95, IniInt("FrameWarpMinRate", 75)));
     s.warpGame = IniInt("FrameWarpGameMotion", 1) != 0 ? 1 : 0;
     s.warpGameSign = IniInt("FrameWarpGameMotionSign", 1) < 0 ? -1 : 1;
@@ -366,12 +369,14 @@ static void LoadSettings(Settings &s)
     s.warpGameFg = IniInt("FrameWarpGameMotionWithFG", 0) ? 1 : 0;
     s.warpFgLag = std::max(-1, std::min(1, IniInt("FrameWarpGameMotionFGLag", 1)));
     s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
+    s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
     s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
     s.warpPauseLb = IniInt("FrameWarpPauseCutscenes", 1) ? 1 : 0;
     s.warpSnapX = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapX", 0.0f)));
     s.warpSnapY = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapY", 0.0f)));
+    s.warpEdge = std::max(0, std::min(2, IniInt("FrameWarpEdge", 0)));
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -547,7 +552,8 @@ static void UpgradeIni(const Settings &s)
 
 // Defaults changed in a release, applied once to an existing BFIPresenter.ini (the file holds every setting, so a
 // new default never reaches it otherwise). DefaultsVersion records what was applied; set a value back afterwards
-// and it stays. 1.0.39: ReflexAlign on (it was off and written as 0 into every ini).
+// and it stays. 1.0.39: ReflexAlign on (it was off and written as 0 into every ini). 1.0.45: FrameWarpMaxAhead 0.8 where it
+// was the old default, 1.0 (filled flashes snapped back visibly in third-person games above about 0.6 before the ease).
 static void MigrateDefaults()
 {
     char keys[64];
@@ -561,6 +567,17 @@ static void MigrateDefaults()
             LOGI("BFI Presenter: ReflexAlign turned on (the default since 1.0.39; set ReflexAlign=0 to turn it off again)");
         }
         WritePrivateProfileStringA("BFI", "DefaultsVersion", "39", g_iniPath);
+    }
+    if ((int)GetPrivateProfileIntA("BFI", "DefaultsVersion", 0, g_iniPath) < 45)
+    {
+        char b[32] = "";
+        GetPrivateProfileStringA("BFI", "FrameWarpMaxAhead", "", b, sizeof(b), g_iniPath);
+        if (b[0] && fabs(atof(b) - 1.0) < 0.001)
+        {
+            WritePrivateProfileStringA("BFI", "FrameWarpMaxAhead", "0.800", g_iniPath);
+            LOGI("BFI Presenter: FrameWarpMaxAhead set to 0.8 (the default since 1.0.45; set it back to 1.0 if you prefer)");
+        }
+        WritePrivateProfileStringA("BFI", "DefaultsVersion", "45", g_iniPath);
     }
 }
 
@@ -606,9 +623,11 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarpGameMotionWithFG", s.warpGameFg);
     IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
     IniWriteInt("FrameWarpEvenPacing", s.warpEven);
+    IniWriteInt("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg);
     IniWriteInt("FrameWarpPauseCutscenes", s.warpPauseLb);
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
+    IniWriteInt("FrameWarpEdge", s.warpEdge);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -1787,6 +1806,23 @@ float2 WarpShift(float2 uv)
     return clamp(f.xy * (f.z * warp), -0.08, 0.08);
 }
 
+// The strip at the screen edge a moved flash has no picture for (FrameWarpEdge, 1.0.45). Mirror (flags & 4096): a place
+// beyond the edge is read from the picture reflected at the edge. Fade (flags & 8192): on the side the picture comes in
+// from, the move eases off over a band three moves wide, so the strip is drawn from the picture squeezed a little
+// instead of from one repeated edge pixel.
+float2 EdgeMirror(float2 p, float2 size)
+{
+    p = p < 0.5 ? 1.0 - p : p;
+    return p > size - 0.5 ? 2.0 * size - 1.0 - p : p;
+}
+float2 EdgeFade(float2 cp, float2 d, float2 size)
+{
+    float2 dist = d > 0.0 ? cp : size - cp;
+    float2 band = 3.0 * abs(d);
+    float2 k = band > 0.5 ? saturate(dist / max(band, 0.5)) : 1.0;
+    return d * k;
+}
+
 // Frame warp: a pixel that is the same in this frame and the one shown before it (8-bit: the same value; 10-bit:
 // within a step or two).
 bool Unchanged(int2 q)
@@ -1836,11 +1872,14 @@ bool FetchWarped(float2 pos, out float3 c)
     float2 inv = 1.0 / size;
     float2 cp = pos * srcPerOut;
     float2 d = WarpShift(cp * inv) * size;
+    if ((flags & 8192) != 0) d = EdgeFade(cp, d, size);
     if (warpSnapX > 0.0) d.x = round(d.x / warpSnapX) * warpSnapX;
     if (warpSnapY > 0.0) d.y = round(d.y / warpSnapY) * warpSnapY;
     if (dot(d, d) < 0.0004) return false;                 // under 1/50 pixel
     if (Still(int2(cp), size)) return false;
-    float2 p = clamp(cp - d, float2(0.5, 0.5), size - 0.5);
+    float2 p = cp - d;
+    if ((flags & 4096) != 0) p = EdgeMirror(p, size);
+    p = clamp(p, float2(0.5, 0.5), size - 0.5);
     // the game's HUD mask (w = -1): a HUD pixel is never moved, and no moved pixel is taken from the HUD
     if (warpSrc != 0 && (GameFlow(cp * inv).w < -0.5 || GameFlow(p * inv).w < -0.5)) return false;
     if (Still(int2(p), size)) return false;
@@ -4630,12 +4669,13 @@ static DWORD WINAPI PresenterThread(void *)
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = (uint32_t)gsrc;
                 c.warpLag = g_status.fgActive ? gmo::SlotLag(pick) : 0.0f;
-                c.warpEase = (g_status.fgActive && s.warpEase) ? 1.0f : 0.0f;
+                c.warpEase = (s.warpEase && (g_status.fgActive || s.warpEaseNoFg)) ? 1.0f : 0.0f;
             }
             // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
             else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
             else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
+            if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
             // Around a camera cut, and in a letterboxed cutscene: shown as rendered (no motion connects two shots).
             const char *pauseWhy = nullptr;
             if (c.warp != 0.0f && gmo::PauseNow(pickId, s.warpPauseLb != 0, &pauseWhy))
@@ -13834,6 +13874,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
                                                               "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
                                                               "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
+                bool en = s.warpEaseNoFg != 0;
+                if (ImGui::Checkbox("Ease off as the motion slows", &en)) s.warpEaseNoFg = en ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
+                                                              "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
+                                                              "stop isn't carried past it and snapped back. With frame generation it is always on.");
             }
             bool pl = s.warpPauseLb != 0;
             if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
@@ -13862,6 +13907,15 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader,\n"
                                                           "set it to the scanline width (e.g. CRT-Standalone's Scanline Width) so the scanlines\n"
                                                           "don't break up where parts of the picture move by different amounts. 0 = off.");
+            {
+                int em = s.warpEdge;
+                if (ImGui::Combo("Screen edges", &em, "Fade the move\0Mirror the picture\0Repeat the edge\0")) s.warpEdge = em;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("A moved flash needs picture from beyond the screen's edge on the side new picture comes in\n"
+                                                              "from. Fade (default): the move eases off toward that edge, so nothing has to be made up (the\n"
+                                                              "strip moves a little less than the rest). Mirror: the picture next to the edge is reflected\n"
+                                                              "into it. Repeat: the edge's last pixels are stretched over the strip, a smear as wide as the\n"
+                                                              "move (before 1.0.45).");
+            }
             if (s.warpGame)
             {
                 bool gf = s.warpGameFg != 0;

@@ -62,7 +62,7 @@
 struct Swapchain; struct DeviceData;
 namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
-#define BFI_VERSION "1.0.44"
+#define BFI_VERSION "1.0.45"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -274,15 +274,17 @@ struct Settings
     float osdScale = 1.0f;    // OsdScale: text size
     int   frameWarp = 0;      // FrameWarp: a strobe cycle without a new game frame shows the last one moved ahead
                               // along the camera's motion instead of lit again (as in the DX add-on, v1.0.41)
-    float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
+    float warpMax = 0.8f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5; 1.0 before 1.0.45)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
     int   warpGame = 1;       // FrameWarpGameMotion (as DX 1.0.44): the game's own motion vectors and depth where it hands them to DLSS
     int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: also while frame generation is on (edges double up on generated frames)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this many shown frames
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many pixels
+    int   warpEdge = 0;       // FrameWarpEdge (as DX): the screen-edge strip of a moved flash: 0 faded, 1 mirrored, 2 repeated
     int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
                               // is in the rendered frame: 1 generated frames before the rendered one, -1 after it, 0 off
+    int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (as DX 1.0.45): the ease without frame generation too
     int   warpEase = 1;       // FrameWarpGameMotionEase (ini only, as DX): moves past the rendered frame ease off as the motion slows
     int   warpGuard = 1;      // FrameWarpGuard (ini only, as DX): filled repeats that keep making their refresh late are shown as they are
     int   warpPauseLb = 1;    // FrameWarpPauseCutscenes (as DX): no frame warp while a cutscene is letterboxed through DLSS
@@ -401,7 +403,7 @@ static void LoadSettings(Settings &s)
     s.splitSeam = std::max(0, std::min(400, KvInt(kv, "SplitCompareSeamPx", 0)));
     s.osd = KvInt(kv, "Osd", 0) ? 1 : 0;
     s.frameWarp = KvInt(kv, "FrameWarp", 0) != 0 ? 1 : 0;
-    s.warpMax = Clamp(KvFloat(kv, "FrameWarpMaxAhead", 1.0f), 0.25f, 1.5f);
+    s.warpMax = Clamp(KvFloat(kv, "FrameWarpMaxAhead", 0.8f), 0.25f, 1.5f);
     s.warpMinRate = Clamp(KvInt(kv, "FrameWarpMinRate", 75), 40, 95);
     s.warpGame = KvInt(kv, "FrameWarpGameMotion", 1) ? 1 : 0;
     s.warpGameFg = KvInt(kv, "FrameWarpGameMotionWithFG", 0) ? 1 : 0;
@@ -409,8 +411,10 @@ static void LoadSettings(Settings &s)
     s.warpSnapX = Clamp(KvFloat(kv, "FrameWarpSnapX", 0.0f), 0.0f, 16.0f);
     s.warpSnapY = Clamp(KvFloat(kv, "FrameWarpSnapY", 0.0f), 0.0f, 16.0f);
     s.warpEven = KvInt(kv, "FrameWarpEvenPacing", 0) ? 1 : 0;
+    s.warpEdge = Clamp(KvInt(kv, "FrameWarpEdge", 0), 0, 2);
     s.warpFgLag = Clamp(KvInt(kv, "FrameWarpGameMotionFGLag", 1), -1, 1);
     s.warpEase = KvInt(kv, "FrameWarpGameMotionEase", 1) ? 1 : 0;
+    s.warpEaseNoFg = KvInt(kv, "FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
     s.warpGuard = KvInt(kv, "FrameWarpGuard", 1) ? 1 : 0;
     s.warpPauseLb = KvInt(kv, "FrameWarpPauseCutscenes", 1) ? 1 : 0;
     s.dlssHooks = KvInt(kv, "DlssHooks", 1) ? 1 : 0;
@@ -495,7 +499,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexLimitAtSleep", s.reflexAtSleep); I("ReflexAlign", s.reflexAlign); I("LearnReflexStart", s.learnReflex); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -2791,6 +2795,7 @@ static void PresenterThread(Swapchain *sc)
         uint64_t warpOld = 0;
         c.warp = 0.0f; c.warpSrc = 0; c.warpPrevN = 0.0f; c.warpLag = 0.0f;
         c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
+        if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
         if (warpAhead > 0.0 && s.frameWarp && R.warp.ok && !copyMode && (warpOld = R.warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrevReady && warpPrevId == warpOld)
         {
@@ -2805,7 +2810,7 @@ static void PresenterThread(Swapchain *sc)
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = sc->gSlotDepth[pick] ? 1u : 2u;
                 c.warpLag = fgF > 1 ? sc->gSlotLag[pick] : 0.0f;
-                if (fgF > 1 && s.warpEase) c.flags |= 2048u;          // moves past the rendered frame ease off (as DX: with frame generation)
+                if (s.warpEase && (fgF > 1 || s.warpEaseNoFg)) c.flags |= 2048u;   // moves past the rendered frame ease off (without frame generation: FrameWarpGameMotionEaseNoFG)
             }
             // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
             else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
@@ -3680,8 +3685,9 @@ static void PresenterThread(Swapchain *sc)
                         if (dupPresents && !dupLogged)
                         {
                             dupLogged = true;
-                            LOGI("BFI Presenter: the game presents each frame twice (%.0f presents, %ld Reflex sleeps a second) -- "
-                                 "the automatic frame cap tries Refresh rate again every 20 s when it steps down", fpsA, rend);
+                            LOGI("BFI Presenter: two presents per rendered frame (%.0f presents, %ld Reflex sleeps a second: the game presents each "
+                                 "frame twice, or NVIDIA Smooth Motion adds one) -- "
+                                 "the automatic frame cap steps down only after 10 s below Refresh rate and tries it again every 10 s", fpsA, rend);
                         }
                     }
                     // A second with far fewer presents than rendered frames is a stall or a rebuilt swap chain (its first
@@ -4113,7 +4119,7 @@ static void PresenterThread(Swapchain *sc)
                                          "tries at Refresh rate every 5 minutes from now; set the cap to One game frame per strobe "
                                          "cycle to stop them", hzA / s.frames);
                                 LOGI("BFI Presenter: automatic frame cap: still one game frame per strobe cycle (%.0f fps of %.0f "
-                                     "at Refresh); next try in %.0f s", fpsA, hzA, dupSeen ? std::min(probeWait, 20.0) : probeWait);
+                                     "at Refresh); next try in %.0f s", fpsA, hzA, dupSeen ? std::min(probeWait, 10.0) : probeWait);
                             }
                         }
                     }
@@ -4121,7 +4127,13 @@ static void PresenterThread(Swapchain *sc)
                     {
                         // Not in the first 10 s after the presenter starts: the game is still warming up (as the DX add-on).
                         capDownSecs = (!hitchPaused && t - runStartT > 10.0 && fpsA > 0.3 * hzA / s.frames && fpsA < capHoldFrac * hzA) ? capDownSecs + 1 : 0;
-                        if (capDownSecs >= 3 && t - capSwitchT > 3.0)
+                        // 1.0.45: a game with two presents per rendered frame (NVIDIA Smooth Motion in MotorStorm: Pacific Rift,
+                        // through RPCS3), or that held Refresh rate in an earlier session, steps
+                        // down only after 10 s below: a short dip (MotorStorm: Pacific Rift at each race start, 3-4 s at 36-41
+                        // frames a second) is loading, not a struggle, and stepping down there halved the race's first 20 s to
+                        // 30 game frames a second.
+                        const bool heldRefresh = dupSeen || (s.learnPerGame && learnMine.frames > 0 && learnSavedDown == 0);
+                        if (capDownSecs >= (heldRefresh ? 10 : 3) && t - capSwitchT > 3.0)
                         {
                             // Down again soon after going back up: the game is close to the limit, so the next try waits
                             // longer; well under the refresh rate, the first try waits a minute (as the DX add-on).
@@ -4134,7 +4146,7 @@ static void PresenterThread(Swapchain *sc)
                                  "%.0f fps of %.0f, so frames were dropped unevenly", hzA / s.frames, fpsA, hzA);
                         }
                     }
-                    else if (t - capSwitchT >= (dupSeen ? std::min(probeWait, 20.0) : probeWait) && !hitchPaused)
+                    else if (t - capSwitchT >= (dupSeen ? std::min(probeWait, 10.0) : probeWait) && !hitchPaused)
                     {
                         down = false; capProbe = true; probeSecs = probeGood = 0; capSwitchT = t;
                     }
@@ -6676,6 +6688,24 @@ static void InitProcess()
         g_active = enabled;
         if (!g_active) return;                       // no ini: stay silent (no log file)
         if (const char *dmp = getenv("BFI_PRESENTER_DUMP")) g_dumpFrames = atoi(dmp);
+        if (haveIni)
+        {
+            // Defaults changed in a release, applied once to an existing ini (as the DX add-on; DefaultsVersion records it).
+            // 1.0.45: FrameWarpMaxAhead 0.8 where it was the old default, 1.0.
+            const auto kv = ReadIni();
+            if (KvInt(kv, "DefaultsVersion", 0) < 45)
+            {
+                std::vector<std::pair<std::string, std::string>> w;
+                const auto it = kv.find("framewarpmaxahead");
+                if (it != kv.end() && !it->second.empty() && fabs(atof(it->second.c_str()) - 1.0) < 0.001)
+                {
+                    w.push_back({ "FrameWarpMaxAhead", "0.800" });
+                    LOGI("BFI Presenter: FrameWarpMaxAhead set to 0.8 (the default since 1.0.45; set it back to 1.0 if you prefer)");
+                }
+                w.push_back({ "DefaultsVersion", "45" });
+                WriteIni(w, false);
+            }
+        }
         LoadShared();
         LOGI("BFI Presenter: active in %s (settings: %s%s)", g_exeName.c_str(), g_iniPath.c_str(), haveIni ? "" : ", not found -- defaults");
     });
@@ -7887,6 +7917,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
                                                               "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
                                                               "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
+                bool en = s.warpEaseNoFg != 0;
+                if (ImGui::Checkbox("Ease off as the motion slows", &en)) s.warpEaseNoFg = en ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
+                                                              "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
+                                                              "stop isn't carried past it and snapped back. With frame generation it is always on.");
                 ImGui::SameLine();
                 bool pl = s.warpPauseLb != 0;
                 if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
@@ -7909,6 +7944,15 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::SliderFloat("Snap moves up and down (px)", &s.warpSnapY, 0.0f, 16.0f, s.warpSnapY > 0.0f ? "%.2f" : "off");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader, set\n"
                                                           "it to the scanline width. 0 = off. Ctrl+click to type a value.");
+            {
+                int em = s.warpEdge;
+                if (ImGui::Combo("Screen edges", &em, "Fade the move\0Mirror the picture\0Repeat the edge\0")) s.warpEdge = em;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("A moved flash needs picture from beyond the screen's edge on the side new picture comes in\n"
+                                                              "from. Fade (default): the move eases off toward that edge, so nothing has to be made up (the\n"
+                                                              "strip moves a little less than the rest). Mirror: the picture next to the edge is reflected\n"
+                                                              "into it. Repeat: the edge's last pixels are stretched over the strip, a smear as wide as the\n"
+                                                              "move (before 1.0.45).");
+            }
             ImGui::Unindent(16.0f);
         }
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");

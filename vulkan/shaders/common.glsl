@@ -9,7 +9,7 @@ layout(push_constant) uniform C
     float dfloor;
     float knee;
     float ceilLin;    // panel ceiling, linear (1.0 = SDR white / 80 nits)
-    uint  flags;      // 1 roll-off, 2 sine, 4 invert, 8 rolling scan, 1024 the game's frames are linear (scRGB; frame warp), 2048 frame warp eases off moves past the rendered frame
+    uint  flags;      // 1 roll-off, 2 sine, 4 invert, 8 rolling scan, 1024 the game's frames are linear (scRGB; frame warp), 2048 frame warp eases off moves past the rendered frame, 4096 / 8192 screen edges mirrored / faded
     float sdrScale;   // outType 4/5 (SDR game shown as HDR10): SDR white in 80-nit units
     float sdrKnee;    // highlight expansion starts here (linear, 1.0 = SDR white)
     float sdrPeak;    // SDR white highlights expand to this (80-nit units); <= sdrScale = off

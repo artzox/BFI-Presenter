@@ -7,6 +7,17 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.45] — 2026-11-20
+
+**Frame warp fades its move toward the screen edges instead of smearing them, eases off as the game's motion slows without frame generation too, and carries frames at most 0.8 game frames ahead by default; the Vulkan layer's automatic frame cap no longer steps down at short dips in games that present each frame twice.**
+
+- **[DX] [Vulkan] Frame warp's screen edges** (`FrameWarpEdge`, in the settings window as **Screen edges**). A moved flash needs picture from beyond the screen's edge on the side new picture comes in from, which the game never drew; until now the edge's last pixels were stretched over that strip, a smear as wide as the move. **Fade the move** (0, the default) eases the move off toward that edge over a band three moves wide, so nothing has to be made up; **Mirror the picture** (1) fills the strip with the picture next to the edge, reflected; **Repeat the edge** (2) is the old behaviour. Both new ones took the smear away at the sides in pans; fade looked best.
+- **[DX] [Vulkan] Ease off as the motion slows, without frame generation too** (`FrameWarpGameMotionEaseNoFG`, on by default; **Ease off as the motion slows** next to Even pacing). With the game's own motion, the part of a move past the rendered frame is scaled by how much each point's motion kept up from the frame before, as it already was with frame generation, so a camera coming to a stop isn't carried past it and snapped back. In third-person games the snap was clearly visible above about 0.6 game frames ahead without it, and gone at 1.0 with it.
+- **[DX] [Vulkan] Frame warp's Furthest ahead is 0.8 by default** (`FrameWarpMaxAhead`, was 1.0). An ini still at 1.0 is set to 0.8 once (`DefaultsVersion=45`); any other value is kept.
+- **[Vulkan] Automatic frame cap: games that present each frame twice step down only after 10 s** below Refresh rate (was 3 s), and so do games that held Refresh rate in an earlier session (`LearnPerGame`). MotorStorm: Pacific Rift in RPCS3 dipped to 36–41 frames a second for 3–4 s at each race start, and the step down halved the race's first 20 s to 30 game frames a second; it now stays at Refresh rate. Such games try Refresh rate again after 10 s when they do step down (was 20).
+- **[Vulkan]** Log: two presents per rendered frame are reported as either the game presenting each frame twice or NVIDIA Smooth Motion adding one (with Smooth Motion on in the driver profile, RPCS3 showed the same doubling).
+- **[Docs]** Settings guide: **Screen edges**, **Ease off as the motion slows**, and Furthest ahead's new default.
+
 ## [1.0.44] — 2026-11-19
 
 **Frame warp moves each part of the picture by the game's own motion where a DX12 or Vulkan game hands DLSS its motion vectors and depth, with even pacing and pauses at camera cuts and cutscenes; the Vulkan layer gets the dark refresh queue and the Reflex frame limit without frame generation; the frame start steps earlier when frames repeat.**

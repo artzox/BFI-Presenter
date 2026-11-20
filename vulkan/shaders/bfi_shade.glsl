@@ -82,6 +82,20 @@ bool Still(ivec2 q, vec2 size)
     float lim = (pc.flags & 1024u) != 0u ? 0.04 * (0.1 + max(max(a.r, a.g), a.b)) : 0.04;
     return max(max(d.r, d.g), d.b) > lim;
 }
+// The screen-edge strip of a moved flash (FrameWarpEdge; as DX): mirrored at the edge (flags & 4096), or the move
+// eased off over a band three moves wide on the side the picture comes in from (flags & 8192).
+vec2 EdgeMirror(vec2 p, vec2 size)
+{
+    p = mix(p, 1.0 - p, lessThan(p, vec2(0.5)));
+    return mix(p, 2.0 * size - 1.0 - p, greaterThan(p, size - 0.5));
+}
+vec2 EdgeFade(vec2 cp, vec2 d, vec2 size)
+{
+    vec2 dist = mix(size - cp, cp, greaterThan(d, vec2(0.0)));
+    vec2 band = 3.0 * abs(d);
+    vec2 k = mix(vec2(1.0), clamp(dist / max(band, vec2(0.5)), 0.0, 1.0), greaterThan(band, vec2(0.5)));
+    return d * k;
+}
 // The game's frame moved ahead (Catmull-Rom, 9 bilinear taps). False = show the pixel as rendered.
 bool FetchWarped(vec2 fc, out vec3 c)
 {
@@ -89,11 +103,14 @@ bool FetchWarped(vec2 fc, out vec3 c)
     vec2 size = vec2(textureSize(src, 0));
     vec2 inv = 1.0 / size;
     vec2 d = WarpShift(fc * inv) * size;
+    if ((pc.flags & 8192u) != 0u) d = EdgeFade(fc, d, size);
     if (pc.warpSnapX > 0.0) d.x = round(d.x / pc.warpSnapX) * pc.warpSnapX;
     if (pc.warpSnapY > 0.0) d.y = round(d.y / pc.warpSnapY) * pc.warpSnapY;
     if (dot(d, d) < 0.0004) return false;
     if (Still(ivec2(fc), size)) return false;
-    vec2 p = clamp(fc - d, vec2(0.5), size - 0.5);
+    vec2 p = fc - d;
+    if ((pc.flags & 4096u) != 0u) p = EdgeMirror(p, size);
+    p = clamp(p, vec2(0.5), size - 0.5);
     if (Still(ivec2(p), size)) return false;
     vec2 tc = floor(p - 0.5) + 0.5;
     vec2 f = p - tc;
