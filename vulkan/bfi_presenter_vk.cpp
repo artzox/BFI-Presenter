@@ -274,7 +274,7 @@ struct Settings
     float osdScale = 1.0f;    // OsdScale: text size
     int   frameWarp = 0;      // FrameWarp: a strobe cycle without a new game frame shows the last one moved ahead
                               // along the camera's motion instead of lit again (as in the DX add-on, v1.0.41)
-    float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
+    float warpMax = 0.8f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5; 1.0 before 1.0.45)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
     int   warpGame = 1;       // FrameWarpGameMotion (as DX 1.0.44): the game's own motion vectors and depth where it hands them to DLSS
     int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: also while frame generation is on (edges double up on generated frames)
@@ -284,7 +284,7 @@ struct Settings
     int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
                               // is in the rendered frame: 1 generated frames before the rendered one, -1 after it, 0 off
-    int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (test, as DX 1.0.45): the ease without frame generation too
+    int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (as DX 1.0.45): the ease without frame generation too
     int   warpEase = 1;       // FrameWarpGameMotionEase (ini only, as DX): moves past the rendered frame ease off as the motion slows
     int   warpGuard = 1;      // FrameWarpGuard (ini only, as DX): filled repeats that keep making their refresh late are shown as they are
     int   warpPauseLb = 1;    // FrameWarpPauseCutscenes (as DX): no frame warp while a cutscene is letterboxed through DLSS
@@ -403,7 +403,7 @@ static void LoadSettings(Settings &s)
     s.splitSeam = std::max(0, std::min(400, KvInt(kv, "SplitCompareSeamPx", 0)));
     s.osd = KvInt(kv, "Osd", 0) ? 1 : 0;
     s.frameWarp = KvInt(kv, "FrameWarp", 0) != 0 ? 1 : 0;
-    s.warpMax = Clamp(KvFloat(kv, "FrameWarpMaxAhead", 1.0f), 0.25f, 1.5f);
+    s.warpMax = Clamp(KvFloat(kv, "FrameWarpMaxAhead", 0.8f), 0.25f, 1.5f);
     s.warpMinRate = Clamp(KvInt(kv, "FrameWarpMinRate", 75), 40, 95);
     s.warpGame = KvInt(kv, "FrameWarpGameMotion", 1) ? 1 : 0;
     s.warpGameFg = KvInt(kv, "FrameWarpGameMotionWithFG", 0) ? 1 : 0;
@@ -2810,7 +2810,7 @@ static void PresenterThread(Swapchain *sc)
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = sc->gSlotDepth[pick] ? 1u : 2u;
                 c.warpLag = fgF > 1 ? sc->gSlotLag[pick] : 0.0f;
-                if (s.warpEase && (fgF > 1 || s.warpEaseNoFg)) c.flags |= 2048u;   // moves past the rendered frame ease off (without frame generation: test)
+                if (s.warpEase && (fgF > 1 || s.warpEaseNoFg)) c.flags |= 2048u;   // moves past the rendered frame ease off (without frame generation: FrameWarpGameMotionEaseNoFG)
             }
             // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
             else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
@@ -6688,6 +6688,24 @@ static void InitProcess()
         g_active = enabled;
         if (!g_active) return;                       // no ini: stay silent (no log file)
         if (const char *dmp = getenv("BFI_PRESENTER_DUMP")) g_dumpFrames = atoi(dmp);
+        if (haveIni)
+        {
+            // Defaults changed in a release, applied once to an existing ini (as the DX add-on; DefaultsVersion records it).
+            // 1.0.45: FrameWarpMaxAhead 0.8 where it was the old default, 1.0.
+            const auto kv = ReadIni();
+            if (KvInt(kv, "DefaultsVersion", 0) < 45)
+            {
+                std::vector<std::pair<std::string, std::string>> w;
+                const auto it = kv.find("framewarpmaxahead");
+                if (it != kv.end() && !it->second.empty() && fabs(atof(it->second.c_str()) - 1.0) < 0.001)
+                {
+                    w.push_back({ "FrameWarpMaxAhead", "0.800" });
+                    LOGI("BFI Presenter: FrameWarpMaxAhead set to 0.8 (the default since 1.0.45; set it back to 1.0 if you prefer)");
+                }
+                w.push_back({ "DefaultsVersion", "45" });
+                WriteIni(w, false);
+            }
+        }
         LoadShared();
         LOGI("BFI Presenter: active in %s (settings: %s%s)", g_exeName.c_str(), g_iniPath.c_str(), haveIni ? "" : ", not found -- defaults");
     });
@@ -7900,7 +7918,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
                                                               "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
                 bool en = s.warpEaseNoFg != 0;
-                if (ImGui::Checkbox("Ease off as the motion slows (test)", &en)) s.warpEaseNoFg = en ? 1 : 0;
+                if (ImGui::Checkbox("Ease off as the motion slows", &en)) s.warpEaseNoFg = en ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
                                                               "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
                                                               "stop isn't carried past it and snapped back. With frame generation it is always on.");

@@ -159,7 +159,7 @@ struct Settings
     int   splitSeam = 0;      // soft seam width in pixels (0 = hard edge)
     int   frameWarp = 0;      // FrameWarp: a strobe cycle without a new game frame shows the last one moved ahead
                               // along the camera's motion instead of lit again (no frame is held back: no added latency)
-    float warpMax = 1.0f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5)
+    float warpMax = 0.8f;     // FrameWarpMaxAhead: never further ahead than this many game frames (0.25-1.5; 1.0 before 1.0.45)
     int   warpMinRate = 75;   // FrameWarpMinRate: only while the game makes at least this percent of the strobe rate (40-95)
     int   warpGame = 1;       // FrameWarpGameMotion: use the game's own motion vectors and depth where it hands them to
                               // its upscaler (Streamline / DLSS, D3D12, 64-bit); otherwise the motion measured from the picture
@@ -180,7 +180,7 @@ struct Settings
                               // the rendered one (DLSS frame generation), -1 = after it, 0 = off (read where shown, ep7)
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
-    int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (test, 1.0.45): the ease below without frame generation too
+    int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
     int   warpEase = 1;       // FrameWarpGameMotionEase (test, ini only): with the game's motion and frame generation, the
                               // part of a move past the rendered frame eases off as the game's motion slows (1 = on)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
@@ -357,7 +357,7 @@ static void LoadSettings(Settings &s)
     s.splitPos = std::max(5, std::min(95, IniInt("SplitComparePosition", 50)));
     s.splitSeam = std::max(0, std::min(400, IniInt("SplitCompareSeamPx", 0)));
     s.frameWarp = IniInt("FrameWarp", 0) != 0 ? 1 : 0;      // 2 (even pacing, test builds t1-t2) is gone: fill
-    s.warpMax = std::max(0.25f, std::min(1.5f, IniFloat("FrameWarpMaxAhead", 1.0f)));
+    s.warpMax = std::max(0.25f, std::min(1.5f, IniFloat("FrameWarpMaxAhead", 0.8f)));
     s.warpMinRate = std::max(40, std::min(95, IniInt("FrameWarpMinRate", 75)));
     s.warpGame = IniInt("FrameWarpGameMotion", 1) != 0 ? 1 : 0;
     s.warpGameSign = IniInt("FrameWarpGameMotionSign", 1) < 0 ? -1 : 1;
@@ -552,7 +552,8 @@ static void UpgradeIni(const Settings &s)
 
 // Defaults changed in a release, applied once to an existing BFIPresenter.ini (the file holds every setting, so a
 // new default never reaches it otherwise). DefaultsVersion records what was applied; set a value back afterwards
-// and it stays. 1.0.39: ReflexAlign on (it was off and written as 0 into every ini).
+// and it stays. 1.0.39: ReflexAlign on (it was off and written as 0 into every ini). 1.0.45: FrameWarpMaxAhead 0.8 where it
+// was the old default, 1.0 (filled flashes snapped back visibly in third-person games above about 0.6 before the ease).
 static void MigrateDefaults()
 {
     char keys[64];
@@ -566,6 +567,17 @@ static void MigrateDefaults()
             LOGI("BFI Presenter: ReflexAlign turned on (the default since 1.0.39; set ReflexAlign=0 to turn it off again)");
         }
         WritePrivateProfileStringA("BFI", "DefaultsVersion", "39", g_iniPath);
+    }
+    if ((int)GetPrivateProfileIntA("BFI", "DefaultsVersion", 0, g_iniPath) < 45)
+    {
+        char b[32] = "";
+        GetPrivateProfileStringA("BFI", "FrameWarpMaxAhead", "", b, sizeof(b), g_iniPath);
+        if (b[0] && fabs(atof(b) - 1.0) < 0.001)
+        {
+            WritePrivateProfileStringA("BFI", "FrameWarpMaxAhead", "0.800", g_iniPath);
+            LOGI("BFI Presenter: FrameWarpMaxAhead set to 0.8 (the default since 1.0.45; set it back to 1.0 if you prefer)");
+        }
+        WritePrivateProfileStringA("BFI", "DefaultsVersion", "45", g_iniPath);
     }
 }
 
@@ -13863,7 +13875,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
                                                               "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
                 bool en = s.warpEaseNoFg != 0;
-                if (ImGui::Checkbox("Ease off as the motion slows (test)", &en)) s.warpEaseNoFg = en ? 1 : 0;
+                if (ImGui::Checkbox("Ease off as the motion slows", &en)) s.warpEaseNoFg = en ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
                                                               "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
                                                               "stop isn't carried past it and snapped back. With frame generation it is always on.");
