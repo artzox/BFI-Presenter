@@ -7,6 +7,10 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [Manager 1.3.21] — 2026-11-21
+
+- **[Manager] Fixed: the Tools buttons were drawn over the Vulkan layer's status** when the layer was installed for all users and ReShade's Vulkan layer was in order: the Tools row started on the Vulkan layer's line instead of its own.
+
 ## [1.0.45] — 2026-11-20
 
 **Frame warp fades its move toward the screen edges instead of smearing them, eases off as the game's motion slows without frame generation too, and carries frames at most 0.8 game frames ahead by default; the Vulkan layer's automatic frame cap no longer steps down at short dips in games that present each frame twice.**
