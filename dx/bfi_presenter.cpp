@@ -1836,7 +1836,7 @@ bool Unchanged(int2 q)
 // motion step back, shows something else there (a crosshair's one-pixel line over a moving scene, the edge or text
 // of a HUD). A pixel of a moving picture can be unchanged by chance, along whole lines in a regular pattern (stripes
 // that moved by their own spacing), and all over an area with nothing in it to see moving (a clear sky in a pan):
-// there the motion explains it, and it moves with the rest. (Before 1.0.45-ep6, 5 of 8 unchanged around it was
+// there the motion explains it, and it moves with the rest. (Before 1.0.46, 5 of 8 unchanged around it was
 // still without the motion test: a clear sky stood still, and a tree's outline against it with it, while the rest
 // of the tree moved -- the outline flickered on moved flashes. The inside of an even HUD panel can now move too,
 // which shows nothing; its edges and text are within a motion step of something else and stay.)

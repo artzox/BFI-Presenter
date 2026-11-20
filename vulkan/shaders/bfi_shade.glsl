@@ -71,7 +71,7 @@ bool Still(ivec2 q, vec2 size)
     for (int y = -1; y <= 1; y++)
         for (int x = -1; x <= 1; x++)
             if ((x != 0 || y != 0) && Unchanged(q + ivec2(x, y), isz)) n++;
-    if (n >= 5) return true;
+    // (as DX 1.0.46: no 5-of-8 shortcut -- a clear sky in a pan is unchanged, and stood still with a tree's outline against it)
     if (n < 1) return false;
     vec2 c = vec2(q) + 0.5;
     vec4 f = pc.warpSrc != 0u ? textureLod(gameFlow, c / size, 0.0) : textureLod(flowTex, c / size, 0.0);
