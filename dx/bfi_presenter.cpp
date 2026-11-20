@@ -180,6 +180,7 @@ struct Settings
                               // the rendered one (DLSS frame generation), -1 = after it, 0 = off (read where shown, ep7)
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
+    int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (test, 1.0.45): the ease below without frame generation too
     int   warpEase = 1;       // FrameWarpGameMotionEase (test, ini only): with the game's motion and frame generation, the
                               // part of a move past the rendered frame eases off as the game's motion slows (1 = on)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
@@ -368,6 +369,7 @@ static void LoadSettings(Settings &s)
     s.warpGameFg = IniInt("FrameWarpGameMotionWithFG", 0) ? 1 : 0;
     s.warpFgLag = std::max(-1, std::min(1, IniInt("FrameWarpGameMotionFGLag", 1)));
     s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
+    s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
     s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
@@ -609,6 +611,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarpGameMotionWithFG", s.warpGameFg);
     IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
     IniWriteInt("FrameWarpEvenPacing", s.warpEven);
+    IniWriteInt("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg);
     IniWriteInt("FrameWarpPauseCutscenes", s.warpPauseLb);
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
@@ -4654,7 +4657,7 @@ static DWORD WINAPI PresenterThread(void *)
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = (uint32_t)gsrc;
                 c.warpLag = g_status.fgActive ? gmo::SlotLag(pick) : 0.0f;
-                c.warpEase = (g_status.fgActive && s.warpEase) ? 1.0f : 0.0f;
+                c.warpEase = (s.warpEase && (g_status.fgActive || s.warpEaseNoFg)) ? 1.0f : 0.0f;
             }
             // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
             else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
@@ -13859,6 +13862,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
                                                               "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
                                                               "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
+                bool en = s.warpEaseNoFg != 0;
+                if (ImGui::Checkbox("Ease off as the motion slows (test)", &en)) s.warpEaseNoFg = en ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
+                                                              "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
+                                                              "stop isn't carried past it and snapped back. With frame generation it is always on.");
             }
             bool pl = s.warpPauseLb != 0;
             if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
