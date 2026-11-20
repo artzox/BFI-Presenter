@@ -280,6 +280,7 @@ struct Settings
     int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: also while frame generation is on (edges double up on generated frames)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this many shown frames
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many pixels
+    int   warpEdge = 0;       // FrameWarpEdge (test, as DX): the screen-edge strip of a moved flash: 0 repeated, 1 mirrored, 2 faded
     int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
                               // is in the rendered frame: 1 generated frames before the rendered one, -1 after it, 0 off
@@ -409,6 +410,7 @@ static void LoadSettings(Settings &s)
     s.warpSnapX = Clamp(KvFloat(kv, "FrameWarpSnapX", 0.0f), 0.0f, 16.0f);
     s.warpSnapY = Clamp(KvFloat(kv, "FrameWarpSnapY", 0.0f), 0.0f, 16.0f);
     s.warpEven = KvInt(kv, "FrameWarpEvenPacing", 0) ? 1 : 0;
+    s.warpEdge = Clamp(KvInt(kv, "FrameWarpEdge", 0), 0, 2);
     s.warpFgLag = Clamp(KvInt(kv, "FrameWarpGameMotionFGLag", 1), -1, 1);
     s.warpEase = KvInt(kv, "FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpGuard = KvInt(kv, "FrameWarpGuard", 1) ? 1 : 0;
@@ -495,7 +497,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexLimitAtSleep", s.reflexAtSleep); I("ReflexAlign", s.reflexAlign); I("LearnReflexStart", s.learnReflex); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -2791,6 +2793,7 @@ static void PresenterThread(Swapchain *sc)
         uint64_t warpOld = 0;
         c.warp = 0.0f; c.warpSrc = 0; c.warpPrevN = 0.0f; c.warpLag = 0.0f;
         c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
+        if (s.warpEdge == 1) c.flags |= 4096u; else if (s.warpEdge == 2) c.flags |= 8192u;   // the screen edges (FrameWarpEdge)
         if (warpAhead > 0.0 && s.frameWarp && R.warp.ok && !copyMode && (warpOld = R.warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrevReady && warpPrevId == warpOld)
         {
@@ -7916,6 +7919,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::SliderFloat("Snap moves up and down (px)", &s.warpSnapY, 0.0f, 16.0f, s.warpSnapY > 0.0f ? "%.2f" : "off");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader, set\n"
                                                           "it to the scanline width. 0 = off. Ctrl+click to type a value.");
+            {
+                int em = s.warpEdge;
+                if (ImGui::Combo("Screen edges (test)", &em, "Repeat the edge (as before)\0Mirror the picture\0Fade the move\0")) s.warpEdge = em;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("A moved flash needs picture from beyond the screen's edge on the side new picture comes in\n"
+                                                              "from. Repeat: the edge's last pixels are stretched over that strip (a smear as wide as the\n"
+                                                              "move). Mirror: the picture next to the edge is reflected into it. Fade: the move eases off\n"
+                                                              "toward that edge, so nothing has to be made up (the strip moves less than the rest).");
+            }
             ImGui::Unindent(16.0f);
         }
         ImGui::Combo("Frame pacing", &s.pacingMode, "Smooth (every game frame once, in order)\0Lowest latency (newest frame)\0");

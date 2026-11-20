@@ -168,6 +168,8 @@ struct Settings
                               // smaller than the screen, e.g. Townfall)
     int   warpEven = 0;       // FrameWarpEvenPacing: every strobe cycle moved to where the game's motion is, where the game's
                               // own motion is used; elsewhere missing frames are filled as usual
+    int   warpEdge = 0;       // FrameWarpEdge (test): the strip at the screen edge a moved flash has no picture for: 0 the edge
+                              // repeated (stretched), 1 the picture mirrored at the edge, 2 the move faded out toward the edge
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many
                               // pixels of the game frame (0 = off) -- a CRT shader's scanlines and mask stay in place
     int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: the game's motion also while frame generation is on. Off by default:
@@ -372,6 +374,7 @@ static void LoadSettings(Settings &s)
     s.warpPauseLb = IniInt("FrameWarpPauseCutscenes", 1) ? 1 : 0;
     s.warpSnapX = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapX", 0.0f)));
     s.warpSnapY = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapY", 0.0f)));
+    s.warpEdge = std::max(0, std::min(2, IniInt("FrameWarpEdge", 0)));
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -609,6 +612,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarpPauseCutscenes", s.warpPauseLb);
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
+    IniWriteInt("FrameWarpEdge", s.warpEdge);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -1787,6 +1791,23 @@ float2 WarpShift(float2 uv)
     return clamp(f.xy * (f.z * warp), -0.08, 0.08);
 }
 
+// The strip at the screen edge a moved flash has no picture for (FrameWarpEdge, test). Mirror (flags & 4096): a place
+// beyond the edge is read from the picture reflected at the edge. Fade (flags & 8192): on the side the picture comes in
+// from, the move eases off over a band three moves wide, so the strip is drawn from the picture squeezed a little
+// instead of from one repeated edge pixel.
+float2 EdgeMirror(float2 p, float2 size)
+{
+    p = p < 0.5 ? 1.0 - p : p;
+    return p > size - 0.5 ? 2.0 * size - 1.0 - p : p;
+}
+float2 EdgeFade(float2 cp, float2 d, float2 size)
+{
+    float2 dist = d > 0.0 ? cp : size - cp;
+    float2 band = 3.0 * abs(d);
+    float2 k = band > 0.5 ? saturate(dist / max(band, 0.5)) : 1.0;
+    return d * k;
+}
+
 // Frame warp: a pixel that is the same in this frame and the one shown before it (8-bit: the same value; 10-bit:
 // within a step or two).
 bool Unchanged(int2 q)
@@ -1836,11 +1857,14 @@ bool FetchWarped(float2 pos, out float3 c)
     float2 inv = 1.0 / size;
     float2 cp = pos * srcPerOut;
     float2 d = WarpShift(cp * inv) * size;
+    if ((flags & 8192) != 0) d = EdgeFade(cp, d, size);
     if (warpSnapX > 0.0) d.x = round(d.x / warpSnapX) * warpSnapX;
     if (warpSnapY > 0.0) d.y = round(d.y / warpSnapY) * warpSnapY;
     if (dot(d, d) < 0.0004) return false;                 // under 1/50 pixel
     if (Still(int2(cp), size)) return false;
-    float2 p = clamp(cp - d, float2(0.5, 0.5), size - 0.5);
+    float2 p = cp - d;
+    if ((flags & 4096) != 0) p = EdgeMirror(p, size);
+    p = clamp(p, float2(0.5, 0.5), size - 0.5);
     // the game's HUD mask (w = -1): a HUD pixel is never moved, and no moved pixel is taken from the HUD
     if (warpSrc != 0 && (GameFlow(cp * inv).w < -0.5 || GameFlow(p * inv).w < -0.5)) return false;
     if (Still(int2(p), size)) return false;
@@ -4636,6 +4660,7 @@ static DWORD WINAPI PresenterThread(void *)
             else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
             else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
+            if (s.warpEdge == 1) c.flags |= 4096u; else if (s.warpEdge == 2) c.flags |= 8192u;   // the screen edges (FrameWarpEdge)
             // Around a camera cut, and in a letterboxed cutscene: shown as rendered (no motion connects two shots).
             const char *pauseWhy = nullptr;
             if (c.warp != 0.0f && gmo::PauseNow(pickId, s.warpPauseLb != 0, &pauseWhy))
@@ -13862,6 +13887,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader,\n"
                                                           "set it to the scanline width (e.g. CRT-Standalone's Scanline Width) so the scanlines\n"
                                                           "don't break up where parts of the picture move by different amounts. 0 = off.");
+            {
+                int em = s.warpEdge;
+                if (ImGui::Combo("Screen edges (test)", &em, "Repeat the edge (as before)\0Mirror the picture\0Fade the move\0")) s.warpEdge = em;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("A moved flash needs picture from beyond the screen's edge on the side new picture comes in\n"
+                                                              "from. Repeat: the edge's last pixels are stretched over that strip (a smear as wide as the\n"
+                                                              "move). Mirror: the picture next to the edge is reflected into it. Fade: the move eases off\n"
+                                                              "toward that edge, so nothing has to be made up (the strip moves less than the rest).");
+            }
             if (s.warpGame)
             {
                 bool gf = s.warpGameFg != 0;
