@@ -280,7 +280,7 @@ struct Settings
     int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: also while frame generation is on (edges double up on generated frames)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this many shown frames
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many pixels
-    int   warpEdge = 0;       // FrameWarpEdge (test, as DX): the screen-edge strip of a moved flash: 0 repeated, 1 mirrored, 2 faded
+    int   warpEdge = 0;       // FrameWarpEdge (as DX): the screen-edge strip of a moved flash: 0 faded, 1 mirrored, 2 repeated
     int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
                               // is in the rendered frame: 1 generated frames before the rendered one, -1 after it, 0 off
@@ -2793,7 +2793,7 @@ static void PresenterThread(Swapchain *sc)
         uint64_t warpOld = 0;
         c.warp = 0.0f; c.warpSrc = 0; c.warpPrevN = 0.0f; c.warpLag = 0.0f;
         c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
-        if (s.warpEdge == 1) c.flags |= 4096u; else if (s.warpEdge == 2) c.flags |= 8192u;   // the screen edges (FrameWarpEdge)
+        if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
         if (warpAhead > 0.0 && s.frameWarp && R.warp.ok && !copyMode && (warpOld = R.warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrevReady && warpPrevId == warpOld)
         {
@@ -7921,11 +7921,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "it to the scanline width. 0 = off. Ctrl+click to type a value.");
             {
                 int em = s.warpEdge;
-                if (ImGui::Combo("Screen edges (test)", &em, "Repeat the edge (as before)\0Mirror the picture\0Fade the move\0")) s.warpEdge = em;
+                if (ImGui::Combo("Screen edges", &em, "Fade the move\0Mirror the picture\0Repeat the edge\0")) s.warpEdge = em;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("A moved flash needs picture from beyond the screen's edge on the side new picture comes in\n"
-                                                              "from. Repeat: the edge's last pixels are stretched over that strip (a smear as wide as the\n"
-                                                              "move). Mirror: the picture next to the edge is reflected into it. Fade: the move eases off\n"
-                                                              "toward that edge, so nothing has to be made up (the strip moves less than the rest).");
+                                                              "from. Fade (default): the move eases off toward that edge, so nothing has to be made up (the\n"
+                                                              "strip moves a little less than the rest). Mirror: the picture next to the edge is reflected\n"
+                                                              "into it. Repeat: the edge's last pixels are stretched over the strip, a smear as wide as the\n"
+                                                              "move (before 1.0.45).");
             }
             ImGui::Unindent(16.0f);
         }

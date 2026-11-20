@@ -168,8 +168,8 @@ struct Settings
                               // smaller than the screen, e.g. Townfall)
     int   warpEven = 0;       // FrameWarpEvenPacing: every strobe cycle moved to where the game's motion is, where the game's
                               // own motion is used; elsewhere missing frames are filled as usual
-    int   warpEdge = 0;       // FrameWarpEdge (test): the strip at the screen edge a moved flash has no picture for: 0 the edge
-                              // repeated (stretched), 1 the picture mirrored at the edge, 2 the move faded out toward the edge
+    int   warpEdge = 0;       // FrameWarpEdge: the strip at the screen edge a moved flash has no picture for: 0 the move faded
+                              // out toward the edge, 1 the picture mirrored at the edge, 2 the edge repeated (stretched, before 1.0.45)
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many
                               // pixels of the game frame (0 = off) -- a CRT shader's scanlines and mask stay in place
     int   warpGameFg = 0;     // FrameWarpGameMotionWithFG: the game's motion also while frame generation is on. Off by default:
@@ -1791,7 +1791,7 @@ float2 WarpShift(float2 uv)
     return clamp(f.xy * (f.z * warp), -0.08, 0.08);
 }
 
-// The strip at the screen edge a moved flash has no picture for (FrameWarpEdge, test). Mirror (flags & 4096): a place
+// The strip at the screen edge a moved flash has no picture for (FrameWarpEdge, 1.0.45). Mirror (flags & 4096): a place
 // beyond the edge is read from the picture reflected at the edge. Fade (flags & 8192): on the side the picture comes in
 // from, the move eases off over a band three moves wide, so the strip is drawn from the picture squeezed a little
 // instead of from one repeated edge pixel.
@@ -4660,7 +4660,7 @@ static DWORD WINAPI PresenterThread(void *)
             else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
             else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
-            if (s.warpEdge == 1) c.flags |= 4096u; else if (s.warpEdge == 2) c.flags |= 8192u;   // the screen edges (FrameWarpEdge)
+            if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
             // Around a camera cut, and in a letterboxed cutscene: shown as rendered (no motion connects two shots).
             const char *pauseWhy = nullptr;
             if (c.warp != 0.0f && gmo::PauseNow(pickId, s.warpPauseLb != 0, &pauseWhy))
@@ -13889,11 +13889,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "don't break up where parts of the picture move by different amounts. 0 = off.");
             {
                 int em = s.warpEdge;
-                if (ImGui::Combo("Screen edges (test)", &em, "Repeat the edge (as before)\0Mirror the picture\0Fade the move\0")) s.warpEdge = em;
+                if (ImGui::Combo("Screen edges", &em, "Fade the move\0Mirror the picture\0Repeat the edge\0")) s.warpEdge = em;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("A moved flash needs picture from beyond the screen's edge on the side new picture comes in\n"
-                                                              "from. Repeat: the edge's last pixels are stretched over that strip (a smear as wide as the\n"
-                                                              "move). Mirror: the picture next to the edge is reflected into it. Fade: the move eases off\n"
-                                                              "toward that edge, so nothing has to be made up (the strip moves less than the rest).");
+                                                              "from. Fade (default): the move eases off toward that edge, so nothing has to be made up (the\n"
+                                                              "strip moves a little less than the rest). Mirror: the picture next to the edge is reflected\n"
+                                                              "into it. Repeat: the edge's last pixels are stretched over the strip, a smear as wide as the\n"
+                                                              "move (before 1.0.45).");
             }
             if (s.warpGame)
             {

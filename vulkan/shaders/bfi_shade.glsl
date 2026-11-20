@@ -82,7 +82,7 @@ bool Still(ivec2 q, vec2 size)
     float lim = (pc.flags & 1024u) != 0u ? 0.04 * (0.1 + max(max(a.r, a.g), a.b)) : 0.04;
     return max(max(d.r, d.g), d.b) > lim;
 }
-// The screen-edge strip of a moved flash (FrameWarpEdge, test; as DX): mirrored at the edge (flags & 4096), or the move
+// The screen-edge strip of a moved flash (FrameWarpEdge; as DX): mirrored at the edge (flags & 4096), or the move
 // eased off over a band three moves wide on the side the picture comes in from (flags & 8192).
 vec2 EdgeMirror(vec2 p, vec2 size)
 {
