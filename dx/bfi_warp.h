@@ -302,81 +302,10 @@ HudOut PSWarpHud(float4 pos : SV_Position)
     o.hud = (o.raw > 0.5 && hPrev.Load(int3(int2(pos.xy), 0)) > 0.5) ? 1.0 : 0.0;
     return o;
 }
-// ---- The HUD mask learned over time (FrameWarpHudMask, test build). Scored per pixel of the frame (ep5: per 2x2 block
-// in ep4 missed thin text, whose strokes are rarely 2x2 pixels clear of their soft edges). A HUD stays the same from
-// frame to frame while the scene around it changes; a part of the scene that is the same once by chance is not,
-// frame after frame. Score pass: ta = the newest frame, tb = the frame shown before, tc = the score so far;
-// r = how sure it is a HUD (+1/3 each frame it is unchanged while the scene around it changes; 1 = HUD), g = changes in
-// a row (two reset the score: the HUD went away or moved). Where nothing changes around it, the score is kept (a still
-// scene says nothing). wmode: 1 the frame is linear (scRGB), 2 no score yet.
-bool HudChanged(int2 q, int2 sz)
-{
-    q = clamp(q, int2(0, 0), sz - 1);
-    float3 a = ta.Load(int3(q, 0)).rgb, b = tb.Load(int3(q, 0)).rgb;
-    float3 tol = (wmode & 1) != 0 ? 0.002 * (0.1 + max(abs(a), abs(b))) : float3(0.0016, 0.0016, 0.0016);
-    return any(abs(a - b) > tol);
-}
-static const float2 kHudDir[8] = {
-    float2(1.0, 0.0), float2(0.7071, 0.7071), float2(0.0, 1.0), float2(-0.7071, 0.7071),
-    float2(-1.0, 0.0), float2(-0.7071, -0.7071), float2(0.0, -1.0), float2(0.7071, -0.7071) };
-float4 PSWarpHudScore(float4 pos : SV_Position) : SV_Target
-{
-    uint fw, fh;
-    ta.GetDimensions(fw, fh);
-    const int2 sz = int2(fw, fh);
-    const int2 q = int2(pos.xy);
-    const bool changed = HudChanged(q, sz);
-    float2 prev = (wmode & 2) != 0 ? float2(0.0, 0.0) : tc.Load(int3(int2(pos.xy), 0)).rg;
-    float score = prev.r, run = prev.g;
-    if (changed)
-    {
-        run += 0.5;
-        if (run > 0.75) { score = 0.0; run = 0.0; }
-    }
-    else
-    {
-        run = 0.0;
-        int n = 0;
-        [unroll] for (int r = 0; r < 3; r++)
-        {
-            const float rad = r == 0 ? 8.0 : r == 1 ? 24.0 : 64.0;
-            [unroll] for (int i = 0; i < 8; i++)
-                if (HudChanged(q + int2(kHudDir[i] * rad), sz)) n++;
-        }
-        if (n >= 3) score = saturate(score + 0.34);   // 3 of 24: a flat sky behind the HUD changes in few places
-    }
-    return float4(score, run, 0.0, 1.0);
-}
-// Half the size: HUD where any of the 2x2 pixels is sure. ta = the score.
-float4 PSWarpHudReduce(float4 pos : SV_Position) : SV_Target
-{
-    uint w, h;
-    ta.GetDimensions(w, h);
-    const int2 q = int2(pos.xy) * 2, mx = int2(w, h) - 1;
-    float m = 0.0;
-    [unroll] for (int y = 0; y <= 1; y++)
-        [unroll] for (int x = 0; x <= 1; x++)
-            if (ta.Load(int3(min(q + int2(x, y), mx), 0)).r >= 0.99) m = 1.0;
-    return float4(m, 0.0, 0.0, 1.0);
-}
-// The mask: a point counts as HUD where any point within 3 (7x7 at half size, about 6 pixels of the game frame) is --
-// the HUD's soft edges and text shadows, which change with the scene behind them, are kept still with it. ta = the above.
-float4 PSWarpHudDilate(float4 pos : SV_Position) : SV_Target
-{
-    uint w, h;
-    ta.GetDimensions(w, h);
-    const int2 p = int2(pos.xy), mx = int2(w, h) - 1;
-    float m = 0.0;
-    [unroll] for (int y = -3; y <= 3; y++)
-        [unroll] for (int x = -3; x <= 3; x++)
-            if (ta.Load(int3(clamp(p + int2(x, y), int2(0, 0), mx), 0)).r > 0.5) m = 1.0;
-    return float4(m, 0.0, 0.0, 1.0);
-}
 )HLSL";
 
-static const char *const kWarpEntry[] = { "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud",
-                                          "PSWarpHudScore", "PSWarpHudReduce", "PSWarpHudDilate" };
-static const int kWarpShN = 9;
+static const char *const kWarpEntry[] = { "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud" };
+static const int kWarpShN = 6;
 
 struct WarpConstants
 {
@@ -403,16 +332,8 @@ struct WarpGpu
     double t[2] = {};                                   // and when the game presented it
     UINT64 flowNew = 0, flowOld = 0;                    // the pair of frames the motion texture was measured between
     bool  ok = false;
-    // The HUD mask learned over time (FrameWarpHudMask, test): scores (ping-pong) and the mask, at half the frame's size
-    ID3D12Resource       *hudScore[2] = {}, *hudHalf = nullptr, *hudMask = nullptr;   // scores at the frame's size, the rest half
-    ID3D12PipelineState  *psoHudScore = nullptr, *psoHudRed = nullptr, *psoHudDil = nullptr;
-    UINT  hw = 0, hh = 0;
-    int   hudCur = 0;                                   // which score is the newest
-    bool  hudOk = false, hudHave = false;               // made; a score and mask are there (from the frames since the last Forget)
-    UINT64 hudId = 0;                                   // the frame the mask was last brought up to date with
 
-    static const UINT kHudBase = 4 * kLevels;           // the HUD textures' RTV and SRV indices: 2 scores, half size, the mask
-    static const UINT kSrvCount = 4 * kLevels + 4;  // descriptors it takes in the presenter's SRV heap
+    static const UINT kSrvCount = 4 * kLevels;      // descriptors it takes in the presenter's SRV heap
 
     static D3D12_RESOURCE_BARRIER Tr(ID3D12Resource *r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
     {
@@ -438,7 +359,6 @@ struct WarpGpu
     static int Last() { return 1; }                     // the level the motion is refined down to (1/8)
     static int Out() { return 3; }                      // the size of the texture the per-refresh shader reads (1/32)
     D3D12_GPU_DESCRIPTOR_HANDLE FlowSrv() const { return Srv((UINT)(3 * kLevels + Out())); }
-    D3D12_GPU_DESCRIPTOR_HANDLE HudMaskSrv() const { return Srv(kHudBase + 3); }
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(UINT i) const
     {
         D3D12_CPU_DESCRIPTOR_HANDLE hnd = rtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -484,7 +404,7 @@ struct WarpGpu
 
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hd.NumDescriptors = 4 * kLevels + 4;
+        hd.NumDescriptors = 4 * kLevels;
         m = m && SUCCEEDED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
 
         D3D12_HEAP_PROPERTIES hp = {};
@@ -518,26 +438,6 @@ struct WarpGpu
         }
         for (int l = 0; m && l < kLevels - 1; l++) m = MakeOut(l);
         if (!m) { Release(); return false; }
-        // The HUD mask (optional: frame warp works without it)
-        hudOk = false; hudHave = false; hudCur = 0; hudId = 0;
-        hw = (frameW + 1) / 2; hh = (frameH + 1) / 2;
-        if (psBlobs[6] && psBlobs[7] && psBlobs[8])
-        {
-            bool hm = true;
-            pd.RTVFormats[0] = DXGI_FORMAT_R8G8_UNORM;
-            pd.PS = { psBlobs[6]->GetBufferPointer(), psBlobs[6]->GetBufferSize() };
-            hm = SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoHudScore)));
-            pd.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
-            pd.PS = { psBlobs[7]->GetBufferPointer(), psBlobs[7]->GetBufferSize() };
-            hm = hm && SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoHudRed)));
-            pd.PS = { psBlobs[8]->GetBufferPointer(), psBlobs[8]->GetBufferSize() };
-            hm = hm && SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoHudDil)));
-            hm = hm && MakeTex(&hudScore[0], frameW, frameH, DXGI_FORMAT_R8G8_UNORM, kHudBase + 0, L"BFI frame warp HUD score");
-            hm = hm && MakeTex(&hudScore[1], frameW, frameH, DXGI_FORMAT_R8G8_UNORM, kHudBase + 1, L"BFI frame warp HUD score");
-            hm = hm && MakeTex(&hudHalf, hw, hh, DXGI_FORMAT_R8_UNORM, kHudBase + 2, L"BFI frame warp HUD (half size)");
-            hm = hm && MakeTex(&hudMask, hw, hh, DXGI_FORMAT_R8_UNORM, kHudBase + 3, L"BFI frame warp HUD mask");
-            if (hm) hudOk = true; else ReleaseHud();
-        }
         cur = 0; id[0] = id[1] = 0; t[0] = t[1] = 0.0; flowNew = flowOld = 0;
         ok = true;
         return true;
@@ -571,48 +471,8 @@ struct WarpGpu
         return true;
     }
 
-    // A texture the passes draw into, with its RTV and SRV at index i.
-    bool MakeTex(ID3D12Resource **slot, UINT tw, UINT th, DXGI_FORMAT fmt, UINT i, const wchar_t *name)
-    {
-        D3D12_HEAP_PROPERTIES hp = {};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC rd = {};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width = tw; rd.Height = th; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-        rd.Format = fmt;
-        rd.SampleDesc.Count = 1;
-        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        D3D12_CLEAR_VALUE cv = {};
-        cv.Format = fmt;
-        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                                   &cv, IID_PPV_ARGS(slot)))) return false;
-        (*slot)->SetName(name);
-        device->CreateRenderTargetView(*slot, nullptr, Rtv(i));
-        D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
-        sv.Format = fmt;
-        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        sv.Texture2D.MipLevels = 1;
-        D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
-        sh.ptr += (SIZE_T)(srvBase + i) * srvStride;
-        device->CreateShaderResourceView(*slot, &sv, sh);
-        return true;
-    }
-
-    void ReleaseHud()
-    {
-        for (int i = 0; i < 2; i++) if (hudScore[i]) { hudScore[i]->Release(); hudScore[i] = nullptr; }
-        if (hudMask) { hudMask->Release(); hudMask = nullptr; }
-        if (hudHalf) { hudHalf->Release(); hudHalf = nullptr; }
-        if (psoHudRed) { psoHudRed->Release(); psoHudRed = nullptr; }
-        if (psoHudScore) { psoHudScore->Release(); psoHudScore = nullptr; }
-        if (psoHudDil) { psoHudDil->Release(); psoHudDil = nullptr; }
-        hudOk = false; hudHave = false; hudId = 0;
-    }
-
     void Release()
     {
-        ReleaseHud();
         for (int i = 0; i < kLevels; i++) if (flowOut[i]) { flowOut[i]->Release(); flowOut[i] = nullptr; }
         if (psoSmooth) { psoSmooth->Release(); psoSmooth = nullptr; }
         for (int p = 0; p < 2; p++)
@@ -626,7 +486,7 @@ struct WarpGpu
     }
 
     // Forget the frames seen (frame warp switched off and on again, a gap in the frames).
-    void Forget() { id[0] = id[1] = 0; flowNew = flowOld = 0; hudHave = false; hudId = 0; }
+    void Forget() { id[0] = id[1] = 0; flowNew = flowOld = 0; }
 
     // The frame the motion of `frameId` would be measured from, if that frame were shown now: 0 = none usable.
     // (The frame before it must be the one shown just before, at most 4 game frames and a quarter second older.)
@@ -705,28 +565,5 @@ struct WarpGpu
             Pass(list, psoSmooth, flowOut[o], (UINT)(3 * kLevels + o), w[o], h[o], wc);
         }
         flowNew = id[cur]; flowOld = id[1 - cur];
-    }
-
-    // The HUD mask brought up to date with a new frame: newSrv = the frame, prevSrv = the frame shown before it (both
-    // in a shader-resource state). Sets t0-t2; the caller sets its own again after.
-    void RecordHud(ID3D12GraphicsCommandList *list, D3D12_GPU_DESCRIPTOR_HANDLE newSrv, D3D12_GPU_DESCRIPTOR_HANDLE prevSrv,
-                   UINT64 frameId, bool linear)
-    {
-        if (!hudOk) return;
-        WarpConstants wc = {};
-        wc.texelX = 1.0f / (float)srcW; wc.texelY = 1.0f / (float)srcH;
-        wc.texel2X = 1.0f / (float)hw; wc.texel2Y = 1.0f / (float)hh;
-        wc.mode = (linear ? 1u : 0u) | (hudHave ? 0u : 2u);
-        const int nx = 1 - hudCur;
-        list->SetGraphicsRootDescriptorTable(1, newSrv);
-        list->SetGraphicsRootDescriptorTable(2, prevSrv);
-        list->SetGraphicsRootDescriptorTable(3, Srv(kHudBase + (UINT)hudCur));
-        Pass(list, psoHudScore, hudScore[nx], kHudBase + (UINT)nx, srcW, srcH, wc);
-        hudCur = nx;
-        list->SetGraphicsRootDescriptorTable(1, Srv(kHudBase + (UINT)hudCur));
-        Pass(list, psoHudRed, hudHalf, kHudBase + 2, hw, hh, wc);
-        list->SetGraphicsRootDescriptorTable(1, Srv(kHudBase + 2));
-        Pass(list, psoHudDil, hudMask, kHudBase + 3, hw, hh, wc);
-        hudHave = true; hudId = frameId;
     }
 };
