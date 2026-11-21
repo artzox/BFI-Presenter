@@ -1845,10 +1845,11 @@ bool Unchanged(int2 q)
 // still without the motion test: a clear sky stood still, and a tree's outline against it with it, while the rest
 // of the tree moved -- the outline flickered on moved flashes. The inside of an even HUD panel can now move too,
 // which shows nothing; its edges and text are within a motion step of something else and stay.)
-// 1.0.47: only where it has contrast (a HUD's text, icons and edges). A flat or soft area is never held: moving it
-// shows nothing for a HUD, and in the scene it must move -- the inside of a soft cloud is unchanged in a camera turn,
-// and near its edge one motion step back shows another part of the cloud, so patches of it were held and looked a frame
-// late on filled flashes (Oblivion Remastered, 1.0.46).
+// 1.0.47: a flat or soft area counts as unchanged only where it is exactly the same, bit for bit, around it -- as a HUD
+// is, drawn the same every frame. The inside of a soft cloud is only the same within the tolerance in a camera turn, and
+// near its edge one motion step back shows another part of the cloud, so patches of it were held and looked a frame
+// late on filled flashes (Oblivion Remastered, 1.0.46). (1.0.47-ep1 held no flat area at all: a flat HUD fill near its
+// edge then took in the scene from beside it -- the stamina bar, the OSD's and ReShade's windows.)
 bool Still(int2 q, float2 size)
 {
     if (!Unchanged(q)) return false;
@@ -1864,7 +1865,13 @@ bool Still(int2 q, float2 size)
                 const float3 e = abs(src.Load(int3(q + int2(x, y), 0)).rgb - a0);
                 con = max(con, max(max(e.r, e.g), e.b));
             }
-    if (n < 1 || con < lc) return false;
+    if (n < 1) return false;
+    if (con < lc)
+    {
+        [unroll] for (int y = -1; y <= 1; y++)
+            [unroll] for (int x = -1; x <= 1; x++)
+                if (any(src.Load(int3(q + int2(x, y), 0)).rgb != srcPrev.Load(int3(q + int2(x, y), 0)).rgb)) return false;
+    }
     float2 c = float2(q) + 0.5;
     float4 f = flowTex.SampleLevel(linClamp, c / size, 0);
     float2 step = f.xy * size * (warpSrc != 0 ? min(f.z, 1.0) * warpPrevN : f.z);   // this part of the scene's motion since the frame before, pixels
