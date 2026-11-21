@@ -8426,7 +8426,9 @@ static std::atomic<int> hudState{0};                     // 0 no HUD-less pictur
 // How the frame and the HUD-less picture are compared (PSWarpHud's gHudMode). 007 First Light's HUD-less picture is
 // linear (RGBA16F) against an HDR10 frame: compared as they are, the mask covered 99.9% (gm9). The modes are tried
 // in turn, from the likeliest for the two formats; the check (every 2 s) moves on when the mask covers too much.
-static int hudModes[3] = { 0, 1, 2 }; static int hudModeN = 3; static std::atomic<int> hudModeI{0};
+// 1.0.47: by structure (3) last -- tone mapping and post-processing between the HUD-less picture and the frame shown
+// (Directive 8020: 74-75% in every way of comparing by value) keep the scene's structure.
+static int hudModes[4] = { 0, 1, 2, 3 }; static int hudModeN = 4; static std::atomic<int> hudModeI{0};
 static bool hudModesSet = false;
 // Without a HUD-less picture (FrameWarpHudFromDlss, 1.0.47): DLSS's own output, copied on the game's list right after its
 // call -- the scene upscaled, before post-processing and the HUD (Unreal Engine). It differs from the frame by tone
@@ -8619,7 +8621,7 @@ static void Map(const Tag &t, UINT w, UINT h, float m[4])
 static const char *HudModeName(uint32_t m)
 {
     return m == 1 ? "HDR10 frame against a linear scRGB picture" : m == 2 ? "sRGB frame against a linear picture"
-         : m == 3 ? "the frame's structure against DLSS's output" : "the same encoding";
+         : m == 3 ? "by structure (tone mapping and post-processing between them allowed)" : "the same encoding";
 }
 
 static DXGI_FORMAT ColorView(DXGI_FORMAT f)
@@ -9155,6 +9157,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         const bool fFloat = f == DXGI_FORMAT_R16G16B16A16_FLOAT;
         if (hlFloat && !fFloat) { hudModes[0] = f == DXGI_FORMAT_R10G10B10A2_UNORM ? 1 : 2; hudModes[1] = hudModes[0] == 1 ? 2 : 1; hudModes[2] = 0; }
         else { hudModes[0] = 0; hudModes[1] = 1; hudModes[2] = 2; }
+        hudModes[3] = 3;
         hudModeI = 0; hudModesSet = true;
     }
     gc.hudMode = (uint32_t)hudModes[std::min(hudModeI.load(), hudModeN - 1)];
