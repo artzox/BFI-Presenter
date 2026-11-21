@@ -2488,7 +2488,8 @@ struct Constants
 // rendered frame). The presenter shows one of these instead of moving the finished frame when its move matches.
 namespace fxa
 {
-static const int kVar = 4;                      // two frames' worth: the move for a frame's first flash and for a repeat
+static const int kVar = 6;                      // two frames' worth: the moves for a frame's first flash (on time, or a cycle
+                                                // late) and for a repeat
 struct Var
 {
     ID3D12Resource *res = nullptr;              // made by the game's thread (with ReShade's device: its effects draw on it)
@@ -2498,7 +2499,9 @@ struct Var
 };
 static Var var[kVar];
 static std::atomic<UINT> varGen{0};             // bumped when the textures are made anew: the presenter writes its views again
-static std::atomic<float> predFirst{-1.0f}, predRepeat{-1.0f};   // the presenter's guess of the next moves (-1 = none)
+static std::atomic<float> predFirst{-1.0f}, predLate{-1.0f}, predRepeat{-1.0f};   // the presenter's guess of the next moves
+                                                // (-1 = none): the next frame's first flash at the next cycle, one cycle later, a repeat
+static std::atomic<bool> overlayOpen{false};    // ReShade's window is open (drawn after the effects: not on frames drawn ahead)
 static std::atomic<int> hits{0}, missNone{0}, missFar{0};       // per 10 s
 static std::atomic<int> sumDeltaMilli{0};                        // |move wanted - move drawn| of the hits, 1/1000 frames
 static std::atomic<float> missWant{0.0f}, missHave{0.0f};       // the last miss with frames drawn: the move wanted, the nearest drawn
@@ -4557,7 +4560,7 @@ static DWORD WINAPI PresenterThread(void *)
         if (cycleStart)
         {
             const bool even = s.warpEven && s.warpGame && gmo::StateFast() > 0 && (!g_status.fgActive || s.warpGameFg);
-            float f1 = -1.0f, f2 = -1.0f;
+            float f1 = -1.0f, f2 = -1.0f, f3 = -1.0f;
             if (s.frameWarp && s.warpDrawAhead && warpClock.engaged && warpClock.rate > 0.0)
             {
                 const double r0 = warpClock.rate, mx = s.warpMax;
@@ -4567,7 +4570,11 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     double a1 = std::max(0.0, std::min(mx, (warpClock.ahead + r - 1.0) * k));
                     double a2 = std::max(a1, std::min(mx, (a1 + r) * k));
+                    // the frame first shown a cycle later: the old one repeated once more before it (da2: half the misses)
+                    const double aRep = std::max(warpClock.ahead, std::min(mx, (warpClock.ahead + r) * k));
+                    double a3 = std::max(0.0, std::min(mx, (aRep + r - 1.0) * k));
                     f1 = (float)(std::floor(a1 * 256.0 + 0.5) / 256.0); f2 = (float)(std::floor(a2 * 256.0 + 0.5) / 256.0);
+                    f3 = (float)(std::floor(a3 * 256.0 + 0.5) / 256.0);
                 }
                 else
                 {
@@ -4575,7 +4582,7 @@ static DWORD WINAPI PresenterThread(void *)
                     f2 = (float)(std::floor(std::min(mx, 1.0 / (N + 1)) * 256.0 + 0.5) / 256.0);
                 }
             }
-            fxa::predFirst = f1; fxa::predRepeat = f2;
+            fxa::predFirst = f1; fxa::predRepeat = f2; fxa::predLate = f3;
         }
         pickNew = cycleStart && pickId != lastShownId;
         pickRelT = (pickNew && g_relId[pickId % kRel] == pickId) ? g_relT[pickId % kRel] : 0.0;
@@ -5691,9 +5698,9 @@ static DWORD WINAPI PresenterThread(void *)
                     if (s.warpDrawAhead && (h || mn || mf) && fxLogs++ < 120)
                         LOGI("BFI Presenter: draw ahead, last %.0f s: %d moved flashes shown from frames drawn ahead with the effects on them "
                              "(%.3f frames from the move wanted on average), %d moved as before: %d with none drawn for that frame, %d with "
-                             "none close enough (the last: %.3f wanted, %.3f drawn; next guess: first flash %.3f, repeat %.3f)", t - winPauseT, h,
+                             "none close enough (the last: %.3f wanted, %.3f drawn; next guess: first flash %.3f, a cycle late %.3f, repeat %.3f)", t - winPauseT, h,
                              h ? dm / 1000.0 / h : 0.0, mn + mf, mn, mf, fxa::missWant.load(), fxa::missHave.load(),
-                             fxa::predFirst.load(), fxa::predRepeat.load());
+                             fxa::predFirst.load(), fxa::predLate.load(), fxa::predRepeat.load());
                 }
                 static int pauseLogs = 0;
                 if ((winWarpPaused || winCuts || winWarpHeld) && pauseLogs++ < 60)

@@ -44,8 +44,8 @@ struct Gpu
     resource_view         apiRtv[kVar] = {};      // ReShade's views of them (render_technique)
     UINT                  w = 0, h = 0;
     DXGI_FORMAT           bbFmt = DXGI_FORMAT_UNKNOWN, fmt = DXGI_FORMAT_UNKNOWN;
-    int                   pendN = 0, pendVar[2] = {};
-    float                 pendAhead[2] = {};
+    int                   pendN = 0, pendVar[3] = {};
+    float                 pendAhead[3] = {};
     UINT64                waitRead = 0;           // the presenter's last read of the textures about to be drawn into
     bool                  failed = false, logged = false;
 };
@@ -239,15 +239,27 @@ static void Record(ID3D12GraphicsCommandList *list, UINT s)
     G.capturedNow = false;
     G.presentN++;
     if (!cap || !Enabled() || !G.pso || !G.clean[0] || g_status.fgActive) return;
+    // Not while ReShade's window or the OSD is shown: they are drawn on the frame after the effects, so frames drawn
+    // ahead (from before them) lack them, and they flickered (da2, Oblivion). Not without an effect on either: the frame
+    // moved as before is the same picture (da2: Oblivion drew them with no technique on).
+    if (overlayOpen.load() || g_shared.osd || !G.rt) return;
+    {
+        int on = 0;
+        G.rt->enumerate_techniques(nullptr, [&](effect_runtime *r, effect_technique t) { if (r->get_technique_state(t)) on++; });
+        if (!on) return;
+    }
     const int cur = G.cleanCur, prev = 1 - cur;
     if (G.cleanN[cur] != G.presentN || G.cleanN[prev] + 1 != G.presentN) return;   // this frame's and the one just before
     const int gsrc = gmo::PendingFor(s);
     ID3D12Resource *fl = gmo::FlowRes((int)s);
     if (!gsrc || !fl) return;
-    float want[2]; int n = 0;
-    const float f1 = predFirst.load(), f2 = predRepeat.load();
-    if (f1 > 0.004f) want[n++] = f1;
-    if (f2 > 0.004f && (n == 0 || std::fabs(f2 - want[0]) > 0.004f)) want[n++] = f2;
+    float want[3]; int n = 0;
+    for (const float f : { predFirst.load(), predLate.load(), predRepeat.load() })
+    {
+        bool dup = f <= 0.004f;
+        for (int j = 0; j < n && !dup; j++) if (std::fabs(f - want[j]) <= 0.004f) dup = true;
+        if (!dup) want[n++] = f;
+    }
     if (!n) return;
     // The oldest frames drawn ahead are drawn over (not selectable from here until published again).
     EnterCriticalSection(&g_lock);
@@ -374,6 +386,7 @@ static ID3D12Resource *CleanNow()
 }
 
 static void on_destroy_rt(effect_runtime *rt) { if (rt == G.rt) Release(); }
+static bool on_open(effect_runtime *, bool open, input_source) { overlayOpen = open; return false; }
 
 static void Register(bool on)
 {
@@ -381,11 +394,13 @@ static void Register(bool on)
     {
         reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_rt);
+        reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open);
     }
     else
     {
         reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(on_begin);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_rt);
+        reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(on_open);
     }
 }
 }   // namespace fxa
