@@ -13367,9 +13367,12 @@ static void on_osd(reshade::api::effect_runtime *rt)
     d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
     d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
     d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
-    // which motion: what the last second's moved cycles used, or (none moved) what the game hands over
+    // which motion: what the last second's moved cycles used, or (none moved) what the game hands over -- unless frame
+    // generation is on with the game's motion off for it, as in the settings window (Townfall, 2x: the OSD switched
+    // between the game's vectors and the measured motion with each second that had no cycle to fill)
+    const bool fgOff = g_status.fgActive && !g_shared.warpGameFg;
     d.warpSrc = g_status.warpCycles ? g_status.warpSrc
-              : (g_shared.warpGame && g_status.warpGameState > 0 ? g_status.warpGameState : 0);
+              : (g_shared.warpGame && !fgOff && g_status.warpGameState > 0 ? g_status.warpGameState : 0);
     d.warpVia = g_status.warpGameVia;
     LeaveCriticalSection(&g_cfgLock);
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
