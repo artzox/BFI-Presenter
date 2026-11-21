@@ -290,6 +290,20 @@ float HudByStructure(float2 uv, uint fw, uint fh, uint lw, uint lh)
     return cv / (df * ds) < 0.4 ? 1.0 : 0.0;             // structure that doesn't follow the scene's
 }
 
+// The raw target holds how many Presents in a row this texel has differed (n / 8, at most 8), and HUD is what differed
+// at least one rendered frame's worth of Presents in a row (at least 2): with 3x or 4x frame generation two generated
+// frames come one after the other, and the AND of two Presents alone kept the moving scene between them (Directive
+// 8020, 3x: the mask covered 75-100% at some Presents, under 10% at others).
+HudOut HudRun(bool diff, float2 p)
+{
+    HudOut o;
+    const float run = diff ? min(round(hPrev.Load(int3(int2(p), 0)) * 8.0) + 1.0, 8.0) : 0.0;
+    const float need = clamp(round(gPerRendered), 2.0, 8.0);
+    o.raw = run / 8.0;
+    o.hud = run >= need ? 1.0 : 0.0;
+    return o;
+}
+
 HudOut PSWarpHud(float4 pos : SV_Position)
 {
     float2 uv = pos.xy * gOutTexel;
@@ -299,9 +313,7 @@ HudOut PSWarpHud(float4 pos : SV_Position)
     if (gHudMode == 3)
     {
         HudOut s;
-        s.raw = HudByStructure(uv, fw, fh, lw, lh);
-        s.hud = (s.raw > 0.5 && hPrev.Load(int3(int2(pos.xy), 0)) > 0.5) ? 1.0 : 0.0;
-        return s;
+        return HudRun(HudByStructure(uv, fw, fh, lw, lh) > 0.5, pos.xy);
     }
     float d = 0.0;
     [unroll] for (int y = 0; y < 3; y++)
@@ -333,10 +345,7 @@ HudOut PSWarpHud(float4 pos : SV_Position)
             d = max(d, m);
         }
     }
-    HudOut o;
-    o.raw = d > gHudThr ? 1.0 : 0.0;
-    o.hud = (o.raw > 0.5 && hPrev.Load(int3(int2(pos.xy), 0)) > 0.5) ? 1.0 : 0.0;
-    return o;
+    return HudRun(d > gHudThr, pos.xy);
 }
 )HLSL";
 
