@@ -193,9 +193,13 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
     }
     // Where it is on the frame (its window, a few pixels around): frame warp never moves anything there (1.0.47). Its
     // background is see-through -- the scene changes under it every frame, so nothing finds it standing still.
+    // Its corner is where it was placed (pos, pivot); its size from GetWindowWidth / Height. (GetWindowPos / GetWindowSize
+    // return an ImVec2, which ReShade's ImGui -- built with MSVC -- returns through a hidden pointer and MinGW expects in
+    // a register: ReShade wrote it to a stray address and Oblivion Remastered crashed, 1.0.47-ep4.)
     {
-        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-        drawnRect[0] = wp.x - 4.0f; drawnRect[1] = wp.y - 4.0f; drawnRect[2] = wp.x + ws.x + 4.0f; drawnRect[3] = wp.y + ws.y + 4.0f;
+        const float w = ImGui::GetWindowWidth(), h = ImGui::GetWindowHeight();
+        const float x0 = (corner & 1) ? pos.x - w : pos.x, y0 = (corner & 2) ? pos.y - h : pos.y;
+        drawnRect[0] = x0 - 4.0f; drawnRect[1] = y0 - 4.0f; drawnRect[2] = x0 + w + 4.0f; drawnRect[3] = y0 + h + 4.0f;
         drawnT.store(d.now);
     }
     ImGui::End();
