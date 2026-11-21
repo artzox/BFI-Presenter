@@ -181,6 +181,8 @@ struct Settings
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
+    int   fxReplayTest = 0;   // EffectsReplayTest (test build, ini only): can ReShade's effects be rendered again on a copy of the
+                              // frame taken before them? Logs the result every 3 s (dx/bfi_fxreplay.h)
     int   warpEase = 1;       // FrameWarpGameMotionEase (test, ini only): with the game's motion and frame generation, the
                               // part of a move past the rendered frame eases off as the game's motion slows (1 = on)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
@@ -370,6 +372,7 @@ static void LoadSettings(Settings &s)
     s.warpFgLag = std::max(-1, std::min(1, IniInt("FrameWarpGameMotionFGLag", 1)));
     s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
+    s.fxReplayTest = IniInt("EffectsReplayTest", 0) ? 1 : 0;
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
     s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
@@ -14127,6 +14130,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("Use ENABLE_DECAY=0 in CRT-Standalone. Fixed 120 Hz, VRR off.");
 }
 
+#include "bfi_fxreplay.h"   // effects replay check (test build)
+
 static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 {
     if (!g_sc || g_gameQueue) return;
@@ -14198,6 +14203,7 @@ static void UnregisterAll(HMODULE hModule)
     reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::unregister_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
     RegisterDx9Events(false);
+    fxr::Register(false);
     reshade::unregister_overlay("BFI Presenter", draw_overlay);
     reshade::unregister_event<reshade::addon_event::reshade_overlay>(on_osd);
     RemoveHooks();
@@ -14223,6 +14229,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
     RegisterDx9Events(true);
+    fxr::Register(true);
     reshade::register_overlay("BFI Presenter", draw_overlay);
     reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
     if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
@@ -14280,6 +14287,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
         RegisterDx9Events(true);
+        fxr::Register(true);
         reshade::register_overlay("BFI Presenter", draw_overlay);
         reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
         ShaderPrepare();                                // compiled (or loaded) while the game starts up
