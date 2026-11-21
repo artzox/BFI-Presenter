@@ -353,9 +353,11 @@ static void Effects()
     if (!G.logged)
     {
         G.logged = true;
-        LOGI("BFI Presenter: draw ahead: first frames drawn ahead (%d of them, moves %.3f%s%.3f), %d technique%s each, %.2f ms on the CPU",
-             G.pendN, G.pendAhead[0], G.pendN > 1 ? " and " : "", G.pendN > 1 ? G.pendAhead[1] : 0.0f, on, on == 1 ? "" : "s",
-             (Now() - t0) * 1000.0);
+        char mv[48];
+        if (G.pendN > 1) snprintf(mv, sizeof(mv), "moves %.3f and %.3f", G.pendAhead[0], G.pendAhead[1]);
+        else snprintf(mv, sizeof(mv), "move %.3f", G.pendAhead[0]);
+        LOGI("BFI Presenter: draw ahead: first frames drawn ahead (%d, %s), %d technique%s each, %.2f ms on the CPU",
+             G.pendN, mv, on, on == 1 ? "" : "s", (Now() - t0) * 1000.0);
     }
 }
 
@@ -365,6 +367,11 @@ static void Publish(UINT64 id)
     for (int k = 0; k < G.pendN; k++) { var[G.pendVar[k]].frameId = id; var[G.pendVar[k]].ahead = G.pendAhead[k]; }
 }
 static UINT64 WaitRead() { return G.pendN ? G.waitRead : 0; }
+static ID3D12Resource *CleanNow()
+{
+    if (!G.capturedNow || G.cleanCur < 0 || !Enabled()) return nullptr;
+    return G.cleanN[G.cleanCur] == G.presentN + 1 ? G.clean[G.cleanCur] : nullptr;
+}
 
 static void on_destroy_rt(effect_runtime *rt) { if (rt == G.rt) Release(); }
 

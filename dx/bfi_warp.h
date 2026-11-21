@@ -261,12 +261,48 @@ float4 PSWarpGame(float4 pos : SV_Position) : SV_Target
 // frame is generated, and a generated frame differs from the rendered frame's HUD-less picture wherever things move
 // -- the rendered frame next to it doesn't, so the AND keeps only the HUD.
 struct HudOut { float raw : SV_Target0; float hud : SV_Target1; };
+// gHudMode 3 (test): against DLSS's output -- the scene before post-processing and the HUD -- by structure, not value:
+// tone mapping, grading, bloom and vignette change the values but keep the scene's local structure (a monotone change);
+// the HUD adds structure the scene doesn't have. Over a 6x6 window of the frame around the texel: the frame's
+// brightness (its code values; log for a linear frame) against the scene's (log) -- where the frame has structure and
+// either the scene is flat there or the two don't go together (correlation under 0.4), it is HUD.
+float HudLumF(float3 a) { float y = dot(a, float3(0.2126, 0.7152, 0.0722)); return (gFlags & 8) != 0 ? log2(max(y, 1e-4)) * 0.125 : y; }
+float HudLumS(float3 b) { return log2(max(dot(max(b, 0.0), float3(0.2126, 0.7152, 0.0722)), 1e-4)) * 0.125; }
+float HudByStructure(float2 uv, uint fw, uint fh, uint lw, uint lh)
+{
+    float sf = 0.0, ss = 0.0, sff = 0.0, sss = 0.0, sfs = 0.0;
+    const float2 fpx = 1.0 / float2(fw, fh);
+    [unroll] for (int y = 0; y < 6; y++)
+        [unroll] for (int x = 0; x < 6; x++)
+        {
+            float2 fu = uv + (float2(x, y) - 2.5) * fpx;
+            int2 fq = clamp(int2(fu * float2(fw, fh)), int2(0, 0), int2(fw, fh) - 1);
+            int2 lq = clamp(int2(fu * gHMap.xy + gHMap.zw), int2(0, 0), int2(lw, lh) - 1);
+            float f = HudLumF(hFinal.Load(int3(fq, 0)).rgb), l = HudLumS(hLess.Load(int3(lq, 0)).rgb);
+            sf += f; ss += l; sff += f * f; sss += l * l; sfs += f * l;
+        }
+    const float n = 36.0;
+    const float mf = sf / n, ms = ss / n;
+    const float vf = max(sff / n - mf * mf, 0.0), vs = max(sss / n - ms * ms, 0.0), cv = sfs / n - mf * ms;
+    const float df = sqrt(vf), ds = sqrt(vs);
+    if (df < 0.015) return 0.0;                          // nothing to see in the frame here
+    if (ds < 0.01) return 1.0;                           // structure in the frame over a flat scene
+    return cv / (df * ds) < 0.4 ? 1.0 : 0.0;             // structure that doesn't follow the scene's
+}
+
 HudOut PSWarpHud(float4 pos : SV_Position)
 {
     float2 uv = pos.xy * gOutTexel;
     uint fw, fh, lw, lh;
     hFinal.GetDimensions(fw, fh);
     hLess.GetDimensions(lw, lh);
+    if (gHudMode == 3)
+    {
+        HudOut s;
+        s.raw = HudByStructure(uv, fw, fh, lw, lh);
+        s.hud = (s.raw > 0.5 && hPrev.Load(int3(int2(pos.xy), 0)) > 0.5) ? 1.0 : 0.0;
+        return s;
+    }
     float d = 0.0;
     [unroll] for (int y = 0; y < 3; y++)
     {

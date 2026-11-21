@@ -183,6 +183,9 @@ struct Settings
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
+    int   hudFromDlss = 1;    // FrameWarpHudFromDlss (test, ini only): without a HUD-less picture from the game, DLSS's own
+                              // output (the scene before post-processing and the HUD) is compared with the frame instead
+    int   dlssOutState = 8;   // DlssOutputState (test, ini only): the state DLSS's output is in after its call (8 = UAV)
     int   warpDrawAhead = 1;  // FrameWarpDrawAhead (test): with the game's motion, ReShade's effects drawn after the move
                               // (dx/bfi_fxahead.h) -- a CRT shader's mask and curve stay put on moved flashes
     int   fxReplayTest = 0;   // EffectsReplayTest (test build, ini only): can ReShade's effects be rendered again on a copy of the
@@ -378,6 +381,8 @@ static void LoadSettings(Settings &s)
     s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
     s.fxReplayTest = IniInt("EffectsReplayTest", 0) ? 1 : 0;
     s.warpDrawAhead = IniInt("FrameWarpDrawAhead", 1) ? 1 : 0;
+    s.hudFromDlss = IniInt("FrameWarpHudFromDlss", 1) ? 1 : 0;
+    s.dlssOutState = IniInt("DlssOutputState", 8);
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
     s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
@@ -2496,11 +2501,13 @@ static std::atomic<UINT> varGen{0};             // bumped when the textures are 
 static std::atomic<float> predFirst{-1.0f}, predRepeat{-1.0f};   // the presenter's guess of the next moves (-1 = none)
 static std::atomic<int> hits{0}, missNone{0}, missFar{0};       // per 10 s
 static std::atomic<int> sumDeltaMilli{0};                        // |move wanted - move drawn| of the hits, 1/1000 frames
+static std::atomic<float> missWant{0.0f}, missHave{0.0f};       // the last miss with frames drawn: the move wanted, the nearest drawn
 static void Record(ID3D12GraphicsCommandList *list, UINT s);   // the game's thread, in Present (defined in bfi_fxahead.h)
 static UINT64 WaitRead();
 static void Effects();
 static void Publish(UINT64 id);
 static void Release();
+static ID3D12Resource *CleanNow();                // this frame from before ReShade's effects (in Present, before Record), or null
 }
 static_assert(sizeof(Constants) / 4 <= 63, "root constants: at most 64 DWORDs in the root signature");
 
@@ -4784,7 +4791,14 @@ static DWORD WINAPI PresenterThread(void *)
             if (cycleStart)
             {
                 if (fxv >= 0) { fxa::hits++; fxa::sumDeltaMilli += (int)(bestD * 1000.0f + 0.5f); }
-                else if (any) fxa::missFar++;
+                else if (any)
+                {
+                    fxa::missFar++; fxa::missWant = c.warp;
+                    float nd = 9.0f, nh = 0.0f;
+                    for (int v = 0; v < fxa::kVar; v++)
+                        if (fxa::var[v].frameId == pickId && std::fabs(fxa::var[v].ahead - c.warp) < nd) { nd = std::fabs(fxa::var[v].ahead - c.warp); nh = fxa::var[v].ahead; }
+                    fxa::missHave = nh;
+                }
                 else fxa::missNone++;
             }
             if (fxv >= 0) { c.warp = 0.0f; c.warpSrc = 0; c.warpPrevN = 0.0f; c.warpEase = 0.0f; c.warpLag = 0.0f; gFlow = nullptr; c.fxVar = (uint32_t)fxv + 1; }
@@ -5677,8 +5691,9 @@ static DWORD WINAPI PresenterThread(void *)
                     if (s.warpDrawAhead && (h || mn || mf) && fxLogs++ < 120)
                         LOGI("BFI Presenter: draw ahead, last %.0f s: %d moved flashes shown from frames drawn ahead with the effects on them "
                              "(%.3f frames from the move wanted on average), %d moved as before: %d with none drawn for that frame, %d with "
-                             "none close enough (next guess: first flash %.3f, repeat %.3f)", t - winPauseT, h, h ? dm / 1000.0 / h : 0.0,
-                             mn + mf, mn, mf, fxa::predFirst.load(), fxa::predRepeat.load());
+                             "none close enough (the last: %.3f wanted, %.3f drawn; next guess: first flash %.3f, repeat %.3f)", t - winPauseT, h,
+                             h ? dm / 1000.0 / h : 0.0, mn + mf, mn, mf, fxa::missWant.load(), fxa::missHave.load(),
+                             fxa::predFirst.load(), fxa::predRepeat.load());
                 }
                 static int pauseLogs = 0;
                 if ((winWarpPaused || winCuts || winWarpHeld) && pauseLogs++ < 60)
@@ -8534,6 +8549,11 @@ static std::atomic<int> hudState{0};                     // 0 no HUD-less pictur
 // in turn, from the likeliest for the two formats; the check (every 2 s) moves on when the mask covers too much.
 static int hudModes[3] = { 0, 1, 2 }; static int hudModeN = 3; static std::atomic<int> hudModeI{0};
 static bool hudModesSet = false;
+// Without a HUD-less picture (FrameWarpHudFromDlss, test): DLSS's own output, copied on the game's list right after its
+// call -- the scene upscaled, before post-processing and the HUD (Unreal Engine). It differs from the frame by tone
+// mapping, grading, bloom and vignette as well as the HUD, so it is compared by structure (gHudMode 3), not value.
+static bool hudFromOut = false;                          // hudCopy holds DLSS's output, not a HUD-less picture
+static double hudRealT = -10.0;                          // when the game last tagged a real HUD-less picture
 static char hudWhy[160] = "";
 static Consts consts = {}; static bool haveConsts = false;
 static bool depthFailed = false;                         // a copy texture of the game's depth format couldn't be made
@@ -8719,7 +8739,8 @@ static void Map(const Tag &t, UINT w, UINT h, float m[4])
 
 static const char *HudModeName(uint32_t m)
 {
-    return m == 1 ? "HDR10 frame against a linear scRGB picture" : m == 2 ? "sRGB frame against a linear picture" : "the same encoding";
+    return m == 1 ? "HDR10 frame against a linear scRGB picture" : m == 2 ? "sRGB frame against a linear picture"
+         : m == 3 ? "the frame's structure against DLSS's output" : "the same encoding";
 }
 
 static DXGI_FORMAT ColorView(DXGI_FORMAT f)
@@ -8775,9 +8796,50 @@ static void CopyHud(const Tag &t, void *cmd)
         Map(t, hudW, hudH, hudMap);
         hudCopyT = Now();
         hudLive = false;
+        hudFromOut = false; hudRealT = hudCopyT;
     }
     cl->Release();
     src->Release();
+}
+
+// DLSS's output as the stand-in for a HUD-less picture (FrameWarpHudFromDlss): copied on the game's list right after the
+// DLSS call recorded on it (ngx::hk_Eval). Not while the game tags a real HUD-less picture.
+static void CopyOut(void *cmd, ID3D12Resource *src)
+{
+    if (!g_shared.hudFromDlss || !g_shared.warpGameHud || hudState.load() < 0 || !g_device || !cmd || !src) return;
+    std::lock_guard<std::mutex> l(lk);
+    if (Now() - hudRealT < 1.0) return;
+    const D3D12_RESOURCE_DESC hd = src->GetDesc();
+    if (hd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || ColorView(hd.Format) == DXGI_FORMAT_UNKNOWN) return;
+    ID3D12GraphicsCommandList *cl = nullptr;
+    if (FAILED(((IUnknown *)cmd)->QueryInterface(__uuidof(ID3D12GraphicsCommandList), (void **)&cl)) || !cl) return;
+    if (!hudCopy || hudW != (UINT)hd.Width || hudH != hd.Height || hudFmt != hd.Format)
+    {
+        if (hudCopy) retired.push_back({ hudCopy, Now() });
+        hudCopy = MakeCopy(hd, L"BFI frame warp: DLSS's output (for the HUD mask)");
+        hudW = (UINT)hd.Width; hudH = hd.Height; hudFmt = hd.Format;
+    }
+    if (hudCopy)
+    {
+        const D3D12_RESOURCE_STATES st = (D3D12_RESOURCE_STATES)g_shared.dlssOutState;
+        D3D12_RESOURCE_BARRIER b = Transition(src, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cl->ResourceBarrier(1, &b);
+        cl->CopyResource(hudCopy, src);
+        b = Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, st);
+        cl->ResourceBarrier(1, &b);
+        hudMap[0] = (float)hudW; hudMap[1] = (float)hudH; hudMap[2] = hudMap[3] = 0.0f;
+        hudCopyT = Now();
+        hudLive = false;
+        if (!hudFromOut)
+        {
+            static int logged = 0;
+            if (logged++ < 4)
+                LOGI("BFI Presenter: frame warp, the game's own motion: no HUD-less picture from the game -- DLSS's output (%ux%u, format %d) "
+                     "is compared with the frame by structure for the HUD mask (test)", hudW, hudH, (int)hudFmt);
+        }
+        hudFromOut = true;
+    }
+    cl->Release();
 }
 
 static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int from);
@@ -9163,6 +9225,10 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
             }
         }
     }
+    // The frame compared: from before ReShade's effects where draw ahead copied it (they would differ from the HUD-less
+    // picture everywhere), else the frame as staged.
+    ID3D12Resource *hFrame = fxa::CleanNow();
+    if (!hFrame) hFrame = g_stage[s];
     // the views for this slot: t5 vectors, t6 depth, t7 HUD mask, t8 the frame, t9 the HUD-less picture, t10 the raw mask before
     D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
     sh.ptr += (SIZE_T)(7 * s) * srvStride;
@@ -9180,7 +9246,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         sv.Format = DXGI_FORMAT_R8_UNORM;
         g_device->CreateShaderResourceView(hudMask, &sv, at(2));
         sv.Format = StageFormat();
-        g_device->CreateShaderResourceView(g_stage[s], &sv, at(3));
+        g_device->CreateShaderResourceView(hFrame, &sv, at(3));
         sv.Format = hl ? ColorView(hlFmt) : DXGI_FORMAT_R8G8B8A8_UNORM;
         g_device->CreateShaderResourceView(hl, &sv, at(4));
         sv.Format = DXGI_FORMAT_R8_UNORM;
@@ -9217,13 +9283,14 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         hudModeI = 0; hudModesSet = true;
     }
     gc.hudMode = (uint32_t)hudModes[std::min(hudModeI.load(), hudModeN - 1)];
+    if (hl && hudFromOut && !hlLive) gc.hudMode = 3;        // DLSS's output: by structure
     gc.hudThr = (linear || gc.hudMode != 0) ? 0.08f : 0.04f;
 
     // 1. The HUD mask (when the game gives a HUD-less picture)
     if (hl)
     {
         D3D12_RESOURCE_BARRIER hb[4]; UINT nh = 0;
-        hb[nh++] = Transition(g_stage[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        hb[nh++] = Transition(hFrame, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         const bool hlTr = !(hlState & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         if (hlTr) hb[nh++] = Transition(hl, (D3D12_RESOURCE_STATES)hlState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         hb[nh++] = Transition(hudRaw[hudCur], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -9237,7 +9304,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         list->OMSetRenderTargets(2, rt, FALSE, nullptr);
         list->DrawInstanced(3, 1, 0, 0);
         nh = 0;
-        hb[nh++] = Transition(g_stage[s], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        hb[nh++] = Transition(hFrame, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         if (hlTr) hb[nh++] = Transition(hl, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, (D3D12_RESOURCE_STATES)hlState);
         hb[nh++] = Transition(hudRaw[hudCur], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         hb[nh++] = Transition(hudMask, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -9247,9 +9314,11 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         if (hudState.load() == 0)
         {
             hudState = 1;
-            LOGI("BFI Presenter: frame warp, the game's own motion: the HUD is kept still with the game's HUD-less picture (%ux%u, format %d, "
-                 "the frame's %d, %s); compared as: %s", (unsigned)hlMap[0], (unsigned)hlMap[1], (int)hlFmt, (int)StageFormat(),
-                 hlLive ? "read at the Present" : "copied when tagged", HudModeName(gc.hudMode));
+            LOGI("BFI Presenter: frame warp, the game's own motion: the HUD is kept still with %s (%ux%u, format %d, "
+                 "the frame's %d, %s%s); compared as: %s", gc.hudMode == 3 ? "DLSS's output" : "the game's HUD-less picture",
+                 (unsigned)hlMap[0], (unsigned)hlMap[1], (int)hlFmt, (int)StageFormat(),
+                 hlLive ? "read at the Present" : "copied when tagged", hFrame != g_stage[s] ? ", the frame from before ReShade's effects" : "",
+                 HudModeName(gc.hudMode));
         }
         hl->Release();
     }
@@ -9356,6 +9425,13 @@ static int StateFast() { return state.load(); }
 static void HudBad(double pct)
 {
     if (hudState.load() < 0) return;
+    if (hudFromOut)
+    {
+        hudState = -1;
+        LOGW("BFI Presenter: frame warp, the game's own motion: HUD protection off -- compared by structure with DLSS's output, the mask "
+             "covered %.0f%% of the frame (the game's post-processing, or ReShade's effects without draw ahead?)", pct);
+        return;
+    }
     const int i = hudModeI.load();
     if (i + 1 < hudModeN)
     {
@@ -9417,6 +9493,7 @@ static std::map<uintptr_t, Feat> feats;                // by handle, from Create
 static bool tried[2] = {};                             // "nvngx.dll", "_nvngx.dll"
 static bool hooked = false;
 static thread_local int inside = 0;                    // nested NGX call (OptiScaler calling the driver's DLSS)
+static thread_local bool usedNow = false;              // this call was taken as an upscaler call (OnEval -> AfterEval)
 // The parameter object is a C++ interface: 8 Set overloads, then 8 Get overloads, then Reset. MSVC puts overloads
 // of one name in reverse order, so Get(ID3D12Resource**) is slot 9 there and slot 14 in declaration order. Which one
 // is found once, from the first DLSS call, by asking for "MotionVectors" and checking that what comes back is a D3D12
@@ -9577,6 +9654,7 @@ static void OnEval(void *cmd, const Handle *h, const void *params)
     }
     std::lock_guard<std::mutex> l(lk);
     nUsed++;
+    usedNow = true;
 }
 
 template <int I> static int hk_Create(void *cl, int feature, void *params, Handle **out)
@@ -9587,12 +9665,24 @@ template <int I> static int hk_Create(void *cl, int feature, void *params, Handl
     if (r == kSuccess && out && Plaus(out) && inside == 0) OnCreate(feature, params, *out);
     return r;
 }
+// DLSS's output, for the HUD mask without a HUD-less picture: after the call, so the copy is of what DLSS wrote.
+static void AfterEval(void *cmd, const void *params)
+{
+    if (!usedNow || !g_shared.hudFromDlss) return;
+    usedNow = false;
+    void *out = GetRes(params, "Output", nullptr);
+    ID3D12Resource *r = nullptr;
+    if (!out || !Plaus(out) || FAILED(((IUnknown *)out)->QueryInterface(__uuidof(ID3D12Resource), (void **)&r)) || !r) return;
+    gmo::CopyOut(cmd, r);
+    r->Release();
+}
 template <int I> static int hk_Eval(void *cl, const Handle *h, const void *params, void *cb)
 {
     if (inside == 0) OnEval(cl, h, params);
     inside++;
     const int r = o_Eval[I](cl, h, params, cb);
     inside--;
+    if (inside == 0 && r == kSuccess) AfterEval(cl, params);
     return r;
 }
 template <int I> static int hk_EvalC(void *cl, const Handle *h, const void *params, void *cb)
@@ -9601,6 +9691,7 @@ template <int I> static int hk_EvalC(void *cl, const Handle *h, const void *para
     inside++;
     const int r = o_EvalC[I](cl, h, params, cb);
     inside--;
+    if (inside == 0 && r == kSuccess) AfterEval(cl, params);
     return r;
 }
 
