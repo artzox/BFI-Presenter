@@ -114,6 +114,12 @@ vec2 EdgeFade(vec2 cp, vec2 d, vec2 size)
     return d * k;
 }
 // The game's frame moved ahead (Catmull-Rom, 9 bilinear taps). False = show the pixel as rendered.
+bool InOsd(vec2 p)
+{
+    if (pc.osdB == 0u) return false;
+    vec2 a = vec2(float(pc.osdA & 0xFFFFu), float(pc.osdA >> 16)), b = vec2(float(pc.osdB & 0xFFFFu), float(pc.osdB >> 16));
+    return all(greaterThanEqual(p, a)) && all(lessThan(p, b));
+}
 bool FetchWarped(vec2 fc, out vec3 c)
 {
     c = vec3(0.0);
@@ -124,9 +130,11 @@ bool FetchWarped(vec2 fc, out vec3 c)
     if (pc.warpSnapX > 0.0) d.x = round(d.x / pc.warpSnapX) * pc.warpSnapX;
     if (pc.warpSnapY > 0.0) d.y = round(d.y / pc.warpSnapY) * pc.warpSnapY;
     if (dot(d, d) < 0.0004) return false;
+    if (InOsd(fc)) return false;                          // the BFI OSD: never moved (as DX 1.0.47)
     if (Still(ivec2(fc), size)) return false;
     vec2 p = fc - d;
     if ((pc.flags & 4096u) != 0u) p = EdgeMirror(p, size);
+    if (InOsd(p)) return false;                           // and nothing moved is taken from it
     p = clamp(p, vec2(0.5), size - 0.5);
     if (Still(ivec2(p), size)) return false;
     vec2 tc = floor(p - 0.5) + 0.5;

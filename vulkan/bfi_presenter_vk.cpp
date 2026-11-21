@@ -145,7 +145,8 @@ static void Log(const char *lvl, const char *fmt, ...)
 #include "../common/bfi_syscheck.h"
 #include "../common/bfi_vram.h"
 #include "../common/bfi_clockdrift.h"
-namespace Osd { inline void FramePush(double tNowSec); inline void AddSecond(int, int, int, double); inline void ResetTotals(double); }   // common/bfi_osd.h (included with ImGui further down)
+namespace Osd { inline void FramePush(double tNowSec); inline void AddSecond(int, int, int, double); inline void ResetTotals(double);
+                inline float drawnRect[4] = {}; inline std::atomic<double> drawnT{0.0}; }   // common/bfi_osd.h (included with ImGui further down)
 static SysCheck g_sysCheck;      // power plan, GPUs, displays (checked on the window watch thread)
 #endif
 #define LOGE(...) Log("ERROR", __VA_ARGS__)
@@ -737,6 +738,8 @@ struct Constants
     float    warpPrevN;                 // the game's own motion: game frames back to the frame shown before
     float    warpSnapX, warpSnapY;      // moves rounded to whole steps of this many game-frame pixels (0 = off)
     float    warpLag;                   // the game's motion with frame generation: shown frames behind its vectors' frame
+    uint32_t osdA, osdB;                // frame warp: the BFI OSD on the frame, left | top << 16 and right | bottom << 16
+                                        // (game-frame pixels; 0 = none): never moved (1.0.47)
 };
 static_assert(sizeof(Constants) <= 128, "push constants: 128 bytes is the most every GPU offers");
 
@@ -2796,6 +2799,12 @@ static void PresenterThread(Swapchain *sc)
         c.warp = 0.0f; c.warpSrc = 0; c.warpPrevN = 0.0f; c.warpLag = 0.0f;
         c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
         if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
+        if (s.osd && Now() - Osd::drawnT.load() < 0.5)    // the BFI OSD on the frame: never moved (its background is see-through)
+        {
+            auto px = [](float v) { return (uint32_t)std::max(0.0f, std::min(65535.0f, v)); };
+            c.osdA = px(Osd::drawnRect[0]) | px(Osd::drawnRect[1]) << 16;
+            c.osdB = px(Osd::drawnRect[2]) | px(Osd::drawnRect[3]) << 16;
+        }
         if (warpAhead > 0.0 && s.frameWarp && R.warp.ok && !copyMode && (warpOld = R.warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrevReady && warpPrevId == warpOld)
         {
@@ -7280,6 +7289,7 @@ BFI_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL BFI_vkGetDeviceProcAddr(VkDe
 #ifdef _WIN32
 #include <imgui.h>
 #include <reshade.hpp>
+#define BFI_OSD_RECT_DECLARED
 #include "../common/bfi_osd.h"
 
 extern "C" __declspec(dllexport) const char *NAME;

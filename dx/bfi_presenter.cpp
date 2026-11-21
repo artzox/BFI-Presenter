@@ -1749,6 +1749,7 @@ cbuffer C : register(b0)
                       // motion vectors are for (a generated frame sits between two rendered ones; 0 = the rendered frame)
     float warpEase;   // the game's motion: 1 = the part of a move past the rendered frame is scaled by how much the motion
                       // kept up from the frame before (z - 1 of the motion texture): no overshoot when the camera slows down
+    float osdX0, osdY0, osdX1, osdY1;   // frame warp: the BFI OSD on the frame (game-frame pixels; x1 <= x0 = none): never moved
 };
 Texture2D<float4> src : register(t0);
 Texture2D<float> aplTex : register(t1);
@@ -1882,6 +1883,8 @@ bool Still(int2 q, float2 size)
     return max(max(d.r, d.g), d.b) > lim;
 }
 
+bool InOsd(float2 p) { return osdX1 > osdX0 && p.x >= osdX0 && p.x < osdX1 && p.y >= osdY0 && p.y < osdY1; }
+
 // The game's frame moved ahead: each output pixel is taken from where its part of the picture is in the frame.
 // False = show the pixel as rendered: what stands still on the screen is never moved, and nothing that stands
 // still is pulled over what moves next to it (the edge of a HUD stays clean; the scene coming out from behind it
@@ -1901,10 +1904,12 @@ bool FetchWarped(float2 pos, out float3 c)
     if (warpSnapX > 0.0) d.x = round(d.x / warpSnapX) * warpSnapX;
     if (warpSnapY > 0.0) d.y = round(d.y / warpSnapY) * warpSnapY;
     if (dot(d, d) < 0.0004) return false;                 // under 1/50 pixel
+    if (InOsd(cp)) return false;                          // the BFI OSD: never moved
     if (Still(int2(cp), size)) return false;
     float2 p = cp - d;
     if ((flags & 4096) != 0) p = EdgeMirror(p, size);
     p = clamp(p, float2(0.5, 0.5), size - 0.5);
+    if (InOsd(p)) return false;                           // and nothing moved is taken from it
     // the game's HUD mask (w = -1): a HUD pixel is never moved, and no moved pixel is taken from the HUD
     if (warpSrc != 0 && (GameFlow(cp * inv).w < -0.5 || GameFlow(p * inv).w < -0.5)) return false;
     if (Still(int2(p), size)) return false;
@@ -2479,6 +2484,7 @@ struct Constants
     float    warpSnapX, warpSnapY;      // frame warp: moves rounded to whole steps of this many game-frame pixels (0 = off)
     float    warpLag;                   // the game's motion with frame generation: shown frames behind its vectors' frame
     float    warpEase;                  // the game's motion: 1 = moves past the rendered frame ease off as the motion slows
+    float    osdX0, osdY0, osdX1, osdY1;  // frame warp: the BFI OSD on the frame, game-frame pixels (none: x1 <= x0)
 };
 static_assert(sizeof(Constants) / 4 <= 63, "root constants: at most 64 DWORDs in the root signature");
 
@@ -4701,6 +4707,10 @@ static DWORD WINAPI PresenterThread(void *)
             else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
             if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
+            if (s.osd && Now() - Osd::drawnT.load() < 0.5)    // the BFI OSD on the frame: never moved (its background is see-through)
+            {
+                c.osdX0 = Osd::drawnRect[0]; c.osdY0 = Osd::drawnRect[1]; c.osdX1 = Osd::drawnRect[2]; c.osdY1 = Osd::drawnRect[3];
+            }
             // Around a camera cut, and in a letterboxed cutscene: shown as rendered (no motion connects two shots).
             const char *pauseWhy = nullptr;
             if (c.warp != 0.0f && gmo::PauseNow(pickId, s.warpPauseLb != 0, &pauseWhy))

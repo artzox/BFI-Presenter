@@ -32,6 +32,8 @@ layout(push_constant) uniform C
     float warpSnapX;  // moves rounded to whole steps of this many game-frame pixels (0 = off)
     float warpSnapY;
     float warpLag;    // the game's motion with frame generation: shown frames this one is behind its vectors' frame
+    uint  osdA;       // frame warp: the BFI OSD on the frame, left | top << 16 (game-frame pixels; osdB 0 = none): never moved
+    uint  osdB;       // right | bottom << 16
 } pc;
 layout(set = 0, binding = 0) uniform sampler2D src;
 // RenoFX APL Limiter: the frame's average SDR brightness (1x1), written by apl.comp before the frame's first refresh

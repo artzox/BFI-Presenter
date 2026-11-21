@@ -118,6 +118,10 @@ inline int GpuLoad()
 }
 
 // corner: 0 top left, 1 top right, 2 bottom left, 3 bottom right.
+#ifndef BFI_OSD_RECT_DECLARED                    // (the Vulkan layer declares these before it includes this file)
+inline float drawnRect[4] = {};                 // the OSD's window on the frame, pixels (left, top, right, bottom)
+inline std::atomic<double> drawnT{0.0};         // when it was last drawn (OsdData::now)
+#endif
 inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float scale)
 {
     const ImGuiIO &io = ImGui::GetIO();
@@ -186,6 +190,13 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
         const int c = CpuLoad(), g = GpuLoad();
         if (g >= 0) ImGui::Text("CPU %3d%%   GPU %3d%%", c, g);
         else ImGui::Text("CPU %3d%%", c);
+    }
+    // Where it is on the frame (its window, a few pixels around): frame warp never moves anything there (1.0.47). Its
+    // background is see-through -- the scene changes under it every frame, so nothing finds it standing still.
+    {
+        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        drawnRect[0] = wp.x - 4.0f; drawnRect[1] = wp.y - 4.0f; drawnRect[2] = wp.x + ws.x + 4.0f; drawnRect[3] = wp.y + ws.y + 4.0f;
+        drawnT.store(d.now);
     }
     ImGui::End();
 }
