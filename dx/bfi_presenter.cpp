@@ -139,7 +139,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.45"
+#define BFI_ADDON_VERSION "1.0.46"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -1832,12 +1832,14 @@ bool Unchanged(int2 q)
     return all(abs(a - b) <= tol);
 }
 // Does the pixel stand still on the screen (a HUD, text, a crosshair) rather than move with the scene? It is
-// unchanged, and either most of what is around it is too (5 of 8: the inside or the edge of something still, or an
-// area with nothing in it to see moving), or one around it is and the scene's motion does not explain it: the
-// frame before, one motion step back, shows something else there (a crosshair's one-pixel line over a moving
-// scene, the corner of a HUD). A pixel of a moving picture can be unchanged by chance, and along whole lines in a
-// regular pattern (stripes that moved by their own spacing): there the motion explains it, and it moves with the
-// rest.
+// unchanged, one or more around it are too, and the scene's motion does not explain it: the frame before, one
+// motion step back, shows something else there (a crosshair's one-pixel line over a moving scene, the edge or text
+// of a HUD). A pixel of a moving picture can be unchanged by chance, along whole lines in a regular pattern (stripes
+// that moved by their own spacing), and all over an area with nothing in it to see moving (a clear sky in a pan):
+// there the motion explains it, and it moves with the rest. (Before 1.0.46, 5 of 8 unchanged around it was
+// still without the motion test: a clear sky stood still, and a tree's outline against it with it, while the rest
+// of the tree moved -- the outline flickered on moved flashes. The inside of an even HUD panel can now move too,
+// which shows nothing; its edges and text are within a motion step of something else and stay.)
 bool Still(int2 q, float2 size)
 {
     if (!Unchanged(q)) return false;
@@ -1845,7 +1847,6 @@ bool Still(int2 q, float2 size)
     [unroll] for (int y = -1; y <= 1; y++)
         [unroll] for (int x = -1; x <= 1; x++)
             if ((x != 0 || y != 0) && Unchanged(q + int2(x, y))) n++;
-    if (n >= 5) return true;
     if (n < 1) return false;
     float2 c = float2(q) + 0.5;
     float4 f = flowTex.SampleLevel(linClamp, c / size, 0);
