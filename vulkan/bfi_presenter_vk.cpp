@@ -3791,17 +3791,18 @@ static void PresenterThread(Swapchain *sc)
                     else badSecs = 0;
                     // Overshoot check (vp6): the limit has to hold the game, too. Uncharted (Vulkan) ran 54-74 fps under a
                     // 60 fps limit at its Reflex sleep, the sleep not pacing it -- and with the limit on, the presenter takes
-                    // every frame. 4 of the last 6 s more than 5% above the limit switch it off for the session; the
+                    // every frame. 4 of the last 6 s more than 8% above the limit switch it off for the session; the
                     // presenter's own frame cap then holds the game in its present.
                     {
                         static unsigned fastBits = 0;
                         const double lim = want > 0 ? 1e6 / want * f : 0.0;
-                        const bool fast = want > 0 && was == want && !hitchPaused && t - onT >= 2.0 && lim > 0.0 && fpsA > 1.05 * lim;
-                        fastBits = want > 0 ? (((fastBits << 1) | (fast ? 1u : 0u)) & 63u) : 0u;
+                        // Not with frame generation (the presenter's cap doesn't hold it: no cap would be left).
+                        const bool fast = f == 1 && want > 0 && was == want && !hitchPaused && t - onT >= 2.0 && lim > 0.0 && fpsA > 1.08 * lim;
+                        fastBits = (want > 0 && f == 1) ? (((fastBits << 1) | (fast ? 1u : 0u)) & 63u) : 0u;
                         if (__builtin_popcount(fastBits) >= 4)
                         {
                             fastBits = 0;
-                            if (f == 1) g_vkAtSleepBad.store(true); else g_vkRfxBad.store(true);
+                            g_vkAtSleepBad.store(true);
                             g_vkSleepLimitUs.store(0);
                             LOGW("BFI Presenter: frame limit at the game's Reflex sleep: the game ran %.0f fps under a %.0f fps limit "
                                  "(its Reflex sleep doesn't pace it; %ld sleeps last second) -- off for this session; the presenter's frame cap "

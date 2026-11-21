@@ -5818,13 +5818,15 @@ static DWORD WINAPI PresenterThread(void *)
                 else rfxBadSecs = 0;
                 // Overshoot (as the Vulkan layer, 1.0.47): the limit has to hold the game too. A game whose Reflex sleep
                 // doesn't pace it ran well above it (Vulkan: 54-74 fps under a 60 fps limit), and with the limit on the
-                // presenter takes every frame. 4 of the last 6 s more than 5% above one frame per strobe cycle switch
+                // presenter takes every frame. 4 of the last 6 s more than 8% above one frame per strobe cycle switch
                 // it off for the session; the presenter's own cap holds the game at Present.
                 {
                     static unsigned fastBits = 0;
                     const double capFps = hzA > 0.0 ? hzA / s.frames : 0.0;
-                    const bool on = autoCapDown && capByReflex && !rfxLimitBad;
-                    const bool fast = on && !stallSec && !fgChanging && t - rfxChkT >= 2.0 && capFps > 0.0 && fpsA > 1.05 * capFps;
+                    // Never with frame generation: the presenter's own cap doesn't hold frame generation, so switching the limit
+                    // off would leave the game without a cap (Townfall with frame generation, ep7).
+                    const bool on = autoCapDown && capByReflex && !rfxLimitBad && !fgWas && !fgChanging;
+                    const bool fast = on && !stallSec && t - rfxChkT >= 2.0 && capFps > 0.0 && fpsA > 1.08 * capFps;
                     fastBits = on ? (((fastBits << 1) | (fast ? 1u : 0u)) & 63u) : 0u;
                     if (__builtin_popcount(fastBits) >= 4)
                     {
