@@ -1098,9 +1098,11 @@ static void DrawTop(HWND hwnd)
             if (e.empty() && g_app.vk.machine && !IsElevated()) e = VkMachineElevated(false, g_app.vk.dir);
             DoAction("Vulkan layer removed.", e);
         }
-        ImGui::SameLine();
+        // SameLine only before a button that follows: a trailing SameLine put the Tools row on this line, its buttons
+        // over the layer's status (installed for all users, ReShade's layer in order).
         if (!g_app.vk.machine)
         {
+            ImGui::SameLine();
             if (ImGui::Button("All users"))
                 DoAction("Vulkan layer registered for all users: it also loads in games run as administrator.",
                          VkMachineElevated(true, g_app.vk.dir));
@@ -1110,6 +1112,7 @@ static void DrawTop(HWND hwnd)
         }
         else if (g_app.vk.reshadeAfter)
         {
+            ImGui::SameLine();
             if (ImGui::Button("Fix order"))
                 DoAction("BFI Presenter is listed after ReShade again.", VkMachineElevated(true, g_app.vk.dir));
             Tooltip("Lists the BFI Presenter layer after ReShade's again (asks for administrator rights).");
