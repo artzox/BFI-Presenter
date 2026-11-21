@@ -24,7 +24,7 @@ struct State
 {
     device       *dev = nullptr;
     effect_runtime *rt = nullptr;
-    resource      clean = {}, test = {}, post = {}, rb[3] = {};
+    resource      clean = {}, test = {}, post = {}, rb[3] = {}, bb = {};
     resource_view testRtv = {}, testRtvSrgb = {};
     uint32_t      w = 0, h = 0, pw = 0, ph = 0, bpp = 0;
     format        fmt = format::unknown, viewFmt = format::unknown, viewFmtSrgb = format::unknown;
@@ -78,16 +78,34 @@ static void Unpack(const uint8_t *p, format f, float o[3])
     o[0] = bgr ? c : a; o[1] = b; o[2] = bgr ? a : c;
 }
 
-static bool Ensure(resource bb, resource_view rtv, resource_view rtvSrgb)
+// The typed formats for a back buffer format: the view without and with sRGB (unknown = none).
+static void ViewFormats(int f, format &vf, format &vfs)
 {
-    const resource_desc d = g.dev->get_resource_desc(bb);
-    const format vf = g.dev->get_resource_view_desc(rtv).format;
-    const format vfs = rtvSrgb.handle ? g.dev->get_resource_view_desc(rtvSrgb).format : format::unknown;
-    if (g.clean.handle && d.texture.width == g.w && d.texture.height == g.h && d.texture.format == g.fmt && vf == g.viewFmt) return true;
+    vfs = format::unknown;
+    switch (f)
+    {
+    case 23: vf = (format)24; break;                                  // R10G10B10A2
+    case 9:  vf = (format)10; break;                                  // R16G16B16A16_FLOAT
+    case 27: case 28: case 29: vf = (format)28; vfs = (format)29; break;   // R8G8B8A8
+    case 87: case 90: case 91: vf = (format)87; vfs = (format)91; break;   // B8G8R8A8
+    default: vf = (format)f; break;
+    }
+}
+
+// The ReShade calls that return a description (get_resource_desc, get_resource_view_desc) return a structure, which
+// MSVC (ReShade) and MinGW (this add-on) pass differently: ReShade crashed reading from the stack (fx1, 007 First
+// Light). The back buffer comes from the runtime and its description from D3D12 itself.
+static bool Ensure(resource bb, resource_view rtvSrgb)
+{
+    const D3D12_RESOURCE_DESC d = reinterpret_cast<ID3D12Resource *>(bb.handle)->GetDesc();
+    format vf, vfs;
+    ViewFormats((int)d.Format, vf, vfs);
+    if (!rtvSrgb.handle) vfs = format::unknown;
+    if (g.clean.handle && (uint32_t)d.Width == g.w && d.Height == g.h && (format)d.Format == g.fmt) return true;
     device *dv = g.dev; effect_runtime *rt = g.rt; const int probes = g.probes; const double nextT = g.nextT;
     Release();
     g.dev = dv; g.rt = rt; g.probes = probes; g.nextT = nextT;
-    g.w = d.texture.width; g.h = d.texture.height; g.fmt = d.texture.format; g.viewFmt = vf; g.viewFmtSrgb = vfs;
+    g.w = (uint32_t)d.Width; g.h = d.Height; g.fmt = (format)d.Format; g.viewFmt = vf; g.viewFmtSrgb = vfs;
     g.bpp = Bpp(vf);
     if (!g.bpp) { LOGW("BFI Presenter: effects replay check: frame format %d not handled -- check off", (int)vf); return false; }
     g.pw = std::min(512u, g.w); g.ph = std::min(512u, g.h);
@@ -118,18 +136,20 @@ static void on_begin(effect_runtime *rt, command_list *cmd, resource_view rtv, r
 {
     if (g.guard || !Mine(rt) || g.phase != 0 || Now() < g.nextT) return;
     g.dev = rt->get_device(); g.rt = rt;
-    const resource bb = g.dev->get_resource_from_view(rtv);
-    if (!bb.handle || !Ensure(bb, rtv, rtvSrgb)) { g.failed = true; return; }
+    (void)rtv;
+    const resource bb = rt->get_current_back_buffer();
+    if (!bb.handle || !Ensure(bb, rtvSrgb)) { g.failed = true; return; }
+    g.bb = bb;
     cmd->barrier(bb, resource_usage::render_target, resource_usage::copy_source);
     cmd->copy_resource(bb, g.clean);
     cmd->barrier(bb, resource_usage::copy_source, resource_usage::render_target);
     g.phase = 1;
 }
 
-static void on_finish(effect_runtime *rt, command_list *cmd, resource_view rtv, resource_view)
+static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, resource_view)
 {
     if (g.guard || g.phase != 1 || rt != g.rt) return;
-    const resource bb = g.dev->get_resource_from_view(rtv);
+    const resource bb = g.bb;
     cmd->barrier(bb, resource_usage::render_target, resource_usage::copy_source);
     cmd->copy_resource(bb, g.post);
     cmd->barrier(bb, resource_usage::copy_source, resource_usage::render_target);
