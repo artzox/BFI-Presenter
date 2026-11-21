@@ -7,6 +7,13 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.46] — 2026-11-21
+
+**Frame warp no longer holds a clear sky still in pans, so outlines against it move with the rest of the picture.**
+
+- **[DX] [Vulkan] Frame warp: outlines against a clear sky no longer flicker.** What is the same in this frame and the one before stands still on the screen (a HUD) and isn't moved. An even area counted as still whenever most of the pixels around it were unchanged too, and a clear sky in a pan is unchanged from frame to frame. The sky then stood still, and with it the outlines of trees and branches against it, while the rest of the trees moved: the outlines flickered on moved flashes (The Witcher 3 at 0.6 frames ahead). Now a still pixel also needs the scene's motion not to explain it, everywhere: one motion step back, the frame before shows something else there (a HUD, its text and edges), where a clear sky shows the same sky. The inside of an even HUD panel can now move too, which shows nothing; its edges and text stay. The Witcher 3: "better", with no loss in the HUD.
+- **[Docs]** Settings guide: a clear sky moves with the scene under frame warp.
+
 ## [Manager 1.3.21] — 2026-11-21
 
 - **[Manager] Fixed: the Tools buttons were drawn over the Vulkan layer's status** when the layer was installed for all users and ReShade's Vulkan layer was in order: the Tools row started on the Vulkan layer's line instead of its own.
