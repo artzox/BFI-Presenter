@@ -212,11 +212,30 @@ static void on_present(effect_runtime *rt)
     cmd->barrier(g.clean, resource_usage::copy_dest, resource_usage::copy_source);
     cmd->copy_resource(g.clean, g.test);
     cmd->barrier(g.test, resource_usage::copy_dest, resource_usage::render_target);
+    // fx3: render_effects drew nothing (0.00 ms, the copy came back as it went in): ReShade renders the effects once per
+    // frame, and a second call in the same frame returns at once. render_technique has no such rule: the enabled
+    // techniques, one by one, in ReShade's order.
+    effect_technique list[64];
+    int n = 0, on = 0;
+    rt->enumerate_techniques(nullptr, [&](effect_runtime *, effect_technique t) { if (n < 64) list[n++] = t; });
     const double t0 = Now();
     g.guard = true;
-    rt->render_effects(cmd, g.testRtv, g.testRtvSrgb);
+    for (int i = 0; i < n; i++)
+        if (rt->get_technique_state(list[i])) { rt->render_technique(list[i], cmd, g.testRtv, g.testRtvSrgb); on++; }
     g.guard = false;
     g.cpuMs = (Now() - t0) * 1000.0;
+    if (g.probes == 0)
+    {
+        char names[512] = {}; size_t at = 0;
+        for (int i = 0; i < n && at < sizeof(names) - 80; i++)
+            if (rt->get_technique_state(list[i]))
+            {
+                char nm[64] = {}; size_t sz = sizeof(nm);
+                rt->get_technique_name(list[i], nm, &sz);
+                at += snprintf(names + at, sizeof(names) - at, "%s%s", at ? ", " : "", nm);
+            }
+        LOGI("BFI Presenter: effects replay check: %d of %d techniques on, drawn one by one: %s", on, n, names);
+    }
     // the patches from the middle
     subresource_box box = {};
     box.left = (g.w - g.pw) / 2; box.top = (g.h - g.ph) / 2; box.front = 0;
