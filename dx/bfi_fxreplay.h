@@ -124,8 +124,24 @@ static bool Ensure(resource bb, resource_view rtvSrgb)
     return true;
 }
 
+// effect_runtime::get_back_buffer, called as MSVC compiles it. MSVC returns a structure from a class method -- even an
+// 8-byte handle like resource -- through a hidden pointer after `this`; MinGW returns one that small in RAX. Called the
+// MinGW way, ReShade wrote the handle to the address in the index's place (fx2: "writing address 0x3"). Slot 5 of the
+// vtable: get_native, get_private_data, set_private_data (api_object), get_device (device_object), get_hwnd, get_back_buffer.
+static resource BackBuffer(effect_runtime *rt, uint32_t index)
+{
+    typedef resource *(*Fn)(effect_runtime *self, resource *ret, uint32_t index);
+    resource r = {};
+    void **vt = *reinterpret_cast<void ***>(rt);
+    reinterpret_cast<Fn>(vt[5])(rt, &r, index);
+    return r;
+}
+
 static bool Mine(effect_runtime *rt)
 {
+#ifndef _WIN64
+    return false;                                          // the MSVC call above is written for 64-bit only
+#endif
     if (!g_shared.fxReplayTest || g.failed || g.probes >= 20) return false;
     if (!g_sc || g_dx11.load() || reinterpret_cast<void *>(rt->get_native()) != (void *)g_sc) return false;
     if (rt->get_device()->get_api() != device_api::d3d12) return false;
@@ -137,7 +153,7 @@ static void on_begin(effect_runtime *rt, command_list *cmd, resource_view rtv, r
     if (g.guard || !Mine(rt) || g.phase != 0 || Now() < g.nextT) return;
     g.dev = rt->get_device(); g.rt = rt;
     (void)rtv;
-    const resource bb = rt->get_current_back_buffer();
+    const resource bb = BackBuffer(rt, rt->get_current_back_buffer_index());
     if (!bb.handle || !Ensure(bb, rtvSrgb)) { g.failed = true; return; }
     g.bb = bb;
     cmd->barrier(bb, resource_usage::render_target, resource_usage::copy_source);
