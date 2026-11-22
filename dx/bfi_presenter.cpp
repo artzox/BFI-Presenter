@@ -139,7 +139,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.46"
+#define BFI_ADDON_VERSION "1.0.47"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -181,6 +181,9 @@ struct Settings
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
+    int   hudFromDlss = 1;    // FrameWarpHudFromDlss (1.0.47, ini only): without a HUD-less picture from the game, DLSS's own
+                              // output (the scene before post-processing and the HUD) is compared with the frame instead
+    int   dlssOutState = 8;   // DlssOutputState (ini only): the state DLSS's output is in after its call (8 = unordered access)
     int   warpEase = 1;       // FrameWarpGameMotionEase (test, ini only): with the game's motion and frame generation, the
                               // part of a move past the rendered frame eases off as the game's motion slows (1 = on)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
@@ -370,6 +373,8 @@ static void LoadSettings(Settings &s)
     s.warpFgLag = std::max(-1, std::min(1, IniInt("FrameWarpGameMotionFGLag", 1)));
     s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
+    s.hudFromDlss = IniInt("FrameWarpHudFromDlss", 1) ? 1 : 0;
+    s.dlssOutState = IniInt("DlssOutputState", 8);
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
     s.warpEven = IniInt("FrameWarpEvenPacing", 0) ? 1 : 0;
@@ -1744,6 +1749,7 @@ cbuffer C : register(b0)
                       // motion vectors are for (a generated frame sits between two rendered ones; 0 = the rendered frame)
     float warpEase;   // the game's motion: 1 = the part of a move past the rendered frame is scaled by how much the motion
                       // kept up from the frame before (z - 1 of the motion texture): no overshoot when the camera slows down
+    float osdX0, osdY0, osdX1, osdY1;   // frame warp: the BFI OSD on the frame (game-frame pixels; x1 <= x0 = none): never moved
 };
 Texture2D<float4> src : register(t0);
 Texture2D<float> aplTex : register(t1);
@@ -1840,14 +1846,33 @@ bool Unchanged(int2 q)
 // still without the motion test: a clear sky stood still, and a tree's outline against it with it, while the rest
 // of the tree moved -- the outline flickered on moved flashes. The inside of an even HUD panel can now move too,
 // which shows nothing; its edges and text are within a motion step of something else and stay.)
+// 1.0.47: a flat or soft area counts as unchanged only where it is exactly the same, bit for bit, around it -- as a HUD
+// is, drawn the same every frame. The inside of a soft cloud is only the same within the tolerance in a camera turn, and
+// near its edge one motion step back shows another part of the cloud, so patches of it were held and looked a frame
+// late on filled flashes (Oblivion Remastered, 1.0.46). (1.0.47-ep1 held no flat area at all: a flat HUD fill near its
+// edge then took in the scene from beside it -- the stamina bar, the OSD's and ReShade's windows.)
 bool Still(int2 q, float2 size)
 {
     if (!Unchanged(q)) return false;
+    const float3 a0 = src.Load(int3(q, 0)).rgb;
+    const float lc = (flags & 1024) != 0 ? 0.06 * (0.1 + max(max(a0.r, a0.g), a0.b)) : 0.03;
     int n = 0;
+    float con = 0.0;
     [unroll] for (int y = -1; y <= 1; y++)
         [unroll] for (int x = -1; x <= 1; x++)
-            if ((x != 0 || y != 0) && Unchanged(q + int2(x, y))) n++;
+            if (x != 0 || y != 0)
+            {
+                if (Unchanged(q + int2(x, y))) n++;
+                const float3 e = abs(src.Load(int3(q + int2(x, y), 0)).rgb - a0);
+                con = max(con, max(max(e.r, e.g), e.b));
+            }
     if (n < 1) return false;
+    if (con < lc)
+    {
+        [unroll] for (int y = -1; y <= 1; y++)
+            [unroll] for (int x = -1; x <= 1; x++)
+                if (any(src.Load(int3(q + int2(x, y), 0)).rgb != srcPrev.Load(int3(q + int2(x, y), 0)).rgb)) return false;
+    }
     float2 c = float2(q) + 0.5;
     float4 f = flowTex.SampleLevel(linClamp, c / size, 0);
     float2 step = f.xy * size * (warpSrc != 0 ? min(f.z, 1.0) * warpPrevN : f.z);   // this part of the scene's motion since the frame before, pixels
@@ -1857,6 +1882,8 @@ bool Still(int2 q, float2 size)
     float lim = (flags & 1024) != 0 ? 0.04 * (0.1 + max(max(a.r, a.g), a.b)) : 0.04;
     return max(max(d.r, d.g), d.b) > lim;
 }
+
+bool InOsd(float2 p) { return osdX1 > osdX0 && p.x >= osdX0 && p.x < osdX1 && p.y >= osdY0 && p.y < osdY1; }
 
 // The game's frame moved ahead: each output pixel is taken from where its part of the picture is in the frame.
 // False = show the pixel as rendered: what stands still on the screen is never moved, and nothing that stands
@@ -1877,10 +1904,12 @@ bool FetchWarped(float2 pos, out float3 c)
     if (warpSnapX > 0.0) d.x = round(d.x / warpSnapX) * warpSnapX;
     if (warpSnapY > 0.0) d.y = round(d.y / warpSnapY) * warpSnapY;
     if (dot(d, d) < 0.0004) return false;                 // under 1/50 pixel
+    if (InOsd(cp)) return false;                          // the BFI OSD: never moved
     if (Still(int2(cp), size)) return false;
     float2 p = cp - d;
     if ((flags & 4096) != 0) p = EdgeMirror(p, size);
     p = clamp(p, float2(0.5, 0.5), size - 0.5);
+    if (InOsd(p)) return false;                           // and nothing moved is taken from it
     // the game's HUD mask (w = -1): a HUD pixel is never moved, and no moved pixel is taken from the HUD
     if (warpSrc != 0 && (GameFlow(cp * inv).w < -0.5 || GameFlow(p * inv).w < -0.5)) return false;
     if (Still(int2(p), size)) return false;
@@ -2455,6 +2484,7 @@ struct Constants
     float    warpSnapX, warpSnapY;      // frame warp: moves rounded to whole steps of this many game-frame pixels (0 = off)
     float    warpLag;                   // the game's motion with frame generation: shown frames behind its vectors' frame
     float    warpEase;                  // the game's motion: 1 = moves past the rendered frame ease off as the motion slows
+    float    osdX0, osdY0, osdX1, osdY1;  // frame warp: the BFI OSD on the frame, game-frame pixels (none: x1 <= x0)
 };
 static_assert(sizeof(Constants) / 4 <= 63, "root constants: at most 64 DWORDs in the root signature");
 
@@ -4677,6 +4707,10 @@ static DWORD WINAPI PresenterThread(void *)
             else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
             if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
+            if (s.osd && Now() - Osd::drawnT.load() < 0.5)    // the BFI OSD on the frame: never moved (its background is see-through)
+            {
+                c.osdX0 = Osd::drawnRect[0]; c.osdY0 = Osd::drawnRect[1]; c.osdX1 = Osd::drawnRect[2]; c.osdY1 = Osd::drawnRect[3];
+            }
             // Around a camera cut, and in a letterboxed cutscene: shown as rendered (no motion connects two shots).
             const char *pauseWhy = nullptr;
             if (c.warp != 0.0f && gmo::PauseNow(pickId, s.warpPauseLb != 0, &pauseWhy))
@@ -4820,10 +4854,11 @@ static DWORD WINAPI PresenterThread(void *)
             if (gmo::HudNow() > 0)
             {
                 static int hudLogs = 0;
-                if (hudLogs++ < 30) LOGI("BFI Presenter: frame warp check: the HUD mask covers %.1f%% of the picture", hudPct);
+                if (s.warpGameCheck && hudLogs++ < 30) LOGI("BFI Presenter: frame warp check: the HUD mask covers %.1f%% of the picture", hudPct);
                 if (hudPct > 35.0) { gmo::HudBad(hudPct); hudBigN = 0; } else hudBigN = 0;
             }
-            if (!(wsum[0] > 0.0 && wsum[1] > 0.0 && chkFrames > 0))
+            if (!s.warpGameCheck) { }                     // only the HUD mask's coverage was wanted
+            else if (!(wsum[0] > 0.0 && wsum[1] > 0.0 && chkFrames > 0))
             {
                 static int nLog = 0;
                 if (nLog++ < 10)
@@ -4858,7 +4893,9 @@ static DWORD WINAPI PresenterThread(void *)
             }
             if (c.warp != 0.0f && c.warpSrc == 0 && (warp.flowNew != pickId || warp.flowOld != warpOld)) { warp.RecordFlow(list); touched = true; }
             // The check: the measured motion for this pair too, and both textures copied for reading back.
-            if (s.warpGameCheck && c.warpSrc != 0 && cycleStart && !chkPending && Now() - chkT >= 2.0 && gFlow)
+            // (1.0.47: also whenever the game's HUD mask is in use, for its coverage -- it switches itself off when it covers too
+            // much, which the structure comparison with DLSS's output can do with effects drawn after the game's frame)
+            if ((s.warpGameCheck || gmo::HudNow() > 0) && c.warpSrc != 0 && cycleStart && !chkPending && Now() - chkT >= 2.0 && gFlow)
             {
                 if (warp.flowNew != pickId || warp.flowOld != warpOld) { warp.RecordFlow(list); touched = true; }
                 ID3D12Resource *srcR[2] = { gFlow, warp.flowOut[WarpGpu::Out()] };
@@ -5779,6 +5816,27 @@ static DWORD WINAPI PresenterThread(void *)
                     }
                 }
                 else rfxBadSecs = 0;
+                // Overshoot (as the Vulkan layer, 1.0.47): the limit has to hold the game too. A game whose Reflex sleep
+                // doesn't pace it ran well above it (Vulkan: 54-74 fps under a 60 fps limit), and with the limit on the
+                // presenter takes every frame. 4 of the last 6 s more than 8% above one frame per strobe cycle switch
+                // it off for the session; the presenter's own cap holds the game at Present.
+                {
+                    static unsigned fastBits = 0;
+                    const double capFps = hzA > 0.0 ? hzA / s.frames : 0.0;
+                    // Never with frame generation: the presenter's own cap doesn't hold frame generation, so switching the limit
+                    // off would leave the game without a cap (Townfall with frame generation, ep7).
+                    const bool on = autoCapDown && capByReflex && !rfxLimitBad && !fgWas && !fgChanging;
+                    const bool fast = on && !stallSec && t - rfxChkT >= 2.0 && capFps > 0.0 && fpsA > 1.08 * capFps;
+                    fastBits = on ? (((fastBits << 1) | (fast ? 1u : 0u)) & 63u) : 0u;
+                    if (__builtin_popcount(fastBits) >= 4)
+                    {
+                        fastBits = 0;
+                        g_rfxLimitBad.store(true); capByReflex = false;
+                        LOGW("BFI Presenter: Reflex frame limit: the game ran %.0f fps under a %.0f fps limit (its Reflex sleep doesn't "
+                             "pace it) -- no Reflex frame limit for the rest of this session; the automatic frame cap uses the "
+                             "presenter's own cap", fpsA, capFps);
+                    }
+                }
                 // The same collapse under the game's own Reflex limit (Returnal sets 16,666 us now and then:
                 // 60 fps -> 7.9 the same second, back to 60 when it clears it).
                 if (hzA > 0.0 && fpsA >= 0.5 * hzA / s.frames) fpsGoodT = t;
@@ -8389,8 +8447,15 @@ static std::atomic<int> hudState{0};                     // 0 no HUD-less pictur
 // How the frame and the HUD-less picture are compared (PSWarpHud's gHudMode). 007 First Light's HUD-less picture is
 // linear (RGBA16F) against an HDR10 frame: compared as they are, the mask covered 99.9% (gm9). The modes are tried
 // in turn, from the likeliest for the two formats; the check (every 2 s) moves on when the mask covers too much.
-static int hudModes[3] = { 0, 1, 2 }; static int hudModeN = 3; static std::atomic<int> hudModeI{0};
+// 1.0.47: by structure (3) last -- tone mapping and post-processing between the HUD-less picture and the frame shown
+// (Directive 8020: 74-75% in every way of comparing by value) keep the scene's structure.
+static int hudModes[4] = { 0, 1, 2, 3 }; static int hudModeN = 4; static std::atomic<int> hudModeI{0};
 static bool hudModesSet = false;
+// Without a HUD-less picture (FrameWarpHudFromDlss, 1.0.47): DLSS's own output, copied on the game's list right after its
+// call -- the scene upscaled, before post-processing and the HUD (Unreal Engine). It differs from the frame by tone
+// mapping, grading, bloom and vignette as well as the HUD, so it is compared by structure (gHudMode 3), not value.
+static bool hudFromOut = false;                          // hudCopy holds DLSS's output, not a HUD-less picture
+static double hudRealT = -10.0;                          // when the game last tagged a real HUD-less picture
 static char hudWhy[160] = "";
 static Consts consts = {}; static bool haveConsts = false;
 static bool depthFailed = false;                         // a copy texture of the game's depth format couldn't be made
@@ -8576,7 +8641,8 @@ static void Map(const Tag &t, UINT w, UINT h, float m[4])
 
 static const char *HudModeName(uint32_t m)
 {
-    return m == 1 ? "HDR10 frame against a linear scRGB picture" : m == 2 ? "sRGB frame against a linear picture" : "the same encoding";
+    return m == 1 ? "HDR10 frame against a linear scRGB picture" : m == 2 ? "sRGB frame against a linear picture"
+         : m == 3 ? "by structure (tone mapping and post-processing between them allowed)" : "the same encoding";
 }
 
 static DXGI_FORMAT ColorView(DXGI_FORMAT f)
@@ -8632,9 +8698,50 @@ static void CopyHud(const Tag &t, void *cmd)
         Map(t, hudW, hudH, hudMap);
         hudCopyT = Now();
         hudLive = false;
+        hudFromOut = false; hudRealT = hudCopyT;
     }
     cl->Release();
     src->Release();
+}
+
+// DLSS's output as the stand-in for a HUD-less picture (FrameWarpHudFromDlss): copied on the game's list right after the
+// DLSS call recorded on it (ngx::hk_Eval). Not while the game tags a real HUD-less picture.
+static void CopyOut(void *cmd, ID3D12Resource *src)
+{
+    if (!g_shared.hudFromDlss || !g_shared.warpGameHud || hudState.load() < 0 || !g_device || !cmd || !src) return;
+    std::lock_guard<std::mutex> l(lk);
+    if (Now() - hudRealT < 1.0) return;
+    const D3D12_RESOURCE_DESC hd = src->GetDesc();
+    if (hd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || ColorView(hd.Format) == DXGI_FORMAT_UNKNOWN) return;
+    ID3D12GraphicsCommandList *cl = nullptr;
+    if (FAILED(((IUnknown *)cmd)->QueryInterface(__uuidof(ID3D12GraphicsCommandList), (void **)&cl)) || !cl) return;
+    if (!hudCopy || hudW != (UINT)hd.Width || hudH != hd.Height || hudFmt != hd.Format)
+    {
+        if (hudCopy) retired.push_back({ hudCopy, Now() });
+        hudCopy = MakeCopy(hd, L"BFI frame warp: DLSS's output (for the HUD mask)");
+        hudW = (UINT)hd.Width; hudH = hd.Height; hudFmt = hd.Format;
+    }
+    if (hudCopy)
+    {
+        const D3D12_RESOURCE_STATES st = (D3D12_RESOURCE_STATES)g_shared.dlssOutState;
+        D3D12_RESOURCE_BARRIER b = Transition(src, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cl->ResourceBarrier(1, &b);
+        cl->CopyResource(hudCopy, src);
+        b = Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, st);
+        cl->ResourceBarrier(1, &b);
+        hudMap[0] = (float)hudW; hudMap[1] = (float)hudH; hudMap[2] = hudMap[3] = 0.0f;
+        hudCopyT = Now();
+        hudLive = false;
+        if (!hudFromOut)
+        {
+            static int logged = 0;
+            if (logged++ < 4)
+                LOGI("BFI Presenter: frame warp, the game's own motion: no HUD-less picture from the game -- DLSS's output (%ux%u, format %d) "
+                     "is compared with the frame by structure for the HUD mask", hudW, hudH, (int)hudFmt);
+        }
+        hudFromOut = true;
+    }
+    cl->Release();
 }
 
 static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int from);
@@ -9071,9 +9178,11 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         const bool fFloat = f == DXGI_FORMAT_R16G16B16A16_FLOAT;
         if (hlFloat && !fFloat) { hudModes[0] = f == DXGI_FORMAT_R10G10B10A2_UNORM ? 1 : 2; hudModes[1] = hudModes[0] == 1 ? 2 : 1; hudModes[2] = 0; }
         else { hudModes[0] = 0; hudModes[1] = 1; hudModes[2] = 2; }
+        hudModes[3] = 3;
         hudModeI = 0; hudModesSet = true;
     }
     gc.hudMode = (uint32_t)hudModes[std::min(hudModeI.load(), hudModeN - 1)];
+    if (hl && hudFromOut && !hlLive) gc.hudMode = 3;        // DLSS's output: by structure
     gc.hudThr = (linear || gc.hudMode != 0) ? 0.08f : 0.04f;
 
     // 1. The HUD mask (when the game gives a HUD-less picture)
@@ -9104,8 +9213,9 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         if (hudState.load() == 0)
         {
             hudState = 1;
-            LOGI("BFI Presenter: frame warp, the game's own motion: the HUD is kept still with the game's HUD-less picture (%ux%u, format %d, "
-                 "the frame's %d, %s); compared as: %s", (unsigned)hlMap[0], (unsigned)hlMap[1], (int)hlFmt, (int)StageFormat(),
+            LOGI("BFI Presenter: frame warp, the game's own motion: the HUD is kept still with %s (%ux%u, format %d, "
+                 "the frame's %d, %s); compared as: %s", gc.hudMode == 3 ? "DLSS's output" : "the game's HUD-less picture",
+                 (unsigned)hlMap[0], (unsigned)hlMap[1], (int)hlFmt, (int)StageFormat(),
                  hlLive ? "read at the Present" : "copied when tagged", HudModeName(gc.hudMode));
         }
         hl->Release();
@@ -9206,6 +9316,13 @@ static int StateFast() { return state.load(); }
 static void HudBad(double pct)
 {
     if (hudState.load() < 0) return;
+    if (hudFromOut)
+    {
+        hudState = -1;
+        LOGW("BFI Presenter: frame warp, the game's own motion: HUD protection off -- compared by structure with DLSS's output, the mask "
+             "covered %.0f%% of the frame (the game's post-processing, or ReShade's effects?)", pct);
+        return;
+    }
     const int i = hudModeI.load();
     if (i + 1 < hudModeN)
     {
@@ -9267,6 +9384,7 @@ static std::map<uintptr_t, Feat> feats;                // by handle, from Create
 static bool tried[2] = {};                             // "nvngx.dll", "_nvngx.dll"
 static bool hooked = false;
 static thread_local int inside = 0;                    // nested NGX call (OptiScaler calling the driver's DLSS)
+static thread_local bool usedNow = false;              // this call was taken as an upscaler call (OnEval -> AfterEval)
 // The parameter object is a C++ interface: 8 Set overloads, then 8 Get overloads, then Reset. MSVC puts overloads
 // of one name in reverse order, so Get(ID3D12Resource**) is slot 9 there and slot 14 in declaration order. Which one
 // is found once, from the first DLSS call, by asking for "MotionVectors" and checking that what comes back is a D3D12
@@ -9427,6 +9545,7 @@ static void OnEval(void *cmd, const Handle *h, const void *params)
     }
     std::lock_guard<std::mutex> l(lk);
     nUsed++;
+    usedNow = true;
 }
 
 template <int I> static int hk_Create(void *cl, int feature, void *params, Handle **out)
@@ -9437,12 +9556,24 @@ template <int I> static int hk_Create(void *cl, int feature, void *params, Handl
     if (r == kSuccess && out && Plaus(out) && inside == 0) OnCreate(feature, params, *out);
     return r;
 }
+// DLSS's output, for the HUD mask without a HUD-less picture: after the call, so the copy is of what DLSS wrote.
+static void AfterEval(void *cmd, const void *params)
+{
+    if (!usedNow || !g_shared.hudFromDlss) return;
+    usedNow = false;
+    void *out = GetRes(params, "Output", nullptr);
+    ID3D12Resource *r = nullptr;
+    if (!out || !Plaus(out) || FAILED(((IUnknown *)out)->QueryInterface(__uuidof(ID3D12Resource), (void **)&r)) || !r) return;
+    gmo::CopyOut(cmd, r);
+    r->Release();
+}
 template <int I> static int hk_Eval(void *cl, const Handle *h, const void *params, void *cb)
 {
     if (inside == 0) OnEval(cl, h, params);
     inside++;
     const int r = o_Eval[I](cl, h, params, cb);
     inside--;
+    if (inside == 0 && r == kSuccess) AfterEval(cl, params);
     return r;
 }
 template <int I> static int hk_EvalC(void *cl, const Handle *h, const void *params, void *cb)
@@ -9451,6 +9582,7 @@ template <int I> static int hk_EvalC(void *cl, const Handle *h, const void *para
     inside++;
     const int r = o_EvalC[I](cl, h, params, cb);
     inside--;
+    if (inside == 0 && r == kSuccess) AfterEval(cl, params);
     return r;
 }
 
@@ -13235,9 +13367,12 @@ static void on_osd(reshade::api::effect_runtime *rt)
     d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
     d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
     d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
-    // which motion: what the last second's moved cycles used, or (none moved) what the game hands over
+    // which motion: what the last second's moved cycles used, or (none moved) what the game hands over -- unless frame
+    // generation is on with the game's motion off for it, as in the settings window (Townfall, 2x: the OSD switched
+    // between the game's vectors and the measured motion with each second that had no cycle to fill)
+    const bool fgOff = g_status.fgActive && !g_shared.warpGameFg;
     d.warpSrc = g_status.warpCycles ? g_status.warpSrc
-              : (g_shared.warpGame && g_status.warpGameState > 0 ? g_status.warpGameState : 0);
+              : (g_shared.warpGame && !fgOff && g_status.warpGameState > 0 ? g_status.warpGameState : 0);
     d.warpVia = g_status.warpGameVia;
     LeaveCriticalSection(&g_cfgLock);
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);

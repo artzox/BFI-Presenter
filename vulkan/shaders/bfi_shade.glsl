@@ -67,12 +67,29 @@ bool Still(ivec2 q, vec2 size)
 {
     ivec2 isz = ivec2(size);
     if (!Unchanged(q, isz)) return false;
+    // (as DX: no 5-of-8 shortcut since 1.0.46 -- a clear sky stood still with a tree's outline against it; and since
+    // 1.0.47 a flat area only where it is exactly the same around it, as a HUD is -- patches of soft clouds were held)
+    vec3 a0 = texelFetch(src, q, 0).rgb;
+    float lc = (pc.flags & 1024u) != 0u ? 0.06 * (0.1 + max(max(a0.r, a0.g), a0.b)) : 0.03;
     int n = 0;
+    float con = 0.0;
     for (int y = -1; y <= 1; y++)
         for (int x = -1; x <= 1; x++)
-            if ((x != 0 || y != 0) && Unchanged(q + ivec2(x, y), isz)) n++;
-    // (as DX 1.0.46: no 5-of-8 shortcut -- a clear sky in a pan is unchanged, and stood still with a tree's outline against it)
+            if (x != 0 || y != 0)
+            {
+                ivec2 nq = clamp(q + ivec2(x, y), ivec2(0), isz - 1);
+                if (Unchanged(q + ivec2(x, y), isz)) n++;
+                vec3 e = abs(texelFetch(src, nq, 0).rgb - a0);
+                con = max(con, max(max(e.r, e.g), e.b));
+            }
     if (n < 1) return false;
+    if (con < lc)
+        for (int y = -1; y <= 1; y++)
+            for (int x = -1; x <= 1; x++)
+            {
+                ivec2 nq = clamp(q + ivec2(x, y), ivec2(0), isz - 1);
+                if (any(notEqual(texelFetch(src, nq, 0).rgb, texelFetch(srcPrev, nq, 0).rgb))) return false;
+            }
     vec2 c = vec2(q) + 0.5;
     vec4 f = pc.warpSrc != 0u ? textureLod(gameFlow, c / size, 0.0) : textureLod(flowTex, c / size, 0.0);
     vec2 step = f.xy * size * (pc.warpSrc != 0u ? min(f.z, 1.0) * pc.warpPrevN : f.z);
@@ -97,6 +114,12 @@ vec2 EdgeFade(vec2 cp, vec2 d, vec2 size)
     return d * k;
 }
 // The game's frame moved ahead (Catmull-Rom, 9 bilinear taps). False = show the pixel as rendered.
+bool InOsd(vec2 p)
+{
+    if (pc.osdB == 0u) return false;
+    vec2 a = vec2(float(pc.osdA & 0xFFFFu), float(pc.osdA >> 16)), b = vec2(float(pc.osdB & 0xFFFFu), float(pc.osdB >> 16));
+    return all(greaterThanEqual(p, a)) && all(lessThan(p, b));
+}
 bool FetchWarped(vec2 fc, out vec3 c)
 {
     c = vec3(0.0);
@@ -107,9 +130,11 @@ bool FetchWarped(vec2 fc, out vec3 c)
     if (pc.warpSnapX > 0.0) d.x = round(d.x / pc.warpSnapX) * pc.warpSnapX;
     if (pc.warpSnapY > 0.0) d.y = round(d.y / pc.warpSnapY) * pc.warpSnapY;
     if (dot(d, d) < 0.0004) return false;
+    if (InOsd(fc)) return false;                          // the BFI OSD: never moved (as DX 1.0.47)
     if (Still(ivec2(fc), size)) return false;
     vec2 p = fc - d;
     if ((pc.flags & 4096u) != 0u) p = EdgeMirror(p, size);
+    if (InOsd(p)) return false;                           // and nothing moved is taken from it
     p = clamp(p, vec2(0.5), size - 0.5);
     if (Still(ivec2(p), size)) return false;
     vec2 tc = floor(p - 0.5) + 0.5;

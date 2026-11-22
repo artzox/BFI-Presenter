@@ -118,6 +118,10 @@ inline int GpuLoad()
 }
 
 // corner: 0 top left, 1 top right, 2 bottom left, 3 bottom right.
+#ifndef BFI_OSD_RECT_DECLARED                    // (the Vulkan layer declares these before it includes this file)
+inline float drawnRect[4] = {};                 // the OSD's window on the frame, pixels (left, top, right, bottom)
+inline std::atomic<double> drawnT{0.0};         // when it was last drawn (OsdData::now)
+#endif
 inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float scale)
 {
     const ImGuiIO &io = ImGui::GetIO();
@@ -186,6 +190,17 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
         const int c = CpuLoad(), g = GpuLoad();
         if (g >= 0) ImGui::Text("CPU %3d%%   GPU %3d%%", c, g);
         else ImGui::Text("CPU %3d%%", c);
+    }
+    // Where it is on the frame (its window, a few pixels around): frame warp never moves anything there (1.0.47). Its
+    // background is see-through -- the scene changes under it every frame, so nothing finds it standing still.
+    // Its corner is where it was placed (pos, pivot); its size from GetWindowWidth / Height. (GetWindowPos / GetWindowSize
+    // return an ImVec2, which ReShade's ImGui -- built with MSVC -- returns through a hidden pointer and MinGW expects in
+    // a register: ReShade wrote it to a stray address and Oblivion Remastered crashed, 1.0.47-ep4.)
+    {
+        const float w = ImGui::GetWindowWidth(), h = ImGui::GetWindowHeight();
+        const float x0 = (corner & 1) ? pos.x - w : pos.x, y0 = (corner & 2) ? pos.y - h : pos.y;
+        drawnRect[0] = x0 - 4.0f; drawnRect[1] = y0 - 4.0f; drawnRect[2] = x0 + w + 4.0f; drawnRect[3] = y0 + h + 4.0f;
+        drawnT.store(d.now);
     }
     ImGui::End();
 }
