@@ -3560,6 +3560,13 @@ struct ReflexSecond
     double renderedFps = -1.0;   // rendered frames a second (frame numbers)
     int    limitUs = 0;          // Reflex frame limit in effect
 };
+// DX11: the second's NvAPI Reflex calls, handed to the game's present thread (ReflexTick / ReflexServe11).
+struct Rfx11Req { int limitUs = 0, limitAll = 0; bool atSleep = false; };
+static std::mutex g_rfx11Lk;
+static Rfx11Req g_rfx11Req;
+static ReflexSecond g_rfx11Out;
+static std::atomic<bool> g_rfx11Pending{false};
+static void ReflexServe11();
 static void ReflexTick(int limitUs, ReflexSecond &out);
 // How long the last ReflexTick took (its calls into NVIDIA's driver), for the reflex log. (1.0.43 tests also ran it on a
 // thread of its own: the calls took at most 0.6 ms either way, in Control, Jusant and Returnal, so nothing to move.)
@@ -7450,6 +7457,7 @@ static void NoteGameThread11()
 static HRESULT Present11Paced(IDXGISwapChain *sc, UINT sync, UINT flags)
 {
     NoteGameThread11();
+    ReflexServe11();
     const HRESULT hr = SubmitGameFrame11(sc, sync, flags);
     FgPaceAfterPresent();
     return hr;
@@ -9692,6 +9700,7 @@ static int ReflexGameLimitUs()
     return us;
 }
 
+static void ReflexNv(int limitUs, int limitAll, bool atSleep, ReflexSecond &out);
 static void ReflexTick(int limitUs, ReflexSecond &out)
 {
     out = ReflexSecond();
@@ -9770,6 +9779,25 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
     if (atSleep) limitUs = 0;
     g_rfxWantLimitUs.store(limitUs);
     if (limitAll > 0 || g_rfxLimitBad.load() || g_sleepActive.load() || g_sleepFgStrip.load()) ReflexWatch();
+    // DX11: NvAPI's Reflex calls on the game's D3D11 device are made on the game's own present thread (ReflexServe11),
+    // not here. From the presenter thread GetLatency deadlocked with the game's Present (Days Gone: the game's present
+    // thread waited in NvAPI inside dxgi's Present, the presenter in NvAPI inside d3d11 -- the game never started).
+    // The second's results are then a second old.
+    if (g_dx11.load())
+    {
+        std::lock_guard<std::mutex> l(g_rfx11Lk);
+        g_rfx11Req = { limitUs, limitAll, atSleep };
+        g_rfx11Pending = true;
+        out = g_rfx11Out;
+        g_rfx11Out = ReflexSecond();
+        return;
+    }
+    ReflexNv(limitUs, limitAll, atSleep, out);
+}
+
+// NvAPI's part of the second: the game's latency reports and the frame limit sent to the driver.
+static void ReflexNv(int limitUs, int limitAll, bool atSleep, ReflexSecond &out)
+{
     IUnknown *dev = nullptr;
     AcquireSRWLockShared(&g_rfxLock);
     dev = g_rfxDev;
@@ -9878,9 +9906,26 @@ static void ReflexTick(int limitUs, ReflexSecond &out)
     }
     out.limitUs = (limitAll > 0 && (gameUses || atSleep)) ? limitAll : 0;
 }
+// DX11, on the game's present thread: the presenter's request for this second's NvAPI calls (see ReflexTick).
+static void ReflexServe11()
+{
+    if (!g_rfx11Pending.load(std::memory_order_relaxed)) return;
+    Rfx11Req q;
+    {
+        std::lock_guard<std::mutex> l(g_rfx11Lk);
+        if (!g_rfx11Pending) return;
+        g_rfx11Pending = false;
+        q = g_rfx11Req;
+    }
+    ReflexSecond r;
+    ReflexNv(q.limitUs, q.limitAll, q.atSleep, r);
+    std::lock_guard<std::mutex> l(g_rfx11Lk);
+    g_rfx11Out = r;
+}
 #else
 static int ReflexGameLimitUs() { return 0; }
 static void ReflexTick(int, ReflexSecond &out) { out = ReflexSecond(); }
+static void ReflexServe11() {}
 #endif
 
 // DXGI's own Present and ResizeBuffers1, past any inline hooks, for the calls
