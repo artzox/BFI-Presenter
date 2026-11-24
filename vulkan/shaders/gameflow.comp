@@ -15,7 +15,7 @@ layout(push_constant) uniform G
     vec2  mvScale;    // the vectors' scale to uv
     vec4  mvMap;      // screen uv -> motion-vector texel: xy scale, zw offset (texels)
     vec4  dMap;       // screen uv -> depth texel
-    uint  flags;      // 1 depth reversed (near = 1), 2 depth available
+    uint  flags;      // 1 depth reversed (near = 1), 2 depth available, 4 dilate the vectors
     float mvInvalid;  // the value written where a vector is not valid
     float perRendered;  // shown frames per rendered one (frame generation; 1 without): mvScale * this = a rendered frame's motion
     float prevOk;     // 1 = gMvPrev holds the vectors of the rendered frame before
@@ -37,6 +37,24 @@ void main()
         ivec2 dq = clamp(ivec2(uv * g.dMap.xy + g.dMap.zw), ivec2(0), dsz - 1);
         float d = texelFetch(gDepth, dq, 0).r;
         nearv = (g.flags & 1u) != 0u ? d : 1.0 - d;
+        // Dilation (FrameWarpGameDilate, 1.0.48, as DX): the vector of the nearest point of the 3x3 depth texels around
+        // this one, so the edge of something in front moves with it instead of staying behind with the background.
+        if ((g.flags & 4u) != 0u)
+        {
+            vec2 dt = 1.0 / g.dMap.xy;
+            for (int y = -1; y <= 1; y++)
+                for (int x = -1; x <= 1; x++)
+                {
+                    if (x == 0 && y == 0) continue;
+                    vec2 nu = uv + vec2(x, y) * dt;
+                    float dn = texelFetch(gDepth, clamp(ivec2(nu * g.dMap.xy + g.dMap.zw), ivec2(0), dsz - 1), 0).r;
+                    float nn = (g.flags & 1u) != 0u ? dn : 1.0 - dn;
+                    if (nn <= nearv) continue;
+                    vec2 mn = texelFetch(gMv, clamp(ivec2(nu * g.mvMap.xy + g.mvMap.zw), ivec2(0), msz - 1), 0).xy;
+                    if (mn.x == g.mvInvalid || mn.y == g.mvInvalid || any(isnan(mn))) continue;
+                    nearv = nn; m = mn;
+                }
+        }
     }
     // How much the motion kept up (as DX, ep9): this point's motion against its motion one rendered frame before, where it
     // was then; slower now -> k < 1, and a move past the rendered frame is scaled by it. Both under half a pixel: k = 1.

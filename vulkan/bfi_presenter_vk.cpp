@@ -285,6 +285,7 @@ struct Settings
     int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
                               // is in the rendered frame: 1 generated frames before the rendered one, -1 after it, 0 off
+    int   warpDilate = 1;     // FrameWarpGameDilate (1.0.48, as DX, ini only): the game's vectors dilated by depth
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (as DX 1.0.45): the ease without frame generation too
     int   warpEase = 1;       // FrameWarpGameMotionEase (ini only, as DX): moves past the rendered frame ease off as the motion slows
     int   warpGuard = 1;      // FrameWarpGuard (ini only, as DX): filled repeats that keep making their refresh late are shown as they are
@@ -416,6 +417,7 @@ static void LoadSettings(Settings &s)
     s.warpFgLag = Clamp(KvInt(kv, "FrameWarpGameMotionFGLag", 1), -1, 1);
     s.warpEase = KvInt(kv, "FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = KvInt(kv, "FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
+    s.warpDilate = KvInt(kv, "FrameWarpGameDilate", 1) ? 1 : 0;
     s.warpGuard = KvInt(kv, "FrameWarpGuard", 1) ? 1 : 0;
     s.warpPauseLb = KvInt(kv, "FrameWarpPauseCutscenes", 1) ? 1 : 0;
     s.dlssHooks = KvInt(kv, "DlssHooks", 1) ? 1 : 0;
@@ -5378,7 +5380,7 @@ static void AtPresent(DeviceData *d, Swapchain *sc, uint32_t slot, VkCommandBuff
     gp.outTexel[0] = 1.0f / (float)sc->gW; gp.outTexel[1] = 1.0f / (float)sc->gH;
     gp.mvScale[0] = e.mvScale[0] * scale; gp.mvScale[1] = e.mvScale[1] * scale;
     memcpy(gp.mvMap, e.mvMap, sizeof(gp.mvMap)); memcpy(gp.dMap, e.dMap, sizeof(gp.dMap));
-    gp.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u);
+    gp.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (g_shared.warpDilate ? 4u : 0u);
     gp.mvInvalid = 3.402823466e38f;                                // DLSS has no marker for a missing vector
     gp.perRendered = scale > 0.0f ? 1.0f / scale : 1.0f;            // shown frames per rendered one: back to a whole rendered frame's motion
     gp.prevOk = prevOk ? 1.0f : 0.0f;
