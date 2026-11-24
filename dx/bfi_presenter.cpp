@@ -181,6 +181,7 @@ struct Settings
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
+    int   warpDilate = 1;     // FrameWarpGameDilate (1.0.48, ini only): the game's vectors dilated by depth (nearest of 3x3)
     int   hudFromDlss = 1;    // FrameWarpHudFromDlss (1.0.47, ini only): without a HUD-less picture from the game, DLSS's own
                               // output (the scene before post-processing and the HUD) is compared with the frame instead
     int   dlssOutState = 8;   // DlssOutputState (ini only): the state DLSS's output is in after its call (8 = unordered access)
@@ -374,6 +375,7 @@ static void LoadSettings(Settings &s)
     s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
     s.hudFromDlss = IniInt("FrameWarpHudFromDlss", 1) ? 1 : 0;
+    s.warpDilate = IniInt("FrameWarpGameDilate", 1) ? 1 : 0;
     s.dlssOutState = IniInt("DlssOutputState", 8);
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
@@ -9176,7 +9178,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     gc.pad[0] = scale > 0.0f ? 1.0f / scale : 1.0f;        // shown frames per rendered one: back to a whole rendered frame's motion
     gc.pad[1] = prevOk ? 1.0f : 0.0f;
     const bool linear = StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (linear ? 8u : 0u);
+    gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (linear ? 8u : 0u) | (g_shared.warpDilate ? 16u : 0u);
     memcpy(gc.hMap, hlMap, sizeof(gc.hMap));
     if (hl && !hudModesSet)
     {
