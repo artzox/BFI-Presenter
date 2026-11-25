@@ -188,7 +188,7 @@ struct Settings
     int   hudFromDlss = 1;    // FrameWarpHudFromDlss (1.0.47, ini only): without a HUD-less picture from the game, DLSS's own
                               // output (the scene before post-processing and the HUD) is compared with the frame instead
     int   dlssOutState = 8;   // DlssOutputState (ini only): the state DLSS's output is in after its call (8 = unordered access)
-    int   warpDrawAhead = 1;  // FrameWarpDrawAhead (test): with the game's motion, ReShade's effects drawn after the move
+    int   warpDrawAhead = 0;  // FrameWarpDrawAhead (test, off: it added moire to the sky with CRT-Standalone): with the game's motion, ReShade's effects drawn after the move
                               // (dx/bfi_fxahead.h) -- a CRT shader's mask and curve stay put on moved flashes
     int   fxReplayTest = 0;   // EffectsReplayTest (test build, ini only): can ReShade's effects be rendered again on a copy of the
                               // frame taken before them? Logs the result every 3 s (dx/bfi_fxreplay.h)
@@ -384,7 +384,7 @@ static void LoadSettings(Settings &s)
     s.hudFromDlss = IniInt("FrameWarpHudFromDlss", 1) ? 1 : 0;
     s.warpDilate = std::max(0, std::min(3, IniInt("FrameWarpGameDilate", 1)));
     s.fxReplayTest = IniInt("EffectsReplayTest", 0) ? 1 : 0;
-    s.warpDrawAhead = IniInt("FrameWarpDrawAhead", 1) ? 1 : 0;
+    s.warpDrawAhead = IniInt("FrameWarpDrawAhead", 0) ? 1 : 0;
     s.dlssOutState = IniInt("DlssOutputState", 8);
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
