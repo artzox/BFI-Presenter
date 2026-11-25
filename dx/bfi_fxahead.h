@@ -47,7 +47,7 @@ struct Gpu
     int                   pendN = 0, pendVar[3] = {};
     float                 pendAhead[3] = {};
     UINT64                waitRead = 0;           // the presenter's last read of the textures about to be drawn into
-    bool                  failed = false, logged = false;
+    bool                  failed = false, pipeFailed = false, logged = false;   // textures / draw ahead's pipeline
 };
 static Gpu G;
 
@@ -66,7 +66,7 @@ static bool Enabled()
 #ifndef _WIN64
     return false;
 #else
-    return g_shared.frameWarp && g_shared.warpDrawAhead && g_shared.warpGame && !G.failed && !g_dx11.load() && g_sc;
+    return g_shared.frameWarp && g_shared.warpDrawAhead && g_shared.warpGame && !G.failed && !G.pipeFailed && !g_dx11.load() && g_sc;
 #endif
 }
 
@@ -115,13 +115,14 @@ static bool EnsurePipeline()
 {
     if (G.pso) return true;
     if (!g_shDone || !g_shBlob[0] || !g_shBlob[kShMoveOnly]) return false;
-    D3D12_DESCRIPTOR_RANGE rg[5] = {};
-    D3D12_ROOT_PARAMETER p[6] = {};
+    if (G.fmt == DXGI_FORMAT_UNKNOWN) G.fmt = StageFormat();   // the frames drawn ahead are in it (they may not be made yet)
+    D3D12_DESCRIPTOR_RANGE rg[7] = {};
+    D3D12_ROOT_PARAMETER p[8] = {};
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     p[0].Constants.ShaderRegister = 0;
     p[0].Constants.Num32BitValues = sizeof(Constants) / 4;
     p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < 7; i++)
     {
         rg[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg[i].NumDescriptors = 1; rg[i].BaseShaderRegister = (UINT)i;
         p[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -135,7 +136,7 @@ static bool EnsurePipeline()
     smp.MaxLOD = D3D12_FLOAT32_MAX;
     smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rsd = {};
-    rsd.NumParameters = 6; rsd.pParameters = p; rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &smp;
+    rsd.NumParameters = 8; rsd.pParameters = p; rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &smp;
     ID3DBlob *blob = nullptr, *err = nullptr;
     bool ok = SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) &&
               SUCCEEDED(g_device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&G.rootSig)));
@@ -160,7 +161,7 @@ static bool EnsurePipeline()
     if (ok)
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 8 * 5; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 8 * 7; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ok = SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&G.srvHeap)));
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = kVar; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&G.rtvHeap)));
@@ -171,7 +172,7 @@ static bool EnsurePipeline()
     {
         LOGW("BFI Presenter: draw ahead: its pipeline could not be made -- off for this session");
         SafeRelease(G.pso); SafeRelease(G.rootSig); SafeRelease(G.srvHeap); SafeRelease(G.rtvHeap);
-        G.failed = true;
+        G.pipeFailed = true;
     }
     return ok;
 }
@@ -180,7 +181,7 @@ static bool EnsurePipeline()
 static bool EnsureTextures(ID3D12Resource *bb)
 {
     const D3D12_RESOURCE_DESC d = bb->GetDesc();
-    const bool wantVar = Enabled();
+    const bool wantVar = Enabled() && G.pso && G.rtvHeap;   // draw ahead's frames need its pipeline's heaps
     if (G.clean[0] && (UINT)d.Width == G.w && d.Height == G.h && d.Format == G.bbFmt && (!wantVar || var[0].res)) return true;
     if (G.clean[0])                                       // the size changed: the GPU must be done with the old ones
     {
@@ -226,7 +227,7 @@ static void on_begin(effect_runtime *rt, command_list *cmd, resource_view, resou
     if (!Capturing() || reinterpret_cast<void *>(rt->get_native()) != (void *)g_sc) return;
     if (fxr::g.guard) return;
     G.rt = rt; G.dev = rt->get_device();
-    if (Enabled() && !EnsurePipeline()) return;
+    if (Enabled()) EnsurePipeline();                      // its heaps are needed for the frames drawn ahead; a failure stops only draw ahead
     const resource bbr = fxr::BackBuffer(rt, rt->get_current_back_buffer_index());
     ID3D12Resource *bb = reinterpret_cast<ID3D12Resource *>(bbr.handle);
     if (!bb || !EnsureTextures(bb)) return;
@@ -294,13 +295,13 @@ static void Record(ID3D12GraphicsCommandList *list, UINT s)
 
     // Views: t0 this frame, t3 its motion, t4 the frame before; t1, t2 unused (this frame). One set per Present in turn
     // (a set in use by a list still on the GPU is never written).
-    const UINT set = (UINT)(G.presentN % 8) * 5;
+    const UINT set = (UINT)(G.presentN % 8) * 7;
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
     sv.Format = G.fmt; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Texture2D.MipLevels = 1;
     D3D12_SHADER_RESOURCE_VIEW_DESC fv = sv; fv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    ID3D12Resource *srcs[5] = { G.clean[cur], G.clean[cur], G.clean[cur], fl, G.clean[prev] };
-    for (UINT t = 0; t < 5; t++)
+    ID3D12Resource *srcs[7] = { G.clean[cur], G.clean[cur], G.clean[cur], fl, G.clean[prev], G.clean[cur], G.clean[prev] };
+    for (UINT t = 0; t < 7; t++)
     {
         D3D12_CPU_DESCRIPTOR_HANDLE hc = G.srvHeap->GetCPUDescriptorHandleForHeapStart();
         hc.ptr += (SIZE_T)(set + t) * G.srvStride;
@@ -318,7 +319,7 @@ static void Record(ID3D12GraphicsCommandList *list, UINT s)
     list->SetDescriptorHeaps(1, &G.srvHeap);
     list->SetPipelineState(G.pso);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    for (UINT t = 0; t < 5; t++)
+    for (UINT t = 0; t < 7; t++)
     {
         D3D12_GPU_DESCRIPTOR_HANDLE hg = G.srvHeap->GetGPUDescriptorHandleForHeapStart();
         hg.ptr += (UINT64)(set + t) * G.srvStride;
