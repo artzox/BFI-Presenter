@@ -139,7 +139,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.47"
+#define BFI_ADDON_VERSION "1.0.48"
 
 // ---------------------------------------------------------------- settings
 struct Settings

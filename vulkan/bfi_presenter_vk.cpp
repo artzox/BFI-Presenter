@@ -62,7 +62,7 @@
 struct Swapchain; struct DeviceData;
 namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
-#define BFI_VERSION "1.0.47"
+#define BFI_VERSION "1.0.48"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
