@@ -181,6 +181,8 @@ struct Settings
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
+    int   warpStillPre = 1;   // FrameWarpStillBeforeEffects (1.0.48): what stands still (a HUD) is found in the frame from
+                              // before ReShade's effects, while an effect is on (dx/bfi_prefx.h)
     int   warpDilate = 1;     // FrameWarpGameDilate (1.0.48): the game's vectors dilated by depth -- each point takes the
                               // nearest point's vector within this many depth texels (0 off, 1-3)
     int   hudFromDlss = 1;    // FrameWarpHudFromDlss (1.0.47, ini only): without a HUD-less picture from the game, DLSS's own
@@ -377,6 +379,7 @@ static void LoadSettings(Settings &s)
     s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
     s.hudFromDlss = IniInt("FrameWarpHudFromDlss", 1) ? 1 : 0;
     s.warpDilate = std::max(0, std::min(3, IniInt("FrameWarpGameDilate", 1)));
+    s.warpStillPre = IniInt("FrameWarpStillBeforeEffects", 1) ? 1 : 0;
     s.dlssOutState = IniInt("DlssOutputState", 8);
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
@@ -633,6 +636,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarpEvenPacing", s.warpEven);
     IniWriteInt("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg);
     IniWriteInt("FrameWarpGameDilate", s.warpDilate);
+    IniWriteInt("FrameWarpStillBeforeEffects", s.warpStillPre);
     IniWriteInt("FrameWarpPauseCutscenes", s.warpPauseLb);
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
@@ -993,6 +997,9 @@ static UINT                   g_bufCount = 0;
 static UINT                   g_cur = 0;
 
 static ID3D12Resource        *g_stage[kStage] = {};
+static ID3D12Resource        *g_pre[kStage] = {};         // FrameWarpStillBeforeEffects: each slot's frame from before ReShade's effects
+static bool                   g_preOk[kStage] = {};       // and whether the slot's frame has one
+static std::atomic<UINT>      g_preGen{0};                // counts g_pre being made or released (the presenter rewrites its views)
 static UINT64                 g_stageFence[kStage] = {};   // game-queue fence value of the copy
 static UINT64                 g_stageId[kStage] = {};      // game frame number (0 = empty)
 static double                 g_stageTime[kStage] = {};
@@ -1515,7 +1522,8 @@ static bool RefreshRealDesc()
 static void ReleaseFrameResources()
 {
     for (UINT i = 0; i < kMaxBuf; i++) SafeRelease(g_virt[i]);
-    for (UINT s = 0; s < kStage; s++) SafeRelease(g_stage[s]);
+    for (UINT s = 0; s < kStage; s++) { SafeRelease(g_stage[s]); SafeRelease(g_pre[s]); g_preOk[s] = false; }
+    g_preGen++;
     gmo::Release();
     g_bufCount = 0;
 }
@@ -1759,6 +1767,8 @@ Texture2D<float4> src : register(t0);
 Texture2D<float> aplTex : register(t1);
 Texture2D<float4> srcNew : register(t2);  // split comparison: the newest game frame, for the side without BFI   // APL Limiter: the scene average (1x1); for its reduction pass, the 32x18 cells
 Texture2D<float4> srcPrev : register(t4); // frame warp: the game frame shown before this one (what stands still is not moved)
+Texture2D<float4> preCur  : register(t5); // FrameWarpStillBeforeEffects (flags & 32768): this frame from before ReShade's effects
+Texture2D<float4> prePrev : register(t6); // and the frame shown before, likewise
 Texture2D<float4> flowTex : register(t3); // frame warp: xy = how far the picture moved since the frame before (uv), z = confidence
 SamplerState linClamp : register(s0);
 
@@ -1835,9 +1845,15 @@ float2 EdgeFade(float2 cp, float2 d, float2 size)
 
 // Frame warp: a pixel that is the same in this frame and the one shown before it (8-bit: the same value; 10-bit:
 // within a step or two).
+// What stands still is found in the frames from before ReShade's effects where they are kept (FrameWarpStillBeforeEffects,
+// flags & 32768, 1.0.48): a CRT shader's pre-blur and glow spread the moving scene into a HUD's pixels, so in the finished
+// frame the HUD changed a little every frame and was moved with the scene (Onimusha with CRT-Standalone).
+float3 StillCur(int2 q) { return (flags & 32768) != 0 ? preCur.Load(int3(q, 0)).rgb : src.Load(int3(q, 0)).rgb; }
+float3 StillPrev(int2 q) { return (flags & 32768) != 0 ? prePrev.Load(int3(q, 0)).rgb : srcPrev.Load(int3(q, 0)).rgb; }
+float3 StillPrevAt(float2 uv) { return (flags & 32768) != 0 ? prePrev.SampleLevel(linClamp, uv, 0).rgb : srcPrev.SampleLevel(linClamp, uv, 0).rgb; }
 bool Unchanged(int2 q)
 {
-    float3 a = src.Load(int3(q, 0)).rgb, b = srcPrev.Load(int3(q, 0)).rgb;
+    float3 a = StillCur(q), b = StillPrev(q);
     float3 tol = (flags & 1024) != 0 ? 0.002 * (0.1 + max(abs(a), abs(b))) : float3(0.0016, 0.0016, 0.0016);
     return all(abs(a - b) <= tol);
 }
@@ -1858,7 +1874,7 @@ bool Unchanged(int2 q)
 bool Still(int2 q, float2 size)
 {
     if (!Unchanged(q)) return false;
-    const float3 a0 = src.Load(int3(q, 0)).rgb;
+    const float3 a0 = StillCur(q);
     const float lc = (flags & 1024) != 0 ? 0.06 * (0.1 + max(max(a0.r, a0.g), a0.b)) : 0.03;
     int n = 0;
     float con = 0.0;
@@ -1867,7 +1883,7 @@ bool Still(int2 q, float2 size)
             if (x != 0 || y != 0)
             {
                 if (Unchanged(q + int2(x, y))) n++;
-                const float3 e = abs(src.Load(int3(q + int2(x, y), 0)).rgb - a0);
+                const float3 e = abs(StillCur(q + int2(x, y)) - a0);
                 con = max(con, max(max(e.r, e.g), e.b));
             }
     if (n < 1) return false;
@@ -1875,14 +1891,14 @@ bool Still(int2 q, float2 size)
     {
         [unroll] for (int y = -1; y <= 1; y++)
             [unroll] for (int x = -1; x <= 1; x++)
-                if (any(src.Load(int3(q + int2(x, y), 0)).rgb != srcPrev.Load(int3(q + int2(x, y), 0)).rgb)) return false;
+                if (any(StillCur(q + int2(x, y)) != StillPrev(q + int2(x, y)))) return false;
     }
     float2 c = float2(q) + 0.5;
     float4 f = flowTex.SampleLevel(linClamp, c / size, 0);
     float2 step = f.xy * size * (warpSrc != 0 ? min(f.z, 1.0) * warpPrevN : f.z);   // this part of the scene's motion since the frame before, pixels
     if (dot(step, step) < 2.25) return true;               // under a pixel and a half: nothing to tell apart
-    float3 a = src.Load(int3(q, 0)).rgb;
-    float3 d = abs(a - srcPrev.SampleLevel(linClamp, (c - step) / size, 0).rgb);
+    float3 a = StillCur(q);
+    float3 d = abs(a - StillPrevAt((c - step) / size));
     float lim = (flags & 1024) != 0 ? 0.04 * (0.1 + max(max(a.r, a.g), a.b)) : 0.04;
     return max(max(d.r, d.g), d.b) > lim;
 }
@@ -2490,7 +2506,8 @@ struct Constants
     float    warpEase;                  // the game's motion: 1 = moves past the rendered frame ease off as the motion slows
     float    osdX0, osdY0, osdX1, osdY1;  // frame warp: the BFI OSD on the frame, game-frame pixels (none: x1 <= x0)
 };
-static_assert(sizeof(Constants) / 4 <= 63, "root constants: at most 64 DWORDs in the root signature");
+static_assert(sizeof(Constants) / 4 + 7 <= 64, "root signature: the constants and seven tables in at most 64 DWORDs");
+namespace pfx { static ID3D12Resource *Peek12(); static ID3D12Resource *Take12(); static ID3D11Texture2D *Take11(); static void Release(); static void Register(bool on); }
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
 // every 32x18 cell's lit value is capped at C. Plain strobe: the lit refresh.
@@ -3738,6 +3755,8 @@ static DWORD WINAPI PresenterThread(void *)
     bool   chkPending = false;
     int    chkSrc = 0;
     const UINT kGameFlowSrv = kStage + 2 + WarpGpu::kSrvCount;   // their views in srvHeap
+    const UINT kPreSrv = kGameFlowSrv + kStage;                  // the frames from before ReShade's effects (g_pre)
+    UINT   preGenSeen = ~0u;
     bool   kwarp = false;
     UINT64 measFence = 0;
     IDXGIOutput *output = nullptr;
@@ -3764,7 +3783,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
+    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
                                                                        // frame warp's textures, the game's own motion per stage slot
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
@@ -3824,7 +3843,11 @@ static DWORD WINAPI PresenterThread(void *)
         rangeFlow.BaseShaderRegister = 3;                  // t3: frame warp's motion
         D3D12_DESCRIPTOR_RANGE rangePrev = range;
         rangePrev.BaseShaderRegister = 4;                  // t4: frame warp's frame shown before
-        D3D12_ROOT_PARAMETER params[6] = {};
+        D3D12_DESCRIPTOR_RANGE rangePreC = range;
+        rangePreC.BaseShaderRegister = 5;                  // t5: this frame from before ReShade's effects (FrameWarpStillBeforeEffects)
+        D3D12_DESCRIPTOR_RANGE rangePreP = range;
+        rangePreP.BaseShaderRegister = 6;                  // t6: and the frame shown before, likewise
+        D3D12_ROOT_PARAMETER params[8] = {};
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
         params[0].Constants.Num32BitValues = sizeof(Constants) / 4;
@@ -3841,6 +3864,10 @@ static DWORD WINAPI PresenterThread(void *)
         params[4].DescriptorTable.pDescriptorRanges   = &rangeFlow;
         params[5] = params[1];
         params[5].DescriptorTable.pDescriptorRanges   = &rangePrev;
+        params[6] = params[1];
+        params[6].DescriptorTable.pDescriptorRanges   = &rangePreC;
+        params[7] = params[1];
+        params[7].DescriptorTable.pDescriptorRanges   = &rangePreP;
         D3D12_STATIC_SAMPLER_DESC samp = {};
         samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -3848,7 +3875,7 @@ static DWORD WINAPI PresenterThread(void *)
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 6;
+        rsd.NumParameters = 8;
         rsd.pParameters   = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers   = &samp;
@@ -4718,6 +4745,8 @@ static DWORD WINAPI PresenterThread(void *)
             else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
             if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
+            // what stands still, found in the frames from before ReShade's effects (FrameWarpStillBeforeEffects)
+            if (s.warpStillPre && g_pre[pick] && g_pre[warpPrev] && g_preOk[pick] && g_preOk[warpPrev]) c.flags |= 32768u;
             if (s.osd && Now() - Osd::drawnT.load() < 0.5)    // the BFI OSD on the frame: never moved (its background is see-through)
             {
                 c.osdX0 = Osd::drawnRect[0]; c.osdY0 = Osd::drawnRect[1]; c.osdX1 = Osd::drawnRect[2]; c.osdY1 = Osd::drawnRect[3];
@@ -4797,6 +4826,12 @@ static DWORD WINAPI PresenterThread(void *)
         {
             D3D12_RESOURCE_BARRIER b3 = Transition(g_stage[warpPrev], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &b3);
+            if ((c.flags & 32768u) != 0)
+            {
+                D3D12_RESOURCE_BARRIER pb[2] = { Transition(g_pre[pick], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                                                 Transition(g_pre[warpPrev], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) };
+                list->ResourceBarrier(pick == warpPrev ? 1 : 2, pb);
+            }
             if (c.warpSrc != 0)
             {
                 D3D12_RESOURCE_BARRIER b4 = Transition(gFlow, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -4866,7 +4901,9 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 static int hudLogs = 0;
                 if (s.warpGameCheck && hudLogs++ < 30) LOGI("BFI Presenter: frame warp check: the HUD mask covers %.1f%% of the picture", hudPct);
-                if (hudPct > 35.0) { gmo::HudBad(hudPct); hudBigN = 0; } else hudBigN = 0;
+                // 3 checks in a row over 35% (1.0.48): a single one at a camera cut or a fade switched it off for the session
+                // (Directive 8020: 1-13% for 30 s, then one reading of 70% in a cutscene)
+                if (hudPct > 35.0) { if (++hudBigN >= 3) { gmo::HudBad(hudPct); hudBigN = 0; } } else hudBigN = 0;
             }
             if (!s.warpGameCheck) { }                     // only the HUD mask's coverage was wanted
             else if (!(wsum[0] > 0.0 && wsum[1] > 0.0 && chkFrames > 0))
@@ -4977,6 +5014,28 @@ static DWORD WINAPI PresenterThread(void *)
             psrv.ptr += (UINT64)(c.warp != 0.0f ? warpPrev : pick) * srvStride;
             list->SetGraphicsRootDescriptorTable(5, psrv);                         // t4: the frame shown before (likewise)
         }
+        {
+            // t5, t6: the frames from before ReShade's effects (read only with flags & 32768); otherwise the stage frames
+            if (preGenSeen != g_preGen.load())
+            {
+                preGenSeen = g_preGen.load();
+                D3D12_SHADER_RESOURCE_VIEW_DESC pv = {};
+                pv.Format = StageFormat(); pv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                pv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; pv.Texture2D.MipLevels = 1;
+                for (UINT k = 0; k < kStage; k++)
+                {
+                    D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                    h.ptr += (SIZE_T)(kPreSrv + k) * srvStride;
+                    g_device->CreateShaderResourceView(g_pre[k] ? g_pre[k] : g_stage[k], &pv, h);
+                }
+            }
+            const bool pre = (c.flags & 32768u) != 0;
+            D3D12_GPU_DESCRIPTOR_HANDLE p5 = srvHeap->GetGPUDescriptorHandleForHeapStart(), p6 = p5;
+            p5.ptr += (UINT64)((pre ? kPreSrv : 0) + (UINT)pick) * srvStride;
+            p6.ptr += (UINT64)((pre ? kPreSrv : 0) + (UINT)(c.warp != 0.0f ? warpPrev : pick)) * srvStride;
+            list->SetGraphicsRootDescriptorTable(6, p5);
+            list->SetGraphicsRootDescriptorTable(7, p6);
+        }
         // RenoFX APL Limiter: measure the frame before its first refresh, so the boost uses its own average (as in
         // RenoFX). Its later refreshes reuse the value.
         if (aplOn && pickId != aplFrameId)
@@ -5079,6 +5138,12 @@ static DWORD WINAPI PresenterThread(void *)
         {
             D3D12_RESOURCE_BARRIER b3 = Transition(g_stage[warpPrev], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             list->ResourceBarrier(1, &b3);
+            if ((c.flags & 32768u) != 0)
+            {
+                D3D12_RESOURCE_BARRIER pb[2] = { Transition(g_pre[pick], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                                                 Transition(g_pre[warpPrev], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON) };
+                list->ResourceBarrier(pick == warpPrev ? 1 : 2, pb);
+            }
             if (c.warpSrc != 0)
             {
                 D3D12_RESOURCE_BARRIER b4 = Transition(gFlow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -7125,6 +7190,31 @@ static HRESULT SubmitGameFrameLocked()
     g_copyList->ResourceBarrier(2, br);
     gmo::AtPresent(g_copyList, s);            // frame warp: this frame's motion from the game's own vectors and depth
     {
+        // FrameWarpStillBeforeEffects: the frame from before ReShade's effects, kept with the slot (dx/bfi_prefx.h)
+        bool preOk = false;
+        ID3D12Resource *pre = pfx::Take12();
+        if (pre && !g_pre[s])
+        {
+            D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = g_stage[s]->GetDesc();
+            if (SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_pre[s]))))
+            { g_pre[s]->SetName(L"BFI frame before ReShade's effects (slot)"); g_preGen++; }
+            else g_pre[s] = nullptr;
+        }
+        if (pre && g_pre[s])
+        {
+            D3D12_RESOURCE_BARRIER pb[2] = { Transition(pre, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                             Transition(g_pre[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
+            g_copyList->ResourceBarrier(2, pb);
+            g_copyList->CopyResource(g_pre[s], pre);
+            pb[0] = Transition(pre, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            pb[1] = Transition(g_pre[s], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            g_copyList->ResourceBarrier(2, pb);
+            preOk = true;
+        }
+        g_preOk[s] = preOk;
+    }
+    {
         const HRESULT ch = g_copyList->Close();
         static bool once = false;
         if (FAILED(ch) && !once)
@@ -9139,6 +9229,10 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
             }
         }
     }
+    // The frame the HUD-less picture is compared with: from before ReShade's effects where it is kept (FrameWarpStillBeforeEffects,
+    // 1.0.48) -- a CRT shader's mask, grain and glow differ from the HUD-less picture everywhere -- else the finished frame.
+    ID3D12Resource *hFrame = pfx::Peek12();
+    if (!hFrame) hFrame = g_stage[s];
     // the views for this slot: t5 vectors, t6 depth, t7 HUD mask, t8 the frame, t9 the HUD-less picture, t10 the raw mask before
     D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
     sh.ptr += (SIZE_T)(7 * s) * srvStride;
@@ -9156,7 +9250,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         sv.Format = DXGI_FORMAT_R8_UNORM;
         g_device->CreateShaderResourceView(hudMask, &sv, at(2));
         sv.Format = StageFormat();
-        g_device->CreateShaderResourceView(g_stage[s], &sv, at(3));
+        g_device->CreateShaderResourceView(hFrame, &sv, at(3));
         sv.Format = hl ? ColorView(hlFmt) : DXGI_FORMAT_R8G8B8A8_UNORM;
         g_device->CreateShaderResourceView(hl, &sv, at(4));
         sv.Format = DXGI_FORMAT_R8_UNORM;
@@ -9201,7 +9295,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     if (hl)
     {
         D3D12_RESOURCE_BARRIER hb[4]; UINT nh = 0;
-        hb[nh++] = Transition(g_stage[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        hb[nh++] = Transition(hFrame, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         const bool hlTr = !(hlState & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         if (hlTr) hb[nh++] = Transition(hl, (D3D12_RESOURCE_STATES)hlState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         hb[nh++] = Transition(hudRaw[hudCur], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -9215,7 +9309,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         list->OMSetRenderTargets(2, rt, FALSE, nullptr);
         list->DrawInstanced(3, 1, 0, 0);
         nh = 0;
-        hb[nh++] = Transition(g_stage[s], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        hb[nh++] = Transition(hFrame, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         if (hlTr) hb[nh++] = Transition(hl, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, (D3D12_RESOURCE_STATES)hlState);
         hb[nh++] = Transition(hudRaw[hudCur], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         hb[nh++] = Transition(hudMask, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -10922,6 +11016,7 @@ static IUnknown *ReflexOwnDevice()
 static ID3D11DeviceContext4 *g_ctx11 = nullptr;
 static ID3D11Fence          *g_gameFence11 = nullptr, *g_presFence11 = nullptr;
 static ID3D11Texture2D      *g_stage11[kStage] = {};
+static ID3D11Texture2D      *g_pre11[kStage] = {};         // FrameWarpStillBeforeEffects: g_pre[s] opened on the game's DX11 device
 static ID3D12Device         *g_dev12own = nullptr;     // the add-on's D3D12 device (kept across swap chains)
 static LUID                  g_dev12Luid = {};
 static HWND                  g_gameHwnd = nullptr;
@@ -11088,7 +11183,8 @@ static void ApplyColorSpace11()
 
 static void ReleaseStage11()
 {
-    for (UINT s = 0; s < kStage; s++) { SafeRelease(g_stage11[s]); SafeRelease(g_stage[s]); }
+    for (UINT s = 0; s < kStage; s++) { SafeRelease(g_stage11[s]); SafeRelease(g_stage[s]); SafeRelease(g_pre11[s]); SafeRelease(g_pre[s]); g_preOk[s] = false; }
+    g_preGen++;
     g_bufCount = 0;
 }
 
@@ -11767,6 +11863,31 @@ static HRESULT SubmitFrame11Core(GetFrame getFrame, ShowOwn showOwn)
     if (waitRead) g_ctx11->Wait(g_presFence11, waitRead);   // presenter done reading this slot
     if (bd.SampleDesc.Count > 1) g_ctx11->ResolveSubresource(g_stage11[s], 0, bb, 0, StageFormat());
     else                         g_ctx11->CopyResource(g_stage11[s], bb);
+    {
+        // FrameWarpStillBeforeEffects: the frame from before ReShade's effects, kept with the slot (dx/bfi_prefx.h). The
+        // slot's own texture is made on the add-on's D3D12 device and shared with the game's, as the stage frames are.
+        bool preOk = false;
+        ID3D11Texture2D *pre = pfx::Take11();
+        if (pre && !g_pre11[s])
+        {
+            D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            const D3D12_RESOURCE_DESC rd = g_stage[s]->GetDesc();
+            HANDLE h = nullptr;
+            HRESULT hr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_pre[s]));
+            if (SUCCEEDED(hr)) hr = g_device->CreateSharedHandle(g_pre[s], nullptr, GENERIC_ALL, nullptr, &h);
+            if (SUCCEEDED(hr)) hr = g_dev11->OpenSharedResource1(h, IID_PPV_ARGS(&g_pre11[s]));
+            if (h) CloseHandle(h);
+            if (FAILED(hr)) { SafeRelease(g_pre11[s]); SafeRelease(g_pre[s]); }
+            else { g_pre[s]->SetName(L"BFI frame before ReShade's effects (slot, shared with DX11)"); g_preGen++; }
+        }
+        if (pre && g_pre11[s])
+        {
+            D3D11_TEXTURE2D_DESC a = {}, b = {};
+            pre->GetDesc(&a); g_pre11[s]->GetDesc(&b);
+            if (a.Width == b.Width && a.Height == b.Height) { g_ctx11->CopyResource(g_pre11[s], pre); preOk = true; }
+        }
+        g_preOk[s] = preOk;
+    }
     g_ctx11->Signal(g_gameFence11, ++g_gameFenceVal);
     g_ctx11->Flush();
     EnterCriticalSection(&g_lock);                       // publish: selectable from here on
@@ -14085,6 +14206,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
                     ImGui::SetTooltip("This game hasn't handed DLSS any motion data (no Streamline or DLSS call seen).");
             }
+            {
+                bool sp = s.warpStillPre != 0;
+                if (ImGui::Checkbox("Find the HUD before ReShade's effects", &sp)) s.warpStillPre = sp ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("What stands still on the screen (a HUD, text) is found in the game's frame from before\n"
+                                                              "ReShade's effects, so a CRT shader's blur and glow over the HUD don't make it look as if\n"
+                                                              "it moved (it broke up on filled flashes). Only while an effect is on: one more copy of\n"
+                                                              "each frame. DirectX 12 and 11.");
+            }
             ImGui::SliderInt("Edge dilation (depth texels)", &s.warpDilate, 0, 3, s.warpDilate > 0 ? "%d" : "off");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's motion: each point takes the motion of the nearest thing within this many of\n"
                                                           "the game's depth texels, so the edges of what is in front move with it instead of staying\n"
@@ -14372,6 +14501,8 @@ static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize
     LOGI("BFI Presenter: presenter stopped, resources released");
 }
 
+#include "bfi_prefx.h"      // the frame from before ReShade's effects (FrameWarpStillBeforeEffects)
+
 // ---------------------------------------------------------------- entry
 // Unregister from ReShade. The module is pinned (the watchdog thread runs for
 // the life of the process), so ReShade's FreeLibrary never reaches
@@ -14390,6 +14521,7 @@ static void UnregisterAll(HMODULE hModule)
     RegisterDx9Events(false);
     reshade::unregister_overlay("BFI Presenter", draw_overlay);
     reshade::unregister_event<reshade::addon_event::reshade_overlay>(on_osd);
+    pfx::Register(false);
     RemoveHooks();
     reshade::unregister_addon(hModule);
 }
@@ -14415,6 +14547,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     RegisterDx9Events(true);
     reshade::register_overlay("BFI Presenter", draw_overlay);
     reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
+    pfx::Register(true);
     if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
     return true;
 }
@@ -14472,6 +14605,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         RegisterDx9Events(true);
         reshade::register_overlay("BFI Presenter", draw_overlay);
         reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
+        pfx::Register(true);
         ShaderPrepare();                                // compiled (or loaded) while the game starts up
         // DRED must be switched on before the game creates its device; a
         // thread avoids calling into D3D12 under the loader lock.
