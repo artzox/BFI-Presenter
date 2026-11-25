@@ -9,6 +9,13 @@ layout(set = 2, binding = 0) uniform sampler2D flowTex;   // xy = how far the pi
 layout(set = 2, binding = 1) uniform sampler2D srcPrev;
 layout(set = 2, binding = 2) uniform sampler2D srcLin;
 layout(set = 2, binding = 3) uniform sampler2D gameFlow;   // the game's own motion for this frame (gameflow.comp), half size
+// FrameWarpStillBeforeEffects (1.0.48, as DX; flags & 16384): the frames from before ReShade's effects, where what stands
+// still is found (a CRT shader's blur and glow over a HUD made it look as if it moved). Otherwise the stage frames.
+layout(set = 2, binding = 4) uniform sampler2D preCur;
+layout(set = 2, binding = 5) uniform sampler2D prePrev;
+vec3 StillCur(ivec2 q) { return (pc.flags & 16384u) != 0u ? texelFetch(preCur, q, 0).rgb : texelFetch(src, q, 0).rgb; }
+vec3 StillPrev(ivec2 q) { return (pc.flags & 16384u) != 0u ? texelFetch(prePrev, q, 0).rgb : texelFetch(srcPrev, q, 0).rgb; }
+vec3 StillPrevAt(vec2 uv) { return (pc.flags & 16384u) != 0u ? textureLod(prePrev, uv, 0.0).rgb : textureLod(srcPrev, uv, 0.0).rgb; }
 
 // The game's own motion (as dx/bfi_presenter.cpp, WarpShiftGame): the place the output pixel comes from is found in up
 // to three steps along the motion, and each step checked -- does the point found really move onto this pixel? Of the
@@ -58,7 +65,7 @@ vec2 WarpShift(vec2 uv)
 bool Unchanged(ivec2 q, ivec2 size)
 {
     if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) return true;
-    vec3 a = texelFetch(src, q, 0).rgb, b = texelFetch(srcPrev, q, 0).rgb;
+    vec3 a = StillCur(q), b = StillPrev(q);
     vec3 tol = (pc.flags & 1024u) != 0u ? 0.002 * (0.1 + max(abs(a), abs(b))) : vec3(0.0016);
     return all(lessThanEqual(abs(a - b), tol));
 }
@@ -69,7 +76,7 @@ bool Still(ivec2 q, vec2 size)
     if (!Unchanged(q, isz)) return false;
     // (as DX: no 5-of-8 shortcut since 1.0.46 -- a clear sky stood still with a tree's outline against it; and since
     // 1.0.47 a flat area only where it is exactly the same around it, as a HUD is -- patches of soft clouds were held)
-    vec3 a0 = texelFetch(src, q, 0).rgb;
+    vec3 a0 = StillCur(q);
     float lc = (pc.flags & 1024u) != 0u ? 0.06 * (0.1 + max(max(a0.r, a0.g), a0.b)) : 0.03;
     int n = 0;
     float con = 0.0;
@@ -79,7 +86,7 @@ bool Still(ivec2 q, vec2 size)
             {
                 ivec2 nq = clamp(q + ivec2(x, y), ivec2(0), isz - 1);
                 if (Unchanged(q + ivec2(x, y), isz)) n++;
-                vec3 e = abs(texelFetch(src, nq, 0).rgb - a0);
+                vec3 e = abs(StillCur(nq) - a0);
                 con = max(con, max(max(e.r, e.g), e.b));
             }
     if (n < 1) return false;
@@ -88,14 +95,14 @@ bool Still(ivec2 q, vec2 size)
             for (int x = -1; x <= 1; x++)
             {
                 ivec2 nq = clamp(q + ivec2(x, y), ivec2(0), isz - 1);
-                if (any(notEqual(texelFetch(src, nq, 0).rgb, texelFetch(srcPrev, nq, 0).rgb))) return false;
+                if (any(notEqual(StillCur(nq), StillPrev(nq)))) return false;
             }
     vec2 c = vec2(q) + 0.5;
     vec4 f = pc.warpSrc != 0u ? textureLod(gameFlow, c / size, 0.0) : textureLod(flowTex, c / size, 0.0);
     vec2 step = f.xy * size * (pc.warpSrc != 0u ? min(f.z, 1.0) * pc.warpPrevN : f.z);
     if (dot(step, step) < 2.25) return true;
-    vec3 a = texelFetch(src, q, 0).rgb;
-    vec3 d = abs(a - textureLod(srcPrev, (c - step) / size, 0.0).rgb);
+    vec3 a = StillCur(q);
+    vec3 d = abs(a - StillPrevAt((c - step) / size));
     float lim = (pc.flags & 1024u) != 0u ? 0.04 * (0.1 + max(max(a.r, a.g), a.b)) : 0.04;
     return max(max(d.r, d.g), d.b) > lim;
 }

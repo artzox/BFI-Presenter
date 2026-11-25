@@ -62,7 +62,7 @@
 struct Swapchain; struct DeviceData;
 namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
-#define BFI_VERSION "1.0.47"
+#define BFI_VERSION "1.0.48"
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -285,6 +285,9 @@ struct Settings
     int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
                               // is in the rendered frame: 1 generated frames before the rendered one, -1 after it, 0 off
+    int   warpStillPre = 1;   // FrameWarpStillBeforeEffects (1.0.48, as DX): what stands still is found in the frame from before
+                              // ReShade's effects (made with the swap chain: a change takes effect when the game recreates it)
+    int   warpDilate = 1;     // FrameWarpGameDilate (1.0.48, as DX): the game's vectors dilated by depth
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (as DX 1.0.45): the ease without frame generation too
     int   warpEase = 1;       // FrameWarpGameMotionEase (ini only, as DX): moves past the rendered frame ease off as the motion slows
     int   warpGuard = 1;      // FrameWarpGuard (ini only, as DX): filled repeats that keep making their refresh late are shown as they are
@@ -416,6 +419,8 @@ static void LoadSettings(Settings &s)
     s.warpFgLag = Clamp(KvInt(kv, "FrameWarpGameMotionFGLag", 1), -1, 1);
     s.warpEase = KvInt(kv, "FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = KvInt(kv, "FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
+    s.warpDilate = std::max(0, std::min(3, KvInt(kv, "FrameWarpGameDilate", 1)));
+    s.warpStillPre = KvInt(kv, "FrameWarpStillBeforeEffects", 1) ? 1 : 0;
     s.warpGuard = KvInt(kv, "FrameWarpGuard", 1) ? 1 : 0;
     s.warpPauseLb = KvInt(kv, "FrameWarpPauseCutscenes", 1) ? 1 : 0;
     s.dlssHooks = KvInt(kv, "DlssHooks", 1) ? 1 : 0;
@@ -500,7 +505,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); I("FrameWarpGameDilate", s.warpDilate); I("FrameWarpStillBeforeEffects", s.warpStillPre); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexLimitAtSleep", s.reflexAtSleep); I("ReflexAlign", s.reflexAlign); I("LearnReflexStart", s.learnReflex); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -920,6 +925,17 @@ struct Swapchain
     uint64_t       recentId[8] = {};
     int            recentSlot[8] = {};
     uint64_t       nextTick = 0;
+
+    // FrameWarpStillBeforeEffects (1.0.48): the game's frame from before ReShade's effects -- copied at
+    // reshade_begin_effects into `clean` (on ReShade's command buffer), then at the game's present with the frame into
+    // its staging slot's pre[] (the presenter's still test reads it there)
+    VkImage        pre[kStage] = {};
+    VkDeviceMemory preMem[kStage] = {};
+    VkImageView    preView[kStage] = {};
+    bool           preOk[kStage] = {};          // the slot's frame has one
+    VkImage        clean = VK_NULL_HANDLE;
+    VkDeviceMemory cleanMem = VK_NULL_HANDLE;
+    std::atomic<bool> preCaptured{false};       // `clean` holds this frame's (set at reshade_begin_effects, taken at present)
 
     // presenter
     uint32_t       nReal = 0;
@@ -1795,7 +1811,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     if (p)
     {
         // Frame warp: set 2 is needed by the BFI pipelines; its passes are optional.
-        p = R.warp.Init(d, sc->stageView, sc->gFlowView, sc->extent.width, sc->extent.height);
+        p = R.warp.Init(d, sc->stageView, sc->gFlowView, sc->preView, sc->extent.width, sc->extent.height);
         if (p && !R.warp.ok) LOGW("BFI Presenter: frame warp unavailable (its compute passes could not be created)");
     }
     if (!p)
@@ -2799,6 +2815,8 @@ static void PresenterThread(Swapchain *sc)
         c.warp = 0.0f; c.warpSrc = 0; c.warpPrevN = 0.0f; c.warpLag = 0.0f;
         c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
         if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
+        // what stands still, found in the frames from before ReShade's effects (FrameWarpStillBeforeEffects)
+        if (s.warpStillPre && warpPrev >= 0 && sc->pre[pick] && sc->preOk[pick] && sc->preOk[warpPrev]) c.flags |= 16384u;
         if (s.osd && Now() - Osd::drawnT.load() < 0.5)    // the BFI OSD on the frame: never moved (its background is see-through)
         {
             auto px = [](float v) { return (uint32_t)std::max(0.0f, std::min(65535.0f, v)); };
@@ -5378,7 +5396,7 @@ static void AtPresent(DeviceData *d, Swapchain *sc, uint32_t slot, VkCommandBuff
     gp.outTexel[0] = 1.0f / (float)sc->gW; gp.outTexel[1] = 1.0f / (float)sc->gH;
     gp.mvScale[0] = e.mvScale[0] * scale; gp.mvScale[1] = e.mvScale[1] * scale;
     memcpy(gp.mvMap, e.mvMap, sizeof(gp.mvMap)); memcpy(gp.dMap, e.dMap, sizeof(gp.dMap));
-    gp.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u);
+    gp.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | ((uint32_t)g_shared.warpDilate << 4);
     gp.mvInvalid = 3.402823466e38f;                                // DLSS has no marker for a missing vector
     gp.perRendered = scale > 0.0f ? 1.0f / scale : 1.0f;            // shown frames per rendered one: back to a whole rendered frame's motion
     gp.prevOk = prevOk ? 1.0f : 0.0f;
@@ -5739,6 +5757,21 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
     br[1] = ImgBarrier(sc->stage[slot], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        VK_ACCESS_TRANSFER_WRITE_BIT, 0);   // the presenter reads it after the copy fence
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 2, br);
+    // FrameWarpStillBeforeEffects: this frame from before ReShade's effects, into the slot's own image
+    {
+        const bool pc = sc->preCaptured.exchange(false);
+        bool preOk = false;
+        if (pc && sc->pre[slot] && sc->clean && g_shared.warpStillPre)
+        {
+            VkImageMemoryBarrier pb = ImgBarrier(sc->pre[slot], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+            d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &pb);
+            d->CmdCopyImage(cb, sc->clean, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc->pre[slot], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+            pb = ImgBarrier(sc->pre[slot], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+            d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &pb);
+            preOk = true;
+        }
+        sc->preOk[slot] = preOk;
+    }
     gvk::AtPresent(d, sc, (uint32_t)slot, cb);       // frame warp: the game's own motion for this frame
     d->EndCommandBuffer(cb);
 
@@ -5901,6 +5934,9 @@ static void DestroySCResources(Swapchain *sc)
     }
     for (auto &kv : sc->copyCmds) d->DestroyCommandPool(dev, kv.second.pool, nullptr);
     sc->copyCmds.clear();
+    if (sc->clean) d->DestroyImage(dev, sc->clean, nullptr);
+    if (sc->cleanMem) d->FreeMemory(dev, sc->cleanMem, nullptr);
+    sc->clean = VK_NULL_HANDLE; sc->cleanMem = VK_NULL_HANDLE; sc->preCaptured = false;
     for (uint32_t i = 0; i < kStage; i++)
     {
         if (sc->stageView[i]) d->DestroyImageView(dev, sc->stageView[i], nullptr);
@@ -5908,6 +5944,10 @@ static void DestroySCResources(Swapchain *sc)
         if (sc->stageMem[i]) d->FreeMemory(dev, sc->stageMem[i], nullptr);
         if (sc->copyFence[i]) d->DestroyFence(dev, sc->copyFence[i], nullptr);
         sc->stageView[i] = VK_NULL_HANDLE; sc->stage[i] = VK_NULL_HANDLE; sc->stageMem[i] = VK_NULL_HANDLE; sc->copyFence[i] = VK_NULL_HANDLE;
+        if (sc->preView[i]) d->DestroyImageView(dev, sc->preView[i], nullptr);
+        if (sc->pre[i]) d->DestroyImage(dev, sc->pre[i], nullptr);
+        if (sc->preMem[i]) d->FreeMemory(dev, sc->preMem[i], nullptr);
+        sc->preView[i] = VK_NULL_HANDLE; sc->pre[i] = VK_NULL_HANDLE; sc->preMem[i] = VK_NULL_HANDLE; sc->preOk[i] = false;
         if (sc->gFlowView[i]) d->DestroyImageView(dev, sc->gFlowView[i], nullptr);
         if (sc->gFlow[i]) d->DestroyImage(dev, sc->gFlow[i], nullptr);
         if (sc->gFlowMem[i]) d->FreeMemory(dev, sc->gFlowMem[i], nullptr);
@@ -5990,6 +6030,36 @@ static bool BuildSC(Swapchain *sc, const VkSwapchainCreateInfoKHR *ci)
         ok = ok && d->CreateFence(dev, &fci, nullptr, &sc->copyFence[i]) == VK_SUCCESS;
     }
     if (!ok) { LOGE("BFI Presenter: could not create the staging images"); DestroySCResources(sc); return false; }
+    // FrameWarpStillBeforeEffects: one more image per slot and one for the capture (optional: without them the still test
+    // reads the finished frames)
+    if (g_shared.frameWarp && g_shared.warpStillPre)
+    {
+        bool pok = CreateImageMem(d, sti, &sc->clean, &sc->cleanMem);
+        for (uint32_t i = 0; pok && i < kStage; i++)
+        {
+            pok = CreateImageMem(d, sti, &sc->pre[i], &sc->preMem[i]);
+            VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+            vci.image = sc->pre[i];
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = ci->imageFormat;
+            vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            pok = pok && d->CreateImageView(dev, &vci, nullptr, &sc->preView[i]) == VK_SUCCESS;
+        }
+        if (!pok)
+        {
+            for (uint32_t i = 0; i < kStage; i++)
+            {
+                if (sc->preView[i]) d->DestroyImageView(dev, sc->preView[i], nullptr);
+                if (sc->pre[i]) d->DestroyImage(dev, sc->pre[i], nullptr);
+                if (sc->preMem[i]) d->FreeMemory(dev, sc->preMem[i], nullptr);
+                sc->preView[i] = VK_NULL_HANDLE; sc->pre[i] = VK_NULL_HANDLE; sc->preMem[i] = VK_NULL_HANDLE;
+            }
+            if (sc->clean) d->DestroyImage(dev, sc->clean, nullptr);
+            if (sc->cleanMem) d->FreeMemory(dev, sc->cleanMem, nullptr);
+            sc->clean = VK_NULL_HANDLE; sc->cleanMem = VK_NULL_HANDLE;
+            LOGW("BFI Presenter: frame warp: the images for the frame from before ReShade's effects could not be made -- the finished frame is used");
+        }
+    }
     // Frame warp with the game's own motion: a motion texture per staging slot at half the frame's size (rgba16f,
     // written by a compute pass at the game's present, sampled by the presenter). Optional: without them the measured
     // motion is used.
@@ -6053,6 +6123,9 @@ static bool BuildSC(Swapchain *sc, const VkSwapchainCreateInfoKHR *ci)
         }
         for (uint32_t i = 0; i < kStage; i++)
             b.push_back(ImgBarrier(sc->stage[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 0));
+        for (uint32_t i = 0; i < kStage; i++)
+            if (sc->pre[i]) b.push_back(ImgBarrier(sc->pre[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 0));
+        if (sc->clean) b.push_back(ImgBarrier(sc->clean, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, 0));
         d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr,
                               (uint32_t)b.size(), b.data());
         d->EndCommandBuffer(cb);
@@ -7394,6 +7467,58 @@ static bool RelimiterLoaded()
 }
 
 // The in-game OSD (common/bfi_osd.h), every frame through ReShade's overlay event.
+// FrameWarpStillBeforeEffects (1.0.48, as DX's dx/bfi_prefx.h): reshade_begin_effects -- the game's frame, before ReShade's
+// effects, copied into the swap chain's `clean` image on ReShade's command buffer (the back buffer is in
+// COLOR_ATTACHMENT_OPTIMAL there, as ReShade has it for its effects). 64-bit: ReShade's back buffer call returns its
+// resource through a hidden pointer (MSVC), called through the vtable as ReShade expects.
+static void on_begin_effects(reshade::api::effect_runtime *rt, reshade::api::command_list *cmd, reshade::api::resource_view, reshade::api::resource_view)
+{
+#ifdef _WIN64
+    if (!rt || !cmd || !g_shared.frameWarp || !g_shared.warpStillPre) return;
+    {
+        static int on = -1;
+        static unsigned n = 0;
+        if (on < 0 || (n++ % 60) == 0)
+        {
+            int k = 0;
+            rt->enumerate_techniques(nullptr, [&](reshade::api::effect_runtime *r, reshade::api::effect_technique t) { if (r->get_technique_state(t)) k++; });
+            on = k;
+        }
+        if (on == 0) return;
+    }
+    Swapchain *sc = GetSC((VkSwapchainKHR)rt->get_native());
+    if (!sc || !sc->clean || !sc->d) return;
+    typedef reshade::api::resource *(*Fn)(reshade::api::effect_runtime *self, reshade::api::resource *ret, uint32_t index);
+    reshade::api::resource r = {};
+    void **vt = *reinterpret_cast<void ***>(rt);
+    reinterpret_cast<Fn>(vt[5])(rt, &r, rt->get_current_back_buffer_index());
+    VkImage bb = (VkImage)r.handle;
+    bool ours = false;
+    for (uint32_t i = 0; i < sc->nVirt; i++) if (sc->virt[i] == bb) ours = true;
+    if (!ours) return;                                  // not one of the stand-in images the game renders to
+    DeviceData *d = sc->d;
+    VkCommandBuffer cb = (VkCommandBuffer)cmd->get_native();
+    VkImageMemoryBarrier b[2] = {
+        ImgBarrier(bb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT),
+        ImgBarrier(sc->clean, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT) };
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+    VkImageCopy ic = {};
+    ic.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    ic.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    ic.extent = { sc->extent.width, sc->extent.height, 1 };
+    d->CmdCopyImage(cb, bb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc->clean, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    b[0] = ImgBarrier(bb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    b[1] = ImgBarrier(sc->clean, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+    sc->preCaptured = true;
+    static bool logged = false;
+    if (!logged) { logged = true; LOGI("BFI Presenter: frame warp: what stands still is found in the frame from before ReShade's effects"); }
+#else
+    (void)rt; (void)cmd;
+#endif
+}
+
 static void on_osd(reshade::api::effect_runtime *rt)
 {
     // One runtime only (ImGui's context is shared between ReShade's runtimes; see the DX add-on): the first that draws,
@@ -7968,6 +8093,20 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
                     ImGui::SetTooltip("This game hasn't handed DLSS (Vulkan) any motion data (no DLSS call seen).");
             }
+            {
+                bool sp = s.warpStillPre != 0;
+                if (ImGui::Checkbox("Find the HUD before ReShade's effects", &sp)) s.warpStillPre = sp ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("What stands still on the screen (a HUD, text) is found in the game's frame from before\n"
+                                                              "ReShade's effects, so a CRT shader's blur and glow over the HUD don't make it look as if\n"
+                                                              "it moved (it broke up on filled flashes). Only while an effect is on. Switched on, it\n"
+                                                              "takes effect when the game next recreates its swap chain (a resolution or mode change).");
+            }
+            ImGui::SliderInt("Edge dilation (depth texels)", &s.warpDilate, 0, 3, s.warpDilate > 0 ? "%d" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's motion: each point takes the motion of the nearest thing within this many of\n"
+                                                          "the game's depth texels, so the edges of what is in front move with it instead of staying\n"
+                                                          "behind with the background (outlines around characters). Higher reaches further, for\n"
+                                                          "things close to the camera; too high and the background next to an edge moves with it\n"
+                                                          "(a halo). 1 by default, 0 = off.");
             ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader, set it\n"
                                                           "to the mask's width so the mask stays in place. 0 = off. Ctrl+click to type a value.");
@@ -8174,7 +8313,10 @@ static void TryRegisterReShade()
     ov("BFI Presenter (Vulkan)", draw_overlay);
     // the in-game OSD: ReShade's overlay event, every frame
     if (auto ev = (void (*)(reshade::addon_event, void *))(void *)GetProcAddress(rs, "ReShadeRegisterEvent"))
+    {
         ev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
+        ev(reshade::addon_event::reshade_begin_effects, (void *)&on_begin_effects);   // FrameWarpStillBeforeEffects
+    }
     static bool pinned = false;
     if (!pinned)
     {
@@ -8196,7 +8338,10 @@ static void UnregisterReShade()
     auto ureg = (void (*)(HMODULE))(void *)GetProcAddress(g_rsModule, "ReShadeUnregisterAddon");
     if (uov) uov("BFI Presenter (Vulkan)", draw_overlay);
     if (auto uev = (void (*)(reshade::addon_event, void *))(void *)GetProcAddress(g_rsModule, "ReShadeUnregisterEvent"))
+    {
         uev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
+        uev(reshade::addon_event::reshade_begin_effects, (void *)&on_begin_effects);
+    }
     if (ureg) ureg(g_module);
     g_rsModule = nullptr;
 }
