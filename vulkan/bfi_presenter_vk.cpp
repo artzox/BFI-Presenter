@@ -417,7 +417,7 @@ static void LoadSettings(Settings &s)
     s.warpFgLag = Clamp(KvInt(kv, "FrameWarpGameMotionFGLag", 1), -1, 1);
     s.warpEase = KvInt(kv, "FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = KvInt(kv, "FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
-    s.warpDilate = KvInt(kv, "FrameWarpGameDilate", 1) ? 1 : 0;
+    s.warpDilate = std::max(0, std::min(3, KvInt(kv, "FrameWarpGameDilate", 1)));
     s.warpGuard = KvInt(kv, "FrameWarpGuard", 1) ? 1 : 0;
     s.warpPauseLb = KvInt(kv, "FrameWarpPauseCutscenes", 1) ? 1 : 0;
     s.dlssHooks = KvInt(kv, "DlssHooks", 1) ? 1 : 0;
@@ -502,7 +502,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); I("FrameWarpGameDilate", s.warpDilate); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexLimitAtSleep", s.reflexAtSleep); I("ReflexAlign", s.reflexAlign); I("LearnReflexStart", s.learnReflex); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -5380,7 +5380,7 @@ static void AtPresent(DeviceData *d, Swapchain *sc, uint32_t slot, VkCommandBuff
     gp.outTexel[0] = 1.0f / (float)sc->gW; gp.outTexel[1] = 1.0f / (float)sc->gH;
     gp.mvScale[0] = e.mvScale[0] * scale; gp.mvScale[1] = e.mvScale[1] * scale;
     memcpy(gp.mvMap, e.mvMap, sizeof(gp.mvMap)); memcpy(gp.dMap, e.dMap, sizeof(gp.dMap));
-    gp.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (g_shared.warpDilate ? 4u : 0u);
+    gp.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | ((uint32_t)g_shared.warpDilate << 4);
     gp.mvInvalid = 3.402823466e38f;                                // DLSS has no marker for a missing vector
     gp.perRendered = scale > 0.0f ? 1.0f / scale : 1.0f;            // shown frames per rendered one: back to a whole rendered frame's motion
     gp.prevOk = prevOk ? 1.0f : 0.0f;
@@ -7970,6 +7970,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
                     ImGui::SetTooltip("This game hasn't handed DLSS (Vulkan) any motion data (no DLSS call seen).");
             }
+            ImGui::SliderInt("Edge dilation (depth texels)", &s.warpDilate, 0, 3, s.warpDilate > 0 ? "%d" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's motion: each point takes the motion of the nearest thing within this many of\n"
+                                                          "the game's depth texels, so the edges of what is in front move with it instead of staying\n"
+                                                          "behind with the background (outlines around characters). Higher reaches further, for\n"
+                                                          "things close to the camera; too high and the background next to an edge moves with it\n"
+                                                          "(a halo). 1 by default, 0 = off.");
             ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader, set it\n"
                                                           "to the mask's width so the mask stays in place. 0 = off. Ctrl+click to type a value.");
