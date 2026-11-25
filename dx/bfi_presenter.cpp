@@ -181,7 +181,8 @@ struct Settings
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
-    int   warpDilate = 1;     // FrameWarpGameDilate (1.0.48, ini only): the game's vectors dilated by depth (nearest of 3x3)
+    int   warpDilate = 1;     // FrameWarpGameDilate (1.0.48): the game's vectors dilated by depth -- each point takes the
+                              // nearest point's vector within this many depth texels (0 off, 1-3)
     int   hudFromDlss = 1;    // FrameWarpHudFromDlss (1.0.47, ini only): without a HUD-less picture from the game, DLSS's own
                               // output (the scene before post-processing and the HUD) is compared with the frame instead
     int   dlssOutState = 8;   // DlssOutputState (ini only): the state DLSS's output is in after its call (8 = unordered access)
@@ -375,7 +376,7 @@ static void LoadSettings(Settings &s)
     s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
     s.hudFromDlss = IniInt("FrameWarpHudFromDlss", 1) ? 1 : 0;
-    s.warpDilate = IniInt("FrameWarpGameDilate", 1) ? 1 : 0;
+    s.warpDilate = std::max(0, std::min(3, IniInt("FrameWarpGameDilate", 1)));
     s.dlssOutState = IniInt("DlssOutputState", 8);
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
@@ -631,6 +632,7 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
     IniWriteInt("FrameWarpEvenPacing", s.warpEven);
     IniWriteInt("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg);
+    IniWriteInt("FrameWarpGameDilate", s.warpDilate);
     IniWriteInt("FrameWarpPauseCutscenes", s.warpPauseLb);
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
@@ -9178,7 +9180,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     gc.pad[0] = scale > 0.0f ? 1.0f / scale : 1.0f;        // shown frames per rendered one: back to a whole rendered frame's motion
     gc.pad[1] = prevOk ? 1.0f : 0.0f;
     const bool linear = StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (linear ? 8u : 0u) | (g_shared.warpDilate ? 16u : 0u);
+    gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (linear ? 8u : 0u) | ((uint32_t)g_shared.warpDilate << 16);
     memcpy(gc.hMap, hlMap, sizeof(gc.hMap));
     if (hl && !hudModesSet)
     {
@@ -14083,6 +14085,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
                     ImGui::SetTooltip("This game hasn't handed DLSS any motion data (no Streamline or DLSS call seen).");
             }
+            ImGui::SliderInt("Edge dilation (depth texels)", &s.warpDilate, 0, 3, s.warpDilate > 0 ? "%d" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's motion: each point takes the motion of the nearest thing within this many of\n"
+                                                          "the game's depth texels, so the edges of what is in front move with it instead of staying\n"
+                                                          "behind with the background (outlines around characters). Higher reaches further, for\n"
+                                                          "things close to the camera; too high and the background next to an edge moves with it\n"
+                                                          "(a halo). 1 by default, 0 = off.");
             ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader (e.g.\n"
                                                           "CRT-Standalone), set it to the mask's width so the mask stays in place. 0 = off.");
