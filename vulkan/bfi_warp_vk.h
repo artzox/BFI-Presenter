@@ -62,8 +62,8 @@ struct WarpVk
     // Set 2's layout: made before the BFI pipelines' layouts, which include it.
     bool CreateLayout(DeviceData *d)
     {
-        VkDescriptorSetLayoutBinding b[4] = {};
-        for (int i = 0; i < 4; i++)
+        VkDescriptorSetLayoutBinding b[6] = {};
+        for (int i = 0; i < 6; i++)
         {
             b[i].binding = (uint32_t)i;
             b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -71,7 +71,8 @@ struct WarpVk
             b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
         }
         VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        dli.bindingCount = 4;                          // binding 3: the game's own motion for the frame (gvk)
+        dli.bindingCount = 6;                          // binding 3: the game's own motion for the frame (gvk); 4, 5: the frames
+                                                       // from before ReShade's effects (FrameWarpStillBeforeEffects)
         dli.pBindings = b;
         return d->CreateDescriptorSetLayout(d->device, &dli, nullptr, &dslW) == VK_SUCCESS;
     }
@@ -115,7 +116,7 @@ struct WarpVk
 
     // stageView: the staging ring's views (SHADER_READ_ONLY_OPTIMAL). Set 2 is required (false = the BFI pipelines
     // can't be used); the passes are optional (ok).
-    bool Init(DeviceData *d, const VkImageView *stageView, const VkImageView *gameFlowView, uint32_t frameW, uint32_t frameH)
+    bool Init(DeviceData *d, const VkImageView *stageView, const VkImageView *gameFlowView, const VkImageView *preView, uint32_t frameW, uint32_t frameH)
     {
         VkDevice dev = d->device;
         srcW = frameW; srcH = frameH;
@@ -129,7 +130,7 @@ struct WarpVk
         r = r && MakeImage(d, Out(), w[kOut], h[kOut]);
         if (r)
         {
-            VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * kStage * kStage };
+            VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 * kStage * kStage };
             VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             dpi.maxSets = kStage * kStage;
             dpi.poolSizeCount = 1;
@@ -153,6 +154,16 @@ struct WarpVk
                     gw.dstSet = dsW[a][b]; gw.dstBinding = 3; gw.descriptorCount = 1;
                     gw.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; gw.pImageInfo = &gi;
                     d->UpdateDescriptorSets(d->device, 1, &gw, 0, nullptr);
+                    // the frames from before ReShade's effects (the stage frames where there are none: read only with flags & 16384)
+                    VkDescriptorImageInfo pi[2] = { { lin, preView && preView[a] ? preView[a] : stageView[a], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+                                                    { lin, preView && preView[b] ? preView[b] : stageView[b], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } };
+                    VkWriteDescriptorSet pw[2] = { { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }, { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET } };
+                    for (int k = 0; k < 2; k++)
+                    {
+                        pw[k].dstSet = dsW[a][b]; pw[k].dstBinding = 4 + (uint32_t)k; pw[k].descriptorCount = 1;
+                        pw[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; pw[k].pImageInfo = &pi[k];
+                    }
+                    d->UpdateDescriptorSets(d->device, 2, pw, 0, nullptr);
                 }
         }
         ready = r;
