@@ -198,7 +198,7 @@ cbuffer G : register(b1)
     float4 gDepthMap;     // screen uv -> depth texel
     float  gMvInvalid;    // the value the game writes where a vector is not valid
     uint   gFlags;        // 1 depth reversed (near = 1), 2 depth available, 4 the HUD mask (t7) is valid, 8 the frame is linear (scRGB),
-                          // 16 dilate the vectors (the nearest point's of 3x3)
+                          // bits 16-17: how far the vectors are dilated (the nearest point's within 0-3 depth texels)
     float  gPerRendered;  // shown frames per rendered one (frame generation; 1 without): gMvScale * this = a rendered frame's motion
     float  gPrevOk;       // 1 = t11 holds the vectors of the rendered frame before
     float4 gHMap;         // screen uv -> the game's HUD-less picture's texel
@@ -235,18 +235,19 @@ float4 PSWarpGame(float4 pos : SV_Position) : SV_Target
         int2 dq = clamp(int2(uv * gDepthMap.xy + gDepthMap.zw), int2(0, 0), int2(dw, dh) - 1);
         float d = gDepth.Load(int3(dq, 0));
         nearv = (gFlags & 1) != 0 ? d : 1.0 - d;
-        // Dilation (FrameWarpGameDilate, 1.0.48): the vector of the nearest point of the 3x3 depth texels around this one,
+        // Dilation (FrameWarpGameDilate, 1.0.48): the vector of the nearest point within R depth texels around this one (8 directions),
         // as DLSS and NVIDIA's Reflex 2 capture (cuda_capture_mv_dilate_kernel) do. The game's vectors are at its render
         // size, so along the edge of something in front the frame's pixels took the background's vector: the edge stayed
         // behind (doubled outlines, a smear on filled flashes). Now the edge moves with what it belongs to.
-        if ((gFlags & 16) != 0 && mOk)
+        const int R = int((gFlags >> 16) & 3u);           // how far, in depth texels (FrameWarpGameDilate: 0 off .. 3)
+        if (R > 0 && mOk)
         {
             const float2 dt = 1.0 / gDepthMap.xy;          // one depth texel, in screen uv
-            [unroll] for (int y = -1; y <= 1; y++)
-                [unroll] for (int x = -1; x <= 1; x++)
+            static const int2 dirs[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1) };
+            [loop] for (int r = 1; r <= R; r++)
+                [unroll] for (int k = 0; k < 8; k++)
                 {
-                    if (x == 0 && y == 0) continue;
-                    const float2 nu = uv + float2(x, y) * dt;
+                    const float2 nu = uv + float2(dirs[k] * r) * dt;
                     const int2 nd = clamp(int2(nu * gDepthMap.xy + gDepthMap.zw), int2(0, 0), int2(dw, dh) - 1);
                     const float dn = gDepth.Load(int3(nd, 0));
                     const float nn = (gFlags & 1) != 0 ? dn : 1.0 - dn;

@@ -66,6 +66,7 @@ namespace gmo                                    // frame warp from the game's o
 static void AtPresent(ID3D12GraphicsCommandList *list, UINT s);
 static void Published(UINT s, UINT64 id);
 static int  SlotFor(int s, UINT64 id);
+static int  PendingFor(UINT s);
 static float SlotLag(int s);
 static ID3D12Resource *FlowRes(int s);
 static UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride);
@@ -86,6 +87,7 @@ namespace gmo                                    // 32-bit games: no Streamline,
 static inline void AtPresent(ID3D12GraphicsCommandList *, UINT) {}
 static inline void Published(UINT, UINT64) {}
 static inline int  SlotFor(int, UINT64) { return 0; }
+static inline int  PendingFor(UINT) { return 0; }
 static inline float SlotLag(int) { return 0.0f; }
 static inline ID3D12Resource *FlowRes(int) { return nullptr; }
 static inline UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE, UINT) { return 0; }
@@ -181,10 +183,15 @@ struct Settings
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
-    int   warpDilate = 1;     // FrameWarpGameDilate (1.0.48, ini only): the game's vectors dilated by depth (nearest of 3x3)
+    int   warpDilate = 1;     // FrameWarpGameDilate (1.0.48): the game's vectors dilated by depth -- each point takes the
+                              // nearest point's vector within this many depth texels (0 off, 1-3)
     int   hudFromDlss = 1;    // FrameWarpHudFromDlss (1.0.47, ini only): without a HUD-less picture from the game, DLSS's own
                               // output (the scene before post-processing and the HUD) is compared with the frame instead
     int   dlssOutState = 8;   // DlssOutputState (ini only): the state DLSS's output is in after its call (8 = unordered access)
+    int   warpDrawAhead = 1;  // FrameWarpDrawAhead (test): with the game's motion, ReShade's effects drawn after the move
+                              // (dx/bfi_fxahead.h) -- a CRT shader's mask and curve stay put on moved flashes
+    int   fxReplayTest = 0;   // EffectsReplayTest (test build, ini only): can ReShade's effects be rendered again on a copy of the
+                              // frame taken before them? Logs the result every 3 s (dx/bfi_fxreplay.h)
     int   warpEase = 1;       // FrameWarpGameMotionEase (test, ini only): with the game's motion and frame generation, the
                               // part of a move past the rendered frame eases off as the game's motion slows (1 = on)
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this
@@ -375,7 +382,9 @@ static void LoadSettings(Settings &s)
     s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
     s.hudFromDlss = IniInt("FrameWarpHudFromDlss", 1) ? 1 : 0;
-    s.warpDilate = IniInt("FrameWarpGameDilate", 1) ? 1 : 0;
+    s.warpDilate = std::max(0, std::min(3, IniInt("FrameWarpGameDilate", 1)));
+    s.fxReplayTest = IniInt("EffectsReplayTest", 0) ? 1 : 0;
+    s.warpDrawAhead = IniInt("FrameWarpDrawAhead", 1) ? 1 : 0;
     s.dlssOutState = IniInt("DlssOutputState", 8);
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
@@ -631,6 +640,8 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
     IniWriteInt("FrameWarpEvenPacing", s.warpEven);
     IniWriteInt("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg);
+    IniWriteInt("FrameWarpGameDilate", s.warpDilate);
+    IniWriteInt("FrameWarpDrawAhead", s.warpDrawAhead);
     IniWriteInt("FrameWarpPauseCutscenes", s.warpPauseLb);
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
@@ -2371,6 +2382,15 @@ float DecayShare(uint s, float phi, float T, float n)
     return (exp(-a / T) - exp(-n / T) + 1.0 - exp(-(b - n) / T)) / norm;
 }
 
+// Draw ahead (FrameWarpDrawAhead, test): the game's frame from before ReShade's effects, moved -- in its own encoding,
+// nothing else applied (ReShade's effects are drawn on it after, then the strobe as on any frame).
+float4 PSMoveOnly(float4 pos : SV_Position) : SV_Target
+{
+    float3 c;
+    if (!FetchWarped(pos.xy, c)) c = src.Load(int3(pos.xy, 0)).rgb;
+    return float4(c, 1);
+}
+
 float4 PSMain(float4 pos : SV_Position) : SV_Target
 {
     float3 c = Fetch(pos.xy);
@@ -2487,7 +2507,40 @@ struct Constants
     float    warpLag;                   // the game's motion with frame generation: shown frames behind its vectors' frame
     float    warpEase;                  // the game's motion: 1 = moves past the rendered frame ease off as the motion slows
     float    osdX0, osdY0, osdX1, osdY1;  // frame warp: the BFI OSD on the frame, game-frame pixels (none: x1 <= x0)
+    uint32_t fxVar;                     // draw ahead: 1 + the drawn-ahead frame shown (not read by the shader; keeps the
+                                        // refreshes' constants apart, so a drawn buffer isn't reused for the wrong one)
 };
+
+// Draw ahead (FrameWarpDrawAhead, test; dx/bfi_fxahead.h). At the game's present, on the game's thread, the frame from
+// before ReShade's effects is drawn moved by the game's motion -- to where the presenter will most likely show it -- and
+// ReShade's effects are drawn on each (a CRT shader's curve, mask and grain then sit on the moved picture, as on a
+// rendered frame). The presenter shows one of these instead of moving the finished frame when its move matches.
+namespace fxa
+{
+static const int kVar = 6;                      // two frames' worth: the moves for a frame's first flash (on time, or a cycle
+                                                // late) and for a repeat
+struct Var
+{
+    ID3D12Resource *res = nullptr;              // made by the game's thread (with ReShade's device: its effects draw on it)
+    UINT64 frameId = 0;                         // 0 = being drawn or none (g_lock)
+    float  ahead = 0.0f;                        // the move, game frames (as Constants::warp)
+    UINT64 readFence = 0;                       // the presenter's last read of it (g_presFence)
+};
+static Var var[kVar];
+static std::atomic<UINT> varGen{0};             // bumped when the textures are made anew: the presenter writes its views again
+static std::atomic<float> predFirst{-1.0f}, predLate{-1.0f}, predRepeat{-1.0f};   // the presenter's guess of the next moves
+                                                // (-1 = none): the next frame's first flash at the next cycle, one cycle later, a repeat
+static std::atomic<bool> overlayOpen{false};    // ReShade's window is open (drawn after the effects: not on frames drawn ahead)
+static std::atomic<int> hits{0}, missNone{0}, missFar{0};       // per 10 s
+static std::atomic<int> sumDeltaMilli{0};                        // |move wanted - move drawn| of the hits, 1/1000 frames
+static std::atomic<float> missWant{0.0f}, missHave{0.0f};       // the last miss with frames drawn: the move wanted, the nearest drawn
+static void Record(ID3D12GraphicsCommandList *list, UINT s);   // the game's thread, in Present (defined in bfi_fxahead.h)
+static UINT64 WaitRead();
+static void Effects();
+static void Publish(UINT64 id);
+static void Release();
+static ID3D12Resource *CleanNow();                // this frame from before ReShade's effects (in Present, before Record), or null
+}
 static_assert(sizeof(Constants) / 4 <= 63, "root constants: at most 64 DWORDs in the root signature");
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -2653,9 +2706,12 @@ static void Trace(const char *fmt, ...)
 // they are usually ready), and kept on disk in BFIPresenter_shaders.bin next to the ini, keyed to the exact source and
 // compile flags: from the second start of a version there is no compile at all.
 static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce",
-                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud" };   // the last six: kWarpShader (dx/bfi_warp.h)
-static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
-static const int kShN = 11;
+                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud",   // these six: kWarpShader (dx/bfi_warp.h)
+                                         "PSMoveOnly" };
+static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0",
+                                         "ps_5_0" };
+static const int kShN = 12;
+static const int kShMoveOnly = 11;               // draw ahead: the game's frame moved, nothing else
 static const int kShWarpGame = 9;                // frame warp from the game's own motion vectors and depth
 static const int kShWarpHud = 10;                // and its HUD mask from the game's HUD-less picture
 static const int kShWarp = 5;                    // first of the frame warp shaders
@@ -3736,6 +3792,8 @@ static DWORD WINAPI PresenterThread(void *)
     bool   chkPending = false;
     int    chkSrc = 0;
     const UINT kGameFlowSrv = kStage + 2 + WarpGpu::kSrvCount;   // their views in srvHeap
+    const UINT kFxSrv = kGameFlowSrv + kStage;                   // draw ahead: the frames drawn ahead (fxa::var)
+    UINT   fxGenSeen = ~0u;                                      // the generation of them the views were written for
     bool   kwarp = false;
     UINT64 measFence = 0;
     IDXGIOutput *output = nullptr;
@@ -3762,7 +3820,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
+    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + fxa::kVar;   // the stage frames, the APL Limiter's cells and its 1x1 average,
                                                                        // frame warp's textures, the game's own motion per stage slot
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
@@ -4533,6 +4591,35 @@ static DWORD WINAPI PresenterThread(void *)
         else if (cycleStart)
             warpAhead = warpClock.Cycle((s.warpEven && s.warpGame && gmo::StateFast() > 0 && (!g_status.fgActive || s.warpGameFg)) ? 2 : 1, pickId, pickTime, tVb, (double)s.frames / (modeHz > 1.0 ? modeHz : 120.0),
                                         (double)s.warpMax, (double)s.warpMinRate / 100.0);
+        // Draw ahead: the moves the next frame will most likely be shown with, for the game's thread to draw ahead --
+        // its first flash and a repeat (as WarpClock::Cycle works them out with one new frame, then none).
+        if (cycleStart)
+        {
+            const bool even = s.warpEven && s.warpGame && gmo::StateFast() > 0 && (!g_status.fgActive || s.warpGameFg);
+            float f1 = -1.0f, f2 = -1.0f, f3 = -1.0f;
+            if (s.frameWarp && s.warpDrawAhead && warpClock.engaged && warpClock.rate > 0.0)
+            {
+                const double r0 = warpClock.rate, mx = s.warpMax;
+                const bool locked = r0 > 0.9 && std::fabs(r0 - std::floor(r0 + 0.5)) < 0.012;
+                const double r = locked ? std::floor(r0 + 0.5) : r0, k = locked ? 0.9 : 0.99;
+                if (even)
+                {
+                    double a1 = std::max(0.0, std::min(mx, (warpClock.ahead + r - 1.0) * k));
+                    double a2 = std::max(a1, std::min(mx, (a1 + r) * k));
+                    // the frame first shown a cycle later: the old one repeated once more before it (da2: half the misses)
+                    const double aRep = std::max(warpClock.ahead, std::min(mx, (warpClock.ahead + r) * k));
+                    double a3 = std::max(0.0, std::min(mx, (aRep + r - 1.0) * k));
+                    f1 = (float)(std::floor(a1 * 256.0 + 0.5) / 256.0); f2 = (float)(std::floor(a2 * 256.0 + 0.5) / 256.0);
+                    f3 = (float)(std::floor(a3 * 256.0 + 0.5) / 256.0);
+                }
+                else
+                {
+                    int N = (int)std::floor(1.0 / r0 + 0.5) - 1; if (N < 1) N = 1;
+                    f2 = (float)(std::floor(std::min(mx, 1.0 / (N + 1)) * 256.0 + 0.5) / 256.0);
+                }
+            }
+            fxa::predFirst = f1; fxa::predRepeat = f2; fxa::predLate = f3;
+        }
         pickNew = cycleStart && pickId != lastShownId;
         pickRelT = (pickNew && g_relId[pickId % kRel] == pickId) ? g_relT[pickId % kRel] : 0.0;
         // Measured from when the frame's copy finished on the GPU, not from its Present: in God of War Ragnarok
@@ -4735,6 +4822,34 @@ static DWORD WINAPI PresenterThread(void *)
             }
         }
         if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame[c.warpSrc <= 2 ? c.warpSrc : 0]++; }
+        // Draw ahead: a frame drawn ahead with this move (ReShade's effects on the moved picture) is shown as it is.
+        int fxv = -1;
+        if (s.warpDrawAhead && c.warp != 0.0f && c.warpSrc != 0 && !g_status.fgActive)
+        {
+            float bestD = 1.0f; bool any = false;
+            for (int v = 0; v < fxa::kVar; v++)
+                if (fxa::var[v].frameId == pickId)
+                {
+                    any = true;
+                    const float d = std::fabs(fxa::var[v].ahead - c.warp);
+                    if (d < bestD) { bestD = d; fxv = v; }
+                }
+            if (fxv >= 0 && bestD > 0.02f) fxv = -1;    // too far from it: moved as before (the log counts these)
+            if (cycleStart)
+            {
+                if (fxv >= 0) { fxa::hits++; fxa::sumDeltaMilli += (int)(bestD * 1000.0f + 0.5f); }
+                else if (any)
+                {
+                    fxa::missFar++; fxa::missWant = c.warp;
+                    float nd = 9.0f, nh = 0.0f;
+                    for (int v = 0; v < fxa::kVar; v++)
+                        if (fxa::var[v].frameId == pickId && std::fabs(fxa::var[v].ahead - c.warp) < nd) { nd = std::fabs(fxa::var[v].ahead - c.warp); nh = fxa::var[v].ahead; }
+                    fxa::missHave = nh;
+                }
+                else fxa::missNone++;
+            }
+            if (fxv >= 0) { c.warp = 0.0f; c.warpSrc = 0; c.warpPrevN = 0.0f; c.warpEase = 0.0f; c.warpLag = 0.0f; gFlow = nullptr; c.fxVar = (uint32_t)fxv + 1; }
+        }
 
         if (pickNew2 < 0) pickNew2 = pick;                       // picked later (the wait above): the same frame
         const UINT64 pickId2 = pickNew2 >= 0 ? g_stageId[pickNew2] : 0;
@@ -4746,6 +4861,7 @@ static DWORD WINAPI PresenterThread(void *)
             g_readFence[pick] = reserve;
             if (pickNew2 != pick) g_readFence[pickNew2] = reserve;
             if (c.warp != 0.0f) g_readFence[warpPrev] = reserve;
+            if (fxv >= 0) fxa::var[fxv].readFence = reserve;
         }
         // The game never copies into the slot being shown (g_presCurSlot), so
         // the lock can go before waiting on the GPU.
@@ -4791,6 +4907,11 @@ static DWORD WINAPI PresenterThread(void *)
             D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &b2);
         }
+        if (fxv >= 0)
+        {
+            D3D12_RESOURCE_BARRIER bv = Transition(fxa::var[fxv].res, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &bv);
+        }
         if (c.warp != 0.0f)
         {
             D3D12_RESOURCE_BARRIER b3 = Transition(g_stage[warpPrev], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -4805,10 +4926,32 @@ static DWORD WINAPI PresenterThread(void *)
         rtv.ptr += (SIZE_T)bi * rtvStride;
         D3D12_GPU_DESCRIPTOR_HANDLE srv = srvHeap->GetGPUDescriptorHandleForHeapStart();
         srv.ptr += (UINT64)pick * srvStride;
+        D3D12_GPU_DESCRIPTOR_HANDLE drawSrv = srv;                         // what the strobe draws from (draw ahead: the frame drawn ahead)
+        if (fxv >= 0)
+        {
+            const UINT gen = fxa::varGen.load();
+            if (gen != fxGenSeen)                                          // views of the frames drawn ahead (made anew)
+            {
+                D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+                sv.Format = StageFormat();
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                sv.Texture2D.MipLevels = 1;
+                for (int v = 0; v < fxa::kVar; v++)
+                {
+                    D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                    h.ptr += (SIZE_T)(kFxSrv + (UINT)v) * srvStride;
+                    g_device->CreateShaderResourceView(fxa::var[v].res, &sv, h);   // a null view while there is none
+                }
+                fxGenSeen = gen;
+            }
+            drawSrv = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            drawSrv.ptr += (UINT64)(kFxSrv + (UINT)fxv) * srvStride;
+        }
         list->SetDescriptorHeaps(1, &srvHeap);
         list->SetGraphicsRootSignature(rootSig);
         list->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &c, 0);
-        list->SetGraphicsRootDescriptorTable(1, srv);
+        list->SetGraphicsRootDescriptorTable(1, drawSrv);
         D3D12_GPU_DESCRIPTOR_HANDLE aplSrv = srv;                          // unused unless the limiter is on
         if (aplOk)
         {
@@ -4959,7 +5102,7 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 list->SetPipelineState(pso);
                 list->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &c, 0);
-                list->SetGraphicsRootDescriptorTable(1, srv);
+                list->SetGraphicsRootDescriptorTable(1, drawSrv);
             }
         }
         if (tsOn) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 1);
@@ -5072,6 +5215,11 @@ static DWORD WINAPI PresenterThread(void *)
         {
             D3D12_RESOURCE_BARRIER b2 = Transition(g_stage[pickNew2], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             list->ResourceBarrier(1, &b2);
+        }
+        if (fxv >= 0)
+        {
+            D3D12_RESOURCE_BARRIER bv = Transition(fxa::var[fxv].res, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(1, &bv);
         }
         if (c.warp != 0.0f)
         {
@@ -5587,6 +5735,16 @@ static DWORD WINAPI PresenterThread(void *)
             winWarpPaused += secWarpPaused; winCuts += gmo::CutsTake(); winWarpHeld += secWarpHeld;
             if (t - winPauseT >= 10.0)
             {
+                {
+                    const int h = fxa::hits.exchange(0), mn = fxa::missNone.exchange(0), mf = fxa::missFar.exchange(0), dm = fxa::sumDeltaMilli.exchange(0);
+                    static int fxLogs = 0;
+                    if (s.warpDrawAhead && (h || mn || mf) && fxLogs++ < 120)
+                        LOGI("BFI Presenter: draw ahead, last %.0f s: %d moved flashes shown from frames drawn ahead with the effects on them "
+                             "(%.3f frames from the move wanted on average), %d moved as before: %d with none drawn for that frame, %d with "
+                             "none close enough (the last: %.3f wanted, %.3f drawn; next guess: first flash %.3f, a cycle late %.3f, repeat %.3f)", t - winPauseT, h,
+                             h ? dm / 1000.0 / h : 0.0, mn + mf, mn, mf, fxa::missWant.load(), fxa::missHave.load(),
+                             fxa::predFirst.load(), fxa::predLate.load(), fxa::predRepeat.load());
+                }
                 static int pauseLogs = 0;
                 if ((winWarpPaused || winCuts || winWarpHeld) && pauseLogs++ < 60)
                     LOGI("BFI Presenter: frame warp, last %.0f s: %d camera cuts flagged by the game, %d strobe cycles not filled (camera cuts, "
@@ -7122,6 +7280,7 @@ static HRESULT SubmitGameFrameLocked()
     br[1] = Transition(g_stage[s], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     g_copyList->ResourceBarrier(2, br);
     gmo::AtPresent(g_copyList, s);            // frame warp: this frame's motion from the game's own vectors and depth
+    fxa::Record(g_copyList, s);               // draw ahead (test): the frame before ReShade's effects, moved
     {
         const HRESULT ch = g_copyList->Close();
         static bool once = false;
@@ -7136,13 +7295,16 @@ static HRESULT SubmitGameFrameLocked()
     }
 
     if (waitRead) g_gameQueue->Wait(g_presFence, waitRead);   // presenter done reading this slot
+    if (const UINT64 fw = fxa::WaitRead()) g_gameQueue->Wait(g_presFence, fw);   // and the frames drawn ahead being drawn over
     ID3D12CommandList *l[] = { g_copyList };
     g_gameQueue->ExecuteCommandLists(1, l);
+    fxa::Effects();                           // draw ahead: ReShade's effects on them (its command list, the same queue)
     g_gameQueue->Signal(g_gameFence, ++g_gameFenceVal);
     EnterCriticalSection(&g_lock);            // publish: selectable from here on
     g_stageFence[s] = g_gameFenceVal;
     g_stageId[s]    = ++g_frameId;
     gmo::Published(s, g_frameId);
+    fxa::Publish(g_frameId);
     g_recentFence[g_frameId % 8] = g_gameFenceVal;
     g_stageTime[s]  = Now();
     LeaveCriticalSection(&g_lock);
@@ -9137,6 +9299,10 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
             }
         }
     }
+    // The frame compared: from before ReShade's effects where draw ahead copied it (they would differ from the HUD-less
+    // picture everywhere), else the frame as staged.
+    ID3D12Resource *hFrame = fxa::CleanNow();
+    if (!hFrame) hFrame = g_stage[s];
     // the views for this slot: t5 vectors, t6 depth, t7 HUD mask, t8 the frame, t9 the HUD-less picture, t10 the raw mask before
     D3D12_CPU_DESCRIPTOR_HANDLE sh = srvHeap->GetCPUDescriptorHandleForHeapStart();
     sh.ptr += (SIZE_T)(7 * s) * srvStride;
@@ -9154,7 +9320,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         sv.Format = DXGI_FORMAT_R8_UNORM;
         g_device->CreateShaderResourceView(hudMask, &sv, at(2));
         sv.Format = StageFormat();
-        g_device->CreateShaderResourceView(g_stage[s], &sv, at(3));
+        g_device->CreateShaderResourceView(hFrame, &sv, at(3));
         sv.Format = hl ? ColorView(hlFmt) : DXGI_FORMAT_R8G8B8A8_UNORM;
         g_device->CreateShaderResourceView(hl, &sv, at(4));
         sv.Format = DXGI_FORMAT_R8_UNORM;
@@ -9178,7 +9344,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     gc.pad[0] = scale > 0.0f ? 1.0f / scale : 1.0f;        // shown frames per rendered one: back to a whole rendered frame's motion
     gc.pad[1] = prevOk ? 1.0f : 0.0f;
     const bool linear = StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (linear ? 8u : 0u) | (g_shared.warpDilate ? 16u : 0u);
+    gc.flags = (e.depthRev ? 1u : 0u) | (e.hasDepth ? 2u : 0u) | (linear ? 8u : 0u) | ((uint32_t)g_shared.warpDilate << 16);
     memcpy(gc.hMap, hlMap, sizeof(gc.hMap));
     if (hl && !hudModesSet)
     {
@@ -9199,7 +9365,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
     if (hl)
     {
         D3D12_RESOURCE_BARRIER hb[4]; UINT nh = 0;
-        hb[nh++] = Transition(g_stage[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        hb[nh++] = Transition(hFrame, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         const bool hlTr = !(hlState & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         if (hlTr) hb[nh++] = Transition(hl, (D3D12_RESOURCE_STATES)hlState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         hb[nh++] = Transition(hudRaw[hudCur], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -9213,7 +9379,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         list->OMSetRenderTargets(2, rt, FALSE, nullptr);
         list->DrawInstanced(3, 1, 0, 0);
         nh = 0;
-        hb[nh++] = Transition(g_stage[s], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        hb[nh++] = Transition(hFrame, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         if (hlTr) hb[nh++] = Transition(hl, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, (D3D12_RESOURCE_STATES)hlState);
         hb[nh++] = Transition(hudRaw[hudCur], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         hb[nh++] = Transition(hudMask, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -9224,9 +9390,10 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         {
             hudState = 1;
             LOGI("BFI Presenter: frame warp, the game's own motion: the HUD is kept still with %s (%ux%u, format %d, "
-                 "the frame's %d, %s); compared as: %s", gc.hudMode == 3 ? "DLSS's output" : "the game's HUD-less picture",
+                 "the frame's %d, %s%s); compared as: %s", gc.hudMode == 3 ? "DLSS's output" : "the game's HUD-less picture",
                  (unsigned)hlMap[0], (unsigned)hlMap[1], (int)hlFmt, (int)StageFormat(),
-                 hlLive ? "read at the Present" : "copied when tagged", HudModeName(gc.hudMode));
+                 hlLive ? "read at the Present" : "copied when tagged", hFrame != g_stage[s] ? ", the frame from before ReShade's effects" : "",
+                 HudModeName(gc.hudMode));
         }
         hl->Release();
     }
@@ -9286,6 +9453,13 @@ static bool PauseNow(UINT64 id, bool letterbox, const char **why)
 
 // The presenter: is frame `id` in slot s warped with the game's motion? 0 no, 1 vectors and depth, 2 vectors only.
 static float SlotLag(int s) { return (s >= 0 && s < (int)kStage) ? slotLag[s] : 0.0f; }
+// Draw ahead (the game's thread, right after AtPresent): does the frame being staged in slot s have the game's motion?
+// 0 no (none, or a camera cut), 1 vectors and depth, 2 vectors only.
+static int PendingFor(UINT s)
+{
+    if (s >= kStage || !slotPend[s] || !slotOk[s]) return 0;
+    return slotDepth[s] ? 1 : 2;
+}
 static int SlotFor(int s, UINT64 id)
 {
     if (s < 0 || s >= (int)kStage || !id || slotId[s].load() != id || !slotOk[s]) return 0;
@@ -14059,6 +14233,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
                 bool en = s.warpEaseNoFg != 0;
                 if (ImGui::Checkbox("Ease off as the motion slows", &en)) s.warpEaseNoFg = en ? 1 : 0;
+                bool da = s.warpDrawAhead != 0;
+                if (ImGui::Checkbox("Draw ReShade's effects after the move (test)", &da)) s.warpDrawAhead = da ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion (DX12, without frame generation): each frame is also drawn moved\n"
+                                                              "before ReShade's effects, and the effects are drawn on the moved picture -- a CRT shader's\n"
+                                                              "mask, scanlines and curve stay where they are on moved flashes, and a still HUD is found on\n"
+                                                              "the game's own frame. Costs the effects once or twice more per game frame (GPU).");
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
                                                               "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
                                                               "stop isn't carried past it and snapped back. With frame generation it is always on.");
@@ -14083,6 +14263,12 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
                     ImGui::SetTooltip("This game hasn't handed DLSS any motion data (no Streamline or DLSS call seen).");
             }
+            ImGui::SliderInt("Edge dilation (depth texels)", &s.warpDilate, 0, 3, s.warpDilate > 0 ? "%d" : "off");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's motion: each point takes the motion of the nearest thing within this many of\n"
+                                                          "the game's depth texels, so the edges of what is in front move with it instead of staying\n"
+                                                          "behind with the background (outlines around characters). Higher reaches further, for\n"
+                                                          "things close to the camera; too high and the background next to an edge moves with it\n"
+                                                          "(a halo). 1 by default, 0 = off.");
             ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader (e.g.\n"
                                                           "CRT-Standalone), set it to the mask's width so the mask stays in place. 0 = off.");
@@ -14309,6 +14495,9 @@ static void draw_overlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("Use ENABLE_DECAY=0 in CRT-Standalone. Fixed 120 Hz, VRR off.");
 }
 
+#include "bfi_fxreplay.h"   // effects replay check (test build)
+#include "bfi_fxahead.h"    // draw ahead (test build)
+
 static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 {
     if (!g_sc || g_gameQueue) return;
@@ -14344,6 +14533,7 @@ static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize
     if (resize || !g_sc || g_dx11.load()) return;
     if (reinterpret_cast<void *>(swapchain->get_native()) != (void *)g_sc) return;
     LOGI("BFI Presenter: swap chain %p destroyed -- stopping the presenter", (void *)g_sc);
+    fxa::Release();
     ReleaseAll();
     // Take the vtable hooks off before the swap chain itself goes away, and
     // put them back on the next one. Overlays that hook Present too (Steam's
@@ -14380,6 +14570,8 @@ static void UnregisterAll(HMODULE hModule)
     reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::unregister_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
     RegisterDx9Events(false);
+    fxr::Register(false);
+    fxa::Register(false);
     reshade::unregister_overlay("BFI Presenter", draw_overlay);
     reshade::unregister_event<reshade::addon_event::reshade_overlay>(on_osd);
     RemoveHooks();
@@ -14405,6 +14597,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
     RegisterDx9Events(true);
+    fxr::Register(true);
+    fxa::Register(true);
     reshade::register_overlay("BFI Presenter", draw_overlay);
     reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
     if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
@@ -14462,6 +14656,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::create_resource_view>(on_create_resource_view);
         RegisterDx9Events(true);
+        fxr::Register(true);
+        fxa::Register(true);
         reshade::register_overlay("BFI Presenter", draw_overlay);
         reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
         ShaderPrepare();                                // compiled (or loaded) while the game starts up
