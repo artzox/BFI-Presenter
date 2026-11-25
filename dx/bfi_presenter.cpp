@@ -5072,13 +5072,14 @@ static DWORD WINAPI PresenterThread(void *)
                         if (half)
                         {
                             const uint16_t *h = (const uint16_t *)row + 4 * x;
-                            b = HalfToFloat(h[0]) <= 0.0005f && HalfToFloat(h[1]) <= 0.0005f && HalfToFloat(h[2]) <= 0.0005f;
+                            b = HalfToFloat(h[0]) <= 0.002f && HalfToFloat(h[1]) <= 0.002f && HalfToFloat(h[2]) <= 0.002f;
                         }
                         else
                         {
                             const uint32_t v = ((const uint32_t *)row)[x];
-                            b = barsFmt == DXGI_FORMAT_R10G10B10A2_UNORM ? ((v & 0x3FF) <= 1 && ((v >> 10) & 0x3FF) <= 1 && ((v >> 20) & 0x3FF) <= 1)
-                                                                         : ((v & 0xFF) <= 1 && ((v >> 8) & 0xFF) <= 1 && ((v >> 16) & 0xFF) <= 1);
+                            // black within a few code values (t6 asked for 0-1: none found in Directive 8020)
+                            b = barsFmt == DXGI_FORMAT_R10G10B10A2_UNORM ? ((v & 0x3FF) <= 4 && ((v >> 10) & 0x3FF) <= 4 && ((v >> 20) & 0x3FF) <= 4)
+                                                                         : ((v & 0xFF) <= 2 && ((v >> 8) & 0xFF) <= 2 && ((v >> 16) & 0xFF) <= 2);
                         }
                         if (!b) n++;
                     }
@@ -5089,6 +5090,13 @@ static DWORD WINAPI PresenterThread(void *)
                 const bool top = black(0, nullptr), bottom = black(2, nullptr);
                 black(1, &mid);
                 gmo::NoteBars(top && bottom && mid > 0.25, 2);
+                static int barsLogs = 0;
+                if (barsLogs < 1 || (top && bottom && barsLogs < 6))
+                {
+                    barsLogs++;
+                    LOGI("BFI Presenter: frame warp: black-bar check: top row %s, bottom row %s, middle %.0f%% lit", top ? "black" : "not black",
+                         bottom ? "black" : "not black", mid * 100.0);
+                }
                 D3D12_RANGE wr = { 0, 0 };
                 barsRb->Unmap(0, &wr);
             }
@@ -5170,7 +5178,13 @@ static DWORD WINAPI PresenterThread(void *)
         if (s.frameWarp && s.warpPauseLb && !barsPending && Now() - barsT >= 1.0 && cycleStart)
         {
             barsT = Now();
-            const D3D12_RESOURCE_DESC sd = g_stage[pick]->GetDesc();
+            // From the frame before ReShade's effects where it is kept: a CRT shader's glow, grain and mask light up the bars
+            // in the finished frame (t6 saw none in Directive 8020 with CRT-Standalone).
+            const bool barsPre = s.warpStillPre && g_pre[pick] && g_preOk[pick];
+            const bool prePsr = barsPre && (c.flags & 32768u) != 0 && c.warp != 0.0f;   // moved to PIXEL_SHADER_RESOURCE above
+            ID3D12Resource *barsSrc = barsPre ? g_pre[pick] : g_stage[pick];
+            const D3D12_RESOURCE_STATES barsSt = (!barsPre || prePsr) ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
+            const D3D12_RESOURCE_DESC sd = barsSrc->GetDesc();
             if (!barsRb || barsW != (UINT)sd.Width || barsFmt != sd.Format)
             {
                 SafeRelease(barsRb);
@@ -5188,7 +5202,7 @@ static DWORD WINAPI PresenterThread(void *)
             if (barsRb && (barsFmt == DXGI_FORMAT_R10G10B10A2_UNORM || barsFmt == DXGI_FORMAT_R8G8B8A8_UNORM || barsFmt == DXGI_FORMAT_B8G8R8A8_UNORM ||
                            barsFmt == DXGI_FORMAT_R16G16B16A16_FLOAT))
             {
-                D3D12_RESOURCE_BARRIER cb = Transition(g_stage[pick], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_RESOURCE_BARRIER cb = Transition(barsSrc, barsSt, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 list->ResourceBarrier(1, &cb);
                 const UINT rows[3] = { barsH * 2 / 100, barsH / 2, barsH * 98 / 100 };
                 for (int r = 0; r < 3; r++)
@@ -5196,11 +5210,11 @@ static DWORD WINAPI PresenterThread(void *)
                     D3D12_TEXTURE_COPY_LOCATION dl = {}, sl = {};
                     dl.pResource = barsRb; dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dl.PlacedFootprint = barsFp;
                     dl.PlacedFootprint.Offset = (UINT64)r * barsFp.Footprint.RowPitch;
-                    sl.pResource = g_stage[pick]; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
+                    sl.pResource = barsSrc; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
                     D3D12_BOX box = { 0, rows[r], 0, barsW, rows[r] + 1, 1 };
                     list->CopyTextureRegion(&dl, 0, 0, 0, &sl, &box);
                 }
-                cb = Transition(g_stage[pick], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                cb = Transition(barsSrc, D3D12_RESOURCE_STATE_COPY_SOURCE, barsSt);
                 list->ResourceBarrier(1, &cb);
                 barsPending = true; barsFence = reserve;
             }
