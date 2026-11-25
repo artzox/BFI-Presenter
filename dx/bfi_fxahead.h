@@ -51,6 +51,16 @@ struct Gpu
 };
 static Gpu G;
 
+// The frame from before the effects is also wanted without draw ahead: frame warp finds what stands still in it
+// (FrameWarpStillBeforeEffects, 1.0.48 test).
+static bool Capturing()
+{
+#ifndef _WIN64
+    return false;
+#else
+    return g_shared.frameWarp && ((g_shared.warpDrawAhead && g_shared.warpGame) || g_shared.warpStillPre) && !G.failed && !g_dx11.load() && g_sc;
+#endif
+}
 static bool Enabled()
 {
 #ifndef _WIN64
@@ -170,7 +180,8 @@ static bool EnsurePipeline()
 static bool EnsureTextures(ID3D12Resource *bb)
 {
     const D3D12_RESOURCE_DESC d = bb->GetDesc();
-    if (G.clean[0] && (UINT)d.Width == G.w && d.Height == G.h && d.Format == G.bbFmt) return true;
+    const bool wantVar = Enabled();
+    if (G.clean[0] && (UINT)d.Width == G.w && d.Height == G.h && d.Format == G.bbFmt && (!wantVar || var[0].res)) return true;
     if (G.clean[0])                                       // the size changed: the GPU must be done with the old ones
     {
         if (g_gameFenceVal) WaitFence(g_gameFence, g_gameFenceVal, g_gameFenceEvent);
@@ -182,7 +193,7 @@ static bool EnsureTextures(ID3D12Resource *bb)
     G.w = (UINT)d.Width; G.h = d.Height; G.bbFmt = d.Format; G.fmt = StageFormat();
     bool ok = (G.clean[0] = Tex(G.bbFmt, false, L"BFI draw ahead: frame before the effects")) &&
               (G.clean[1] = Tex(G.bbFmt, false, L"BFI draw ahead: frame before the effects"));
-    for (int v = 0; ok && v < kVar; v++)
+    for (int v = 0; ok && wantVar && v < kVar; v++)
     {
         ID3D12Resource *r = Tex(G.fmt, true, L"BFI draw ahead: frame drawn ahead");
         ok = r != nullptr;
@@ -205,17 +216,17 @@ static bool EnsureTextures(ID3D12Resource *bb)
         G.failed = true;
         return false;
     }
-    LOGI("BFI Presenter: draw ahead: on (%ux%u, format %d) -- ReShade's effects drawn on the moved frames", G.w, G.h, (int)G.fmt);
+    if (wantVar) LOGI("BFI Presenter: draw ahead: on (%ux%u, format %d) -- ReShade's effects drawn on the moved frames", G.w, G.h, (int)G.fmt);
     return true;
 }
 
 // reshade_begin_effects: this frame, before the effects.
 static void on_begin(effect_runtime *rt, command_list *cmd, resource_view, resource_view)
 {
-    if (!Enabled() || reinterpret_cast<void *>(rt->get_native()) != (void *)g_sc) return;
+    if (!Capturing() || reinterpret_cast<void *>(rt->get_native()) != (void *)g_sc) return;
     if (fxr::g.guard) return;
     G.rt = rt; G.dev = rt->get_device();
-    if (!EnsurePipeline()) return;
+    if (Enabled() && !EnsurePipeline()) return;
     const resource bbr = fxr::BackBuffer(rt, rt->get_current_back_buffer_index());
     ID3D12Resource *bb = reinterpret_cast<ID3D12Resource *>(bbr.handle);
     if (!bb || !EnsureTextures(bb)) return;
@@ -381,7 +392,7 @@ static void Publish(UINT64 id)
 static UINT64 WaitRead() { return G.pendN ? G.waitRead : 0; }
 static ID3D12Resource *CleanNow()
 {
-    if (!G.capturedNow || G.cleanCur < 0 || !Enabled()) return nullptr;
+    if (!G.capturedNow || G.cleanCur < 0 || !Capturing()) return nullptr;
     return G.cleanN[G.cleanCur] == G.presentN + 1 ? G.clean[G.cleanCur] : nullptr;
 }
 
