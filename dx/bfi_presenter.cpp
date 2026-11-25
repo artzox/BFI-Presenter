@@ -72,6 +72,7 @@ static ID3D12Resource *FlowRes(int s);
 static UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE base, UINT stride);
 static ID3D12Resource *FlowFor(int s, UINT gen);
 static bool PauseNow(UINT64 id, bool letterbox, const char **why);
+static void NoteBars(bool bars, int topPct);
 static int  CutsTake();
 static UINT FlowGenNow();
 static int  StateNow(char *why, size_t n);
@@ -93,6 +94,7 @@ static inline ID3D12Resource *FlowRes(int) { return nullptr; }
 static inline UINT WriteFlowSrvs(D3D12_CPU_DESCRIPTOR_HANDLE, UINT) { return 0; }
 static inline ID3D12Resource *FlowFor(int, UINT) { return nullptr; }
 static inline bool PauseNow(UINT64, bool, const char **) { return false; }
+static inline void NoteBars(bool, int) {}
 static inline int  CutsTake() { return 0; }
 static inline UINT FlowGenNow() { return 0; }
 static inline int  StateNow(char *why, size_t n) { if (n) why[0] = 0; return 0; }
@@ -3847,6 +3849,13 @@ static DWORD WINAPI PresenterThread(void *)
     // Frame warp check (test, FrameWarpGameMotionCheck): every 2 s, on a cycle moved with the game's motion, the motion
     // measured from the picture for the same pair of frames as well; both read back and compared in the log.
     ID3D12Resource *chkRb[2] = {};          // readback: the game's motion texture, the measured one
+    ID3D12Resource *barsRb = nullptr;       // readback: three rows of the frame (2%, 50%, 98% down), once a second -- black bars
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT barsFp = {};
+    UINT   barsW = 0, barsH = 0;
+    DXGI_FORMAT barsFmt = DXGI_FORMAT_UNKNOWN;
+    bool   barsPending = false;
+    UINT64 barsFence = 0;
+    double barsT = 0.0;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT chkFp[2] = {};
     UINT   chkW[2] = {}, chkH[2] = {};
     UINT64 chkBytes[2] = {};
@@ -5045,6 +5054,45 @@ static DWORD WINAPI PresenterThread(void *)
         // ones); the motion from the frame before is measured only when the frame is shown moved, once per pair.
         const bool tsOn = tsHeap && logf;                // timed only while the timing log runs
         if (tsOn) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 0);
+        // Black bars in the frame (letterboxed cutscenes drawn by the game itself): the three rows read back.
+        if (barsPending && g_presFence->GetCompletedValue() >= barsFence)
+        {
+            barsPending = false;
+            void *mp = nullptr;
+            D3D12_RANGE rr = { 0, (SIZE_T)(3 * barsFp.Footprint.RowPitch) };
+            if (SUCCEEDED(barsRb->Map(0, &rr, &mp)) && mp)
+            {
+                const bool half = barsFmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
+                auto black = [&](int r, double *lit) -> bool {
+                    const uint8_t *row = (const uint8_t *)mp + (size_t)r * barsFp.Footprint.RowPitch;
+                    int n = 0;
+                    for (UINT x = 0; x < barsW; x++)
+                    {
+                        bool b;
+                        if (half)
+                        {
+                            const uint16_t *h = (const uint16_t *)row + 4 * x;
+                            b = HalfToFloat(h[0]) <= 0.0005f && HalfToFloat(h[1]) <= 0.0005f && HalfToFloat(h[2]) <= 0.0005f;
+                        }
+                        else
+                        {
+                            const uint32_t v = ((const uint32_t *)row)[x];
+                            b = barsFmt == DXGI_FORMAT_R10G10B10A2_UNORM ? ((v & 0x3FF) <= 1 && ((v >> 10) & 0x3FF) <= 1 && ((v >> 20) & 0x3FF) <= 1)
+                                                                         : ((v & 0xFF) <= 1 && ((v >> 8) & 0xFF) <= 1 && ((v >> 16) & 0xFF) <= 1);
+                        }
+                        if (!b) n++;
+                    }
+                    if (lit) *lit = barsW ? (double)n / barsW : 0.0;
+                    return n == 0;
+                };
+                double mid = 0.0;
+                const bool top = black(0, nullptr), bottom = black(2, nullptr);
+                black(1, &mid);
+                gmo::NoteBars(top && bottom && mid > 0.25, 2);
+                D3D12_RANGE wr = { 0, 0 };
+                barsRb->Unmap(0, &wr);
+            }
+        }
         // Frame warp check: the two motions read back (a cycle or more later), averaged and logged.
         if (chkPending && g_presFence->GetCompletedValue() >= chkFence)
         {
@@ -5089,7 +5137,9 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 static int hudLogs = 0;
                 if (s.warpGameCheck && hudLogs++ < 30) LOGI("BFI Presenter: frame warp check: the HUD mask covers %.1f%% of the picture", hudPct);
-                if (hudPct > 35.0) { gmo::HudBad(hudPct); hudBigN = 0; } else hudBigN = 0;
+                // 3 checks in a row over 35% (1.0.48): a single one at a camera cut or a fade switched it off for the session
+                // (Directive 8020: 1-13% for 30 s, then one reading of 70% in a cutscene)
+                if (hudPct > 35.0) { if (++hudBigN >= 3) { gmo::HudBad(hudPct); hudBigN = 0; } } else hudBigN = 0;
             }
             if (!s.warpGameCheck) { }                     // only the HUD mask's coverage was wanted
             else if (!(wsum[0] > 0.0 && wsum[1] > 0.0 && chkFrames > 0))
@@ -5114,6 +5164,45 @@ static DWORD WINAPI PresenterThread(void *)
                          gx, gy, gl, mag[0] / wsum[0], mx, my, ml, ml > 0.05 ? gl / ml : 0.0,
                          ang < 0.0 ? "direction n/a " : "", ang < 0.0 ? 0.0 : ang, (unsigned long long)chkFrames, chkFrames == 1 ? "" : "s",
                          chkSrc == 1 ? "vectors and depth" : "vectors only");
+            }
+        }
+        // Black bars: three rows of this frame copied for reading back, once a second, while frame warp pauses in cutscenes.
+        if (s.frameWarp && s.warpPauseLb && !barsPending && Now() - barsT >= 1.0 && cycleStart)
+        {
+            barsT = Now();
+            const D3D12_RESOURCE_DESC sd = g_stage[pick]->GetDesc();
+            if (!barsRb || barsW != (UINT)sd.Width || barsFmt != sd.Format)
+            {
+                SafeRelease(barsRb);
+                D3D12_RESOURCE_DESC rd = sd; rd.Height = 1;
+                UINT64 total = 0;
+                g_device->GetCopyableFootprints(&rd, 0, 1, 0, &barsFp, nullptr, nullptr, &total);
+                D3D12_HEAP_PROPERTIES rh = {}; rh.Type = D3D12_HEAP_TYPE_READBACK;
+                D3D12_RESOURCE_DESC bd = {};
+                bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = 3 * (UINT64)barsFp.Footprint.RowPitch; bd.Height = 1; bd.DepthOrArraySize = 1;
+                bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                if (FAILED(g_device->CreateCommittedResource(&rh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&barsRb))))
+                    barsRb = nullptr;
+                barsW = (UINT)sd.Width; barsH = sd.Height; barsFmt = sd.Format;
+            }
+            if (barsRb && (barsFmt == DXGI_FORMAT_R10G10B10A2_UNORM || barsFmt == DXGI_FORMAT_R8G8B8A8_UNORM || barsFmt == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                           barsFmt == DXGI_FORMAT_R16G16B16A16_FLOAT))
+            {
+                D3D12_RESOURCE_BARRIER cb = Transition(g_stage[pick], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &cb);
+                const UINT rows[3] = { barsH * 2 / 100, barsH / 2, barsH * 98 / 100 };
+                for (int r = 0; r < 3; r++)
+                {
+                    D3D12_TEXTURE_COPY_LOCATION dl = {}, sl = {};
+                    dl.pResource = barsRb; dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dl.PlacedFootprint = barsFp;
+                    dl.PlacedFootprint.Offset = (UINT64)r * barsFp.Footprint.RowPitch;
+                    sl.pResource = g_stage[pick]; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
+                    D3D12_BOX box = { 0, rows[r], 0, barsW, rows[r] + 1, 1 };
+                    list->CopyTextureRegion(&dl, 0, 0, 0, &sl, &box);
+                }
+                cb = Transition(g_stage[pick], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                list->ResourceBarrier(1, &cb);
+                barsPending = true; barsFence = reserve;
             }
         }
         bool warpTouched = false;
@@ -7003,7 +7092,7 @@ static DWORD WINAPI PresenterThread(void *)
     SafeRelease(psAplC);
     SafeRelease(psAplR);
     warp.Release();
-    SafeRelease(chkRb[0]); SafeRelease(chkRb[1]);
+    SafeRelease(chkRb[0]); SafeRelease(chkRb[1]); SafeRelease(barsRb);
     for (int i = 0; i < kWarpShN; i++) SafeRelease(psWarp[i]);
     SafeRelease(rootSig);
     SafeRelease(rsBlob);
@@ -8806,6 +8895,33 @@ static std::atomic<double> lbT{0.0};
 // minutes in a row is play (a game letterboxed throughout, by design): frame warp works there as usual.
 static std::atomic<bool> lbFullSeen{false};
 static std::atomic<double> lbStartT{0.0};
+// Bars the game draws into the frame itself (1.0.48: Directive 8020's cutscenes -- DLSS's output is the full screen, the
+// bars are drawn after it): read from the frame once a second by the presenter (rows near the top and bottom exactly
+// black, the middle not), 3 readings in a row to start, 2 to end. The same rules as above: only after full-screen
+// play in the session, for at most 10 minutes in a row.
+static std::atomic<bool> barsOn{false};
+static std::atomic<double> barsT{0.0}, barsStartT{0.0};
+static std::atomic<bool> barsFullSeen{false};
+static void NoteBars(bool bars, int topPct)
+{
+    static int run = 0, offRun = 0;
+    if (bars) { run++; offRun = 0; } else { offRun++; run = 0; barsFullSeen = true; }
+    const bool was = barsOn.load();
+    if (!was && run >= 3)
+    {
+        barsOn = true; barsStartT = Now();
+        static int logged = 0;
+        if (logged++ < 40) LOGI("BFI Presenter: frame warp: black bars in the frame (about %d%% at the top and bottom) -- a letterboxed cutscene%s",
+                                topPct, barsFullSeen.load() ? "" : " (not paused: no full-screen play seen yet)");
+    }
+    else if (was && offRun >= 2)
+    {
+        barsOn = false;
+        static int logged = 0;
+        if (logged++ < 40) LOGI("BFI Presenter: frame warp: the black bars are gone");
+    }
+    if (barsOn.load()) barsT = Now();
+}
 static void NoteLetterbox(bool lb, unsigned w, unsigned h, unsigned fw, unsigned fh, const char *from)
 {
     const bool was = lbOn.exchange(lb);
@@ -9578,6 +9694,11 @@ static bool PauseNow(UINT64 id, bool letterbox, const char **why)
     const UINT64 c = cutId.load();
     const UINT64 k = (UINT64)std::max(1, g_status.fgActive ? fgK : 1);
     if (c && id >= c && id < c + 3 * k) { *why = "camera cut"; return true; }
+    if (letterbox && barsOn.load() && Now() - barsT.load() < 3.0 && barsFullSeen.load() && Now() - barsStartT.load() < 600.0)
+    {
+        *why = "letterboxed cutscene";
+        return true;
+    }
     if (letterbox && lbOn.load() && Now() - lbT.load() < 1.0 && lbFullSeen.load())
     {
         if (Now() - lbStartT.load() < 600.0) { *why = "letterboxed cutscene"; return true; }
