@@ -119,6 +119,7 @@ static bool BakeReady(UINT s);
 static UINT BakeGen();
 static DXGI_FORMAT PassFormat();
 static void SetBakeSkip(bool skip);
+static void SetMemoryTight(bool tight);
 static void ParamsFor(float *out, float w, float h);
 static void Release();
 static void Register(bool on);
@@ -162,7 +163,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.49"
+#define BFI_ADDON_VERSION "1.0.50"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -807,8 +808,14 @@ struct Status
     int    presBufs = 0;                        // real swap chain buffers behind the presenter
     bool   vramOver = false;                    // the game uses more video memory than its budget (D3DKMT)
     double vramUse = 0.0, vramBudget = 0.0;     // MB
+    double ownMB = 0.0, crtMB = 0.0;            // MB of it that BFI Presenter holds, and of that the CRT hand-off's
 };
 static Status g_status;
+// The video memory BFI Presenter holds (1.0.50), counted where each part is made and kept, in bytes
+static std::atomic<UINT64> g_bytesFrames{0};   // the staging frames (and the frames from before ReShade's effects)
+static std::atomic<UINT64> g_bytesCrtGame{0};  // the CRT hand-off's textures on the game's side (dx/bfi_crt.h)
+static std::atomic<UINT64> g_bytesCrtPres{0};  // and the presenter's (its passes for moved flashes)
+static UINT64 ResBytes(ID3D12Resource *r);
 static char   g_hooksSeen[256] = "";               // other Present hooks found in the process
 static char   g_fgSeen[256] = "";                  // frame-generation components found in the process
 static char   g_scOwner[128] = "";                 // module that implements the swap chain ReShade sees
@@ -1024,6 +1031,12 @@ static UINT g_srcW = 0, g_srcH = 0;   // DX11/DX9/OpenGL: the game's frame size 
 static DXGI_FORMAT            g_stageFmt = DXGI_FORMAT_UNKNOWN;   // the game's frames (staging ring); g_desc.Format if unknown
 static std::atomic<bool>      g_hdrUp{false};   // SDR game presented as HDR10 (SdrToHdr): the presenter's own swap chain
                                                  // (DX11 / DX9 / OpenGL), or the DX12 game's real buffers (g_stageFmt: the game's)
+static UINT64 ResBytes(ID3D12Resource *r)
+{
+    if (!r || !g_device) return 0;
+    const D3D12_RESOURCE_DESC d = r->GetDesc();
+    return g_device->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+}
 static DXGI_FORMAT StageFormat() { return g_stageFmt != DXGI_FORMAT_UNKNOWN ? g_stageFmt : g_desc.Format; }
 static ID3D12Resource        *g_virt[kMaxBuf] = {};
 static UINT                   g_bufCount = 0;
@@ -2565,7 +2578,7 @@ struct Constants
     float    osdX0, osdY0, osdX1, osdY1;  // frame warp: the BFI OSD on the frame, game-frame pixels (none: x1 <= x0)
 };
 static_assert(sizeof(Constants) / 4 + 8 + 3 <= 64, "root signature: the constants, eight tables and a root CBV in at most 64 DWORDs");
-namespace pfx { static ID3D12Resource *Peek12(); static ID3D12Resource *Take12(); static ID3D11Texture2D *Take11(); static void Release(); static void Register(bool on); static bool OverlayOpen(); }
+namespace pfx { static UINT64 Bytes12(); static ID3D12Resource *Peek12(); static ID3D12Resource *Take12(); static ID3D11Texture2D *Take11(); static void Release(); static void Register(bool on); static bool OverlayOpen(); }
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
 // every 32x18 cell's lit value is capped at C. Plain strobe: the lit refresh.
@@ -5317,6 +5330,7 @@ static DWORD WINAPI PresenterThread(void *)
                     queue->Signal(g_presFence, v);
                     WaitFence(g_presFence, v, ev);
                     for (int k = 0; k < 3; k++) SafeRelease(crtRt[k]);
+                    g_bytesCrtPres = 0;
                 }
                 if (!crtRtvHeap)
                 {
@@ -5343,6 +5357,7 @@ static DWORD WINAPI PresenterThread(void *)
                 }
                 if (rok && made)
                 {
+                    g_bytesCrtPres = ResBytes(crtRt[0]) + ResBytes(crtRt[1]) + ResBytes(crtRt[2]);
                     // views (0, 2) and (1, 2): each texture with grain's after it, as t11 t12
                     const int order[4] = { 0, 2, 1, 2 };
                     for (int v = 0; v < 4; v++)
@@ -6038,9 +6053,12 @@ static DWORD WINAPI PresenterThread(void *)
                 if (!on && nOver >= 3)
                 {
                     on = true;
-                    LOGW("BFI Presenter: the game uses more video memory than Windows gives it (%.0f of %.0f MB). Part of it is "
-                         "moved to system memory and the GPU stalls now and then: missed refreshes, frame generation drops "
-                         "frames, BFI pauses. Lower the game's texture or memory settings.", vu, vbud);
+                    const double crtNow = (double)(g_bytesCrtGame.load() + g_bytesCrtPres.load()) / 1048576.0;
+                    LOGW("BFI Presenter: the game uses more video memory than Windows gives it (%.0f of %.0f MB; BFI Presenter's "
+                         "share %.0f MB, of it the CRT hand-off %.0f MB). Part of it is moved to system memory and the GPU stalls "
+                         "now and then: missed refreshes, frame generation drops frames, BFI pauses. Lower the game's texture or "
+                         "memory settings%s.", vu, vbud, (double)g_bytesFrames.load() / 1048576.0 + crtNow, crtNow,
+                         crtNow >= 64.0 ? ", or turn the CRT hand-off off for this game" : "");
                 }
                 else if (on && underSecs >= 10)
                 {
@@ -6048,6 +6066,19 @@ static DWORD WINAPI PresenterThread(void *)
                     LOGI("BFI Presenter: video memory back under the budget (%.0f of %.0f MB)", vu, vbud);
                 }
                 g_status.vramOver = on; g_status.vramUse = vu; g_status.vramBudget = vbud;
+                g_status.crtMB = (double)(g_bytesCrtGame.load() + g_bytesCrtPres.load()) / 1048576.0;
+                {
+                    // the CRT hand-off's per-frame picture only with video memory to spare (1 GB under the budget; again
+                    // once 1.5 GB is free, counting what it would take back)
+                    static bool tight = false;
+                    if (vbud > 0.0)
+                    {
+                        if (!tight && vu > vbud - 1024.0) tight = true;
+                        else if (tight && vu < vbud - 1536.0) tight = false;
+                    }
+                    crt::SetMemoryTight(tight);
+                }
+                g_status.ownMB = (double)g_bytesFrames.load() / 1048576.0 + g_status.crtMB;
             }
             // OpenGL games that present by exchange (Need for Speed: Porsche
             // Unleashed, DOOM 3 BFG) block the presenter's own presents for
@@ -7120,6 +7151,7 @@ static DWORD WINAPI PresenterThread(void *)
     SafeRelease(psoCrt);
     for (int k = 0; k <= kCrtPostN; k++) SafeRelease(psoCrtPass[k]);
     for (int k = 0; k < 3; k++) SafeRelease(crtRt[k]);
+    g_bytesCrtPres = 0;
     SafeRelease(crtRtvHeap);
     if (crtCb && crtCbMap) crtCb->Unmap(0, nullptr);
     SafeRelease(crtCb);
@@ -7645,6 +7677,17 @@ static HRESULT SubmitGameFrameLocked()
         g_preOk[s] = preOk;
     }
     gt::Mark(g_copyList, gt::Q_P3);
+    {
+        static double countT = 0.0;
+        const double tn = Now();
+        if (tn - countT > 1.0)
+        {
+            countT = tn;
+            UINT64 b = pfx::Bytes12();
+            for (UINT k = 0; k < kStage; k++) b += ResBytes(g_stage[k]) + ResBytes(g_pre[k]);
+            g_bytesFrames = b;
+        }
+    }
     crt::CopyAtPresent(g_copyList, s);        // CRT-Standalone's halation and glow, for the CRT hand-off
     crt::Bake(g_copyList, s, g_stage[s], waitRead);   // and the frame's CRT picture with them (shown as is; a moved flash draws its own)
     gt::Mark(g_copyList, gt::Q_P4);
@@ -13986,6 +14029,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
     d.warpSrc = g_status.warpCycles ? g_status.warpSrc
               : (g_shared.warpGame && !fgOff && g_status.warpGameState > 0 ? g_status.warpGameState : 0);
     d.warpVia = g_status.warpGameVia;
+    d.vramUse = g_status.vramUse; d.vramBudget = g_status.vramBudget; d.ownMB = g_status.ownMB; d.crtMB = g_status.crtMB;
     LeaveCriticalSection(&g_cfgLock);
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
 }
@@ -14058,6 +14102,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
             ImGui::TextColored(kRed, "The game uses more video memory than Windows gives it (%.0f of %.0f MB): the GPU stalls,\n"
                                "refreshes are missed, frame generation drops frames. Lower its texture or memory settings.",
                                st.vramUse, st.vramBudget);
+        if (st.vramOver && st.crtMB >= 64.0)
+            ImGui::TextColored(kRed, "Of that, %.0f MB are the CRT hand-off's: turning it off for this game frees them.", st.crtMB);
         {
             // System check: power plan, GPUs, displays (the displays note only while refreshes are missed).
             std::string always, withFlashes;

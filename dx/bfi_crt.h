@@ -341,6 +341,7 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
 }
 
 // The game's Present, on the frame copy list: this frame's halation and glow textures into the slot.
+static void CountBytes();
 static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s)
 {
     // The copies of the frame before ReShade's window (one per slot, 33 MB each at 4K) are needed only while the window
@@ -404,6 +405,7 @@ static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s)
     }
     slotOk[s] = ok;
     curOk = false;
+    CountBytes();
 }
 
 // The presenter: the texture bound for slot s, view k (null: compiled out of the shader).
@@ -615,6 +617,17 @@ static UINT bSrvStride = 0, bRtvStride = 0;
 static DXGI_FORMAT bFmt = DXGI_FORMAT_UNKNOWN;     // the format bPso were made for
 static bool bFailed = false;
 static std::atomic<bool> bSkip{false};              // most flashes are shown moved: not made (SetBakeSkip)
+// Video memory (1.0.50): the per-frame CRT picture keeps one full-size texture per slot and three to draw in (about 330 MB
+// at 4K). With the game close to its video memory budget it isn't made, and its textures are freed: each refresh then
+// draws its CRT picture itself, once per new picture (as 1.0.49-t6), which costs GPU time on the strobe's deadline instead.
+static std::atomic<bool> bTight{false};
+static bool bFreed = true;
+static void SetMemoryTight(bool tight)
+{
+    if (bTight.exchange(tight) != tight)
+        LOGI("BFI Presenter: CRT hand-off: %s", tight ? "the game is close to its video memory budget -- the CRT picture is no longer made with each frame (its textures freed); each refresh draws it"
+                                                      : "video memory to spare again -- the CRT picture is made with each frame");
+}
 static void SetBakeSkip(bool skip)
 {
     if (bSkip.exchange(skip) != skip)
@@ -716,7 +729,22 @@ static void BakeWaitGame() { WaitGame(); }
 static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead)
 {
     bOk[s] = false;
+    if (bTight.load())
+    {
+        if (!bFreed)
+        {
+            // the presenter may still read a slot's picture: wait until it has drawn all it reserved
+            WaitGame();
+            if (g_presFence && g_presFenceVal) WaitFence(g_presFence, g_presFenceVal, g_gameFenceEvent);
+            for (UINT j = 0; j < kStage; j++) { SafeRelease(bOut[j]); bOk[j] = false; }
+            for (int k = 0; k < 3; k++) SafeRelease(bRt[k]);
+            bOutGen++;
+            bFreed = true;
+        }
+        return;
+    }
     if (bSkip.load() || !(state.load() == 2 && slotOk[s] && Wanted() && stage) || !BakeSetup()) return;
+    bFreed = false;
     const D3D12_RESOURCE_DESC sd = stage->GetDesc();
     const UINT fw = (UINT)sd.Width, fh = sd.Height;
     // the working textures (the game's queue only) and the slot's output
@@ -853,6 +881,19 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     bOk[s] = true;
     static bool logged = false;
     if (!logged) { logged = true; LOGI("BFI Presenter: CRT hand-off: each frame's CRT picture is drawn with the frame (the game's queue); flashes moved by frame warp draw their own"); }
+}
+// The game side's video memory, once a second (the settings window and the OSD show it)
+static void CountBytes()
+{
+    static double countT = 0.0;
+    const double tn = Now();
+    if (tn - countT <= 1.0) return;
+    countT = tn;
+    UINT64 n = 0;
+    for (int k = 0; k < kTexN; k++) { n += ResBytes(cur[k]); for (UINT j = 0; j < kStage; j++) n += ResBytes(slotTex[k][j]); }
+    for (UINT j = 0; j < kStage; j++) n += ResBytes(bOut[j]);
+    for (int k = 0; k < 3; k++) n += ResBytes(bRt[k]);
+    g_bytesCrtGame = n;
 }
 static ID3D12Resource *BakeOut(UINT s) { return s < kStage ? bOut[s] : nullptr; }
 static bool BakeReady(UINT s) { return s < kStage && bOk[s] && bOut[s]; }
