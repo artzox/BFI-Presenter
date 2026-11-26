@@ -343,6 +343,27 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
 // The game's Present, on the frame copy list: this frame's halation and glow textures into the slot.
 static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s)
 {
+    // The copies of the frame before ReShade's window (one per slot, 33 MB each at 4K) are needed only while the window
+    // is open: released 5 s after it closes (1.0.49-t14: Returnal went over its video memory budget, and with part of it
+    // moved to system memory every copy and pass on the GPU took ten times as long).
+    {
+        static double closedT = -1.0;
+        if (pfx::OverlayOpen()) closedT = -1.0;
+        else if (closedT < 0.0) closedT = Now();
+        else if (Now() - closedT > 5.0)
+        {
+            bool any = cur[kBase] != nullptr;
+            for (UINT k = 0; k < kStage && !any; k++) if (slotTex[kBase][k]) any = true;
+            if (any)
+            {
+                WaitGame();
+                if (g_presFence && g_presFenceVal) WaitFence(g_presFence, g_presFenceVal, g_gameFenceEvent);
+                SafeRelease(cur[kBase]); curHas[kBase] = false;
+                for (UINT k = 0; k < kStage; k++) SafeRelease(slotTex[kBase][k]);
+                slotGen++;
+            }
+        }
+    }
     bool ok = false;
     if (state.load() == 2 && curOk && Wanted())
     {
