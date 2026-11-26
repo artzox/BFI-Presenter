@@ -9104,7 +9104,9 @@ static DXGI_FORMAT MvView(DXGI_FORMAT f)
 static bool On() { return g_shared.frameWarp != 0 && g_shared.warpGame != 0 && !g_dx11.load(); }
 // With frame generation the game's motion isn't used (FrameWarpGameMotionWithFG=0, the default): its vectors, depth and
 // HUD-less picture aren't copied either (1.0.49: they were, on every upscaler call, for nothing)
-static bool FgUnused() { return g_status.fgActive && !g_shared.warpGameFg; }
+static bool FgUnused() { return (g_status.fgActive && !g_shared.warpGameFg) || g_status.warpOn == 1; }
+// (and while frame warp waits -- the game's frame rate outside its range, no steady rate: nothing is filled, so the
+// game's motion isn't prepared either. Returnal's loading stalls: this step took up to 75 ms of a 93 ms frame there.)
 
 // slSetTag: the last depth and motion vectors a game tagged with a resource (games that pass them here rather than to
 // slEvaluateFeature). Only tags that stay valid up to the upscaler call are kept.
@@ -9599,7 +9601,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
 {
     if (s >= kStage) return;
     slotId[s] = 0; slotPend[s] = slotOk[s] = false;
-    if (!On()) { std::lock_guard<std::mutex> l(lk); pendN = 0; latest = -1; return; }
+    if (!On() || g_status.warpOn == 1) { std::lock_guard<std::mutex> l(lk); pendN = 0; latest = -1; return; }
     Entry e, ep;
     int k;
     float scale = 1.0f, lag = 0.0f;
