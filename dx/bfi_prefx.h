@@ -138,17 +138,25 @@ static ID3D11Texture2D *Take11() { const bool c = captured; captured = false; re
 
 static void on_destroy_rt(effect_runtime *) { Release(); }
 
+// ReShade's own window open (1.0.49-t8): it is drawn after the effects, so only the finished frames have it -- the still
+// test then looks there too (t2-t7 always did: twice the work on every moved flash, missed refreshes -- dark flashes).
+static std::atomic<bool> overlayOpen{false};
+static bool on_open_overlay(effect_runtime *, bool open, input_source) { overlayOpen = open; return false; }
+static bool OverlayOpen() { return overlayOpen.load(); }
+
 static void Register(bool on)
 {
     if (on)
     {
         reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_rt);
+        reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
     }
     else
     {
         reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(on_begin);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_rt);
+        reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
     }
 }
 }   // namespace pfx

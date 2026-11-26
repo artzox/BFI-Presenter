@@ -63,6 +63,9 @@ struct Swapchain; struct DeviceData;
 namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
 #define BFI_VERSION "1.0.49"
+#include <atomic>
+// ReShade's own window open (as DX 1.0.49): only then is frame warp's still test run on the finished frames as well
+static std::atomic<bool> g_rsOverlayOpen{false};
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -2818,7 +2821,8 @@ static void PresenterThread(Swapchain *sc)
         c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
         if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
         // what stands still, found in the frames from before ReShade's effects (FrameWarpStillBeforeEffects)
-        if (s.warpStillPre && warpPrev >= 0 && sc->pre[pick] && sc->preOk[pick] && sc->preOk[warpPrev]) c.flags |= 16384u;
+        if (s.warpStillPre && warpPrev >= 0 && sc->pre[pick] && sc->preOk[pick] && sc->preOk[warpPrev])
+            c.flags |= 16384u | (g_rsOverlayOpen.load() ? 32768u : 0u);   // ReShade's window open: the finished frames too
         if (s.osd && Now() - Osd::drawnT.load() < 0.5)    // the BFI OSD on the frame: never moved (its background is see-through)
         {
             auto px = [](float v) { return (uint32_t)std::max(0.0f, std::min(65535.0f, v)); };
@@ -7474,6 +7478,7 @@ static bool RelimiterLoaded()
 // effects, copied into the swap chain's `clean` image on ReShade's command buffer (the back buffer is in
 // COLOR_ATTACHMENT_OPTIMAL there, as ReShade has it for its effects). 64-bit: ReShade's back buffer call returns its
 // resource through a hidden pointer (MSVC), called through the vtable as ReShade expects.
+static bool on_open_overlay(reshade::api::effect_runtime *, bool open, reshade::api::input_source) { g_rsOverlayOpen = open; return false; }
 static void on_begin_effects(reshade::api::effect_runtime *rt, reshade::api::command_list *cmd, reshade::api::resource_view, reshade::api::resource_view)
 {
 #ifdef _WIN64
@@ -8325,6 +8330,7 @@ static void TryRegisterReShade()
     {
         ev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
         ev(reshade::addon_event::reshade_begin_effects, (void *)&on_begin_effects);   // FrameWarpStillBeforeEffects
+        ev(reshade::addon_event::reshade_open_overlay, (void *)&on_open_overlay);
     }
     static bool pinned = false;
     if (!pinned)
@@ -8350,6 +8356,7 @@ static void UnregisterReShade()
     {
         uev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
         uev(reshade::addon_event::reshade_begin_effects, (void *)&on_begin_effects);
+        uev(reshade::addon_event::reshade_open_overlay, (void *)&on_open_overlay);
     }
     if (ureg) ureg(g_module);
     g_rsModule = nullptr;

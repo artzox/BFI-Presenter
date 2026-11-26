@@ -13,8 +13,8 @@ layout(set = 2, binding = 3) uniform sampler2D gameFlow;   // the game's own mot
 // still is found (a CRT shader's blur and glow over a HUD made it look as if it moved). Otherwise the stage frames.
 layout(set = 2, binding = 4) uniform sampler2D preCur;
 layout(set = 2, binding = 5) uniform sampler2D prePrev;
-// 1.0.49 (as DX): and where it stands still in the finished frames too -- ReShade's window, drawn after the effects, is
-// only in those (it was moved with the scene in 1.0.48).
+// 1.0.49 (as DX): and, while ReShade's window is open (flags & 32768), where it stands still in the finished frames too
+// -- ReShade's window, drawn after the effects, is only in those (it was moved with the scene in 1.0.48).
 bool gStillPre = false;
 vec3 StillCur(ivec2 q) { return gStillPre ? texelFetch(preCur, q, 0).rgb : texelFetch(src, q, 0).rgb; }
 vec3 StillPrev(ivec2 q) { return gStillPre ? texelFetch(prePrev, q, 0).rgb : texelFetch(srcPrev, q, 0).rgb; }
@@ -113,13 +113,11 @@ bool StillIn(ivec2 q, vec2 size)
 }
 bool Still(ivec2 q, vec2 size)
 {
-    gStillPre = false;
-    if (StillIn(q, size)) return true;
-    if ((pc.flags & 16384u) == 0u) return false;
-    gStillPre = true;
+    gStillPre = (pc.flags & 16384u) != 0u;
     bool r = StillIn(q, size);
     gStillPre = false;
-    return r;
+    if (r || (pc.flags & 16384u) == 0u || (pc.flags & 32768u) == 0u) return r;
+    return StillIn(q, size);   // ReShade's window open (flags & 32768): the finished frames too
 }
 // The screen-edge strip of a moved flash (FrameWarpEdge; as DX): mirrored at the edge (flags & 4096), or the move
 // eased off over a band three moves wide on the side the picture comes in from (flags & 8192).

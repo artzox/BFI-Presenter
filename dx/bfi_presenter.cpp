@@ -1880,8 +1880,8 @@ float2 EdgeFade(float2 cp, float2 d, float2 size)
 // What stands still is found in the frames from before ReShade's effects where they are kept (FrameWarpStillBeforeEffects,
 // flags & 32768, 1.0.48): a CRT shader's pre-blur and glow spread the moving scene into a HUD's pixels, so in the finished
 // frame the HUD changed a little every frame and was moved with the scene (Onimusha with CRT-Standalone).
-// 1.0.49: and where it stands still in the finished frames too. What is drawn after the effects -- ReShade's own window,
-// an overlay -- is only in the finished frames: tested on the frames from before the effects alone, ReShade's window
+// 1.0.49: and, while ReShade's window is open (flags & 131072), where it stands still in the finished frames too: it is
+// drawn after the effects, so only they have it -- tested on the frames from before the effects alone, ReShade's window
 // was moved with the scene (1.0.48).
 static bool gStillPre = false;
 float3 StillCur(int2 q) { return gStillPre ? preCur.Load(int3(q, 0)).rgb : src.Load(int3(q, 0)).rgb; }
@@ -1940,13 +1940,11 @@ bool StillIn(int2 q, float2 size)
 }
 bool Still(int2 q, float2 size)
 {
-    gStillPre = false;
-    if (StillIn(q, size)) return true;
-    if ((flags & 32768) == 0) return false;
-    gStillPre = true;
+    gStillPre = (flags & 32768) != 0;
     const bool r = StillIn(q, size);
     gStillPre = false;
-    return r;
+    if (r || (flags & 32768) == 0 || (flags & 131072) == 0) return r;
+    return StillIn(q, size);
 }
 
 bool InOsd(float2 p) { return osdX1 > osdX0 && p.x >= osdX0 && p.x < osdX1 && p.y >= osdY0 && p.y < osdY1; }
@@ -2565,7 +2563,7 @@ struct Constants
     float    osdX0, osdY0, osdX1, osdY1;  // frame warp: the BFI OSD on the frame, game-frame pixels (none: x1 <= x0)
 };
 static_assert(sizeof(Constants) / 4 + 8 + 3 <= 64, "root signature: the constants, eight tables and a root CBV in at most 64 DWORDs");
-namespace pfx { static ID3D12Resource *Peek12(); static ID3D12Resource *Take12(); static ID3D11Texture2D *Take11(); static void Release(); static void Register(bool on); }
+namespace pfx { static ID3D12Resource *Peek12(); static ID3D12Resource *Take12(); static ID3D11Texture2D *Take11(); static void Release(); static void Register(bool on); static bool OverlayOpen(); }
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
 // every 32x18 cell's lit value is capped at C. Plain strobe: the lit refresh.
@@ -4836,7 +4834,8 @@ static DWORD WINAPI PresenterThread(void *)
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
             if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
             // what stands still, found in the frames from before ReShade's effects (FrameWarpStillBeforeEffects)
-            if (s.warpStillPre && g_pre[pick] && g_pre[warpPrev] && g_preOk[pick] && g_preOk[warpPrev]) c.flags |= 32768u;
+            if (s.warpStillPre && g_pre[pick] && g_pre[warpPrev] && g_preOk[pick] && g_preOk[warpPrev])
+                c.flags |= 32768u | (pfx::OverlayOpen() ? 131072u : 0u);   // ReShade's window open: the finished frames too
             if (s.osd && Now() - Osd::drawnT.load() < 0.5)    // the BFI OSD on the frame: never moved (its background is see-through)
             {
                 c.osdX0 = Osd::drawnRect[0]; c.osdY0 = Osd::drawnRect[1]; c.osdX1 = Osd::drawnRect[2]; c.osdY1 = Osd::drawnRect[3];
