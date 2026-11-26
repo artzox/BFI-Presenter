@@ -121,6 +121,59 @@ static bool Wanted()
 
 static void StartCompile();
 
+// ReShade's performance mode compiles the settings into the effect as constants: CRT-Standalone then has no uniform
+// variables to read (t3: every setting read as 0 -- a black picture). They are taken from the preset, as ReShade
+// compiles them in, and where the preset has none, from the shader's initial values (kCrtParams[].def).
+static std::map<std::string, std::vector<float>> presetVals;
+static std::string presetPath;
+static FILETIME presetTime = {};
+static double presetChecked = -1.0;
+static void ReadPreset(effect_runtime *rt)
+{
+    const double t = Now();
+    if (presetChecked >= 0.0 && t - presetChecked < 0.5) return;
+    presetChecked = t;
+    char path[1024] = ""; size_t n = sizeof(path);
+    rt->get_current_preset_path(path, &n);
+    WIN32_FILE_ATTRIBUTE_DATA fa = {};
+    if (!path[0] || !GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) { presetVals.clear(); presetPath.clear(); return; }
+    if (presetPath == path && CompareFileTime(&fa.ftLastWriteTime, &presetTime) == 0) return;
+    presetPath = path; presetTime = fa.ftLastWriteTime;
+    presetVals.clear();
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char line[4096];
+    bool in = false;
+    while (fgets(line, sizeof(line), f))
+    {
+        char *e = line + strlen(line);
+        while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+        char *b = line;
+        while (*b == ' ' || *b == '\t') b++;
+        if (*b == '[') { in = _stricmp(b, "[CRT-Standalone.fx]") == 0; continue; }
+        if (!in) continue;
+        char *eq = strchr(b, '=');
+        if (!eq) continue;
+        *eq = 0;
+        std::string key(b);
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+        std::vector<float> v;
+        for (char *c = eq + 1; *c;)
+        {
+            while (*c == ' ' || *c == ',') c++;
+            if (!*c) break;
+            if (!_strnicmp(c, "true", 4)) { v.push_back(1.0f); c += 4; continue; }
+            if (!_strnicmp(c, "false", 5)) { v.push_back(0.0f); c += 5; continue; }
+            char *end = nullptr;
+            const float x = strtof(c, &end);
+            if (end == c) break;
+            v.push_back(x); c = end;
+        }
+        if (!v.empty()) presetVals[key] = v;
+    }
+    fclose(f);
+}
+
 static void WaitGame() { if (g_gameFence && g_gameFenceVal) WaitFence(g_gameFence, g_gameFenceVal, g_gameFenceEvent); }
 
 // A copy of r in cur[k] (made or remade to its size and format), on ReShade's list; r is in state rs and left in it.
@@ -183,6 +236,8 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
     if (st != 2) { curOk = false; return; }
 
     float p[kCrtSlots * 4] = {};
+    bool presetRead = false;
+    int constants = 0;
     for (int i = 0; i < kCrtParamN; i++)
     {
         float *o = &p[i * 4];
@@ -190,7 +245,16 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
         if (!strcmp(name, "CRT_TIMER") || !strcmp(name, "crt_timer")) { o[0] = (float)(fmod(Now(), 86400.0) * 1000.0); continue; }
         if (!strcmp(name, "FRAMECOUNT")) { static uint32_t fc = 0; o[0] = (float)(fc++ & 0xFFFFFF); continue; }
         effect_uniform_variable v = FindUniform(rt, kEffect, name);
-        if (!v.handle) continue;                                  // compiled out (its switch off): its code is too
+        if (!v.handle)
+        {
+            // compiled in as a constant (performance mode), or out (its switch off: its code is too)
+            if (!presetRead) { ReadPreset(rt); presetRead = true; }
+            auto it = presetVals.find(name);
+            for (int j = 0; j < 4; j++)
+                o[j] = (it != presetVals.end() && j < (int)it->second.size()) ? it->second[j] : kCrtParams[i].def[j];
+            constants++;
+            continue;
+        }
         switch (kCrtParams[i].type)
         {
         case 'f': rt->get_uniform_value_float(v, o, 1); break;
@@ -225,6 +289,15 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
         const resource bbr = pfx::BackBuffer(rt, rt->get_current_back_buffer_index());
         ok = bbr.handle && CopyCur(nl, kBase, reinterpret_cast<ID3D12Resource *>(bbr.handle), D3D12_RESOURCE_STATE_RENDER_TARGET);
         has[kBase] = ok;
+    }
+    {
+        static bool constLogged = false;
+        if (constants > kCrtParamN / 2 && !constLogged)
+        {
+            constLogged = true;
+            LOGI("BFI Presenter: CRT hand-off: CRT-Standalone's settings are compiled in (ReShade's performance mode) -- taken from the preset %s",
+                 presetPath.empty() ? "(none: the shader's initial values)" : presetPath.c_str());
+        }
     }
     std::string d;
     char line[96];
