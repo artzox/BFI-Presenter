@@ -516,6 +516,24 @@ static bool TakeBlobs(UINT *gen, ID3DBlob *out[kBlobN])
     return true;
 }
 static bool PostIsGrainRaw(int k) { return !strcmp(kCrtPost[k].entry, "PSCrtGrainRaw"); }
+// Pass k of kCrtPost would change the picture with these settings (cp, as ParamsFor gives them): one at its off value
+// (the shader's own test: it then leaves the picture as it is) isn't drawn.
+static float ParamOf(const float *cp, const char *name)
+{
+    for (int i = 0; i < kCrtParamN; i++) if (!strcmp(kCrtParams[i].name, name)) return cp[i * 4];
+    return 1.0f;                                         // not read: assume on
+}
+static bool PostOn(int k, const float *cp)
+{
+    const char *e = kCrtPost[k].entry;
+    if (!strcmp(e, "PSCrtSharpen"))    return ParamOf(cp, "crt_sharpen_strength") >= 0.001f;
+    if (!strcmp(e, "PSCrtSoften"))     return ParamOf(cp, "crt_soften_strength") >= 0.001f;
+    if (!strcmp(e, "PSCrtGrainRaw") || !strcmp(e, "PSCrtGrain")) return ParamOf(cp, "crt_grain_intensity") > 0.001f;
+    if (!strcmp(e, "PSCrtNoiseFloor")) return ParamOf(cp, "crt_noise_floor") > 0.001f;
+    if (!strcmp(e, "PSCrtGamut"))      return ParamOf(cp, "crt_gamut_expand_strength") >= 0.001f;
+    if (!strcmp(e, "PSCrtCorner"))     return ParamOf(cp, "crt_corner_size") >= 0.001f || ParamOf(cp, "crt_corner_border") >= 0.001f;
+    return true;
+}
 // The presenter: this frame's settings, with the frame size (w, h).
 static void ParamsFor(float *out, float w, float h)
 {

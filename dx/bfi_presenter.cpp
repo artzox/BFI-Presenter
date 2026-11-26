@@ -112,6 +112,7 @@ static void ReleaseSlots();
 static const int kBlobN = 2 + kCrtPostN;
 static bool TakeBlobs(UINT *gen, ID3DBlob *out[kBlobN]);
 static bool PostIsGrainRaw(int k);
+static bool PostOn(int k, const float *cp);
 static void ParamsFor(float *out, float w, float h);
 static void Release();
 static void Register(bool on);
@@ -3818,6 +3819,12 @@ static DWORD WINAPI PresenterThread(void *)
     ID3D12Resource *crtRt[3] = {};                               // [0] [1] in turn, [2] grain's
     ID3D12DescriptorHeap *crtRtvHeap = nullptr;
     const UINT kCrtPostSrv = kPreSrv + kStage + 4 * kStage;      // their views: (0, 2) (1, 2), as t11 t12
+    // what they were last drawn for: drawn again only for another picture (another frame, another move, other settings),
+    // not for every refresh of the strobe (t5 drew them on every refresh: a large GPU cost)
+    Constants crtKeyC = {};
+    float  crtKeyP[kCrtSlots * 4] = {};
+    UINT64 crtKeyId = 0;
+    int    crtKeyPrev = -2, crtKeyLast = -1;
     ID3D12Resource *crtCb = nullptr;                             // its settings: an upload ring, one entry per draw
     uint8_t *crtCbMap = nullptr;
     const UINT kCrtCbStride = (UINT)((kCrtSlots * 16 + 255) & ~255), kCrtCbN = 64;
@@ -5296,8 +5303,21 @@ static DWORD WINAPI PresenterThread(void *)
                         g_device->CreateShaderResourceView(crtRt[order[v]], nullptr, h);
                     }
                 }
-                if (rok)
+                if (made) crtKeyLast = -1;
+                Constants kc = c;                                    // what the pattern and the passes depend on
+                kc.slot = 0; kc.method = 0; kc.soften = 0.0f; kc.phase = 0.0f; kc.gain = 0.0f; kc.dfloor = 0.0f;
+                const int kPrev = c.warp != 0.0f ? warpPrev : -1;
+                if (rok && crtKeyLast >= 0 && crtKeyId == pickId && crtKeyPrev == kPrev &&
+                    memcmp(&crtKeyC, &kc, sizeof(kc)) == 0 && memcmp(crtKeyP, cp, sizeof(cp)) == 0)
                 {
+                    crtLast = crtKeyLast;                            // the same picture: drawn already
+                    D3D12_GPU_DESCRIPTOR_HANDLE ph = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                    ph.ptr += (UINT64)(kCrtPostSrv + 2 * (UINT)crtLast) * srvStride;
+                    list->SetGraphicsRootDescriptorTable(10, ph);
+                }
+                else if (rok)
+                {
+                    crtKeyC = kc; memcpy(crtKeyP, cp, sizeof(cp)); crtKeyId = pickId; crtKeyPrev = kPrev;
                     D3D12_VIEWPORT pvp = { 0.0f, 0.0f, (float)fw, (float)fh, 0.0f, 1.0f };
                     D3D12_RECT psc = { 0, 0, (LONG)fw, (LONG)fh };
                     list->RSSetViewports(1, &pvp);
@@ -5321,7 +5341,7 @@ static DWORD WINAPI PresenterThread(void *)
                     crtLast = 0;
                     for (int k = 0; k < kCrtPostN; k++)
                     {
-                        if (!psoCrtPass[1 + k]) continue;
+                        if (!psoCrtPass[1 + k] || !crt::PostOn(k, cp)) continue;   // compiled out, or at its off value
                         if (crt::PostIsGrainRaw(k)) { into(2, psoCrtPass[1 + k], crtLast); continue; }
                         into(1 - crtLast, psoCrtPass[1 + k], crtLast);
                         crtLast = 1 - crtLast;
@@ -5332,6 +5352,7 @@ static DWORD WINAPI PresenterThread(void *)
                     D3D12_GPU_DESCRIPTOR_HANDLE ph = srvHeap->GetGPUDescriptorHandleForHeapStart();
                     ph.ptr += (UINT64)(kCrtPostSrv + 2 * (UINT)crtLast) * srvStride;
                     list->SetGraphicsRootDescriptorTable(10, ph);
+                    crtKeyLast = crtLast;
                 }
             }
             if (!psoCrtPass[0] || crtLast >= 0) list->SetPipelineState(psoCrt);   // else the textures could not be made: as without the hand-off
