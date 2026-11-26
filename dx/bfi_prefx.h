@@ -118,6 +118,7 @@ static void on_begin(effect_runtime *rt, command_list *cmd, resource_view, resou
             { clean12 = nullptr; return; }
             clean12->SetName(L"BFI frame before ReShade's effects");
         }
+        gt::Mark(nl, gt::Q_PFX0);
         D3D12_RESOURCE_BARRIER b[2] = { Transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
                                         Transition(clean12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
         nl->ResourceBarrier(2, b);
@@ -125,6 +126,7 @@ static void on_begin(effect_runtime *rt, command_list *cmd, resource_view, resou
         b[0] = Transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         b[1] = Transition(clean12, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         nl->ResourceBarrier(2, b);
+        gt::Mark(nl, gt::Q_PFX1);
     }
     captured = true;
     if (!logged) { logged = true; LOGI("BFI Presenter: frame warp: what stands still is found in the frame from before ReShade's effects"); }

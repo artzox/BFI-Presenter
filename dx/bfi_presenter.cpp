@@ -7381,6 +7381,97 @@ static void CapWait(UINT64 per)
 
 static HRESULT ResizeOnPresenterQueue(IDXGISwapChain3 *sc, UINT cnt, UINT w, UINT h, DXGI_FORMAT f, UINT fl);
 
+// ---- The presenter's own GPU time on the game's queue (1.0.49 test; while the timing log is on) ----
+// Timestamps around each part of what BFI Presenter adds to the game's frame: ReShade's command list at the start and
+// end of its effects (the frame from before the effects, CRT hand-off copies) and the frame copy list at the Present
+// (the frame's copy, the game's motion, the frame from before the effects into the slot, the CRT hand-off). Read back a
+// few frames later and logged every 10 s, so their cost can be told apart from the game's.
+namespace gt
+{
+enum { Q_PFX0, Q_PFX1, Q_FIN0, Q_FIN1, Q_P0, Q_P1, Q_P2, Q_P3, Q_P4, kQ };
+static const int kR = 16;
+static ID3D12QueryHeap *heap = nullptr;
+static ID3D12Resource *rb = nullptr;
+static UINT64 *rbMap = nullptr;
+static ID3D12Device *dev = nullptr;
+static double freq = 0.0;
+static int cur = 0;
+static bool used[kR][kQ] = {};
+static UINT64 fenceOf[kR] = {};
+static bool pending[kR] = {};
+static double sum[6] = {}; static int cnt[6] = {}; static int frames = 0;
+static double logT = 0.0;
+static bool On() { return g_shared.log != 0 && g_device && g_gameQueue && !g_dx11.load(); }
+static bool Ensure()
+{
+    if (dev != g_device)
+    {
+        if (rb && rbMap) rb->Unmap(0, nullptr);
+        SafeRelease(rb); SafeRelease(heap); rbMap = nullptr;
+        for (int r = 0; r < kR; r++) { pending[r] = false; for (int q = 0; q < kQ; q++) used[r][q] = false; }
+        dev = g_device;
+        if (!dev) return false;
+        D3D12_QUERY_HEAP_DESC qd = {}; qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qd.Count = kR * kQ;
+        if (FAILED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&heap)))) { heap = nullptr; return false; }
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)kR * kQ * 8; bd.Height = 1; bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb))))
+        { rb = nullptr; SafeRelease(heap); return false; }
+        if (FAILED(rb->Map(0, nullptr, (void **)&rbMap))) { rbMap = nullptr; SafeRelease(rb); SafeRelease(heap); return false; }
+        UINT64 f = 0;
+        freq = SUCCEEDED(g_gameQueue->GetTimestampFrequency(&f)) && f ? (double)f : 0.0;
+    }
+    return heap && rbMap && freq > 0.0;
+}
+static void Mark(ID3D12GraphicsCommandList *l, int q)
+{
+    if (!l || !On() || !Ensure() || pending[cur]) return;
+    l->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, (UINT)(cur * kQ + q));
+    used[cur][q] = true;
+}
+static void Collect()
+{
+    if (!g_gameFence) return;
+    const UINT64 done = g_gameFence->GetCompletedValue();
+    for (int r = 0; r < kR; r++)
+    {
+        if (!pending[r] || fenceOf[r] > done) continue;
+        const UINT64 *t = rbMap + (size_t)r * kQ;
+        auto d = [&](int a, int b) { return (used[r][a] && used[r][b] && t[b] >= t[a]) ? (double)(t[b] - t[a]) * 1000.0 / freq : -1.0; };
+        const double v[6] = { d(Q_PFX0, Q_PFX1), d(Q_FIN0, Q_FIN1), d(Q_P0, Q_P1), d(Q_P1, Q_P2), d(Q_P2, Q_P3), d(Q_P3, Q_P4) };
+        for (int i = 0; i < 6; i++) if (v[i] >= 0.0 && v[i] < 100.0) { sum[i] += v[i]; cnt[i]++; }
+        frames++;
+        pending[r] = false;
+        for (int q = 0; q < kQ; q++) used[r][q] = false;
+    }
+    const double tn = Now();
+    if (logT == 0.0) logT = tn;
+    if (tn - logT >= 10.0 && frames > 0)
+    {
+        auto a = [&](int i) { return cnt[i] ? sum[i] / cnt[i] : 0.0; };
+        auto n = [&](int i) { return frames ? 100.0 * cnt[i] / frames : 0.0; };
+        LOGI("BFI Presenter: GPU time on the game's queue per presented frame, last %.0f s (%d frames; ms, %% of frames): frame copy %.3f; "
+             "the game's motion %.3f (%.0f%%); frame before the effects: at the effects %.3f (%.0f%%), into the slot %.3f (%.0f%%); "
+             "CRT hand-off: after the effects %.3f (%.0f%%), at the Present %.3f (%.0f%%)",
+             tn - logT, frames, a(2), a(3), n(3), a(0), n(0), a(4), n(4), a(1), n(1), a(5), n(5));
+        for (int i = 0; i < 6; i++) { sum[i] = 0.0; cnt[i] = 0; }
+        frames = 0; logT = tn;
+    }
+}
+// At the end of the frame copy list, before it is closed: its timestamps resolved; fence: the value signalled after it.
+static void EndFrame(ID3D12GraphicsCommandList *l, UINT64 fence)
+{
+    if (!On() || !Ensure()) return;
+    Collect();
+    bool any = false;
+    for (int q = 0; q < kQ; q++)
+        if (used[cur][q]) { l->ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, (UINT)(cur * kQ + q), 1, rb, (UINT64)(cur * kQ + q) * 8); any = true; }
+    if (any) { fenceOf[cur] = fence; pending[cur] = true; cur = (cur + 1) % kR; }
+}
+}   // namespace gt
+
 static HRESULT SubmitGameFrameLocked()
 {
     if (!g_gameQueue) return OwnPresent();
@@ -7516,6 +7607,7 @@ static HRESULT SubmitGameFrameLocked()
 
     g_copyAlloc[s]->Reset();
     g_copyList->Reset(g_copyAlloc[s], nullptr);
+    gt::Mark(g_copyList, gt::Q_P0);
     D3D12_RESOURCE_BARRIER br[2] = {
         Transition(g_virt[g_cur], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
         Transition(g_stage[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
@@ -7524,7 +7616,9 @@ static HRESULT SubmitGameFrameLocked()
     br[0] = Transition(g_virt[g_cur], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
     br[1] = Transition(g_stage[s], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     g_copyList->ResourceBarrier(2, br);
+    gt::Mark(g_copyList, gt::Q_P1);
     gmo::AtPresent(g_copyList, s);            // frame warp: this frame's motion from the game's own vectors and depth
+    gt::Mark(g_copyList, gt::Q_P2);
     {
         // FrameWarpStillBeforeEffects: the frame from before ReShade's effects, kept with the slot (dx/bfi_prefx.h)
         bool preOk = false;
@@ -7550,8 +7644,11 @@ static HRESULT SubmitGameFrameLocked()
         }
         g_preOk[s] = preOk;
     }
+    gt::Mark(g_copyList, gt::Q_P3);
     crt::CopyAtPresent(g_copyList, s);        // CRT-Standalone's halation and glow, for the CRT hand-off
     crt::Bake(g_copyList, s, g_stage[s], waitRead);   // and the frame's CRT picture with them (shown as is; a moved flash draws its own)
+    gt::Mark(g_copyList, gt::Q_P4);
+    gt::EndFrame(g_copyList, g_gameFenceVal + 1);
     {
         const HRESULT ch = g_copyList->Close();
         static bool once = false;
@@ -9005,6 +9102,9 @@ static DXGI_FORMAT MvView(DXGI_FORMAT f)
 }
 
 static bool On() { return g_shared.frameWarp != 0 && g_shared.warpGame != 0 && !g_dx11.load(); }
+// With frame generation the game's motion isn't used (FrameWarpGameMotionWithFG=0, the default): its vectors, depth and
+// HUD-less picture aren't copied either (1.0.49: they were, on every upscaler call, for nothing)
+static bool FgUnused() { return g_status.fgActive && !g_shared.warpGameFg; }
 
 // slSetTag: the last depth and motion vectors a game tagged with a resource (games that pass them here rather than to
 // slEvaluateFeature). Only tags that stay valid up to the upscaler call are kept.
@@ -9105,6 +9205,7 @@ static DXGI_FORMAT ColorView(DXGI_FORMAT f)
 // the Present if it stays valid until then.
 static void CopyHud(const Tag &t, void *cmd)
 {
+    if (FgUnused()) return;
     if (hudState.load() < 0 || !g_device) return;
     if (!cmd)
     {
@@ -9224,6 +9325,7 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
 // call (NGX) put into the same shape. via: 0 Streamline, 1 DLSS (NGX).
 static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int from)
 {
+    if (FgUnused()) return;
     if (!retired.empty())
     {
         const double tn = Now();

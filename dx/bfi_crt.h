@@ -279,6 +279,8 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
     ID3D12GraphicsCommandList *nl = cmd ? reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native()) : nullptr;
     bool ok = dev != nullptr && nl != nullptr && g_device != nullptr;
     bool has[kTexN] = {};
+    gt::Mark(nl, gt::Q_FIN0);
+    struct FinMark { ID3D12GraphicsCommandList *l; ~FinMark() { gt::Mark(l, gt::Q_FIN1); } } finMark{ nl };
     const D3D12_RESOURCE_STATES rs = (D3D12_RESOURCE_STATES)g_shared.crtTexState;   // ReShade's effect textures between passes
     for (int k = 0; ok && k < 3; k++)
     {
