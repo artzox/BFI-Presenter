@@ -312,7 +312,9 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
     {
         int post = 0;
         for (int k = 0; k < kCrtPostN; k++) { const int di = DefIndex(kCrtPost[k].sw); if (di >= 0 && vals[di]) post++; }
-        snprintf(line, sizeof(line), "#define CRT_POST %d\n", post ? 1 : 0); d += line;
+        (void)post;
+        // always: the pattern is drawn into a texture (with the frame, dx/bfi_crt.h Bake), the main shader reads it
+        snprintf(line, sizeof(line), "#define CRT_POST %d\n", 1); d += line;
     }
     {
         std::lock_guard<std::mutex> l(lk);
@@ -389,8 +391,10 @@ static void ReleaseCur()
     for (int k = 0; k < kTexN; k++) SafeRelease(cur[k]);
 }
 
+static void BakeRelease();
 static void ReleaseSlots()
 {
+    BakeRelease();
     for (int k = 0; k < kTexN; k++) for (UINT s = 0; s < kStage; s++) SafeRelease(slotTex[k][s]);
     for (UINT s = 0; s < kStage; s++) slotOk[s] = false;
     slotGen++;
@@ -545,6 +549,269 @@ static void ParamsFor(float *out, float w, float h)
 
 static int StateNow() { return state.load(); }
 static UINT SlotGen() { return slotGen.load(); }
+
+
+// ---- The CRT picture made with the game's frame (1.0.49-t7) ----
+// t4-t6 drew the pattern (and from t5 the passes after it) in the presenter, just before the refresh it is shown on:
+// heavier refreshes on the strobe's own deadline, and more of them missed (dark flashes). Now, at the game's Present, the
+// frame's CRT picture is drawn on the game's queue into bOut[s] with the slot (once per game frame, as CRT-Standalone
+// itself does), and the presenter only reads it. Only a flash shown moved (frame warp) draws it in the presenter.
+static const UINT kBakeCbStride = (UINT)((kCrtSlots * 16 + 255) & ~255);
+static ID3D12RootSignature *bRoot = nullptr;
+static ID3D12PipelineState *bPso[1 + kCrtPostN] = {};
+static UINT bBlobGen = 0;
+static ID3D12DescriptorHeap *bHeap = nullptr, *bRtvHeap = nullptr;
+static ID3D12Resource *bRt[3] = {};                 // [0] [1] in turn, [2] grain's (the game's queue only)
+static ID3D12Resource *bOut[kStage] = {};           // the slot's CRT picture (COMMON between uses)
+static bool bOk[kStage] = {};
+static std::atomic<UINT> bOutGen{0};
+static ID3D12Resource *bCb = nullptr;
+static uint8_t *bCbMap = nullptr;
+static ID3D12Resource *bSeenSrc[kStage] = {}, *bSeenTex[kStage][kTexN] = {};
+static UINT bSrvStride = 0, bRtvStride = 0;
+static bool bFailed = false;
+// heap: [s] the slot's frame (t0..t6), [kStage + 4 s ..] its four textures (t7-t10), [5 kStage + v] the pairs (t11 t12)
+
+static bool BakeSetup()
+{
+    if (bFailed) return false;
+    if (!bRoot)
+    {
+        D3D12_DESCRIPTOR_RANGE r[10] = {};
+        for (int i = 0; i < 10; i++) { r[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r[i].NumDescriptors = 1; r[i].BaseShaderRegister = (UINT)i; }
+        r[7].NumDescriptors = 4;                     // t7-t10
+        r[8].BaseShaderRegister = 11; r[8].NumDescriptors = 2;   // t11-t12
+        D3D12_ROOT_PARAMETER pr[11] = {};
+        pr[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        pr[0].Constants.ShaderRegister = 0; pr[0].Constants.Num32BitValues = sizeof(Constants) / 4;
+        pr[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        const int map[10] = { 0, 1, 2, 3, 4, 5, 6, 7, -1, 8 };   // params 1-8 and 10: t0..t6, t7-t10, (9 = b1), t11-t12
+        for (int i = 1; i <= 10; i++)
+        {
+            if (i == 9) continue;
+            pr[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            pr[i].DescriptorTable.NumDescriptorRanges = 1;
+            pr[i].DescriptorTable.pDescriptorRanges = &r[map[i - 1]];
+            pr[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        }
+        pr[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; pr[9].Descriptor.ShaderRegister = 1;
+        pr[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_STATIC_SAMPLER_DESC samp = {};
+        samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp.MaxLOD = D3D12_FLOAT32_MAX; samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 11; rsd.pParameters = pr; rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &samp;
+        ID3DBlob *rb = nullptr, *re = nullptr;
+        bool ok = SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rb, &re)) &&
+                  SUCCEEDED(g_device->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(&bRoot)));
+        SafeRelease(rb); SafeRelease(re);
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 5 * kStage + 4; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&bHeap)));
+        D3D12_DESCRIPTOR_HEAP_DESC rh = {}; rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rh.NumDescriptors = 3;
+        ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&bRtvHeap)));
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)kBakeCbStride * kStage; bd.Height = 1; bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ok = ok && SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&bCb)));
+        D3D12_RANGE nr = { 0, 0 };
+        ok = ok && SUCCEEDED(bCb->Map(0, &nr, (void **)&bCbMap));
+        if (!ok)
+        {
+            bFailed = true;
+            LOGE("BFI Presenter: CRT hand-off: the game-side pass could not be set up -- drawn by the presenter");
+            return false;
+        }
+        bSrvStride = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        bRtvStride = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    }
+    ID3DBlob *cbs[kBlobN] = {};
+    if (TakeBlobs(&bBlobGen, cbs))
+    {
+        for (int k = 0; k <= kCrtPostN; k++) SafeRelease(bPso[k]);
+        ID3DBlob *vsb = g_shBlob[0];
+        bool ok = vsb != nullptr && cbs[1] != nullptr;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = bRoot;
+        if (vsb) pd.VS = { vsb->GetBufferPointer(), vsb->GetBufferSize() };
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        pd.SampleDesc.Count = 1;
+        for (int e = 1; e < kBlobN && ok; e++)
+        {
+            if (!cbs[e]) continue;
+            pd.PS = { cbs[e]->GetBufferPointer(), cbs[e]->GetBufferSize() };
+            if (FAILED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&bPso[e - 1])))) { bPso[e - 1] = nullptr; ok = false; }
+        }
+        if (!ok) for (int k = 0; k <= kCrtPostN; k++) SafeRelease(bPso[k]);
+        for (int e = 0; e < kBlobN; e++) SafeRelease(cbs[e]);
+    }
+    return bPso[0] != nullptr;
+}
+
+static void BakeWaitGame() { WaitGame(); }
+
+// The game's Present, on the frame copy list after CopyAtPresent: slot s's CRT picture into bOut[s].
+// waitRead: the presenter's fence value it may still be reading slot s at (its bOut[s] is remade only after it).
+static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead)
+{
+    bOk[s] = false;
+    if (!(state.load() == 2 && slotOk[s] && Wanted() && stage) || !BakeSetup()) return;
+    const D3D12_RESOURCE_DESC sd = stage->GetDesc();
+    const UINT fw = (UINT)sd.Width, fh = sd.Height;
+    // the working textures (the game's queue only) and the slot's output
+    if (bRt[0] && (bRt[0]->GetDesc().Width != fw || bRt[0]->GetDesc().Height != fh))
+    { WaitGame(); for (int k = 0; k < 3; k++) SafeRelease(bRt[k]); }
+    if (bOut[s] && (bOut[s]->GetDesc().Width != fw || bOut[s]->GetDesc().Height != fh))
+    {
+        if (waitRead && g_presFence) WaitFence(g_presFence, waitRead, g_gameFenceEvent);
+        SafeRelease(bOut[s]);
+    }
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = fw; rd.Height = fh; rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; rd.SampleDesc.Count = 1;
+    bool madeRt = false;
+    for (int k = 0; k < 3; k++)
+    {
+        if (bRt[k]) continue;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&bRt[k]))))
+        { bRt[k] = nullptr; return; }
+        bRt[k]->SetName(L"BFI CRT-Standalone hand-off (game side)");
+        D3D12_CPU_DESCRIPTOR_HANDLE h = bRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)k * bRtvStride;
+        g_device->CreateRenderTargetView(bRt[k], nullptr, h);
+        madeRt = true;
+    }
+    if (madeRt)
+    {
+        const int order[4] = { 0, 2, 1, 2 };
+        for (int v = 0; v < 4; v++)
+        {
+            D3D12_CPU_DESCRIPTOR_HANDLE h = bHeap->GetCPUDescriptorHandleForHeapStart();
+            h.ptr += (SIZE_T)(5 * kStage + v) * bSrvStride;
+            g_device->CreateShaderResourceView(bRt[order[v]], nullptr, h);
+        }
+    }
+    if (!bOut[s])
+    {
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&bOut[s]))))
+        { bOut[s] = nullptr; return; }
+        bOut[s]->SetName(L"BFI CRT-Standalone hand-off (the slot's CRT picture)");
+        bOutGen++;
+    }
+    // the slot's views (its frame, its four textures), rewritten when they change (the slot's last use is done)
+    if (bSeenSrc[s] != stage)
+    {
+        bSeenSrc[s] = stage;
+        D3D12_SHADER_RESOURCE_VIEW_DESC pv = {};
+        pv.Format = StageFormat(); pv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        pv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; pv.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = bHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)s * bSrvStride;
+        g_device->CreateShaderResourceView(stage, &pv, h);
+    }
+    for (int t = 0; t < kTexN; t++)
+    {
+        ID3D12Resource *r = slotTex[t][s];
+        if (bSeenTex[s][t] == r && r) continue;
+        bSeenTex[s][t] = r;
+        D3D12_SHADER_RESOURCE_VIEW_DESC cv = {};
+        cv.Format = r ? r->GetDesc().Format : DXGI_FORMAT_R16G16B16A16_FLOAT;
+        cv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        cv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; cv.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = bHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)(kStage + 4 * s + (UINT)t) * bSrvStride;
+        g_device->CreateShaderResourceView(r, &cv, h);
+    }
+    // this frame's settings
+    float cp[kCrtSlots * 4];
+    ParamsFor(cp, (float)fw, (float)fh);
+    memcpy(bCbMap + (size_t)s * kBakeCbStride, cp, sizeof(cp));
+    Constants k = {};
+    k.srcPerOutX = 1.0f; k.srcPerOutY = 1.0f;                // the game frame's own pixels, as rendered (not moved)
+
+    ID3D12DescriptorHeap *heaps[] = { bHeap };
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetGraphicsRootSignature(bRoot);
+    list->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &k, 0);
+    D3D12_GPU_DESCRIPTOR_HANDLE g0 = bHeap->GetGPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE src = g0; src.ptr += (UINT64)s * bSrvStride;
+    for (UINT i = 1; i <= 7; i++) list->SetGraphicsRootDescriptorTable(i, src);   // t0 (t1-t6: not read here)
+    D3D12_GPU_DESCRIPTOR_HANDLE tx = g0; tx.ptr += (UINT64)(kStage + 4 * s) * bSrvStride;
+    list->SetGraphicsRootDescriptorTable(8, tx);
+    list->SetGraphicsRootConstantBufferView(9, bCb->GetGPUVirtualAddress() + (UINT64)s * kBakeCbStride);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)fw, (float)fh, 0.0f, 1.0f };
+    D3D12_RECT sc = { 0, 0, (LONG)fw, (LONG)fh };
+    list->RSSetViewports(1, &vp);
+    list->RSSetScissorRects(1, &sc);
+
+    D3D12_RESOURCE_BARRIER in[1 + kTexN]; UINT nin = 0;
+    in[nin++] = Transition(stage, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    for (int t = 0; t < kTexN; t++)
+        if (slotTex[t][s]) in[nin++] = Transition(slotTex[t][s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    list->ResourceBarrier(nin, in);
+
+    auto into = [&](int t, ID3D12PipelineState *pp, int from)
+    {
+        D3D12_RESOURCE_BARRIER b = Transition(bRt[t], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(1, &b);
+        D3D12_GPU_DESCRIPTOR_HANDLE ph = g0; ph.ptr += (UINT64)(5 * kStage + 2 * (UINT)(from >= 0 ? from : 1)) * bSrvStride;
+        list->SetGraphicsRootDescriptorTable(10, ph);
+        D3D12_CPU_DESCRIPTOR_HANDLE rh = bRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rh.ptr += (SIZE_T)t * bRtvStride;
+        list->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+        list->SetPipelineState(pp);
+        list->DrawInstanced(3, 1, 0, 0);
+        b = Transition(bRt[t], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(1, &b);
+    };
+    into(0, bPso[0], -1);
+    int last = 0;
+    for (int p = 0; p < kCrtPostN; p++)
+    {
+        if (!bPso[1 + p] || !PostOn(p, cp)) continue;
+        if (PostIsGrainRaw(p)) { into(2, bPso[1 + p], last); continue; }
+        into(1 - last, bPso[1 + p], last);
+        last = 1 - last;
+    }
+    for (UINT i = 0; i < nin; i++) std::swap(in[i].Transition.StateBefore, in[i].Transition.StateAfter);
+    list->ResourceBarrier(nin, in);
+    D3D12_RESOURCE_BARRIER cb[2] = { Transition(bRt[last], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                     Transition(bOut[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
+    list->ResourceBarrier(2, cb);
+    list->CopyResource(bOut[s], bRt[last]);
+    cb[0] = Transition(bRt[last], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    cb[1] = Transition(bOut[s], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    list->ResourceBarrier(2, cb);
+    bOk[s] = true;
+    static bool logged = false;
+    if (!logged) { logged = true; LOGI("BFI Presenter: CRT hand-off: each frame's CRT picture is drawn with the frame (the game's queue); flashes moved by frame warp draw their own"); }
+}
+static ID3D12Resource *BakeOut(UINT s) { return s < kStage ? bOut[s] : nullptr; }
+static bool BakeReady(UINT s) { return s < kStage && bOk[s] && bOut[s]; }
+static UINT BakeGen() { return bOutGen.load(); }
+static void BakeRelease()
+{
+    for (int k = 0; k <= kCrtPostN; k++) SafeRelease(bPso[k]);
+    for (int k = 0; k < 3; k++) SafeRelease(bRt[k]);
+    for (UINT s = 0; s < kStage; s++) { SafeRelease(bOut[s]); bOk[s] = false; bSeenSrc[s] = nullptr; for (int t = 0; t < kTexN; t++) bSeenTex[s][t] = nullptr; }
+    if (bCb && bCbMap) bCb->Unmap(0, nullptr);
+    bCbMap = nullptr;
+    SafeRelease(bCb); SafeRelease(bHeap); SafeRelease(bRtvHeap); SafeRelease(bRoot);
+    bBlobGen = 0; bFailed = false;
+    bOutGen++;
+}
 
 static void Release()
 {

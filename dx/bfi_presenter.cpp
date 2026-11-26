@@ -113,6 +113,10 @@ static const int kBlobN = 2 + kCrtPostN;
 static bool TakeBlobs(UINT *gen, ID3DBlob *out[kBlobN]);
 static bool PostIsGrainRaw(int k);
 static bool PostOn(int k, const float *cp);
+static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead);
+static ID3D12Resource *BakeOut(UINT s);
+static bool BakeReady(UINT s);
+static UINT BakeGen();
 static void ParamsFor(float *out, float w, float h);
 static void Release();
 static void Register(bool on);
@@ -3825,6 +3829,8 @@ static DWORD WINAPI PresenterThread(void *)
     float  crtKeyP[kCrtSlots * 4] = {};
     UINT64 crtKeyId = 0;
     int    crtKeyPrev = -2, crtKeyLast = -1;
+    const UINT kBakeSrv = kCrtPostSrv + 4;                       // each slot's CRT picture made with the frame (dx/bfi_crt.h Bake), twice (t11 t12)
+    UINT   bakeGenSeen = ~0u;
     ID3D12Resource *crtCb = nullptr;                             // its settings: an upload ring, one entry per draw
     uint8_t *crtCbMap = nullptr;
     const UINT kCrtCbStride = (UINT)((kCrtSlots * 16 + 255) & ~255), kCrtCbN = 64;
@@ -3856,7 +3862,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage + 4 * kStage + 4;   // the stage frames, the APL Limiter's cells and its 1x1 average,
+    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage + 4 * kStage + 4 + 2 * kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
                                                                        // frame warp's textures, the game's own motion per stage slot
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
@@ -5239,7 +5245,7 @@ static DWORD WINAPI PresenterThread(void *)
                         g_device->CreateShaderResourceView(r, &cv, h);   // null: compiled out of the shader (not read)
                     }
             }
-            D3D12_RESOURCE_BARRIER cb3[4]; UINT ncb = 0;
+            D3D12_RESOURCE_BARRIER cb3[5]; UINT ncb = 0;
             for (int t = 0; t < 4; t++)
                 if (ID3D12Resource *r = crt::SlotTex((UINT)pick, t))
                     cb3[ncb++] = Transition(r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -5256,7 +5262,33 @@ static DWORD WINAPI PresenterThread(void *)
             // The passes after the pattern: the pattern into crtRt[0], each pass from one texture into the other (grain's
             // first half into crtRt[2]), and the main shader reads the last (t11)
             int crtLast = -1;
-            if (psoCrtPass[0])
+            ID3D12Resource *baked = (c.warp == 0.0f && crt::BakeReady((UINT)pick)) ? crt::BakeOut((UINT)pick) : nullptr;
+            if (baked)
+            {
+                // shown as rendered: the frame's own CRT picture, made with it on the game's queue
+                if (bakeGenSeen != crt::BakeGen())
+                {
+                    bakeGenSeen = crt::BakeGen();
+                    for (UINT k = 0; k < kStage; k++)
+                        for (UINT v = 0; v < 2; v++)
+                        {
+                            ID3D12Resource *r = crt::BakeOut(k);
+                            D3D12_SHADER_RESOURCE_VIEW_DESC bv = {};
+                            bv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; bv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                            bv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; bv.Texture2D.MipLevels = 1;
+                            D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                            h.ptr += (SIZE_T)(kBakeSrv + 2 * k + v) * srvStride;
+                            g_device->CreateShaderResourceView(r, &bv, h);
+                        }
+                }
+                cb3[ncb++] = Transition(baked, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                list->ResourceBarrier(1, &cb3[ncb - 1]);
+                D3D12_GPU_DESCRIPTOR_HANDLE ph = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                ph.ptr += (UINT64)(kBakeSrv + 2 * (UINT)pick) * srvStride;
+                list->SetGraphicsRootDescriptorTable(10, ph);
+                crtLast = 0;
+            }
+            else if (psoCrtPass[0])
             {
                 const UINT fw = (UINT)fd.Width, fh = fd.Height;
                 if (crtRt[0] && (crtRt[0]->GetDesc().Width != fw || crtRt[0]->GetDesc().Height != fh))
@@ -7498,6 +7530,7 @@ static HRESULT SubmitGameFrameLocked()
         g_preOk[s] = preOk;
     }
     crt::CopyAtPresent(g_copyList, s);        // CRT-Standalone's halation and glow, for the CRT hand-off
+    crt::Bake(g_copyList, s, g_stage[s], waitRead);   // and the frame's CRT picture with them (shown as is; a moved flash draws its own)
     {
         const HRESULT ch = g_copyList->Close();
         static bool once = false;
