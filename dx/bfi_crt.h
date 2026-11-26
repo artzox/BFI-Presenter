@@ -591,6 +591,13 @@ static ID3D12Resource *bSeenSrc[kStage] = {}, *bSeenTex[kStage][kTexN] = {};
 static UINT bSrvStride = 0, bRtvStride = 0;
 static DXGI_FORMAT bFmt = DXGI_FORMAT_UNKNOWN;     // the format bPso were made for
 static bool bFailed = false;
+static std::atomic<bool> bSkip{false};              // most flashes are shown moved: not made (SetBakeSkip)
+static void SetBakeSkip(bool skip)
+{
+    if (bSkip.exchange(skip) != skip)
+        LOGI("BFI Presenter: CRT hand-off: %s", skip ? "most flashes are moved by frame warp -- each draws its CRT picture, none is made with the frame"
+                                                     : "the CRT picture is made with each frame again (most flashes shown as rendered)");
+}
 // heap: [s] the slot's frame (t0..t6), [kStage + 4 s ..] its four textures (t7-t10), [5 kStage + v] the pairs (t11 t12)
 
 static bool BakeSetup()
@@ -686,7 +693,7 @@ static void BakeWaitGame() { WaitGame(); }
 static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead)
 {
     bOk[s] = false;
-    if (!(state.load() == 2 && slotOk[s] && Wanted() && stage) || !BakeSetup()) return;
+    if (bSkip.load() || !(state.load() == 2 && slotOk[s] && Wanted() && stage) || !BakeSetup()) return;
     const D3D12_RESOURCE_DESC sd = stage->GetDesc();
     const UINT fw = (UINT)sd.Width, fh = sd.Height;
     // the working textures (the game's queue only) and the slot's output

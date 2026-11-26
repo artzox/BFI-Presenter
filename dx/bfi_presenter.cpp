@@ -118,6 +118,7 @@ static ID3D12Resource *BakeOut(UINT s);
 static bool BakeReady(UINT s);
 static UINT BakeGen();
 static DXGI_FORMAT PassFormat();
+static void SetBakeSkip(bool skip);
 static void ParamsFor(float *out, float w, float h);
 static void Release();
 static void Register(bool on);
@@ -3787,6 +3788,7 @@ static DWORD WINAPI PresenterThread(void *)
     int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
     UINT64 warpPrevId = 0;
     int    secWarpCycles = 0;
+    int    secCycles = 0;                 // strobe cycles started this second (the CRT hand-off: share of them moved)
     int    secWarpPaused = 0;   // cycles not filled: a camera cut or a letterboxed cutscene
     // Warp guard (ep10): a repeated cycle shown as it is reuses the picture already drawn; filled, it is drawn anew, and
     // that submission can wait in the driver behind the game's own late frame (South of Midnight: about 6 ms, 214 of 296
@@ -4856,6 +4858,7 @@ static DWORD WINAPI PresenterThread(void *)
                 if (cycleStart) secWarpHeld++;
             }
         }
+        if (cycleStart) secCycles++;
         if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame[c.warpSrc <= 2 ? c.warpSrc : 0]++; }
 
         if (pickNew2 < 0) pickNew2 = pick;                       // picked later (the wait above): the same frame
@@ -5938,6 +5941,10 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.frameRepeats = secFrameRepeats;
             g_status.warpOn       = !s.frameWarp ? 0 : !warp.ok ? -1 : warpClock.engaged ? 2 : 1;
             g_status.warpCycles   = secWarpCycles;
+            // CRT hand-off: when most cycles are shown moved (e.g. with frame generation), the picture made with each frame
+            // is rarely shown -- not made then (it cost the game's GPU time for nothing); moved flashes draw their own
+            crt::SetBakeSkip(secCycles > 0 && secWarpCycles * 10 > secCycles * 6);
+            secCycles = 0;
             g_status.warpAvg      = secWarpCycles ? secWarpSum / secWarpCycles : 0.0;
             g_status.warpRate     = warpClock.rate;
             g_status.warpSrc      = secWarpGame[1] ? 1 : secWarpGame[2] ? 2 : 0;
