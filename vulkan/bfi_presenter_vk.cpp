@@ -62,7 +62,10 @@
 struct Swapchain; struct DeviceData;
 namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
-#define BFI_VERSION "1.0.48"
+#define BFI_VERSION "1.0.49"
+#include <atomic>
+// ReShade's own window open (as DX 1.0.49): only then is frame warp's still test run on the finished frames as well
+static std::atomic<bool> g_rsOverlayOpen{false};
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -290,6 +293,7 @@ struct Settings
     int   warpDilate = 1;     // FrameWarpGameDilate (1.0.48, as DX): the game's vectors dilated by depth
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (as DX 1.0.45): the ease without frame generation too
     int   warpEase = 1;       // FrameWarpGameMotionEase (ini only, as DX): moves past the rendered frame ease off as the motion slows
+    float warpEaseStr = 1.0f; // FrameWarpGameMotionEaseStrength (as DX 1.0.49): how hard, 0-3 (1 = as before)
     int   warpGuard = 1;      // FrameWarpGuard (ini only, as DX): filled repeats that keep making their refresh late are shown as they are
     int   warpPauseLb = 1;    // FrameWarpPauseCutscenes (as DX): no frame warp while a cutscene is letterboxed through DLSS
     int   dlssHooks = 1;      // DlssHooks: DLSS's Vulkan calls are hooked for the game's motion (0 = left alone)
@@ -419,6 +423,7 @@ static void LoadSettings(Settings &s)
     s.warpFgLag = Clamp(KvInt(kv, "FrameWarpGameMotionFGLag", 1), -1, 1);
     s.warpEase = KvInt(kv, "FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = KvInt(kv, "FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
+    s.warpEaseStr = std::max(0.0f, std::min(3.0f, KvFloat(kv, "FrameWarpGameMotionEaseStrength", 1.0f)));
     s.warpDilate = std::max(0, std::min(3, KvInt(kv, "FrameWarpGameDilate", 1)));
     s.warpStillPre = KvInt(kv, "FrameWarpStillBeforeEffects", 1) ? 1 : 0;
     s.warpGuard = KvInt(kv, "FrameWarpGuard", 1) ? 1 : 0;
@@ -505,7 +510,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); I("FrameWarpGameDilate", s.warpDilate); I("FrameWarpStillBeforeEffects", s.warpStillPre); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); F("FrameWarpGameMotionEaseStrength", s.warpEaseStr); I("FrameWarpGameDilate", s.warpDilate); I("FrameWarpStillBeforeEffects", s.warpStillPre); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexLimitAtSleep", s.reflexAtSleep); I("ReflexAlign", s.reflexAlign); I("LearnReflexStart", s.learnReflex); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -2816,7 +2821,8 @@ static void PresenterThread(Swapchain *sc)
         c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
         if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
         // what stands still, found in the frames from before ReShade's effects (FrameWarpStillBeforeEffects)
-        if (s.warpStillPre && warpPrev >= 0 && sc->pre[pick] && sc->preOk[pick] && sc->preOk[warpPrev]) c.flags |= 16384u;
+        if (s.warpStillPre && warpPrev >= 0 && sc->pre[pick] && sc->preOk[pick] && sc->preOk[warpPrev])
+            c.flags |= 16384u | (g_rsOverlayOpen.load() ? 32768u : 0u);   // ReShade's window open: the finished frames too
         if (s.osd && Now() - Osd::drawnT.load() < 0.5)    // the BFI OSD on the frame: never moved (its background is see-through)
         {
             auto px = [](float v) { return (uint32_t)std::max(0.0f, std::min(65535.0f, v)); };
@@ -2837,7 +2843,8 @@ static void PresenterThread(Swapchain *sc)
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = sc->gSlotDepth[pick] ? 1u : 2u;
                 c.warpLag = fgF > 1 ? sc->gSlotLag[pick] : 0.0f;
-                if (s.warpEase && (fgF > 1 || s.warpEaseNoFg)) c.flags |= 2048u;   // moves past the rendered frame ease off (without frame generation: FrameWarpGameMotionEaseNoFG)
+                if (s.warpEase && (fgF > 1 || s.warpEaseNoFg) && s.warpEaseStr > 0.001f)
+                    c.flags |= 2048u | ((uint32_t)std::min(255.0f, s.warpEaseStr * 64.0f + 0.5f) << 24);   // moves past the rendered frame ease off (without frame generation: FrameWarpGameMotionEaseNoFG)
             }
             // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
             else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
@@ -7471,6 +7478,7 @@ static bool RelimiterLoaded()
 // effects, copied into the swap chain's `clean` image on ReShade's command buffer (the back buffer is in
 // COLOR_ATTACHMENT_OPTIMAL there, as ReShade has it for its effects). 64-bit: ReShade's back buffer call returns its
 // resource through a hidden pointer (MSVC), called through the vtable as ReShade expects.
+static bool on_open_overlay(reshade::api::effect_runtime *, bool open, reshade::api::input_source) { g_rsOverlayOpen = open; return false; }
 static void on_begin_effects(reshade::api::effect_runtime *rt, reshade::api::command_list *cmd, reshade::api::resource_view, reshade::api::resource_view)
 {
 #ifdef _WIN64
@@ -8071,13 +8079,20 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "is at that moment, not just the cycles without a new frame, so every step on screen is the same.\n"
                                                               "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
                                                               "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
-                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
+                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.\n"
+                                                              "Every flash is drawn moved: more GPU time than filling missing frames (see the settings guide).");
                 bool en = s.warpEaseNoFg != 0;
                 if (ImGui::Checkbox("Ease off as the motion slows", &en)) s.warpEaseNoFg = en ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
                                                               "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
                                                               "stop isn't carried past it and snapped back. With frame generation it is always on.");
                 ImGui::SameLine();
+                ImGui::SetNextItemWidth(140.0f);
+                ImGui::SliderFloat("Ease off strength", &s.warpEaseStr, 0.0f, 3.0f, "%.2f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much less a filled flash is moved as the motion slows. 0 = not at all, 1 = as before\n"
+                                                              "1.0.49, 2-3 = much less as soon as the camera slows: less overshoot when it stops (worth it in\n"
+                                                              "first-person games, where the whole picture moves with the camera, and with a CRT shader, whose\n"
+                                                              "scanlines make an overshoot easy to see), but a slowing pan is filled less too.");
                 bool pl = s.warpPauseLb != 0;
                 if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
@@ -8316,6 +8331,7 @@ static void TryRegisterReShade()
     {
         ev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
         ev(reshade::addon_event::reshade_begin_effects, (void *)&on_begin_effects);   // FrameWarpStillBeforeEffects
+        ev(reshade::addon_event::reshade_open_overlay, (void *)&on_open_overlay);
     }
     static bool pinned = false;
     if (!pinned)
@@ -8341,6 +8357,7 @@ static void UnregisterReShade()
     {
         uev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
         uev(reshade::addon_event::reshade_begin_effects, (void *)&on_begin_effects);
+        uev(reshade::addon_event::reshade_open_overlay, (void *)&on_open_overlay);
     }
     if (ureg) ureg(g_module);
     g_rsModule = nullptr;

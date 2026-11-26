@@ -118,6 +118,7 @@ static void on_begin(effect_runtime *rt, command_list *cmd, resource_view, resou
             { clean12 = nullptr; return; }
             clean12->SetName(L"BFI frame before ReShade's effects");
         }
+        gt::Mark(nl, gt::Q_PFX0);
         D3D12_RESOURCE_BARRIER b[2] = { Transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
                                         Transition(clean12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
         nl->ResourceBarrier(2, b);
@@ -125,6 +126,7 @@ static void on_begin(effect_runtime *rt, command_list *cmd, resource_view, resou
         b[0] = Transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         b[1] = Transition(clean12, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         nl->ResourceBarrier(2, b);
+        gt::Mark(nl, gt::Q_PFX1);
     }
     captured = true;
     if (!logged) { logged = true; LOGI("BFI Presenter: frame warp: what stands still is found in the frame from before ReShade's effects"); }
@@ -138,17 +140,25 @@ static ID3D11Texture2D *Take11() { const bool c = captured; captured = false; re
 
 static void on_destroy_rt(effect_runtime *) { Release(); }
 
+// ReShade's own window open (1.0.49-t8): it is drawn after the effects, so only the finished frames have it -- the still
+// test then looks there too (t2-t7 always did: twice the work on every moved flash, missed refreshes -- dark flashes).
+static std::atomic<bool> overlayOpen{false};
+static bool on_open_overlay(effect_runtime *, bool open, input_source) { overlayOpen = open; return false; }
+static bool OverlayOpen() { return overlayOpen.load(); }
+
 static void Register(bool on)
 {
     if (on)
     {
         reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_rt);
+        reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
     }
     else
     {
         reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(on_begin);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_rt);
+        reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
     }
 }
 }   // namespace pfx

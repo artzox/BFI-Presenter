@@ -101,6 +101,29 @@ static inline void HudBad(double) {}
 static inline void Release() {}
 }
 #endif
+#include "bfi_crt_gen.h"    // CRT-Standalone's pattern stage, copied from the shader (tools/crt-handoff)
+namespace crt
+{
+static UINT SlotGen();
+static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s);
+static ID3D12Resource *SlotTex(UINT s, int k);
+static bool SlotReady(UINT s);
+static void ReleaseSlots();
+static const int kBlobN = 2 + kCrtPostN;
+static bool TakeBlobs(UINT *gen, ID3DBlob *out[kBlobN]);
+static bool PostIsGrainRaw(int k);
+static bool PostOn(int k, const float *cp);
+static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead);
+static ID3D12Resource *BakeOut(UINT s);
+static bool BakeReady(UINT s);
+static UINT BakeGen();
+static DXGI_FORMAT PassFormat();
+static void SetBakeSkip(bool skip);
+static void ParamsFor(float *out, float w, float h);
+static void Release();
+static void Register(bool on);
+static int StateNow();
+}
 
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d12.lib")
@@ -139,7 +162,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.48"
+#define BFI_ADDON_VERSION "1.0.49"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -181,6 +204,11 @@ struct Settings
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
+    float warpEaseStr = 1.0f; // FrameWarpGameMotionEaseStrength (1.0.49): how hard the ease below is, 0-3 (1 = as before 1.0.49;
+                              // the move past the rendered frame is scaled by (motion now / motion before) ^ this)
+    int   crtHandoff = 0;     // CrtStandaloneHandoff (1.0.49, DX12 64-bit): CRT-Standalone's mask, scanlines and glow drawn by
+                              // the presenter after frame warp (with BFI_PRESENTER_HANDOFF=1 in the shader; dx/bfi_crt.h)
+    int   crtTexState = 0xC0; // CrtTextureState (ini only): the state ReShade's effect textures are in after its effects
     int   warpStillPre = 1;   // FrameWarpStillBeforeEffects (1.0.48): what stands still (a HUD) is found in the frame from
                               // before ReShade's effects, while an effect is on (dx/bfi_prefx.h)
     int   warpDilate = 1;     // FrameWarpGameDilate (1.0.48): the game's vectors dilated by depth -- each point takes the
@@ -377,9 +405,12 @@ static void LoadSettings(Settings &s)
     s.warpFgLag = std::max(-1, std::min(1, IniInt("FrameWarpGameMotionFGLag", 1)));
     s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
+    s.warpEaseStr = std::max(0.0f, std::min(3.0f, IniFloat("FrameWarpGameMotionEaseStrength", 1.0f)));
     s.hudFromDlss = IniInt("FrameWarpHudFromDlss", 1) ? 1 : 0;
     s.warpDilate = std::max(0, std::min(3, IniInt("FrameWarpGameDilate", 1)));
     s.warpStillPre = IniInt("FrameWarpStillBeforeEffects", 1) ? 1 : 0;
+    s.crtHandoff = IniInt("CrtStandaloneHandoff", 0) ? 1 : 0;
+    s.crtTexState = IniInt("CrtTextureState", 0xC0);
     s.dlssOutState = IniInt("DlssOutputState", 8);
     s.warpGuard = IniInt("FrameWarpGuard", 1) ? 1 : 0;
     s.warpMaxGameFg = std::max(0.1f, std::min(1.5f, IniFloat("FrameWarpGameMotionMaxAheadFG", 0.10f)));
@@ -635,8 +666,10 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
     IniWriteInt("FrameWarpEvenPacing", s.warpEven);
     IniWriteInt("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg);
+    IniWriteFloat("FrameWarpGameMotionEaseStrength", s.warpEaseStr);
     IniWriteInt("FrameWarpGameDilate", s.warpDilate);
     IniWriteInt("FrameWarpStillBeforeEffects", s.warpStillPre);
+    IniWriteInt("CrtStandaloneHandoff", s.crtHandoff);
     IniWriteInt("FrameWarpPauseCutscenes", s.warpPauseLb);
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
@@ -1523,6 +1556,7 @@ static void ReleaseFrameResources()
 {
     for (UINT i = 0; i < kMaxBuf; i++) SafeRelease(g_virt[i]);
     for (UINT s = 0; s < kStage; s++) { SafeRelease(g_stage[s]); SafeRelease(g_pre[s]); g_preOk[s] = false; }
+    crt::ReleaseSlots();
     g_preGen++;
     gmo::Release();
     g_bufCount = 0;
@@ -1813,7 +1847,7 @@ float2 WarpShiftGame(float2 uv)
     // Up to the rendered frame the motion is known (a generated frame); past it, it's a guess that it carries on: that part
     // eases off as the motion slows, so a camera coming to a stop isn't pushed past where it stops and snapped back (ep9).
     const float known = clamp(warpLag, 0.0, warp);
-    const float k = warpEase > 0.5 ? bestK : 1.0;
+    const float k = warpEase > 0.001 ? pow(max(bestK, 0.0), warpEase) : 1.0;   // warpEase: the strength (1 = before 1.0.49)
     return clamp(best * (known + (warp - known) * k), -0.08, 0.08);
 }
 
@@ -1848,9 +1882,13 @@ float2 EdgeFade(float2 cp, float2 d, float2 size)
 // What stands still is found in the frames from before ReShade's effects where they are kept (FrameWarpStillBeforeEffects,
 // flags & 32768, 1.0.48): a CRT shader's pre-blur and glow spread the moving scene into a HUD's pixels, so in the finished
 // frame the HUD changed a little every frame and was moved with the scene (Onimusha with CRT-Standalone).
-float3 StillCur(int2 q) { return (flags & 32768) != 0 ? preCur.Load(int3(q, 0)).rgb : src.Load(int3(q, 0)).rgb; }
-float3 StillPrev(int2 q) { return (flags & 32768) != 0 ? prePrev.Load(int3(q, 0)).rgb : srcPrev.Load(int3(q, 0)).rgb; }
-float3 StillPrevAt(float2 uv) { return (flags & 32768) != 0 ? prePrev.SampleLevel(linClamp, uv, 0).rgb : srcPrev.SampleLevel(linClamp, uv, 0).rgb; }
+// 1.0.49: and, while ReShade's window is open (flags & 131072), where it stands still in the finished frames too: it is
+// drawn after the effects, so only they have it -- tested on the frames from before the effects alone, ReShade's window
+// was moved with the scene (1.0.48).
+static bool gStillPre = false;
+float3 StillCur(int2 q) { return gStillPre ? preCur.Load(int3(q, 0)).rgb : src.Load(int3(q, 0)).rgb; }
+float3 StillPrev(int2 q) { return gStillPre ? prePrev.Load(int3(q, 0)).rgb : srcPrev.Load(int3(q, 0)).rgb; }
+float3 StillPrevAt(float2 uv) { return gStillPre ? prePrev.SampleLevel(linClamp, uv, 0).rgb : srcPrev.SampleLevel(linClamp, uv, 0).rgb; }
 bool Unchanged(int2 q)
 {
     float3 a = StillCur(q), b = StillPrev(q);
@@ -1871,7 +1909,7 @@ bool Unchanged(int2 q)
 // near its edge one motion step back shows another part of the cloud, so patches of it were held and looked a frame
 // late on filled flashes (Oblivion Remastered, 1.0.46). (1.0.47-ep1 held no flat area at all: a flat HUD fill near its
 // edge then took in the scene from beside it -- the stamina bar, the OSD's and ReShade's windows.)
-bool Still(int2 q, float2 size)
+bool StillIn(int2 q, float2 size)
 {
     if (!Unchanged(q)) return false;
     const float3 a0 = StillCur(q);
@@ -1902,6 +1940,14 @@ bool Still(int2 q, float2 size)
     float lim = (flags & 1024) != 0 ? 0.04 * (0.1 + max(max(a.r, a.g), a.b)) : 0.04;
     return max(max(d.r, d.g), d.b) > lim;
 }
+bool Still(int2 q, float2 size)
+{
+    gStillPre = (flags & 32768) != 0;
+    const bool r = StillIn(q, size);
+    gStillPre = false;
+    if (r || (flags & 32768) == 0 || (flags & 131072) == 0) return r;
+    return StillIn(q, size);
+}
 
 bool InOsd(float2 p) { return osdX1 > osdX0 && p.x >= osdX0 && p.x < osdX1 && p.y >= osdY0 && p.y < osdY1; }
 
@@ -1911,6 +1957,9 @@ bool InOsd(float2 p) { return osdX1 > osdX0 && p.x >= osdX0 && p.x < osdX1 && p.
 // is shown as rendered for that flash).
 // Same size: Catmull-Rom (9 bilinear taps), so a moved frame is as sharp as one shown as rendered. Scaled down to
 // the window: the four-tap area filter, at the moved place.
+// Where the pixel shown was taken from in the game's frame (moved, with frame warp): the CRT hand-off reads its
+// halation and glow there, so they move with the picture while the mask and scanlines stay on the screen's pixels.
+static float2 gSrcPos = float2(0.0, 0.0);
 bool FetchWarped(float2 pos, out float3 c)
 {
     c = float3(0, 0, 0);
@@ -1933,6 +1982,7 @@ bool FetchWarped(float2 pos, out float3 c)
     // the game's HUD mask (w = -1): a HUD pixel is never moved, and no moved pixel is taken from the HUD
     if (warpSrc != 0 && (GameFlow(cp * inv).w < -0.5 || GameFlow(p * inv).w < -0.5)) return false;
     if (Still(int2(p), size)) return false;
+    gSrcPos = p;
     if (srcPerOut.x > 1.0001 || srcPerOut.y > 1.0001)
     {
         float2 o = 0.25 * srcPerOut;
@@ -1966,10 +2016,12 @@ bool FetchWarped(float2 pos, out float3 c)
 // taps across the output pixel's footprint, an area filter for up to 2x.
 float3 Fetch(float2 pos)
 {
+    gSrcPos = pos * srcPerOut;
     if (warp != 0.0)
     {
         float3 m;
         if (FetchWarped(pos, m)) return m;
+        gSrcPos = pos * srcPerOut;
     }
     if (srcPerOut.x <= 1.0001 && srcPerOut.y <= 1.0001) return src.Load(int3(pos, 0)).rgb;
     uint w, h;
@@ -2389,9 +2441,15 @@ float DecayShare(uint s, float phi, float T, float n)
     return (exp(-a / T) - exp(-n / T) + 1.0 - exp(-(b - n) / T)) / norm;
 }
 
+// CRT-Standalone's mask, scanlines and glow (CrtStandaloneHandoff, dx/bfi_crt.h): built in only for the presenter's CRT
+// build of this shader, which puts the copied CRT-Standalone code at the marker below.
+#ifndef CRT_HANDOFF
+float3 CrtColour(float2 pos) { return Fetch(pos); }
+#endif
+// @CRT_HANDOFF@
 float4 PSMain(float4 pos : SV_Position) : SV_Target
 {
-    float3 c = Fetch(pos.xy);
+    float3 c = CrtColour(pos.xy);
     if (method == 2) return float4(outType == 4 ? Encode(Decode(c)) : c, 1);
     float3 lin = Decode(c);
     float litGain = Inverted() ? float(frames) * gain / float(frames - 1) : float(frames) * gain;
@@ -2503,11 +2561,11 @@ struct Constants
     uint32_t warpSrc;                   // 0 motion from the picture, 1 the game's motion vectors and depth, 2 its vectors only
     float    warpSnapX, warpSnapY;      // frame warp: moves rounded to whole steps of this many game-frame pixels (0 = off)
     float    warpLag;                   // the game's motion with frame generation: shown frames behind its vectors' frame
-    float    warpEase;                  // the game's motion: 1 = moves past the rendered frame ease off as the motion slows
+    float    warpEase;                  // the game's motion: moves past the rendered frame ease off as the motion slows, this hard (0 = off)
     float    osdX0, osdY0, osdX1, osdY1;  // frame warp: the BFI OSD on the frame, game-frame pixels (none: x1 <= x0)
 };
-static_assert(sizeof(Constants) / 4 + 7 <= 64, "root signature: the constants and seven tables in at most 64 DWORDs");
-namespace pfx { static ID3D12Resource *Peek12(); static ID3D12Resource *Take12(); static ID3D11Texture2D *Take11(); static void Release(); static void Register(bool on); }
+static_assert(sizeof(Constants) / 4 + 8 + 3 <= 64, "root signature: the constants, eight tables and a root CBV in at most 64 DWORDs");
+namespace pfx { static ID3D12Resource *Peek12(); static ID3D12Resource *Take12(); static ID3D11Texture2D *Take11(); static void Release(); static void Register(bool on); static bool OverlayOpen(); }
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
 // every 32x18 cell's lit value is capped at C. Plain strobe: the lit refresh.
@@ -3730,6 +3788,7 @@ static DWORD WINAPI PresenterThread(void *)
     int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
     UINT64 warpPrevId = 0;
     int    secWarpCycles = 0;
+    int    secCycles = 0;                 // strobe cycles started this second (the CRT hand-off: share of them moved)
     int    secWarpPaused = 0;   // cycles not filled: a camera cut or a letterboxed cutscene
     // Warp guard (ep10): a repeated cycle shown as it is reuses the picture already drawn; filled, it is drawn anew, and
     // that submission can wait in the driver behind the game's own late frame (South of Midnight: about 6 ms, 214 of 296
@@ -3756,6 +3815,28 @@ static DWORD WINAPI PresenterThread(void *)
     int    chkSrc = 0;
     const UINT kGameFlowSrv = kStage + 2 + WarpGpu::kSrvCount;   // their views in srvHeap
     const UINT kPreSrv = kGameFlowSrv + kStage;                  // the frames from before ReShade's effects (g_pre)
+    const UINT kCrtSrv = kPreSrv + kStage;                       // CRT hand-off: each slot's halation, glow, wide glow and frame before ReShade's window (4 each)
+    UINT   crtGenSeen = ~0u, crtBlobGen = 0;
+    ID3D12PipelineState *psoCrt = nullptr;                       // the main shader's CRT build (dx/bfi_crt.h)
+    // CRT hand-off with passes after the pattern (sharpen, scanline soften, grain ...; 1.0.49): the pattern and each
+    // pass drawn into textures the game frame's size (two in turn, and grain's own), the main shader reads the last
+    ID3D12PipelineState *psoCrtPass[1 + kCrtPostN] = {};         // [0] the pattern, [1 + k] kCrtPost[k] (null: off)
+    ID3D12Resource *crtRt[3] = {};                               // [0] [1] in turn, [2] grain's
+    ID3D12DescriptorHeap *crtRtvHeap = nullptr;
+    const UINT kCrtPostSrv = kPreSrv + kStage + 4 * kStage;      // their views: (0, 2) (1, 2), as t11 t12
+    // what they were last drawn for: drawn again only for another picture (another frame, another move, other settings),
+    // not for every refresh of the strobe (t5 drew them on every refresh: a large GPU cost)
+    Constants crtKeyC = {};
+    float  crtKeyP[kCrtSlots * 4] = {};
+    UINT64 crtKeyId = 0;
+    int    crtKeyPrev = -2, crtKeyLast = -1;
+    const UINT kBakeSrv = kCrtPostSrv + 4;                       // each slot's CRT picture made with the frame (dx/bfi_crt.h Bake), twice (t11 t12)
+    UINT   bakeGenSeen = ~0u;
+    bool   crtSnapLogged = false;
+    ID3D12Resource *crtCb = nullptr;                             // its settings: an upload ring, one entry per draw
+    uint8_t *crtCbMap = nullptr;
+    const UINT kCrtCbStride = (UINT)((kCrtSlots * 16 + 255) & ~255), kCrtCbN = 64;
+    UINT   crtCbAt = 0;
     UINT   preGenSeen = ~0u;
     bool   kwarp = false;
     UINT64 measFence = 0;
@@ -3783,7 +3864,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
+    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage + 4 * kStage + 4 + 2 * kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
                                                                        // frame warp's textures, the game's own motion per stage slot
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
@@ -3847,7 +3928,11 @@ static DWORD WINAPI PresenterThread(void *)
         rangePreC.BaseShaderRegister = 5;                  // t5: this frame from before ReShade's effects (FrameWarpStillBeforeEffects)
         D3D12_DESCRIPTOR_RANGE rangePreP = range;
         rangePreP.BaseShaderRegister = 6;                  // t6: and the frame shown before, likewise
-        D3D12_ROOT_PARAMETER params[8] = {};
+        D3D12_DESCRIPTOR_RANGE rangeCrt = range;
+        rangeCrt.BaseShaderRegister = 7; rangeCrt.NumDescriptors = 4;   // t7-t10: CRT hand-off's halation, glow, wide glow, the frame before ReShade's window
+        D3D12_DESCRIPTOR_RANGE rangeCrtPost = range;
+        rangeCrtPost.BaseShaderRegister = 11; rangeCrtPost.NumDescriptors = 2;   // t11-t12: CRT hand-off's pass before, grain's texture
+        D3D12_ROOT_PARAMETER params[11] = {};
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
         params[0].Constants.Num32BitValues = sizeof(Constants) / 4;
@@ -3868,6 +3953,13 @@ static DWORD WINAPI PresenterThread(void *)
         params[6].DescriptorTable.pDescriptorRanges   = &rangePreC;
         params[7] = params[1];
         params[7].DescriptorTable.pDescriptorRanges   = &rangePreP;
+        params[8] = params[1];
+        params[8].DescriptorTable.pDescriptorRanges   = &rangeCrt;
+        params[9].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;   // b1: CRT hand-off's settings
+        params[9].Descriptor.ShaderRegister = 1;
+        params[9].ShaderVisibility          = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[10] = params[1];
+        params[10].DescriptorTable.pDescriptorRanges  = &rangeCrtPost;
         D3D12_STATIC_SAMPLER_DESC samp = {};
         samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -3875,7 +3967,7 @@ static DWORD WINAPI PresenterThread(void *)
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 8;
+        rsd.NumParameters = 11;
         rsd.pParameters   = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers   = &samp;
@@ -4738,7 +4830,7 @@ static DWORD WINAPI PresenterThread(void *)
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = (uint32_t)gsrc;
                 c.warpLag = g_status.fgActive ? gmo::SlotLag(pick) : 0.0f;
-                c.warpEase = (s.warpEase && (g_status.fgActive || s.warpEaseNoFg)) ? 1.0f : 0.0f;
+                c.warpEase = (s.warpEase && (g_status.fgActive || s.warpEaseNoFg)) ? s.warpEaseStr : 0.0f;
             }
             // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
             else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
@@ -4746,7 +4838,8 @@ static DWORD WINAPI PresenterThread(void *)
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
             if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
             // what stands still, found in the frames from before ReShade's effects (FrameWarpStillBeforeEffects)
-            if (s.warpStillPre && g_pre[pick] && g_pre[warpPrev] && g_preOk[pick] && g_preOk[warpPrev]) c.flags |= 32768u;
+            if (s.warpStillPre && g_pre[pick] && g_pre[warpPrev] && g_preOk[pick] && g_preOk[warpPrev])
+                c.flags |= 32768u | (pfx::OverlayOpen() ? 131072u : 0u);   // ReShade's window open: the finished frames too
             if (s.osd && Now() - Osd::drawnT.load() < 0.5)    // the BFI OSD on the frame: never moved (its background is see-through)
             {
                 c.osdX0 = Osd::drawnRect[0]; c.osdY0 = Osd::drawnRect[1]; c.osdX1 = Osd::drawnRect[2]; c.osdY1 = Osd::drawnRect[3];
@@ -4765,9 +4858,74 @@ static DWORD WINAPI PresenterThread(void *)
                 if (cycleStart) secWarpHeld++;
             }
         }
+        if (cycleStart) secCycles++;
         if (cycleStart && c.warp != 0.0f) { secWarpCycles++; secWarpSum += warpAhead; secWarpGame[c.warpSrc <= 2 ? c.warpSrc : 0]++; }
 
         if (pickNew2 < 0) pickNew2 = pick;                       // picked later (the wait above): the same frame
+        // CRT hand-off (dx/bfi_crt.h): the CRT build arriving, and whether this refresh is drawn with it
+        if (s.crtHandoff)
+        {
+            ID3DBlob *cbs[crt::kBlobN] = {};
+            if (crt::TakeBlobs(&crtBlobGen, cbs))
+            {
+                SafeRelease(psoCrt);
+                for (int k = 0; k <= kCrtPostN; k++) SafeRelease(psoCrtPass[k]);
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+                pd.pRootSignature = rootSig;
+                pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+                pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+                pd.SampleMask = UINT_MAX;
+                pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+                pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                pd.RasterizerState.DepthClipEnable = TRUE;
+                pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                pd.NumRenderTargets = 1;
+                pd.SampleDesc.Count = 1;
+                bool pok = cbs[0] != nullptr;
+                for (int e = 0; e < crt::kBlobN && pok; e++)
+                {
+                    if (!cbs[e]) continue;
+                    pd.PS = { cbs[e]->GetBufferPointer(), cbs[e]->GetBufferSize() };
+                    pd.RTVFormats[0] = e == 0 ? g_desc.Format : crt::PassFormat();
+                    ID3D12PipelineState **dst = e == 0 ? &psoCrt : &psoCrtPass[e - 1];
+                    if (FAILED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(dst)))) { *dst = nullptr; pok = false; }
+                }
+                if (cbs[1] && !psoCrtPass[0]) pok = false;
+                if (!pok)
+                {
+                    SafeRelease(psoCrt);
+                    for (int k = 0; k <= kCrtPostN; k++) SafeRelease(psoCrtPass[k]);
+                    if (cbs[0]) LOGE("BFI Presenter: CRT hand-off: its pipeline could not be made");
+                }
+                for (int e = 0; e < crt::kBlobN; e++) SafeRelease(cbs[e]);
+            }
+            if (!crtCb)
+            {
+                D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+                D3D12_RESOURCE_DESC bd = {};
+                bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)kCrtCbStride * kCrtCbN; bd.Height = 1; bd.DepthOrArraySize = 1;
+                bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                if (SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&crtCb))))
+                {
+                    D3D12_RANGE nr = { 0, 0 };
+                    if (FAILED(crtCb->Map(0, &nr, (void **)&crtCbMap))) { SafeRelease(crtCb); crtCbMap = nullptr; }
+                }
+            }
+            if (psoCrt && crtCbMap && crt::StateNow() == 2 && crt::SlotReady((UINT)pick))
+            {
+                c.flags |= 65536u;
+                // The mask and scanlines are drawn after the move now, on the screen's pixels: Snap (moves rounded to the
+                // scanline spacing, for a CRT shader in ReShade) has nothing to keep in line, and a step that isn't the
+                // spacing in use shifts the picture against the scanlines on every moved flash (1.0.49-t8: Snap 3 px with
+                // scanlines 2.5 wide, drawn 2 px apart -- a flash on every fill)
+                if ((c.warpSnapX > 0.0f || c.warpSnapY > 0.0f) && !crtSnapLogged)
+                {
+                    crtSnapLogged = true;
+                    LOGI("BFI Presenter: CRT hand-off: frame warp's Snap (%.1f x %.1f px) not used -- the scanlines are drawn after the move", (double)c.warpSnapX, (double)c.warpSnapY);
+                }
+                c.warpSnapX = c.warpSnapY = 0.0f;
+            }
+        }
         const UINT64 pickId2 = pickNew2 >= 0 ? g_stageId[pickNew2] : 0;
         const bool reuse = s.reuseBuffers && bufValid[bi] && bufFrame[bi] == pickId && bufFrame2[bi] == pickId2 &&
                            memcmp(&bufConst[bi], &c, sizeof(c)) == 0;
@@ -5084,7 +5242,175 @@ static DWORD WINAPI PresenterThread(void *)
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         if (tsOn) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 2);
-        list->DrawInstanced(3, 1, 0, 0);
+        // CRT hand-off: the main shader's CRT build, with this slot's halation and glow and the shader's settings
+        const bool crtDraw = (c.flags & 65536u) != 0 && psoCrt;
+        if (crtDraw)
+        {
+            if (crtGenSeen != crt::SlotGen())
+            {
+                crtGenSeen = crt::SlotGen();
+                for (UINT k = 0; k < kStage; k++)
+                    for (int t = 0; t < 4; t++)
+                    {
+                        D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                        h.ptr += (SIZE_T)(kCrtSrv + 4 * k + (UINT)t) * srvStride;
+                        ID3D12Resource *r = crt::SlotTex(k, t);
+                        D3D12_SHADER_RESOURCE_VIEW_DESC cv = {};
+                        cv.Format = r ? r->GetDesc().Format : DXGI_FORMAT_R16G16B16A16_FLOAT;
+                        cv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                        cv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; cv.Texture2D.MipLevels = 1;
+                        g_device->CreateShaderResourceView(r, &cv, h);   // null: compiled out of the shader (not read)
+                    }
+            }
+            D3D12_RESOURCE_BARRIER cb3[5]; UINT ncb = 0;
+            for (int t = 0; t < 4; t++)
+                if (ID3D12Resource *r = crt::SlotTex((UINT)pick, t))
+                    cb3[ncb++] = Transition(r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (ncb) list->ResourceBarrier(ncb, cb3);
+            float cp[kCrtSlots * 4];
+            const D3D12_RESOURCE_DESC fd = g_stage[pick]->GetDesc();
+            crt::ParamsFor(cp, (float)fd.Width, (float)fd.Height);
+            const UINT at = (crtCbAt++ % kCrtCbN) * kCrtCbStride;
+            memcpy(crtCbMap + at, cp, sizeof(cp));
+            D3D12_GPU_DESCRIPTOR_HANDLE th = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            th.ptr += (UINT64)(kCrtSrv + 4 * (UINT)pick) * srvStride;
+            list->SetGraphicsRootDescriptorTable(8, th);
+            list->SetGraphicsRootConstantBufferView(9, crtCb->GetGPUVirtualAddress() + at);
+            // The passes after the pattern: the pattern into crtRt[0], each pass from one texture into the other (grain's
+            // first half into crtRt[2]), and the main shader reads the last (t11)
+            int crtLast = -1;
+            ID3D12Resource *baked = (c.warp == 0.0f && crt::BakeReady((UINT)pick)) ? crt::BakeOut((UINT)pick) : nullptr;
+            if (baked)
+            {
+                // shown as rendered: the frame's own CRT picture, made with it on the game's queue
+                if (bakeGenSeen != crt::BakeGen())
+                {
+                    bakeGenSeen = crt::BakeGen();
+                    for (UINT k = 0; k < kStage; k++)
+                        for (UINT v = 0; v < 2; v++)
+                        {
+                            ID3D12Resource *r = crt::BakeOut(k);
+                            D3D12_SHADER_RESOURCE_VIEW_DESC bv = {};
+                            bv.Format = r ? r->GetDesc().Format : crt::PassFormat(); bv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                            bv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; bv.Texture2D.MipLevels = 1;
+                            D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                            h.ptr += (SIZE_T)(kBakeSrv + 2 * k + v) * srvStride;
+                            g_device->CreateShaderResourceView(r, &bv, h);
+                        }
+                }
+                cb3[ncb++] = Transition(baked, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                list->ResourceBarrier(1, &cb3[ncb - 1]);
+                D3D12_GPU_DESCRIPTOR_HANDLE ph = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                ph.ptr += (UINT64)(kBakeSrv + 2 * (UINT)pick) * srvStride;
+                list->SetGraphicsRootDescriptorTable(10, ph);
+                crtLast = 0;
+            }
+            else if (psoCrtPass[0])
+            {
+                const UINT fw = (UINT)fd.Width, fh = fd.Height;
+                if (crtRt[0] && (crtRt[0]->GetDesc().Width != fw || crtRt[0]->GetDesc().Height != fh || crtRt[0]->GetDesc().Format != crt::PassFormat()))
+                {
+                    // resized: the textures remade once the presenter's work so far is done
+                    EnterCriticalSection(&g_lock);
+                    const UINT64 v = ++g_presFenceVal;
+                    LeaveCriticalSection(&g_lock);
+                    queue->Signal(g_presFence, v);
+                    WaitFence(g_presFence, v, ev);
+                    for (int k = 0; k < 3; k++) SafeRelease(crtRt[k]);
+                }
+                if (!crtRtvHeap)
+                {
+                    D3D12_DESCRIPTOR_HEAP_DESC rh = {}; rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rh.NumDescriptors = 3;
+                    if (FAILED(g_device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&crtRtvHeap)))) crtRtvHeap = nullptr;
+                }
+                bool rok = crtRtvHeap != nullptr;
+                bool made = false;
+                for (int k = 0; k < 3 && rok; k++)
+                {
+                    if (crtRt[k]) continue;
+                    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    D3D12_RESOURCE_DESC rd = {};
+                    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = fw; rd.Height = fh; rd.DepthOrArraySize = 1;
+                    rd.MipLevels = 1; rd.Format = crt::PassFormat(); rd.SampleDesc.Count = 1;
+                    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&crtRt[k]))))
+                    { crtRt[k] = nullptr; rok = false; break; }
+                    crtRt[k]->SetName(L"BFI CRT-Standalone hand-off (passes after the pattern)");
+                    D3D12_CPU_DESCRIPTOR_HANDLE rh = crtRtvHeap->GetCPUDescriptorHandleForHeapStart();
+                    rh.ptr += (SIZE_T)k * rtvStride;
+                    g_device->CreateRenderTargetView(crtRt[k], nullptr, rh);
+                    made = true;
+                }
+                if (rok && made)
+                {
+                    // views (0, 2) and (1, 2): each texture with grain's after it, as t11 t12
+                    const int order[4] = { 0, 2, 1, 2 };
+                    for (int v = 0; v < 4; v++)
+                    {
+                        D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                        h.ptr += (SIZE_T)(kCrtPostSrv + (UINT)v) * srvStride;
+                        g_device->CreateShaderResourceView(crtRt[order[v]], nullptr, h);
+                    }
+                }
+                if (made) crtKeyLast = -1;
+                Constants kc = c;                                    // what the pattern and the passes depend on
+                kc.slot = 0; kc.method = 0; kc.soften = 0.0f; kc.phase = 0.0f; kc.gain = 0.0f; kc.dfloor = 0.0f;
+                const int kPrev = c.warp != 0.0f ? warpPrev : -1;
+                if (rok && crtKeyLast >= 0 && crtKeyId == pickId && crtKeyPrev == kPrev &&
+                    memcmp(&crtKeyC, &kc, sizeof(kc)) == 0 && memcmp(crtKeyP, cp, sizeof(cp)) == 0)
+                {
+                    crtLast = crtKeyLast;                            // the same picture: drawn already
+                    D3D12_GPU_DESCRIPTOR_HANDLE ph = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                    ph.ptr += (UINT64)(kCrtPostSrv + 2 * (UINT)crtLast) * srvStride;
+                    list->SetGraphicsRootDescriptorTable(10, ph);
+                }
+                else if (rok)
+                {
+                    crtKeyC = kc; memcpy(crtKeyP, cp, sizeof(cp)); crtKeyId = pickId; crtKeyPrev = kPrev;
+                    D3D12_VIEWPORT pvp = { 0.0f, 0.0f, (float)fw, (float)fh, 0.0f, 1.0f };
+                    D3D12_RECT psc = { 0, 0, (LONG)fw, (LONG)fh };
+                    list->RSSetViewports(1, &pvp);
+                    list->RSSetScissorRects(1, &psc);
+                    auto into = [&](int t, ID3D12PipelineState *pp, int from)
+                    {
+                        D3D12_RESOURCE_BARRIER rb = Transition(crtRt[t], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        list->ResourceBarrier(1, &rb);
+                        D3D12_GPU_DESCRIPTOR_HANDLE ph = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                        ph.ptr += (UINT64)(kCrtPostSrv + 2 * (UINT)(from >= 0 ? from : 1)) * srvStride;   // the pattern pass: any (not read)
+                        list->SetGraphicsRootDescriptorTable(10, ph);
+                        D3D12_CPU_DESCRIPTOR_HANDLE rh = crtRtvHeap->GetCPUDescriptorHandleForHeapStart();
+                        rh.ptr += (SIZE_T)t * rtvStride;
+                        list->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+                        list->SetPipelineState(pp);
+                        list->DrawInstanced(3, 1, 0, 0);
+                        rb = Transition(crtRt[t], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        list->ResourceBarrier(1, &rb);
+                    };
+                    into(0, psoCrtPass[0], -1);
+                    crtLast = 0;
+                    for (int k = 0; k < kCrtPostN; k++)
+                    {
+                        if (!psoCrtPass[1 + k] || !crt::PostOn(k, cp)) continue;   // compiled out, or at its off value
+                        if (crt::PostIsGrainRaw(k)) { into(2, psoCrtPass[1 + k], crtLast); continue; }
+                        into(1 - crtLast, psoCrtPass[1 + k], crtLast);
+                        crtLast = 1 - crtLast;
+                    }
+                    list->RSSetViewports(1, &vp);
+                    list->RSSetScissorRects(1, &sc);
+                    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                    D3D12_GPU_DESCRIPTOR_HANDLE ph = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                    ph.ptr += (UINT64)(kCrtPostSrv + 2 * (UINT)crtLast) * srvStride;
+                    list->SetGraphicsRootDescriptorTable(10, ph);
+                    crtKeyLast = crtLast;
+                }
+            }
+            if (!psoCrtPass[0] || crtLast >= 0) list->SetPipelineState(psoCrt);   // else the textures could not be made: as without the hand-off
+            list->DrawInstanced(3, 1, 0, 0);
+            list->SetPipelineState(pso);
+            for (UINT i = 0; i < ncb; i++) std::swap(cb3[i].Transition.StateBefore, cb3[i].Transition.StateAfter);
+            if (ncb) list->ResourceBarrier(ncb, cb3);
+        }
+        else list->DrawInstanced(3, 1, 0, 0);
         if (tsOn)
         {
             list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, 4 * bi + 3);
@@ -5615,6 +5941,10 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.frameRepeats = secFrameRepeats;
             g_status.warpOn       = !s.frameWarp ? 0 : !warp.ok ? -1 : warpClock.engaged ? 2 : 1;
             g_status.warpCycles   = secWarpCycles;
+            // CRT hand-off: when most cycles are shown moved (e.g. with frame generation), the picture made with each frame
+            // is rarely shown -- not made then (it cost the game's GPU time for nothing); moved flashes draw their own
+            crt::SetBakeSkip(secCycles > 0 && secWarpCycles * 10 > secCycles * 6);
+            secCycles = 0;
             g_status.warpAvg      = secWarpCycles ? secWarpSum / secWarpCycles : 0.0;
             g_status.warpRate     = warpClock.rate;
             g_status.warpSrc      = secWarpGame[1] ? 1 : secWarpGame[2] ? 2 : 0;
@@ -6787,6 +7117,12 @@ static DWORD WINAPI PresenterThread(void *)
     if (rfxf) fclose(rfxf);
     SafeRelease(output);
     SafeRelease(pso);
+    SafeRelease(psoCrt);
+    for (int k = 0; k <= kCrtPostN; k++) SafeRelease(psoCrtPass[k]);
+    for (int k = 0; k < 3; k++) SafeRelease(crtRt[k]);
+    SafeRelease(crtRtvHeap);
+    if (crtCb && crtCbMap) crtCb->Unmap(0, nullptr);
+    SafeRelease(crtCb);
     SafeRelease(psoMeas);
     SafeRelease(measRt);
     SafeRelease(measRb);
@@ -7045,6 +7381,97 @@ static void CapWait(UINT64 per)
 
 static HRESULT ResizeOnPresenterQueue(IDXGISwapChain3 *sc, UINT cnt, UINT w, UINT h, DXGI_FORMAT f, UINT fl);
 
+// ---- The presenter's own GPU time on the game's queue (1.0.49 test; while the timing log is on) ----
+// Timestamps around each part of what BFI Presenter adds to the game's frame: ReShade's command list at the start and
+// end of its effects (the frame from before the effects, CRT hand-off copies) and the frame copy list at the Present
+// (the frame's copy, the game's motion, the frame from before the effects into the slot, the CRT hand-off). Read back a
+// few frames later and logged every 10 s, so their cost can be told apart from the game's.
+namespace gt
+{
+enum { Q_PFX0, Q_PFX1, Q_FIN0, Q_FIN1, Q_P0, Q_P1, Q_P2, Q_P3, Q_P4, kQ };
+static const int kR = 16;
+static ID3D12QueryHeap *heap = nullptr;
+static ID3D12Resource *rb = nullptr;
+static UINT64 *rbMap = nullptr;
+static ID3D12Device *dev = nullptr;
+static double freq = 0.0;
+static int cur = 0;
+static bool used[kR][kQ] = {};
+static UINT64 fenceOf[kR] = {};
+static bool pending[kR] = {};
+static double sum[6] = {}; static int cnt[6] = {}; static int frames = 0;
+static double logT = 0.0;
+static bool On() { return g_shared.log != 0 && g_device && g_gameQueue && !g_dx11.load(); }
+static bool Ensure()
+{
+    if (dev != g_device)
+    {
+        if (rb && rbMap) rb->Unmap(0, nullptr);
+        SafeRelease(rb); SafeRelease(heap); rbMap = nullptr;
+        for (int r = 0; r < kR; r++) { pending[r] = false; for (int q = 0; q < kQ; q++) used[r][q] = false; }
+        dev = g_device;
+        if (!dev) return false;
+        D3D12_QUERY_HEAP_DESC qd = {}; qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qd.Count = kR * kQ;
+        if (FAILED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&heap)))) { heap = nullptr; return false; }
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)kR * kQ * 8; bd.Height = 1; bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb))))
+        { rb = nullptr; SafeRelease(heap); return false; }
+        if (FAILED(rb->Map(0, nullptr, (void **)&rbMap))) { rbMap = nullptr; SafeRelease(rb); SafeRelease(heap); return false; }
+        UINT64 f = 0;
+        freq = SUCCEEDED(g_gameQueue->GetTimestampFrequency(&f)) && f ? (double)f : 0.0;
+    }
+    return heap && rbMap && freq > 0.0;
+}
+static void Mark(ID3D12GraphicsCommandList *l, int q)
+{
+    if (!l || !On() || !Ensure() || pending[cur]) return;
+    l->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, (UINT)(cur * kQ + q));
+    used[cur][q] = true;
+}
+static void Collect()
+{
+    if (!g_gameFence) return;
+    const UINT64 done = g_gameFence->GetCompletedValue();
+    for (int r = 0; r < kR; r++)
+    {
+        if (!pending[r] || fenceOf[r] > done) continue;
+        const UINT64 *t = rbMap + (size_t)r * kQ;
+        auto d = [&](int a, int b) { return (used[r][a] && used[r][b] && t[b] >= t[a]) ? (double)(t[b] - t[a]) * 1000.0 / freq : -1.0; };
+        const double v[6] = { d(Q_PFX0, Q_PFX1), d(Q_FIN0, Q_FIN1), d(Q_P0, Q_P1), d(Q_P1, Q_P2), d(Q_P2, Q_P3), d(Q_P3, Q_P4) };
+        for (int i = 0; i < 6; i++) if (v[i] >= 0.0 && v[i] < 100.0) { sum[i] += v[i]; cnt[i]++; }
+        frames++;
+        pending[r] = false;
+        for (int q = 0; q < kQ; q++) used[r][q] = false;
+    }
+    const double tn = Now();
+    if (logT == 0.0) logT = tn;
+    if (tn - logT >= 10.0 && frames > 0)
+    {
+        auto a = [&](int i) { return cnt[i] ? sum[i] / cnt[i] : 0.0; };
+        auto n = [&](int i) { return frames ? 100.0 * cnt[i] / frames : 0.0; };
+        LOGI("BFI Presenter: GPU time on the game's queue per presented frame, last %.0f s (%d frames; ms, %% of frames): frame copy %.3f; "
+             "the game's motion %.3f (%.0f%%); frame before the effects: at the effects %.3f (%.0f%%), into the slot %.3f (%.0f%%); "
+             "CRT hand-off: after the effects %.3f (%.0f%%), at the Present %.3f (%.0f%%)",
+             tn - logT, frames, a(2), a(3), n(3), a(0), n(0), a(4), n(4), a(1), n(1), a(5), n(5));
+        for (int i = 0; i < 6; i++) { sum[i] = 0.0; cnt[i] = 0; }
+        frames = 0; logT = tn;
+    }
+}
+// At the end of the frame copy list, before it is closed: its timestamps resolved; fence: the value signalled after it.
+static void EndFrame(ID3D12GraphicsCommandList *l, UINT64 fence)
+{
+    if (!On() || !Ensure()) return;
+    Collect();
+    bool any = false;
+    for (int q = 0; q < kQ; q++)
+        if (used[cur][q]) { l->ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, (UINT)(cur * kQ + q), 1, rb, (UINT64)(cur * kQ + q) * 8); any = true; }
+    if (any) { fenceOf[cur] = fence; pending[cur] = true; cur = (cur + 1) % kR; }
+}
+}   // namespace gt
+
 static HRESULT SubmitGameFrameLocked()
 {
     if (!g_gameQueue) return OwnPresent();
@@ -7180,6 +7607,7 @@ static HRESULT SubmitGameFrameLocked()
 
     g_copyAlloc[s]->Reset();
     g_copyList->Reset(g_copyAlloc[s], nullptr);
+    gt::Mark(g_copyList, gt::Q_P0);
     D3D12_RESOURCE_BARRIER br[2] = {
         Transition(g_virt[g_cur], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
         Transition(g_stage[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
@@ -7188,7 +7616,9 @@ static HRESULT SubmitGameFrameLocked()
     br[0] = Transition(g_virt[g_cur], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
     br[1] = Transition(g_stage[s], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     g_copyList->ResourceBarrier(2, br);
+    gt::Mark(g_copyList, gt::Q_P1);
     gmo::AtPresent(g_copyList, s);            // frame warp: this frame's motion from the game's own vectors and depth
+    gt::Mark(g_copyList, gt::Q_P2);
     {
         // FrameWarpStillBeforeEffects: the frame from before ReShade's effects, kept with the slot (dx/bfi_prefx.h)
         bool preOk = false;
@@ -7214,6 +7644,11 @@ static HRESULT SubmitGameFrameLocked()
         }
         g_preOk[s] = preOk;
     }
+    gt::Mark(g_copyList, gt::Q_P3);
+    crt::CopyAtPresent(g_copyList, s);        // CRT-Standalone's halation and glow, for the CRT hand-off
+    crt::Bake(g_copyList, s, g_stage[s], waitRead);   // and the frame's CRT picture with them (shown as is; a moved flash draws its own)
+    gt::Mark(g_copyList, gt::Q_P4);
+    gt::EndFrame(g_copyList, g_gameFenceVal + 1);
     {
         const HRESULT ch = g_copyList->Close();
         static bool once = false;
@@ -8667,6 +9102,9 @@ static DXGI_FORMAT MvView(DXGI_FORMAT f)
 }
 
 static bool On() { return g_shared.frameWarp != 0 && g_shared.warpGame != 0 && !g_dx11.load(); }
+// With frame generation the game's motion isn't used (FrameWarpGameMotionWithFG=0, the default): its vectors, depth and
+// HUD-less picture aren't copied either (1.0.49: they were, on every upscaler call, for nothing)
+static bool FgUnused() { return g_status.fgActive && !g_shared.warpGameFg; }
 
 // slSetTag: the last depth and motion vectors a game tagged with a resource (games that pass them here rather than to
 // slEvaluateFeature). Only tags that stay valid up to the upscaler call are kept.
@@ -8767,6 +9205,7 @@ static DXGI_FORMAT ColorView(DXGI_FORMAT f)
 // the Present if it stays valid until then.
 static void CopyHud(const Tag &t, void *cmd)
 {
+    if (FgUnused()) return;
     if (hudState.load() < 0 || !g_device) return;
     if (!cmd)
     {
@@ -8886,6 +9325,7 @@ static void OnEvaluate(const Base **in, uint32_t n, void *cmd)
 // call (NGX) put into the same shape. via: 0 Streamline, 1 DLSS (NGX).
 static void Feed(const Tag *const tg[2], const Consts &consts, void *cmd, int from)
 {
+    if (FgUnused()) return;
     if (!retired.empty())
     {
         const double tn = Now();
@@ -14148,6 +14588,22 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "(a character, a car), which keep their stutter. With frame generation it works, with less to fill.\n"
                                                       "A filled flash is a guess: edges of things moving against the background can smear for that\n"
                                                       "flash, and a CRT shader's mask moves with the picture (see Snap below). Details: the settings guide.");
+        {
+            bool ch = s.crtHandoff != 0;
+            if (ImGui::Checkbox("Apply CRT-Standalone after frame warp", &ch)) s.crtHandoff = ch ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("CRT-Standalone's mask, scanlines, halation and glow -- and its passes after them: sharpen,\n"
+                                                          "scanline soften, grain, noise floor, gamut expand, corner round -- are drawn by the presenter\n"
+                                                          "after frame warp, so a moved frame doesn't move them with the picture (moire, mostly in the\n"
+                                                          "sky). Needs BFI_PRESENTER_HANDOFF=1 in CRT-Standalone's preprocessor definitions too: its\n"
+                                                          "settings stay in its own window. DirectX 12; not with its PIPELINE 1/2 or ENABLE_SCANLINE_SS=1 yet.\n"
+                                                          "Costs GPU time: the CRT picture once per frame, and again on every flash frame warp moves.");
+            if (s.crtHandoff)
+            {
+                const int cs = crt::StateNow();
+                ImGui::SameLine();
+                ImGui::TextDisabled(cs == 2 ? "(in use)" : cs == 1 ? "(CRT-Standalone doesn't hand off)" : cs < 0 ? "(not with this CRT-Standalone setup)" : "(waiting)");
+            }
+        }
         if (s.frameWarp)
         {
             ImGui::Indent(16.0f);
@@ -14179,12 +14635,23 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "is at that moment, not just the cycles without a new frame, so every step on screen is the same.\n"
                                                               "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
                                                               "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
-                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
+                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.\n"
+                                                              "Every flash is drawn moved: more GPU time than filling missing frames (see the settings guide).");
                 bool en = s.warpEaseNoFg != 0;
                 if (ImGui::Checkbox("Ease off as the motion slows", &en)) s.warpEaseNoFg = en ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
                                                               "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
                                                               "stop isn't carried past it and snapped back. With frame generation it is always on.");
+                if (s.warpEaseNoFg || g_status.fgActive)
+                {
+                    ImGui::Indent(16.0f);
+                    ImGui::SliderFloat("Ease off strength", &s.warpEaseStr, 0.0f, 3.0f, "%.2f");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much less a filled flash is moved as the motion slows. 0 = not at all, 1 = as before\n"
+                                                                  "1.0.49, 2-3 = much less as soon as the camera slows: less overshoot when it stops (worth it in\n"
+                                                                  "first-person games, where the whole picture moves with the camera, and with a CRT shader, whose\n"
+                                                                  "scanlines make an overshoot easy to see), but a slowing pan is filled less too.");
+                    ImGui::Unindent(16.0f);
+                }
             }
             bool pl = s.warpPauseLb != 0;
             if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
@@ -14227,6 +14694,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader,\n"
                                                           "set it to the scanline width (e.g. CRT-Standalone's Scanline Width) so the scanlines\n"
                                                           "don't break up where parts of the picture move by different amounts. 0 = off.");
+            if ((s.warpSnapX > 0.0f || s.warpSnapY > 0.0f) && s.crtHandoff && crt::StateNow() == 2)
+                ImGui::TextDisabled("Snap isn't used while CRT-Standalone is applied after frame warp: its scanlines no longer move.");
             {
                 int em = s.warpEdge;
                 if (ImGui::Combo("Screen edges", &em, "Fade the move\0Mirror the picture\0Repeat the edge\0")) s.warpEdge = em;
@@ -14502,6 +14971,7 @@ static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize
 }
 
 #include "bfi_prefx.h"      // the frame from before ReShade's effects (FrameWarpStillBeforeEffects)
+#include "bfi_crt.h"        // CRT-Standalone's mask and scanlines after frame warp (CrtStandaloneHandoff)
 
 // ---------------------------------------------------------------- entry
 // Unregister from ReShade. The module is pinned (the watchdog thread runs for
@@ -14522,6 +14992,7 @@ static void UnregisterAll(HMODULE hModule)
     reshade::unregister_overlay("BFI Presenter", draw_overlay);
     reshade::unregister_event<reshade::addon_event::reshade_overlay>(on_osd);
     pfx::Register(false);
+    crt::Register(false);
     RemoveHooks();
     reshade::unregister_addon(hModule);
 }
@@ -14548,6 +15019,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE)
     reshade::register_overlay("BFI Presenter", draw_overlay);
     reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
     pfx::Register(true);
+    crt::Register(true);
     if (!g_crashHandler && g_crashLogOn) g_crashHandler = AddVectoredExceptionHandler(0, CrashLogger);
     return true;
 }
@@ -14606,6 +15078,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_overlay("BFI Presenter", draw_overlay);
         reshade::register_event<reshade::addon_event::reshade_overlay>(on_osd);
         pfx::Register(true);
+        crt::Register(true);
         ShaderPrepare();                                // compiled (or loaded) while the game starts up
         // DRED must be switched on before the game creates its device; a
         // thread avoids calling into D3D12 under the loader lock.

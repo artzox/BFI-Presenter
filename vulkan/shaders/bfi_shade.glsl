@@ -13,9 +13,12 @@ layout(set = 2, binding = 3) uniform sampler2D gameFlow;   // the game's own mot
 // still is found (a CRT shader's blur and glow over a HUD made it look as if it moved). Otherwise the stage frames.
 layout(set = 2, binding = 4) uniform sampler2D preCur;
 layout(set = 2, binding = 5) uniform sampler2D prePrev;
-vec3 StillCur(ivec2 q) { return (pc.flags & 16384u) != 0u ? texelFetch(preCur, q, 0).rgb : texelFetch(src, q, 0).rgb; }
-vec3 StillPrev(ivec2 q) { return (pc.flags & 16384u) != 0u ? texelFetch(prePrev, q, 0).rgb : texelFetch(srcPrev, q, 0).rgb; }
-vec3 StillPrevAt(vec2 uv) { return (pc.flags & 16384u) != 0u ? textureLod(prePrev, uv, 0.0).rgb : textureLod(srcPrev, uv, 0.0).rgb; }
+// 1.0.49 (as DX): and, while ReShade's window is open (flags & 32768), where it stands still in the finished frames too
+// -- ReShade's window, drawn after the effects, is only in those (it was moved with the scene in 1.0.48).
+bool gStillPre = false;
+vec3 StillCur(ivec2 q) { return gStillPre ? texelFetch(preCur, q, 0).rgb : texelFetch(src, q, 0).rgb; }
+vec3 StillPrev(ivec2 q) { return gStillPre ? texelFetch(prePrev, q, 0).rgb : texelFetch(srcPrev, q, 0).rgb; }
+vec3 StillPrevAt(vec2 uv) { return gStillPre ? textureLod(prePrev, uv, 0.0).rgb : textureLod(srcPrev, uv, 0.0).rgb; }
 
 // The game's own motion (as dx/bfi_presenter.cpp, WarpShiftGame): the place the output pixel comes from is found in up
 // to three steps along the motion, and each step checked -- does the point found really move onto this pixel? Of the
@@ -47,7 +50,9 @@ vec2 WarpShiftGame(vec2 uv)
     // Up to the rendered frame the motion is known (a generated frame); past it, it's a guess that it carries on: that part
     // eases off as the motion slows (flags & 2048), so a camera coming to a stop isn't pushed past where it stops (as DX ep9).
     float known = clamp(pc.warpLag, 0.0, pc.warp);
-    float k = (pc.flags & 2048u) != 0u ? bestK : 1.0;
+    // its strength (FrameWarpGameMotionEaseStrength, 1.0.49): flags bits 24-31, in 64ths (64 = 1, as before 1.0.49)
+    float e = float(pc.flags >> 24) / 64.0;
+    float k = ((pc.flags & 2048u) != 0u && e > 0.001) ? pow(max(bestK, 0.0), e) : 1.0;
     return clamp(best * (known + (pc.warp - known) * k), -0.08, 0.08);
 }
 
@@ -70,7 +75,7 @@ bool Unchanged(ivec2 q, ivec2 size)
     return all(lessThanEqual(abs(a - b), tol));
 }
 // Does the pixel stand still on the screen (a HUD, text, a crosshair) rather than move with the scene? (As in DX.)
-bool Still(ivec2 q, vec2 size)
+bool StillIn(ivec2 q, vec2 size)
 {
     ivec2 isz = ivec2(size);
     if (!Unchanged(q, isz)) return false;
@@ -105,6 +110,14 @@ bool Still(ivec2 q, vec2 size)
     vec3 d = abs(a - StillPrevAt((c - step) / size));
     float lim = (pc.flags & 1024u) != 0u ? 0.04 * (0.1 + max(max(a.r, a.g), a.b)) : 0.04;
     return max(max(d.r, d.g), d.b) > lim;
+}
+bool Still(ivec2 q, vec2 size)
+{
+    gStillPre = (pc.flags & 16384u) != 0u;
+    bool r = StillIn(q, size);
+    gStillPre = false;
+    if (r || (pc.flags & 16384u) == 0u || (pc.flags & 32768u) == 0u) return r;
+    return StillIn(q, size);   // ReShade's window open (flags & 32768): the finished frames too
 }
 // The screen-edge strip of a moved flash (FrameWarpEdge; as DX): mirrored at the edge (flags & 4096), or the move
 // eased off over a band three moves wide on the side the picture comes in from (flags & 8192).
