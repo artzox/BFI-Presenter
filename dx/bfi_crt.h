@@ -46,12 +46,18 @@ static std::mutex lk;
 static float params[kCrtSlots * 4] = {};        // one float4 per uniform (kCrtParams), then the frame size
 static std::string defines;                     // "#define NAME value\n" for each switch, the last read
 static std::atomic<int> state{0};               // 0 off, 1 the shader isn't handing off, 2 handing off, -1 not supported
-static ID3D12Resource *texNow[3] = {};          // this frame's halation and glow textures (ReShade's), at Present
-static bool texNowOk = false;
+// The presenter's own copies of this frame's halation, glow and wide glow (ReShade's textures) and of the finished
+// frame before ReShade's window is drawn on it (kBase), made on ReShade's command list at reshade_finish_effects.
+// (t1 kept ReShade's texture pointers until the game's Present and copied from them there: switching ReShade's
+// performance mode rebuilt the effects in between, and the copy read freed textures -- a crash in the driver.)
+static const int kBase = 3, kTexN = 4;
+static ID3D12Resource *cur[kTexN] = {};
+static bool curHas[kTexN] = {};                 // found this frame (a texture compiled out: none)
+static bool curOk = false;                      // copied since the last Present
 static std::atomic<UINT> slotGen{0};            // counts the slot textures being made (the presenter rewrites its views)
 
 // Per staging slot (next to g_stage[s])
-static ID3D12Resource *slotTex[3][kStage] = {};
+static ID3D12Resource *slotTex[kTexN][kStage] = {};
 static bool slotOk[kStage] = {};
 
 // The presenter's CRT build of its main shader
@@ -115,8 +121,46 @@ static bool Wanted()
 
 static void StartCompile();
 
+static void WaitGame() { if (g_gameFence && g_gameFenceVal) WaitFence(g_gameFence, g_gameFenceVal, g_gameFenceEvent); }
+
+// A copy of r in cur[k] (made or remade to its size and format), on ReShade's list; r is in state rs and left in it.
+static bool CopyCur(ID3D12GraphicsCommandList *nl, int k, ID3D12Resource *r, D3D12_RESOURCE_STATES rs)
+{
+    const D3D12_RESOURCE_DESC d = r->GetDesc();
+    if (d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return false;
+    if (cur[k])
+    {
+        const D3D12_RESOURCE_DESC h = cur[k]->GetDesc();
+        if (h.Width != d.Width || h.Height != d.Height || h.Format != d.Format) { WaitGame(); SafeRelease(cur[k]); }
+    }
+    if (!cur[k])
+    {
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = d;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE; rd.MipLevels = 1; rd.DepthOrArraySize = 1;
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&cur[k]))))
+        { cur[k] = nullptr; return false; }
+        cur[k]->SetName(L"BFI CRT-Standalone hand-off (this frame)");
+    }
+    D3D12_RESOURCE_BARRIER b[2] = { Transition(r, rs, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                    Transition(cur[k], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
+    nl->ResourceBarrier(2, b);
+    if (d.MipLevels > 1)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+        dst.pResource = cur[k]; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
+        src.pResource = r;      src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+        nl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    else nl->CopyResource(cur[k], r);
+    b[0] = Transition(r, D3D12_RESOURCE_STATE_COPY_SOURCE, rs);
+    b[1] = Transition(cur[k], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    nl->ResourceBarrier(2, b);
+    return true;
+}
+
 // reshade_finish_effects (the game's thread): the shader's state for this frame.
-static void on_finish(effect_runtime *rt, command_list *, resource_view, resource_view)
+static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, resource_view)
 {
     if (!Wanted() || !rt) { if (!Wanted()) state = 0; return; }
     if (reinterpret_cast<void *>(rt->get_native()) != (void *)g_sc) return;
@@ -136,7 +180,7 @@ static void on_finish(effect_runtime *rt, command_list *, resource_view, resourc
         else LOGW("BFI Presenter: CRT hand-off: not with CRT-Standalone's PIPELINE 1/2 or ENABLE_SCANLINE_SS=1 yet -- the shader's own pass is needed");
     }
     state = st;
-    if (st != 2) { texNowOk = false; return; }
+    if (st != 2) { curOk = false; return; }
 
     float p[kCrtSlots * 4] = {};
     for (int i = 0; i < kCrtParamN; i++)
@@ -161,15 +205,26 @@ static void on_finish(effect_runtime *rt, command_list *, resource_view, resourc
     // The halation and glow textures: ReShade's own, rendered this frame.
     // (halation or glow compiled out: no texture, and its code is out of the presenter's build too -- nothing bound)
     device *dev = rt->get_device();
-    const bool ok = dev != nullptr;
-    ID3D12Resource *tx[3] = {};
+    ID3D12GraphicsCommandList *nl = cmd ? reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native()) : nullptr;
+    bool ok = dev != nullptr && nl != nullptr && g_device != nullptr;
+    bool has[kTexN] = {};
+    const D3D12_RESOURCE_STATES rs = (D3D12_RESOURCE_STATES)g_shared.crtTexState;   // ReShade's effect textures between passes
     for (int k = 0; ok && k < 3; k++)
     {
         effect_texture_variable tv = FindTexture(rt, kEffect, kTexName[k]);
         resource_view srv = { 0 }, srgb = { 0 };
         if (tv.handle) rt->get_texture_binding(tv, &srv, &srgb);
         const resource r = srv.handle ? ResourceFromView(dev, srv) : resource{ 0 };
-        tx[k] = reinterpret_cast<ID3D12Resource *>(r.handle);
+        if (!r.handle) continue;
+        has[k] = CopyCur(nl, k, reinterpret_cast<ID3D12Resource *>(r.handle), rs);
+        if (!has[k]) ok = false;
+    }
+    // the finished frame as it is now: ReShade's window and overlay are drawn on it after this (shown without the CRT pattern)
+    if (ok)
+    {
+        const resource bbr = pfx::BackBuffer(rt, rt->get_current_back_buffer_index());
+        ok = bbr.handle && CopyCur(nl, kBase, reinterpret_cast<ID3D12Resource *>(bbr.handle), D3D12_RESOURCE_STATE_RENDER_TARGET);
+        has[kBase] = ok;
     }
     std::string d;
     char line[96];
@@ -179,14 +234,14 @@ static void on_finish(effect_runtime *rt, command_list *, resource_view, resourc
         memcpy(params, p, sizeof(params) - 8 * sizeof(float));   // the frame size slot is the presenter's
         defines = d;
     }
-    texNowOk = ok;
-    for (int k = 0; k < 3; k++) texNow[k] = ok ? tx[k] : nullptr;
+    curOk = ok;
+    for (int k = 0; k < kTexN; k++) curHas[k] = ok && has[k];
     static bool texLogged = false;
-    if (!texLogged && ok && (!tx[0] || !tx[1]))
+    if (!texLogged && ok && (!has[0] || !has[1]))
     {
         texLogged = true;
-        LOGI("BFI Presenter: CRT hand-off: CRT-Standalone's textures: halation %s, glow %s, wide glow %s", tx[0] ? "found" : "none",
-             tx[1] ? "found" : "none", tx[2] ? "found" : "none");
+        LOGI("BFI Presenter: CRT hand-off: CRT-Standalone's textures: halation %s, glow %s, wide glow %s", has[0] ? "found" : "none",
+             has[1] ? "found" : "none", has[2] ? "found" : "none");
     }
     {
         std::lock_guard<std::mutex> l(blobLk);
@@ -199,13 +254,13 @@ static void on_finish(effect_runtime *rt, command_list *, resource_view, resourc
 static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s)
 {
     bool ok = false;
-    if (state.load() == 2 && texNowOk && Wanted())
+    if (state.load() == 2 && curOk && Wanted())
     {
         ok = true;
-        for (int k = 0; k < 3 && ok; k++)
+        for (int k = 0; k < kTexN && ok; k++)
         {
-            if (!texNow[k]) { SafeRelease(slotTex[k][s]); continue; }
-            const D3D12_RESOURCE_DESC d = texNow[k]->GetDesc();
+            if (!curHas[k]) { if (slotTex[k][s]) { SafeRelease(slotTex[k][s]); slotGen++; } continue; }
+            const D3D12_RESOURCE_DESC d = cur[k]->GetDesc();
             if (slotTex[k][s])
             {
                 const D3D12_RESOURCE_DESC h = slotTex[k][s]->GetDesc();
@@ -214,40 +269,44 @@ static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s)
             else
             {
                 D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-                D3D12_RESOURCE_DESC rd = d;
-                rd.Flags = D3D12_RESOURCE_FLAG_NONE; rd.MipLevels = 1; rd.DepthOrArraySize = 1;
-                if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&slotTex[k][s]))))
+                if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&slotTex[k][s]))))
                 { slotTex[k][s] = nullptr; ok = false; }
-                else { slotTex[k][s]->SetName(L"BFI CRT-Standalone halation / glow (slot)"); slotGen++; }
+                else { slotTex[k][s]->SetName(L"BFI CRT-Standalone hand-off (slot)"); slotGen++; }
             }
         }
         if (ok)
-        {
-            const D3D12_RESOURCE_STATES rs = (D3D12_RESOURCE_STATES)g_shared.crtTexState;   // ReShade's effect textures between passes
-            for (int k = 0; k < 3; k++)
+            for (int k = 0; k < kTexN; k++)
             {
-                if (!texNow[k]) continue;
-                D3D12_RESOURCE_BARRIER b[2] = { Transition(texNow[k], rs, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                if (!curHas[k]) continue;
+                D3D12_RESOURCE_BARRIER b[2] = { Transition(cur[k], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
                                                 Transition(slotTex[k][s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
                 list->ResourceBarrier(2, b);
-                list->CopyResource(slotTex[k][s], texNow[k]);
-                b[0] = Transition(texNow[k], D3D12_RESOURCE_STATE_COPY_SOURCE, rs);
+                list->CopyResource(slotTex[k][s], cur[k]);
+                b[0] = Transition(cur[k], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
                 b[1] = Transition(slotTex[k][s], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
                 list->ResourceBarrier(2, b);
             }
-        }
     }
     slotOk[s] = ok;
-    texNowOk = false;
+    curOk = false;
 }
 
 // The presenter: the texture bound for slot s, view k (null: compiled out of the shader).
 static ID3D12Resource *SlotTex(UINT s, int k) { return s < kStage ? slotTex[k][s] : nullptr; }
 static bool SlotReady(UINT s) { return s < kStage && slotOk[s]; }
 
+static void ReleaseCur()
+{
+    curOk = false;
+    bool any = false;
+    for (int k = 0; k < kTexN; k++) { curHas[k] = false; if (cur[k]) any = true; }
+    if (any) WaitGame();
+    for (int k = 0; k < kTexN; k++) SafeRelease(cur[k]);
+}
+
 static void ReleaseSlots()
 {
-    for (int k = 0; k < 3; k++) for (UINT s = 0; s < kStage; s++) SafeRelease(slotTex[k][s]);
+    for (int k = 0; k < kTexN; k++) for (UINT s = 0; s < kStage; s++) SafeRelease(slotTex[k][s]);
     for (UINT s = 0; s < kStage; s++) slotOk[s] = false;
     slotGen++;
 }
@@ -260,6 +319,7 @@ static const char kCrtGlue[] =
     "Texture2D<float4> crtHalo : register(t7);\n"
     "Texture2D<float4> crtGlow : register(t8);\n"
     "Texture2D<float4> crtGlowWide : register(t9);\n"
+    "Texture2D<float4> crtBase : register(t10);\n"
     "float4 CrtBB(float2 uv) { return src.SampleLevel(linClamp, uv, 0); }\n"
     "float4 CrtHalo(float2 uv) { return crtHalo.SampleLevel(linClamp, uv, 0); }\n"
     "float4 CrtGlow(float2 uv) { return crtGlow.SampleLevel(linClamp, uv, 0); }\n"
@@ -268,6 +328,9 @@ static const char kCrtApply[] =
     "float3 CrtApply(float3 c, float2 cp)\n"
     "{\n"
     "    // the mask and scanlines at the screen's pixel; the picture, halation and glow from where it came from (moved)\n"
+    "    // what was drawn after the effects (ReShade's window, an overlay) is shown as it is, without the pattern\n"
+    "    const int2 q = int2(cp);\n"
+    "    if (any(abs(src.Load(int3(q, 0)).rgb - crtBase.Load(int3(q, 0)).rgb) > 0.0005)) return c;\n"
     "    return CrtPattern(c, cp, gSrcPos * CrtPixelSize);\n"
     "}\n";
 
@@ -344,10 +407,9 @@ static UINT SlotGen() { return slotGen.load(); }
 static void Release()
 {
     ReleaseSlots();
-    texNowOk = false;
-    for (int k = 0; k < 3; k++) texNow[k] = nullptr;
+    ReleaseCur();
 }
-static void on_destroy_rt(effect_runtime *) { texNowOk = false; for (int k = 0; k < 3; k++) texNow[k] = nullptr; }
+static void on_destroy_rt(effect_runtime *) { ReleaseCur(); }
 
 static void Register(bool on)
 {

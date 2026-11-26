@@ -3804,7 +3804,7 @@ static DWORD WINAPI PresenterThread(void *)
     int    chkSrc = 0;
     const UINT kGameFlowSrv = kStage + 2 + WarpGpu::kSrvCount;   // their views in srvHeap
     const UINT kPreSrv = kGameFlowSrv + kStage;                  // the frames from before ReShade's effects (g_pre)
-    const UINT kCrtSrv = kPreSrv + kStage;                       // CRT hand-off: each slot's halation, glow and wide glow (3 each)
+    const UINT kCrtSrv = kPreSrv + kStage;                       // CRT hand-off: each slot's halation, glow, wide glow and frame before ReShade's window (4 each)
     UINT   crtGenSeen = ~0u, crtBlobGen = 0;
     ID3D12PipelineState *psoCrt = nullptr;                       // the main shader's CRT build (dx/bfi_crt.h)
     ID3D12Resource *crtCb = nullptr;                             // its settings: an upload ring, one entry per draw
@@ -3838,7 +3838,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage + 3 * kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
+    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage + 4 * kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
                                                                        // frame warp's textures, the game's own motion per stage slot
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
@@ -3903,7 +3903,7 @@ static DWORD WINAPI PresenterThread(void *)
         D3D12_DESCRIPTOR_RANGE rangePreP = range;
         rangePreP.BaseShaderRegister = 6;                  // t6: and the frame shown before, likewise
         D3D12_DESCRIPTOR_RANGE rangeCrt = range;
-        rangeCrt.BaseShaderRegister = 7; rangeCrt.NumDescriptors = 3;   // t7-t9: CRT hand-off's halation, glow, wide glow
+        rangeCrt.BaseShaderRegister = 7; rangeCrt.NumDescriptors = 4;   // t7-t10: CRT hand-off's halation, glow, wide glow, the frame before ReShade's window
         D3D12_ROOT_PARAMETER params[10] = {};
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
@@ -5190,10 +5190,10 @@ static DWORD WINAPI PresenterThread(void *)
             {
                 crtGenSeen = crt::SlotGen();
                 for (UINT k = 0; k < kStage; k++)
-                    for (int t = 0; t < 3; t++)
+                    for (int t = 0; t < 4; t++)
                     {
                         D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
-                        h.ptr += (SIZE_T)(kCrtSrv + 3 * k + (UINT)t) * srvStride;
+                        h.ptr += (SIZE_T)(kCrtSrv + 4 * k + (UINT)t) * srvStride;
                         ID3D12Resource *r = crt::SlotTex(k, t);
                         D3D12_SHADER_RESOURCE_VIEW_DESC cv = {};
                         cv.Format = r ? r->GetDesc().Format : DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -5202,8 +5202,8 @@ static DWORD WINAPI PresenterThread(void *)
                         g_device->CreateShaderResourceView(r, &cv, h);   // null: compiled out of the shader (not read)
                     }
             }
-            D3D12_RESOURCE_BARRIER cb3[3]; UINT ncb = 0;
-            for (int t = 0; t < 3; t++)
+            D3D12_RESOURCE_BARRIER cb3[4]; UINT ncb = 0;
+            for (int t = 0; t < 4; t++)
                 if (ID3D12Resource *r = crt::SlotTex((UINT)pick, t))
                     cb3[ncb++] = Transition(r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             if (ncb) list->ResourceBarrier(ncb, cb3);
@@ -5213,7 +5213,7 @@ static DWORD WINAPI PresenterThread(void *)
             const UINT at = (crtCbAt++ % kCrtCbN) * kCrtCbStride;
             memcpy(crtCbMap + at, cp, sizeof(cp));
             D3D12_GPU_DESCRIPTOR_HANDLE th = srvHeap->GetGPUDescriptorHandleForHeapStart();
-            th.ptr += (UINT64)(kCrtSrv + 3 * (UINT)pick) * srvStride;
+            th.ptr += (UINT64)(kCrtSrv + 4 * (UINT)pick) * srvStride;
             list->SetGraphicsRootDescriptorTable(8, th);
             list->SetGraphicsRootConstantBufferView(9, crtCb->GetGPUVirtualAddress() + at);
             list->SetPipelineState(psoCrt);
