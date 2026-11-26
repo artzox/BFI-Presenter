@@ -206,7 +206,7 @@ struct Settings
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
     float warpEaseStr = 1.0f; // FrameWarpGameMotionEaseStrength (1.0.49): how hard the ease below is, 0-3 (1 = as before 1.0.49;
                               // the move past the rendered frame is scaled by (motion now / motion before) ^ this)
-    int   crtHandoff = 0;     // CrtStandaloneHandoff (1.0.49 test, DX12 64-bit): CRT-Standalone's mask, scanlines and glow drawn by
+    int   crtHandoff = 0;     // CrtStandaloneHandoff (1.0.49, DX12 64-bit): CRT-Standalone's mask, scanlines and glow drawn by
                               // the presenter after frame warp (with BFI_PRESENTER_HANDOFF=1 in the shader; dx/bfi_crt.h)
     int   crtTexState = 0xC0; // CrtTextureState (ini only): the state ReShade's effect textures are in after its effects
     int   warpStillPre = 1;   // FrameWarpStillBeforeEffects (1.0.48): what stands still (a HUD) is found in the frame from
@@ -14590,12 +14590,13 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "flash, and a CRT shader's mask moves with the picture (see Snap below). Details: the settings guide.");
         {
             bool ch = s.crtHandoff != 0;
-            if (ImGui::Checkbox("Apply CRT-Standalone after frame warp (test)", &ch)) s.crtHandoff = ch ? 1 : 0;
+            if (ImGui::Checkbox("Apply CRT-Standalone after frame warp", &ch)) s.crtHandoff = ch ? 1 : 0;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("CRT-Standalone's mask, scanlines, halation and glow -- and its passes after them: sharpen,\n"
                                                           "scanline soften, grain, noise floor, gamut expand, corner round -- are drawn by the presenter\n"
                                                           "after frame warp, so a moved frame doesn't move them with the picture (moire, mostly in the\n"
                                                           "sky). Needs BFI_PRESENTER_HANDOFF=1 in CRT-Standalone's preprocessor definitions too: its\n"
-                                                          "settings stay in its own window. DirectX 12; not with its PIPELINE 1/2 or ENABLE_SCANLINE_SS=1 yet.");
+                                                          "settings stay in its own window. DirectX 12; not with its PIPELINE 1/2 or ENABLE_SCANLINE_SS=1 yet.\n"
+                                                          "Costs GPU time: the CRT picture once per frame, and again on every flash frame warp moves.");
             if (s.crtHandoff)
             {
                 const int cs = crt::StateNow();
@@ -14634,7 +14635,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "is at that moment, not just the cycles without a new frame, so every step on screen is the same.\n"
                                                               "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
                                                               "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
-                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
+                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.\n"
+                                                              "Every flash is drawn moved: more GPU time than filling missing frames (see the settings guide).");
                 bool en = s.warpEaseNoFg != 0;
                 if (ImGui::Checkbox("Ease off as the motion slows", &en)) s.warpEaseNoFg = en ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"

@@ -8079,7 +8079,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "is at that moment, not just the cycles without a new frame, so every step on screen is the same.\n"
                                                               "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
                                                               "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
-                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.");
+                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.\n"
+                                                              "Every flash is drawn moved: more GPU time than filling missing frames (see the settings guide).");
                 bool en = s.warpEaseNoFg != 0;
                 if (ImGui::Checkbox("Ease off as the motion slows", &en)) s.warpEaseNoFg = en ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
