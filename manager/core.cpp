@@ -3768,8 +3768,8 @@ std::string EnsureGuide(const std::function<void(const std::string &)> &progress
     std::string have = Exists(path) ? ReadText(verFile) : std::string();
     while (!have.empty() && (have.back() == '\n' || have.back() == '\r' || have.back() == ' ')) have.pop_back();
     // The 1.0.49 release was tagged "v.10.49" for a few hours: a guide saved then reads as 10.49, newer than every 1.0.x
-    // release after it, and would never be replaced. A saved version past 2.0 is taken as unknown, so it is checked again.
-    if (!have.empty() && CompareVersions(have, "2.0") > 0) have = "unknown";
+    // release after it, and would never be replaced. That one tag is taken as 1.0.49.
+    if (have == "v.10.49") have = "v.1.0.49";
     if (pdf) *pdf = path;
     if (progress) progress("Checking GitHub for the settings guide...");
     std::string body, err, url, ver;
