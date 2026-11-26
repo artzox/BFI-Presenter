@@ -39,6 +39,72 @@ tail = [l for l in block(g0, g1) if 'BFI_PRESENTER_HANDOFF' not in l]  # the sha
 body = ['float3 CrtPattern(float3 c, float2 fc, float2 texcoord)', '{'] + block(b0, b1) + tail + ['    return c;', '}']
 out += body
 
+
+# The passes after the main pass that work on the patterned picture (1.0.49): with the hand-off they are drawn by the
+# presenter too, after the pattern, each a full-screen pass (they read the pixels around each one). Each is copied with
+# the shader's own functions it calls; ReShade's back buffer is the pass before (CrtPrev), and a pass that is off
+# ("discard": the back buffer left as it was) passes the picture on.
+POST = [('ENABLE_SHARPEN', 'crt_sharpen_PS', 'Sharpen'), ('ENABLE_SCANLINE_SOFTEN', 'crt_soften_PS', 'Soften'),
+        ('ENABLE_GRAIN', 'crt_grain_merged_PS', 'GrainRaw'), ('ENABLE_GRAIN', 'crt_grain_diffuse_PS', 'Grain'),
+        ('ENABLE_NOISE_FLOOR', 'crt_noise_floor_PS', 'NoiseFloor'), ('ENABLE_GAMUT_EXPAND', 'crt_gamut_expand_PS', 'Gamut'),
+        ('ENABLE_CORNER_ROUND', 'crt_corner_round_PS', 'Corner')]
+fdef = {}
+for i, l in enumerate(src):
+    mm = re.match(r'^(?:static\s+)?(?:float[234]?(?:x[234])?|void|int[234]?|uint[234]?|bool[234]?)\s+([A-Za-z_]\w*)\s*\(', l)
+    if mm: fdef.setdefault(mm.group(1), i)
+def func_lines(i):
+    d = 0; seen = False
+    for j in range(i, len(src)):
+        d += src[j].count('{') - src[j].count('}')
+        if '{' in src[j]: seen = True
+        if seen and d == 0: return src[i:j + 1]
+    raise SystemExit('unbalanced at %d' % i)
+have = set(re.findall(r'^(?:static\s+)?(?:float[234]?(?:x[234])?|void|int[234]?|uint[234]?|bool[234]?)\s+([A-Za-z_]\w*)\s*\(', '\n'.join(out), re.M))
+have |= set(re.findall(r'^\s*#define\s+([A-Za-z_]\w*)', '\n'.join(out), re.M))
+mdef = {}
+for i, l in enumerate(src):
+    mm = re.match(r'^\s*#define\s+([A-Za-z_]\w*)', l)
+    if mm and not mm.group(1).startswith('ENABLE_') and mm.group(1) not in ('BFI_PRESENTER_HANDOFF', 'PIPELINE'): mdef.setdefault(mm.group(1), i)
+cdef = {}
+for i, l in enumerate(src):
+    mm = re.match(r'^static\s+const\s+\w+\s+([A-Za-z_]\w*)', l)
+    if mm: cdef.setdefault(mm.group(1), i)
+have |= set(re.findall(r'^static\s+const\s+\w+\s+([A-Za-z_]\w*)', '\n'.join(out), re.M))
+def const_lines(i):
+    for j in range(i, len(src)):
+        if ';' in src[j]: return src[i:j + 1]
+deps = []
+def need(lines):
+    for name in re.findall(r'\b([A-Za-z_]\w*)\s*\(', '\n'.join(lines)) + re.findall(r'\b([A-Za-z_]\w*)\b', '\n'.join(lines)):
+        if name in have: continue
+        if name in fdef and not name.endswith('_PS'):
+            have.add(name); body = func_lines(fdef[name]); need(body); deps.append(body)
+        elif name in cdef:
+            have.add(name); ln = const_lines(cdef[name]); need(ln); deps.append(ln)
+        elif name in mdef:
+            have.add(name); ln = [src[mdef[name]]]; need(ln); deps.append(ln)
+pbodies = []
+for sw, fn, nm in POST:
+    body = func_lines(fdef[fn]); need(body)
+    pbodies.append((sw, nm, body))
+ptext = []
+for d in deps: ptext += d
+for sw, nm, body in pbodies:
+    outn = re.search(r'out\s+float4\s+(\w+)', '\n'.join(body[:6])).group(1)
+    body = [re.sub(r'\bdiscard\s*;', '{ ' + outn + ' = CrtPrev(texcoord); return; }', l) for l in body]
+    ptext += [f'#if {sw}'] + body + [f'float4 PSCrt{nm}(float4 pos : SV_Position) : SV_Target',
+              '{', '    float4 o;', f'    {body[0].split("(")[0].split()[-1]}(pos, pos.xy * CrtPixelSize, o);', '    return o;', '}', '#endif']
+ptext = '\n'.join(ptext)
+ptext = ptext.replace('tex2D(ReShade::BackBuffer, ', 'CrtPrev(').replace('tex2D(crt_grain_raw_samp, ', 'CrtGrainRaw(')
+ptext = ptext.replace('ReShade::PixelSize', 'CrtPixelSize')
+ptext = re.sub(r'\bdiscard\s*;', '{ color = CrtPrev(texcoord); return; }', ptext)
+ptext = ptext.replace('tex2D(ReShade::BackBuffer, ', 'CrtPrev(')
+if 'tex2D(' in ptext or 'ReShade::' in ptext:
+    raise SystemExit('post passes: unhandled sampler: ' + '\n'.join(l for l in ptext.splitlines() if 'tex2D(' in l or 'ReShade::' in l))
+out.append('#if CRT_POST')
+out.append(ptext)
+out.append('#endif')
+post_names = [(sw, nm) for sw, fn, nm in POST]
 text = '\n'.join(out)
 text = text.replace('tex2D(ReShade::BackBuffer, ', 'CrtBB(').replace('ReShade::PixelSize', 'CrtPixelSize')
 text = text.replace('tex2D(crt_halation_v_sampler, ', 'CrtHalo(').replace('tex2D(crt_glow_v_sampler, ', 'CrtGlow(')
@@ -101,4 +167,10 @@ with open(sys.argv[2], 'w') as f:
         f.write(f'    {{ "{name}", \'{types[t]}\', {{ {", ".join(repr(float(x)) + "f" for x in d)} }} }},\n')
     f.write('};\n')
     f.write('static const char kCrtHlsl[] =\n' + cstr(hlsl) + ';\n')
+    f.write('// the passes after the pattern, in order: the switch each needs, its entry point (PSCrt<name>)\n')
+    f.write('struct CrtPost { const char *sw; const char *entry; };\n')
+    f.write('static const CrtPost kCrtPost[] = {\n')
+    for sw, nm in post_names: f.write(f'    {{ "{sw}", "PSCrt{nm}" }},\n')
+    f.write('};\n')
+    f.write(f'static const int kCrtPostN = {len(post_names)};\n')
 print(n, 'uniforms;', len(hlsl.splitlines()), 'HLSL lines', file=sys.stderr)

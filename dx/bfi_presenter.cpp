@@ -109,7 +109,9 @@ static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s);
 static ID3D12Resource *SlotTex(UINT s, int k);
 static bool SlotReady(UINT s);
 static void ReleaseSlots();
-static ID3DBlob *TakeBlob(UINT *gen);
+static const int kBlobN = 2 + kCrtPostN;
+static bool TakeBlobs(UINT *gen, ID3DBlob *out[kBlobN]);
+static bool PostIsGrainRaw(int k);
 static void ParamsFor(float *out, float w, float h);
 static void Release();
 static void Register(bool on);
@@ -195,6 +197,8 @@ struct Settings
     int   warpGuard = 1;      // FrameWarpGuard (ini only): filled repeats that keep making their refresh late are shown as
                               // they are for a while (30 s, then longer)
     int   warpEaseNoFg = 1;   // FrameWarpGameMotionEaseNoFG (1.0.45): the ease below without frame generation too
+    float warpEaseStr = 1.0f; // FrameWarpGameMotionEaseStrength (1.0.49): how hard the ease below is, 0-3 (1 = as before 1.0.49;
+                              // the move past the rendered frame is scaled by (motion now / motion before) ^ this)
     int   crtHandoff = 0;     // CrtStandaloneHandoff (1.0.49 test, DX12 64-bit): CRT-Standalone's mask, scanlines and glow drawn by
                               // the presenter after frame warp (with BFI_PRESENTER_HANDOFF=1 in the shader; dx/bfi_crt.h)
     int   crtTexState = 0xC0; // CrtTextureState (ini only): the state ReShade's effect textures are in after its effects
@@ -394,6 +398,7 @@ static void LoadSettings(Settings &s)
     s.warpFgLag = std::max(-1, std::min(1, IniInt("FrameWarpGameMotionFGLag", 1)));
     s.warpEase = IniInt("FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = IniInt("FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
+    s.warpEaseStr = std::max(0.0f, std::min(3.0f, IniFloat("FrameWarpGameMotionEaseStrength", 1.0f)));
     s.hudFromDlss = IniInt("FrameWarpHudFromDlss", 1) ? 1 : 0;
     s.warpDilate = std::max(0, std::min(3, IniInt("FrameWarpGameDilate", 1)));
     s.warpStillPre = IniInt("FrameWarpStillBeforeEffects", 1) ? 1 : 0;
@@ -654,6 +659,7 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg);
     IniWriteInt("FrameWarpEvenPacing", s.warpEven);
     IniWriteInt("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg);
+    IniWriteFloat("FrameWarpGameMotionEaseStrength", s.warpEaseStr);
     IniWriteInt("FrameWarpGameDilate", s.warpDilate);
     IniWriteInt("FrameWarpStillBeforeEffects", s.warpStillPre);
     IniWriteInt("CrtStandaloneHandoff", s.crtHandoff);
@@ -1834,7 +1840,7 @@ float2 WarpShiftGame(float2 uv)
     // Up to the rendered frame the motion is known (a generated frame); past it, it's a guess that it carries on: that part
     // eases off as the motion slows, so a camera coming to a stop isn't pushed past where it stops and snapped back (ep9).
     const float known = clamp(warpLag, 0.0, warp);
-    const float k = warpEase > 0.5 ? bestK : 1.0;
+    const float k = warpEase > 0.001 ? pow(max(bestK, 0.0), warpEase) : 1.0;   // warpEase: the strength (1 = before 1.0.49)
     return clamp(best * (known + (warp - known) * k), -0.08, 0.08);
 }
 
@@ -2433,13 +2439,12 @@ float DecayShare(uint s, float phi, float T, float n)
 // CRT-Standalone's mask, scanlines and glow (CrtStandaloneHandoff, dx/bfi_crt.h): built in only for the presenter's CRT
 // build of this shader, which puts the copied CRT-Standalone code at the marker below.
 #ifndef CRT_HANDOFF
-float3 CrtApply(float3 c, float2 cp) { return c; }
+float3 CrtColour(float2 pos) { return Fetch(pos); }
 #endif
 // @CRT_HANDOFF@
 float4 PSMain(float4 pos : SV_Position) : SV_Target
 {
-    float3 c = Fetch(pos.xy);
-    c = CrtApply(c, pos.xy * srcPerOut);
+    float3 c = CrtColour(pos.xy);
     if (method == 2) return float4(outType == 4 ? Encode(Decode(c)) : c, 1);
     float3 lin = Decode(c);
     float litGain = Inverted() ? float(frames) * gain / float(frames - 1) : float(frames) * gain;
@@ -2551,10 +2556,10 @@ struct Constants
     uint32_t warpSrc;                   // 0 motion from the picture, 1 the game's motion vectors and depth, 2 its vectors only
     float    warpSnapX, warpSnapY;      // frame warp: moves rounded to whole steps of this many game-frame pixels (0 = off)
     float    warpLag;                   // the game's motion with frame generation: shown frames behind its vectors' frame
-    float    warpEase;                  // the game's motion: 1 = moves past the rendered frame ease off as the motion slows
+    float    warpEase;                  // the game's motion: moves past the rendered frame ease off as the motion slows, this hard (0 = off)
     float    osdX0, osdY0, osdX1, osdY1;  // frame warp: the BFI OSD on the frame, game-frame pixels (none: x1 <= x0)
 };
-static_assert(sizeof(Constants) / 4 + 7 + 3 <= 64, "root signature: the constants, eight tables and a root CBV in at most 64 DWORDs");
+static_assert(sizeof(Constants) / 4 + 8 + 3 <= 64, "root signature: the constants, eight tables and a root CBV in at most 64 DWORDs");
 namespace pfx { static ID3D12Resource *Peek12(); static ID3D12Resource *Take12(); static ID3D11Texture2D *Take11(); static void Release(); static void Register(bool on); }
 
 // ABL guard: the screen average of the brightest refresh in the cycle when
@@ -3807,6 +3812,12 @@ static DWORD WINAPI PresenterThread(void *)
     const UINT kCrtSrv = kPreSrv + kStage;                       // CRT hand-off: each slot's halation, glow, wide glow and frame before ReShade's window (4 each)
     UINT   crtGenSeen = ~0u, crtBlobGen = 0;
     ID3D12PipelineState *psoCrt = nullptr;                       // the main shader's CRT build (dx/bfi_crt.h)
+    // CRT hand-off with passes after the pattern (sharpen, scanline soften, grain ...; 1.0.49): the pattern and each
+    // pass drawn into textures the game frame's size (two in turn, and grain's own), the main shader reads the last
+    ID3D12PipelineState *psoCrtPass[1 + kCrtPostN] = {};         // [0] the pattern, [1 + k] kCrtPost[k] (null: off)
+    ID3D12Resource *crtRt[3] = {};                               // [0] [1] in turn, [2] grain's
+    ID3D12DescriptorHeap *crtRtvHeap = nullptr;
+    const UINT kCrtPostSrv = kPreSrv + kStage + 4 * kStage;      // their views: (0, 2) (1, 2), as t11 t12
     ID3D12Resource *crtCb = nullptr;                             // its settings: an upload ring, one entry per draw
     uint8_t *crtCbMap = nullptr;
     const UINT kCrtCbStride = (UINT)((kCrtSlots * 16 + 255) & ~255), kCrtCbN = 64;
@@ -3838,7 +3849,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage + 4 * kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
+    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage + 4 * kStage + 4;   // the stage frames, the APL Limiter's cells and its 1x1 average,
                                                                        // frame warp's textures, the game's own motion per stage slot
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
@@ -3904,7 +3915,9 @@ static DWORD WINAPI PresenterThread(void *)
         rangePreP.BaseShaderRegister = 6;                  // t6: and the frame shown before, likewise
         D3D12_DESCRIPTOR_RANGE rangeCrt = range;
         rangeCrt.BaseShaderRegister = 7; rangeCrt.NumDescriptors = 4;   // t7-t10: CRT hand-off's halation, glow, wide glow, the frame before ReShade's window
-        D3D12_ROOT_PARAMETER params[10] = {};
+        D3D12_DESCRIPTOR_RANGE rangeCrtPost = range;
+        rangeCrtPost.BaseShaderRegister = 11; rangeCrtPost.NumDescriptors = 2;   // t11-t12: CRT hand-off's pass before, grain's texture
+        D3D12_ROOT_PARAMETER params[11] = {};
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
         params[0].Constants.Num32BitValues = sizeof(Constants) / 4;
@@ -3930,6 +3943,8 @@ static DWORD WINAPI PresenterThread(void *)
         params[9].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;   // b1: CRT hand-off's settings
         params[9].Descriptor.ShaderRegister = 1;
         params[9].ShaderVisibility          = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[10] = params[1];
+        params[10].DescriptorTable.pDescriptorRanges  = &rangeCrtPost;
         D3D12_STATIC_SAMPLER_DESC samp = {};
         samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -3937,7 +3952,7 @@ static DWORD WINAPI PresenterThread(void *)
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 10;
+        rsd.NumParameters = 11;
         rsd.pParameters   = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers   = &samp;
@@ -4800,7 +4815,7 @@ static DWORD WINAPI PresenterThread(void *)
                 c.warpPrevN = (float)(pickId - warpOld);
                 c.warpSrc = (uint32_t)gsrc;
                 c.warpLag = g_status.fgActive ? gmo::SlotLag(pick) : 0.0f;
-                c.warpEase = (s.warpEase && (g_status.fgActive || s.warpEaseNoFg)) ? 1.0f : 0.0f;
+                c.warpEase = (s.warpEase && (g_status.fgActive || s.warpEaseNoFg)) ? s.warpEaseStr : 0.0f;
             }
             // Even pacing is for the game's motion only: a frame that arrived in time isn't moved by the measured motion.
             else if (s.warpEven && warpClock.repeats == 0) c.warp = 0.0f;
@@ -4833,13 +4848,14 @@ static DWORD WINAPI PresenterThread(void *)
         // CRT hand-off (dx/bfi_crt.h): the CRT build arriving, and whether this refresh is drawn with it
         if (s.crtHandoff)
         {
-            if (ID3DBlob *cb = crt::TakeBlob(&crtBlobGen))
+            ID3DBlob *cbs[crt::kBlobN] = {};
+            if (crt::TakeBlobs(&crtBlobGen, cbs))
             {
                 SafeRelease(psoCrt);
+                for (int k = 0; k <= kCrtPostN; k++) SafeRelease(psoCrtPass[k]);
                 D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
                 pd.pRootSignature = rootSig;
                 pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
-                pd.PS = { cb->GetBufferPointer(), cb->GetBufferSize() };
                 pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
                 pd.SampleMask = UINT_MAX;
                 pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -4847,10 +4863,24 @@ static DWORD WINAPI PresenterThread(void *)
                 pd.RasterizerState.DepthClipEnable = TRUE;
                 pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
                 pd.NumRenderTargets = 1;
-                pd.RTVFormats[0]    = g_desc.Format;
                 pd.SampleDesc.Count = 1;
-                if (FAILED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoCrt)))) { psoCrt = nullptr; LOGE("BFI Presenter: CRT hand-off: its pipeline could not be made"); }
-                cb->Release();
+                bool pok = cbs[0] != nullptr;
+                for (int e = 0; e < crt::kBlobN && pok; e++)
+                {
+                    if (!cbs[e]) continue;
+                    pd.PS = { cbs[e]->GetBufferPointer(), cbs[e]->GetBufferSize() };
+                    pd.RTVFormats[0] = e == 0 ? g_desc.Format : DXGI_FORMAT_R16G16B16A16_FLOAT;
+                    ID3D12PipelineState **dst = e == 0 ? &psoCrt : &psoCrtPass[e - 1];
+                    if (FAILED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(dst)))) { *dst = nullptr; pok = false; }
+                }
+                if (cbs[1] && !psoCrtPass[0]) pok = false;
+                if (!pok)
+                {
+                    SafeRelease(psoCrt);
+                    for (int k = 0; k <= kCrtPostN; k++) SafeRelease(psoCrtPass[k]);
+                    if (cbs[0]) LOGE("BFI Presenter: CRT hand-off: its pipeline could not be made");
+                }
+                for (int e = 0; e < crt::kBlobN; e++) SafeRelease(cbs[e]);
             }
             if (!crtCb)
             {
@@ -5216,7 +5246,95 @@ static DWORD WINAPI PresenterThread(void *)
             th.ptr += (UINT64)(kCrtSrv + 4 * (UINT)pick) * srvStride;
             list->SetGraphicsRootDescriptorTable(8, th);
             list->SetGraphicsRootConstantBufferView(9, crtCb->GetGPUVirtualAddress() + at);
-            list->SetPipelineState(psoCrt);
+            // The passes after the pattern: the pattern into crtRt[0], each pass from one texture into the other (grain's
+            // first half into crtRt[2]), and the main shader reads the last (t11)
+            int crtLast = -1;
+            if (psoCrtPass[0])
+            {
+                const UINT fw = (UINT)fd.Width, fh = fd.Height;
+                if (crtRt[0] && (crtRt[0]->GetDesc().Width != fw || crtRt[0]->GetDesc().Height != fh))
+                {
+                    // resized: the textures remade once the presenter's work so far is done
+                    EnterCriticalSection(&g_lock);
+                    const UINT64 v = ++g_presFenceVal;
+                    LeaveCriticalSection(&g_lock);
+                    queue->Signal(g_presFence, v);
+                    WaitFence(g_presFence, v, ev);
+                    for (int k = 0; k < 3; k++) SafeRelease(crtRt[k]);
+                }
+                if (!crtRtvHeap)
+                {
+                    D3D12_DESCRIPTOR_HEAP_DESC rh = {}; rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rh.NumDescriptors = 3;
+                    if (FAILED(g_device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&crtRtvHeap)))) crtRtvHeap = nullptr;
+                }
+                bool rok = crtRtvHeap != nullptr;
+                bool made = false;
+                for (int k = 0; k < 3 && rok; k++)
+                {
+                    if (crtRt[k]) continue;
+                    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    D3D12_RESOURCE_DESC rd = {};
+                    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = fw; rd.Height = fh; rd.DepthOrArraySize = 1;
+                    rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; rd.SampleDesc.Count = 1;
+                    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&crtRt[k]))))
+                    { crtRt[k] = nullptr; rok = false; break; }
+                    crtRt[k]->SetName(L"BFI CRT-Standalone hand-off (passes after the pattern)");
+                    D3D12_CPU_DESCRIPTOR_HANDLE rh = crtRtvHeap->GetCPUDescriptorHandleForHeapStart();
+                    rh.ptr += (SIZE_T)k * rtvStride;
+                    g_device->CreateRenderTargetView(crtRt[k], nullptr, rh);
+                    made = true;
+                }
+                if (rok && made)
+                {
+                    // views (0, 2) and (1, 2): each texture with grain's after it, as t11 t12
+                    const int order[4] = { 0, 2, 1, 2 };
+                    for (int v = 0; v < 4; v++)
+                    {
+                        D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                        h.ptr += (SIZE_T)(kCrtPostSrv + (UINT)v) * srvStride;
+                        g_device->CreateShaderResourceView(crtRt[order[v]], nullptr, h);
+                    }
+                }
+                if (rok)
+                {
+                    D3D12_VIEWPORT pvp = { 0.0f, 0.0f, (float)fw, (float)fh, 0.0f, 1.0f };
+                    D3D12_RECT psc = { 0, 0, (LONG)fw, (LONG)fh };
+                    list->RSSetViewports(1, &pvp);
+                    list->RSSetScissorRects(1, &psc);
+                    auto into = [&](int t, ID3D12PipelineState *pp, int from)
+                    {
+                        D3D12_RESOURCE_BARRIER rb = Transition(crtRt[t], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        list->ResourceBarrier(1, &rb);
+                        D3D12_GPU_DESCRIPTOR_HANDLE ph = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                        ph.ptr += (UINT64)(kCrtPostSrv + 2 * (UINT)(from >= 0 ? from : 1)) * srvStride;   // the pattern pass: any (not read)
+                        list->SetGraphicsRootDescriptorTable(10, ph);
+                        D3D12_CPU_DESCRIPTOR_HANDLE rh = crtRtvHeap->GetCPUDescriptorHandleForHeapStart();
+                        rh.ptr += (SIZE_T)t * rtvStride;
+                        list->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+                        list->SetPipelineState(pp);
+                        list->DrawInstanced(3, 1, 0, 0);
+                        rb = Transition(crtRt[t], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        list->ResourceBarrier(1, &rb);
+                    };
+                    into(0, psoCrtPass[0], -1);
+                    crtLast = 0;
+                    for (int k = 0; k < kCrtPostN; k++)
+                    {
+                        if (!psoCrtPass[1 + k]) continue;
+                        if (crt::PostIsGrainRaw(k)) { into(2, psoCrtPass[1 + k], crtLast); continue; }
+                        into(1 - crtLast, psoCrtPass[1 + k], crtLast);
+                        crtLast = 1 - crtLast;
+                    }
+                    list->RSSetViewports(1, &vp);
+                    list->RSSetScissorRects(1, &sc);
+                    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                    D3D12_GPU_DESCRIPTOR_HANDLE ph = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                    ph.ptr += (UINT64)(kCrtPostSrv + 2 * (UINT)crtLast) * srvStride;
+                    list->SetGraphicsRootDescriptorTable(10, ph);
+                }
+            }
+            if (!psoCrtPass[0] || crtLast >= 0) list->SetPipelineState(psoCrt);   // else the textures could not be made: as without the hand-off
             list->DrawInstanced(3, 1, 0, 0);
             list->SetPipelineState(pso);
             for (UINT i = 0; i < ncb; i++) std::swap(cb3[i].Transition.StateBefore, cb3[i].Transition.StateAfter);
@@ -6926,6 +7044,9 @@ static DWORD WINAPI PresenterThread(void *)
     SafeRelease(output);
     SafeRelease(pso);
     SafeRelease(psoCrt);
+    for (int k = 0; k <= kCrtPostN; k++) SafeRelease(psoCrtPass[k]);
+    for (int k = 0; k < 3; k++) SafeRelease(crtRt[k]);
+    SafeRelease(crtRtvHeap);
     if (crtCb && crtCbMap) crtCb->Unmap(0, nullptr);
     SafeRelease(crtCb);
     SafeRelease(psoMeas);
@@ -14293,10 +14414,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
         {
             bool ch = s.crtHandoff != 0;
             if (ImGui::Checkbox("Apply CRT-Standalone after frame warp (test)", &ch)) s.crtHandoff = ch ? 1 : 0;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("CRT-Standalone's mask, scanlines, halation and glow are drawn by the presenter after frame\n"
-                                                          "warp, so a moved frame doesn't move them with the picture (moire, mostly in the sky). Needs\n"
-                                                          "BFI_PRESENTER_HANDOFF=1 in CRT-Standalone's preprocessor definitions too: its settings stay\n"
-                                                          "in its own window. DirectX 12; not with its PIPELINE 1/2 or ENABLE_SCANLINE_SS=1 yet.");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("CRT-Standalone's mask, scanlines, halation and glow -- and its passes after them: sharpen,\n"
+                                                          "scanline soften, grain, noise floor, gamut expand, corner round -- are drawn by the presenter\n"
+                                                          "after frame warp, so a moved frame doesn't move them with the picture (moire, mostly in the\n"
+                                                          "sky). Needs BFI_PRESENTER_HANDOFF=1 in CRT-Standalone's preprocessor definitions too: its\n"
+                                                          "settings stay in its own window. DirectX 12; not with its PIPELINE 1/2 or ENABLE_SCANLINE_SS=1 yet.");
             if (s.crtHandoff)
             {
                 const int cs = crt::StateNow();
@@ -14341,6 +14463,16 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
                                                               "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
                                                               "stop isn't carried past it and snapped back. With frame generation it is always on.");
+                if (s.warpEaseNoFg || g_status.fgActive)
+                {
+                    ImGui::Indent(16.0f);
+                    ImGui::SliderFloat("Ease off strength", &s.warpEaseStr, 0.0f, 3.0f, "%.2f");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much less a filled flash is moved as the motion slows. 0 = not at all, 1 = as before\n"
+                                                                  "1.0.49, 2-3 = much less as soon as the camera slows: less overshoot when it stops (worth it in\n"
+                                                                  "first-person games, where the whole picture moves with the camera, and with a CRT shader, whose\n"
+                                                                  "scanlines make an overshoot easy to see), but a slowing pan is filled less too.");
+                    ImGui::Unindent(16.0f);
+                }
             }
             bool pl = s.warpPauseLb != 0;
             if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;

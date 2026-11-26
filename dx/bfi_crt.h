@@ -38,7 +38,11 @@ static const Def kDefs[] = {
     { "ENABLE_HALATION", 1 }, { "ENABLE_GLOW", 1 }, { "ENABLE_VIGNETTE", 1 }, { "ENABLE_CORNER_ROUND", 0 },
     { "ENABLE_BURNIN_PHASE", 1 }, { "ENABLE_BURNIN_ORBIT", 1 }, { "ENABLE_INTERLACE", 0 }, { "ENABLE_SCANLINE_SS", 0 },
     { "ENABLE_DECAY", 0 }, { "ENABLE_PREBLUR", 1 }, { "ENABLE_GEOMETRY", 0 }, { "SCANLINE_REFERENCE_HEIGHT", 0 },
+    // the passes after the pattern (kCrtPost): drawn by the presenter after it (1.0.49)
+    { "ENABLE_SHARPEN", 1 }, { "ENABLE_SCANLINE_SOFTEN", 1 }, { "ENABLE_GRAIN", 1 }, { "ENABLE_NOISE_FLOOR", 0 },
+    { "ENABLE_GAMUT_EXPAND", 0 },
 };
+static int DefIndex(const char *name) { for (int i = 0; i < (int)(sizeof(kDefs) / sizeof(kDefs[0])); i++) if (!strcmp(kDefs[i].name, name)) return i; return -1; }
 static const int kDefN = (int)(sizeof(kDefs) / sizeof(kDefs[0]));
 
 // Game's thread -> presenter
@@ -62,7 +66,10 @@ static bool slotOk[kStage] = {};
 
 // The presenter's CRT build of its main shader
 static std::mutex blobLk;
-static ID3DBlob *blob = nullptr;                // compiled for blobDefs
+// compiled for blobDefs: [0] the main shader (PSMain), [1] the pattern pass (PSCrtPattern, with passes after it),
+// [2 + k] kCrtPost[k] (null: its switch off)
+// (kBlobN = 2 + kCrtPostN: declared with the presenter's forward declarations)
+static ID3DBlob *blobs[kBlobN] = {};
 static std::string blobDefs, wantDefs;
 static std::atomic<UINT> blobGen{0};
 static std::atomic<bool> compiling{false};
@@ -303,6 +310,11 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
     char line[96];
     for (int i = 0; i < kDefN; i++) { snprintf(line, sizeof(line), "#define %s %d\n", kDefs[i].name, vals[i]); d += line; }
     {
+        int post = 0;
+        for (int k = 0; k < kCrtPostN; k++) { const int di = DefIndex(kCrtPost[k].sw); if (di >= 0 && vals[di]) post++; }
+        snprintf(line, sizeof(line), "#define CRT_POST %d\n", post ? 1 : 0); d += line;
+    }
+    {
         std::lock_guard<std::mutex> l(lk);
         memcpy(params, p, sizeof(params) - 8 * sizeof(float));   // the frame size slot is the presenter's
         defines = d;
@@ -396,16 +408,38 @@ static const char kCrtGlue[] =
     "float4 CrtBB(float2 uv) { return src.SampleLevel(linClamp, uv, 0); }\n"
     "float4 CrtHalo(float2 uv) { return crtHalo.SampleLevel(linClamp, uv, 0); }\n"
     "float4 CrtGlow(float2 uv) { return crtGlow.SampleLevel(linClamp, uv, 0); }\n"
-    "float4 CrtGlowWide(float2 uv) { return crtGlowWide.SampleLevel(linClamp, uv, 0); }\n";
+    "float4 CrtGlowWide(float2 uv) { return crtGlowWide.SampleLevel(linClamp, uv, 0); }\n"
+    "#if CRT_POST\n"
+    "Texture2D<float4> crtPrev : register(t11);\n"       // the passes after the pattern: the pass before
+    "Texture2D<float4> crtGrainRaw : register(t12);\n"   // and the grain pass's own texture
+    "float4 CrtPrev(float2 uv) { return crtPrev.SampleLevel(linClamp, uv, 0); }\n"
+    "float4 CrtGrainRaw(float2 uv) { return crtGrainRaw.SampleLevel(linClamp, uv, 0); }\n"
+    "#endif\n";
 static const char kCrtApply[] =
-    "float3 CrtApply(float3 c, float2 cp)\n"
+    "// what was drawn after the effects (ReShade's window, an overlay) is shown as it is, without the pattern\n"
+    "bool CrtOverlay(float2 cp)\n"
     "{\n"
-    "    // the mask and scanlines at the screen's pixel; the picture, halation and glow from where it came from (moved)\n"
-    "    // what was drawn after the effects (ReShade's window, an overlay) is shown as it is, without the pattern\n"
     "    const int2 q = int2(cp);\n"
-    "    if (any(abs(src.Load(int3(q, 0)).rgb - crtBase.Load(int3(q, 0)).rgb) > 0.0005)) return c;\n"
-    "    return CrtPattern(c, cp, gSrcPos * CrtPixelSize);\n"
-    "}\n";
+    "    return any(abs(src.Load(int3(q, 0)).rgb - crtBase.Load(int3(q, 0)).rgb) > 0.0005);\n"
+    "}\n"
+    "// the mask and scanlines at the screen's pixel; the picture, halation and glow from where it came from (moved)\n"
+    "float3 CrtApply(float3 c, float2 cp) { return CrtOverlay(cp) ? c : CrtPattern(c, cp, gSrcPos * CrtPixelSize); }\n"
+    "#if CRT_POST\n"
+    "// with passes after the pattern: the pattern drawn first, at the game frame's pixels, then those passes\n"
+    "float4 PSCrtPattern(float4 pos : SV_Position) : SV_Target\n"
+    "{\n"
+    "    const float3 c = Fetch(pos.xy / srcPerOut);\n"
+    "    return float4(CrtApply(c, pos.xy), 1.0);\n"
+    "}\n"
+    "float3 CrtColour(float2 pos)\n"
+    "{\n"
+    "    const float2 cp = pos * srcPerOut;\n"
+    "    if (CrtOverlay(cp)) return Fetch(pos);\n"
+    "    return crtPrev.SampleLevel(linClamp, cp * CrtPixelSize, 0).rgb;   // the last pass's picture\n"
+    "}\n"
+    "#else\n"
+    "float3 CrtColour(float2 pos) { const float3 c = Fetch(pos); return CrtApply(c, pos * srcPerOut); }\n"
+    "#endif\n";
 
 static DWORD WINAPI CompileThread(void *)
 {
@@ -423,26 +457,42 @@ static DWORD WINAPI CompileThread(void *)
         std::string srcText(kShader);
         const char *marker = "// @CRT_HANDOFF@";
         const size_t at = srcText.find(marker);
-        ID3DBlob *b = nullptr, *err = nullptr;
-        if (compile && at != std::string::npos)
+        ID3DBlob *got[kBlobN] = {};
+        bool failed = !compile || at == std::string::npos;
+        if (!failed)
         {
             std::string full = "#define CRT_HANDOFF 1\n" + defs + srcText.substr(0, at) + kCrtGlue + kCrtHlsl + kCrtApply + srcText.substr(at + strlen(marker));
-            HRESULT hr = compile(full.data(), full.size(), "bfi_presenter_crt", nullptr, nullptr, "PSMain", "ps_5_0",
-                                 D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b, &err);
-            if (FAILED(hr))
+            const bool post = defs.find("#define CRT_POST 1") != std::string::npos;
+            for (int e = 0; e < kBlobN && !failed; e++)
             {
-                LOGE("BFI Presenter: CRT hand-off: the shader failed to compile: %s", err ? (const char *)err->GetBufferPointer() : "?");
-                SafeRelease(b);
+                const char *entry = e == 0 ? "PSMain" : e == 1 ? "PSCrtPattern" : kCrtPost[e - 2].entry;
+                if (e >= 1 && !post) continue;
+                if (e >= 2)
+                {
+                    char sw[96]; snprintf(sw, sizeof(sw), "#define %s 1\n", kCrtPost[e - 2].sw);
+                    if (defs.find(sw) == std::string::npos) continue;      // its switch off: not drawn
+                }
+                ID3DBlob *b = nullptr, *err = nullptr;
+                HRESULT hr = compile(full.data(), full.size(), "bfi_presenter_crt", nullptr, nullptr, entry, "ps_5_0",
+                                     e <= 1 ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &b, &err);
+                if (FAILED(hr))
+                {
+                    LOGE("BFI Presenter: CRT hand-off: the shader (%s) failed to compile: %s", entry, err ? (const char *)err->GetBufferPointer() : "?");
+                    SafeRelease(b);
+                    failed = true;
+                }
+                SafeRelease(err);
+                got[e] = b;
             }
-            SafeRelease(err);
         }
+        if (failed) for (int e = 0; e < kBlobN; e++) SafeRelease(got[e]);
         {
             std::lock_guard<std::mutex> l(blobLk);
-            SafeRelease(blob);
-            blob = b;
+            for (int e = 0; e < kBlobN; e++) { SafeRelease(blobs[e]); blobs[e] = got[e]; }
             blobDefs = defs;                                        // tried: not again until the switches change
             blobGen++;
         }
+        ID3DBlob *b = got[0];
         if (b) LOGI("BFI Presenter: CRT hand-off: shader built in %.0f ms", (Now() - t0) * 1000.0);
     }
 }
@@ -456,15 +506,16 @@ static void StartCompile()
     HANDLE h = CreateThread(nullptr, 0, CompileThread, nullptr, 0, nullptr);
     if (h) CloseHandle(h); else compiling = false;
 }
-// The presenter: the compiled shader (AddRef'd) if newer than `have`.
-static ID3DBlob *TakeBlob(UINT *gen)
+// The presenter: the compiled shaders (each AddRef'd, null where not built) if newer than `gen`; false: no news.
+static bool TakeBlobs(UINT *gen, ID3DBlob *out[kBlobN])
 {
     std::lock_guard<std::mutex> l(blobLk);
-    if (blobGen.load() == *gen) return nullptr;
+    if (blobGen.load() == *gen) return false;
     *gen = blobGen.load();
-    if (blob) blob->AddRef();
-    return blob;
+    for (int e = 0; e < kBlobN; e++) { out[e] = blobs[e]; if (out[e]) out[e]->AddRef(); }
+    return true;
 }
+static bool PostIsGrainRaw(int k) { return !strcmp(kCrtPost[k].entry, "PSCrtGrainRaw"); }
 // The presenter: this frame's settings, with the frame size (w, h).
 static void ParamsFor(float *out, float w, float h)
 {
