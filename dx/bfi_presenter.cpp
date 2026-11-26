@@ -3829,6 +3829,7 @@ static DWORD WINAPI PresenterThread(void *)
     int    crtKeyPrev = -2, crtKeyLast = -1;
     const UINT kBakeSrv = kCrtPostSrv + 4;                       // each slot's CRT picture made with the frame (dx/bfi_crt.h Bake), twice (t11 t12)
     UINT   bakeGenSeen = ~0u;
+    bool   crtSnapLogged = false;
     ID3D12Resource *crtCb = nullptr;                             // its settings: an upload ring, one entry per draw
     uint8_t *crtCbMap = nullptr;
     const UINT kCrtCbStride = (UINT)((kCrtSlots * 16 + 255) & ~255), kCrtCbN = 64;
@@ -4906,7 +4907,20 @@ static DWORD WINAPI PresenterThread(void *)
                     if (FAILED(crtCb->Map(0, &nr, (void **)&crtCbMap))) { SafeRelease(crtCb); crtCbMap = nullptr; }
                 }
             }
-            if (psoCrt && crtCbMap && crt::StateNow() == 2 && crt::SlotReady((UINT)pick)) c.flags |= 65536u;
+            if (psoCrt && crtCbMap && crt::StateNow() == 2 && crt::SlotReady((UINT)pick))
+            {
+                c.flags |= 65536u;
+                // The mask and scanlines are drawn after the move now, on the screen's pixels: Snap (moves rounded to the
+                // scanline spacing, for a CRT shader in ReShade) has nothing to keep in line, and a step that isn't the
+                // spacing in use shifts the picture against the scanlines on every moved flash (1.0.49-t8: Snap 3 px with
+                // scanlines 2.5 wide, drawn 2 px apart -- a flash on every fill)
+                if ((c.warpSnapX > 0.0f || c.warpSnapY > 0.0f) && !crtSnapLogged)
+                {
+                    crtSnapLogged = true;
+                    LOGI("BFI Presenter: CRT hand-off: frame warp's Snap (%.1f x %.1f px) not used -- the scanlines are drawn after the move", (double)c.warpSnapX, (double)c.warpSnapY);
+                }
+                c.warpSnapX = c.warpSnapY = 0.0f;
+            }
         }
         const UINT64 pickId2 = pickNew2 >= 0 ? g_stageId[pickNew2] : 0;
         const bool reuse = s.reuseBuffers && bufValid[bi] && bufFrame[bi] == pickId && bufFrame2[bi] == pickId2 &&
@@ -14568,6 +14582,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader,\n"
                                                           "set it to the scanline width (e.g. CRT-Standalone's Scanline Width) so the scanlines\n"
                                                           "don't break up where parts of the picture move by different amounts. 0 = off.");
+            if ((s.warpSnapX > 0.0f || s.warpSnapY > 0.0f) && s.crtHandoff && crt::StateNow() == 2)
+                ImGui::TextDisabled("Snap isn't used while CRT-Standalone is applied after frame warp: its scanlines no longer move.");
             {
                 int em = s.warpEdge;
                 if (ImGui::Combo("Screen edges", &em, "Fade the move\0Mirror the picture\0Repeat the edge\0")) s.warpEdge = em;
