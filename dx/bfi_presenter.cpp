@@ -1869,9 +1869,13 @@ float2 EdgeFade(float2 cp, float2 d, float2 size)
 // What stands still is found in the frames from before ReShade's effects where they are kept (FrameWarpStillBeforeEffects,
 // flags & 32768, 1.0.48): a CRT shader's pre-blur and glow spread the moving scene into a HUD's pixels, so in the finished
 // frame the HUD changed a little every frame and was moved with the scene (Onimusha with CRT-Standalone).
-float3 StillCur(int2 q) { return (flags & 32768) != 0 ? preCur.Load(int3(q, 0)).rgb : src.Load(int3(q, 0)).rgb; }
-float3 StillPrev(int2 q) { return (flags & 32768) != 0 ? prePrev.Load(int3(q, 0)).rgb : srcPrev.Load(int3(q, 0)).rgb; }
-float3 StillPrevAt(float2 uv) { return (flags & 32768) != 0 ? prePrev.SampleLevel(linClamp, uv, 0).rgb : srcPrev.SampleLevel(linClamp, uv, 0).rgb; }
+// 1.0.49: and where it stands still in the finished frames too. What is drawn after the effects -- ReShade's own window,
+// an overlay -- is only in the finished frames: tested on the frames from before the effects alone, ReShade's window
+// was moved with the scene (1.0.48).
+static bool gStillPre = false;
+float3 StillCur(int2 q) { return gStillPre ? preCur.Load(int3(q, 0)).rgb : src.Load(int3(q, 0)).rgb; }
+float3 StillPrev(int2 q) { return gStillPre ? prePrev.Load(int3(q, 0)).rgb : srcPrev.Load(int3(q, 0)).rgb; }
+float3 StillPrevAt(float2 uv) { return gStillPre ? prePrev.SampleLevel(linClamp, uv, 0).rgb : srcPrev.SampleLevel(linClamp, uv, 0).rgb; }
 bool Unchanged(int2 q)
 {
     float3 a = StillCur(q), b = StillPrev(q);
@@ -1892,7 +1896,7 @@ bool Unchanged(int2 q)
 // near its edge one motion step back shows another part of the cloud, so patches of it were held and looked a frame
 // late on filled flashes (Oblivion Remastered, 1.0.46). (1.0.47-ep1 held no flat area at all: a flat HUD fill near its
 // edge then took in the scene from beside it -- the stamina bar, the OSD's and ReShade's windows.)
-bool Still(int2 q, float2 size)
+bool StillIn(int2 q, float2 size)
 {
     if (!Unchanged(q)) return false;
     const float3 a0 = StillCur(q);
@@ -1922,6 +1926,16 @@ bool Still(int2 q, float2 size)
     float3 d = abs(a - StillPrevAt((c - step) / size));
     float lim = (flags & 1024) != 0 ? 0.04 * (0.1 + max(max(a.r, a.g), a.b)) : 0.04;
     return max(max(d.r, d.g), d.b) > lim;
+}
+bool Still(int2 q, float2 size)
+{
+    gStillPre = false;
+    if (StillIn(q, size)) return true;
+    if ((flags & 32768) == 0) return false;
+    gStillPre = true;
+    const bool r = StillIn(q, size);
+    gStillPre = false;
+    return r;
 }
 
 bool InOsd(float2 p) { return osdX1 > osdX0 && p.x >= osdX0 && p.x < osdX1 && p.y >= osdY0 && p.y < osdY1; }

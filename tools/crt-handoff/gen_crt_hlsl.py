@@ -35,7 +35,8 @@ out.append(src[find('float3 crt_from_linear(float3 x)')])
 m = find('void crt_main_PS(')
 b0 = find('#if ENABLE_BURNIN_PHASE', m); b1 = find('float2 orbit_offs   = float2(0.0, 0.0);', b0) + 1
 g0 = find('// -- CRT gamma decode --', m); g1 = find('color = float4(c, 1.0);', g0) - 1
-body = ['float3 CrtPattern(float3 c, float2 fc, float2 texcoord)', '{'] + block(b0, b1) + block(g0, g1) + ['    return c;', '}']
+tail = [l for l in block(g0, g1) if 'BFI_PRESENTER_HANDOFF' not in l]  # the shader's own hand-off switch
+body = ['float3 CrtPattern(float3 c, float2 fc, float2 texcoord)', '{'] + block(b0, b1) + tail + ['    return c;', '}']
 out += body
 
 text = '\n'.join(out)
