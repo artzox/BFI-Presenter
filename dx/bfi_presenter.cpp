@@ -117,6 +117,7 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
 static ID3D12Resource *BakeOut(UINT s);
 static bool BakeReady(UINT s);
 static UINT BakeGen();
+static DXGI_FORMAT PassFormat();
 static void ParamsFor(float *out, float w, float h);
 static void Release();
 static void Register(bool on);
@@ -4882,7 +4883,7 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     if (!cbs[e]) continue;
                     pd.PS = { cbs[e]->GetBufferPointer(), cbs[e]->GetBufferSize() };
-                    pd.RTVFormats[0] = e == 0 ? g_desc.Format : DXGI_FORMAT_R16G16B16A16_FLOAT;
+                    pd.RTVFormats[0] = e == 0 ? g_desc.Format : crt::PassFormat();
                     ID3D12PipelineState **dst = e == 0 ? &psoCrt : &psoCrtPass[e - 1];
                     if (FAILED(g_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(dst)))) { *dst = nullptr; pok = false; }
                 }
@@ -5287,7 +5288,7 @@ static DWORD WINAPI PresenterThread(void *)
                         {
                             ID3D12Resource *r = crt::BakeOut(k);
                             D3D12_SHADER_RESOURCE_VIEW_DESC bv = {};
-                            bv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; bv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                            bv.Format = r ? r->GetDesc().Format : crt::PassFormat(); bv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
                             bv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; bv.Texture2D.MipLevels = 1;
                             D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
                             h.ptr += (SIZE_T)(kBakeSrv + 2 * k + v) * srvStride;
@@ -5304,7 +5305,7 @@ static DWORD WINAPI PresenterThread(void *)
             else if (psoCrtPass[0])
             {
                 const UINT fw = (UINT)fd.Width, fh = fd.Height;
-                if (crtRt[0] && (crtRt[0]->GetDesc().Width != fw || crtRt[0]->GetDesc().Height != fh))
+                if (crtRt[0] && (crtRt[0]->GetDesc().Width != fw || crtRt[0]->GetDesc().Height != fh || crtRt[0]->GetDesc().Format != crt::PassFormat()))
                 {
                     // resized: the textures remade once the presenter's work so far is done
                     EnterCriticalSection(&g_lock);
@@ -5327,7 +5328,7 @@ static DWORD WINAPI PresenterThread(void *)
                     D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
                     D3D12_RESOURCE_DESC rd = {};
                     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = fw; rd.Height = fh; rd.DepthOrArraySize = 1;
-                    rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; rd.SampleDesc.Count = 1;
+                    rd.MipLevels = 1; rd.Format = crt::PassFormat(); rd.SampleDesc.Count = 1;
                     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
                     if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&crtRt[k]))))
                     { crtRt[k] = nullptr; rok = false; break; }

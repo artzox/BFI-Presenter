@@ -150,7 +150,8 @@ n = len(slots)
 hdr = [f'#define CRT_SLOTS {n + 2}',
        f'cbuffer CrtParams : register(b1) {{ float4 gCrtP[{n + 2}]; }};']
 hdr += [f'#define {name} {acc}' for name, t, k, acc in slots]
-hdr += [f'#define BUFFER_WIDTH (gCrtP[{n}].x)', f'#define BUFFER_HEIGHT (gCrtP[{n}].y)']
+hdr += [f'#define BUFFER_WIDTH (gCrtP[{n}].x)', f'#define BUFFER_HEIGHT (gCrtP[{n}].y)',
+        f'#define CRT_OVERLAY_CHECK (gCrtP[{n}].z > 0.5)']   # the presenter: ReShade's window open (what is drawn after the effects)
 hlsl = '\n'.join(hdr) + '\n' + text + '\n'
 
 def cstr(s):

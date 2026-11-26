@@ -291,7 +291,8 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
         if (!has[k]) ok = false;
     }
     // the finished frame as it is now: ReShade's window and overlay are drawn on it after this (shown without the CRT pattern)
-    if (ok)
+    // (only while ReShade's window is open, 1.0.49-t10: two full-frame copies a frame otherwise)
+    if (ok && pfx::OverlayOpen())
     {
         const resource bbr = pfx::BackBuffer(rt, rt->get_current_back_buffer_index());
         ok = bbr.handle && CopyCur(nl, kBase, reinterpret_cast<ID3D12Resource *>(bbr.handle), D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -346,7 +347,11 @@ static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s)
         ok = true;
         for (int k = 0; k < kTexN && ok; k++)
         {
-            if (!curHas[k]) { if (slotTex[k][s]) { SafeRelease(slotTex[k][s]); slotGen++; } continue; }
+            if (!curHas[k])
+            {
+                if (k != kBase && slotTex[k][s]) { SafeRelease(slotTex[k][s]); slotGen++; }   // compiled out
+                continue;                                                                    // the frame before ReShade's window: kept (not read while it is closed)
+            }
             const D3D12_RESOURCE_DESC d = cur[k]->GetDesc();
             if (slotTex[k][s])
             {
@@ -423,6 +428,7 @@ static const char kCrtApply[] =
     "// what was drawn after the effects (ReShade's window, an overlay) is shown as it is, without the pattern\n"
     "bool CrtOverlay(float2 cp)\n"
     "{\n"
+    "    if (!CRT_OVERLAY_CHECK) return false;\n"
     "    const int2 q = int2(cp);\n"
     "    return any(abs(src.Load(int3(q, 0)).rgb - crtBase.Load(int3(q, 0)).rgb) > 0.0005);\n"
     "}\n"
@@ -444,6 +450,19 @@ static const char kCrtApply[] =
     "#else\n"
     "float3 CrtColour(float2 pos) { const float3 c = Fetch(pos); return CrtApply(c, pos * srcPerOut); }\n"
     "#endif\n";
+
+// The textures between the pattern and the passes after it: 10-bit like the frame where the frame is 8- or 10-bit (as
+// ReShade's own back buffer: half the memory traffic of 16-bit float), else 16-bit float (1.0.49-t10)
+static DXGI_FORMAT PassFormat()
+{
+    switch (StageFormat())
+    {
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    default: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    }
+}
 
 static DWORD WINAPI CompileThread(void *)
 {
@@ -545,6 +564,7 @@ static void ParamsFor(float *out, float w, float h)
     memcpy(out, params, sizeof(params));
     out[kCrtParamN * 4 + 0] = w;
     out[kCrtParamN * 4 + 1] = h;
+    out[kCrtParamN * 4 + 2] = pfx::OverlayOpen() ? 1.0f : 0.0f;   // what is drawn after the effects: only with ReShade's window open
 }
 
 static int StateNow() { return state.load(); }
@@ -569,6 +589,7 @@ static ID3D12Resource *bCb = nullptr;
 static uint8_t *bCbMap = nullptr;
 static ID3D12Resource *bSeenSrc[kStage] = {}, *bSeenTex[kStage][kTexN] = {};
 static UINT bSrvStride = 0, bRtvStride = 0;
+static DXGI_FORMAT bFmt = DXGI_FORMAT_UNKNOWN;     // the format bPso were made for
 static bool bFailed = false;
 // heap: [s] the slot's frame (t0..t6), [kStage + 4 s ..] its four textures (t7-t10), [5 kStage + v] the pairs (t11 t12)
 
@@ -609,7 +630,7 @@ static bool BakeSetup()
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 5 * kStage + 4; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&bHeap)));
-        D3D12_DESCRIPTOR_HEAP_DESC rh = {}; rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rh.NumDescriptors = 3;
+        D3D12_DESCRIPTOR_HEAP_DESC rh = {}; rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rh.NumDescriptors = 3 + kStage;   // bRt, then bOut
         ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&bRtvHeap)));
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bd = {};
@@ -628,6 +649,7 @@ static bool BakeSetup()
         bRtvStride = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     }
     ID3DBlob *cbs[kBlobN] = {};
+    if (bPso[0] && bFmt != PassFormat()) bBlobGen = 0;   // the frame's format changed: made again
     if (TakeBlobs(&bBlobGen, cbs))
     {
         for (int k = 0; k <= kCrtPostN; k++) SafeRelease(bPso[k]);
@@ -642,8 +664,9 @@ static bool BakeSetup()
         pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         pd.RasterizerState.DepthClipEnable = TRUE;
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        pd.NumRenderTargets = 1; pd.RTVFormats[0] = PassFormat();
         pd.SampleDesc.Count = 1;
+        bFmt = PassFormat();
         for (int e = 1; e < kBlobN && ok; e++)
         {
             if (!cbs[e]) continue;
@@ -667,9 +690,10 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     const D3D12_RESOURCE_DESC sd = stage->GetDesc();
     const UINT fw = (UINT)sd.Width, fh = sd.Height;
     // the working textures (the game's queue only) and the slot's output
-    if (bRt[0] && (bRt[0]->GetDesc().Width != fw || bRt[0]->GetDesc().Height != fh))
+    const DXGI_FORMAT pf = PassFormat();
+    if (bRt[0] && (bRt[0]->GetDesc().Width != fw || bRt[0]->GetDesc().Height != fh || bRt[0]->GetDesc().Format != pf))
     { WaitGame(); for (int k = 0; k < 3; k++) SafeRelease(bRt[k]); }
-    if (bOut[s] && (bOut[s]->GetDesc().Width != fw || bOut[s]->GetDesc().Height != fh))
+    if (bOut[s] && (bOut[s]->GetDesc().Width != fw || bOut[s]->GetDesc().Height != fh || bOut[s]->GetDesc().Format != pf))
     {
         if (waitRead && g_presFence) WaitFence(g_presFence, waitRead, g_gameFenceEvent);
         SafeRelease(bOut[s]);
@@ -677,7 +701,7 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = fw; rd.Height = fh; rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; rd.SampleDesc.Count = 1;
+    rd.MipLevels = 1; rd.Format = pf; rd.SampleDesc.Count = 1;
     bool madeRt = false;
     for (int k = 0; k < 3; k++)
     {
@@ -703,10 +727,13 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     }
     if (!bOut[s])
     {
-        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;       // the last pass draws into it (t10: drawn, then copied)
         if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&bOut[s]))))
         { bOut[s] = nullptr; return; }
         bOut[s]->SetName(L"BFI CRT-Standalone hand-off (the slot's CRT picture)");
+        D3D12_CPU_DESCRIPTOR_HANDLE h = bRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)(3 + s) * bRtvStride;
+        g_device->CreateRenderTargetView(bOut[s], nullptr, h);
         bOutGen++;
     }
     // the slot's views (its frame, its four textures), rewritten when they change (the slot's last use is done)
@@ -762,38 +789,37 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
         if (slotTex[t][s]) in[nin++] = Transition(slotTex[t][s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     list->ResourceBarrier(nin, in);
 
+    // t: 0 1 2 = bRt, 3 = bOut[s] (the last pass draws straight into it)
     auto into = [&](int t, ID3D12PipelineState *pp, int from)
     {
-        D3D12_RESOURCE_BARRIER b = Transition(bRt[t], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        ID3D12Resource *r = t < 3 ? bRt[t] : bOut[s];
+        const D3D12_RESOURCE_STATES idle = t < 3 ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
+        D3D12_RESOURCE_BARRIER b = Transition(r, idle, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->ResourceBarrier(1, &b);
         D3D12_GPU_DESCRIPTOR_HANDLE ph = g0; ph.ptr += (UINT64)(5 * kStage + 2 * (UINT)(from >= 0 ? from : 1)) * bSrvStride;
         list->SetGraphicsRootDescriptorTable(10, ph);
         D3D12_CPU_DESCRIPTOR_HANDLE rh = bRtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rh.ptr += (SIZE_T)t * bRtvStride;
+        rh.ptr += (SIZE_T)(t < 3 ? t : 3 + (int)s) * bRtvStride;
         list->OMSetRenderTargets(1, &rh, FALSE, nullptr);
         list->SetPipelineState(pp);
         list->DrawInstanced(3, 1, 0, 0);
-        b = Transition(bRt[t], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        b = Transition(r, D3D12_RESOURCE_STATE_RENDER_TARGET, idle);
         list->ResourceBarrier(1, &b);
     };
-    into(0, bPso[0], -1);
-    int last = 0;
+    int steps[kCrtPostN], ns = 0, lastMain = -1;      // the passes drawn, in order; the last that isn't grain's first half
     for (int p = 0; p < kCrtPostN; p++)
+        if (bPso[1 + p] && PostOn(p, cp)) { steps[ns++] = p; if (!PostIsGrainRaw(p)) lastMain = ns - 1; }
+    int last = 0;
+    into(lastMain < 0 ? 3 : 0, bPso[0], -1);
+    for (int i = 0; i < ns; i++)
     {
-        if (!bPso[1 + p] || !PostOn(p, cp)) continue;
+        const int p = steps[i];
         if (PostIsGrainRaw(p)) { into(2, bPso[1 + p], last); continue; }
-        into(1 - last, bPso[1 + p], last);
+        into(i == lastMain ? 3 : 1 - last, bPso[1 + p], last);
         last = 1 - last;
     }
     for (UINT i = 0; i < nin; i++) std::swap(in[i].Transition.StateBefore, in[i].Transition.StateAfter);
     list->ResourceBarrier(nin, in);
-    D3D12_RESOURCE_BARRIER cb[2] = { Transition(bRt[last], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                                     Transition(bOut[s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST) };
-    list->ResourceBarrier(2, cb);
-    list->CopyResource(bOut[s], bRt[last]);
-    cb[0] = Transition(bRt[last], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    cb[1] = Transition(bOut[s], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-    list->ResourceBarrier(2, cb);
     bOk[s] = true;
     static bool logged = false;
     if (!logged) { logged = true; LOGI("BFI Presenter: CRT hand-off: each frame's CRT picture is drawn with the frame (the game's queue); flashes moved by frame warp draw their own"); }

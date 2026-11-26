@@ -176,6 +176,7 @@ static const char kCrtHlsl[] =
 "#define crt_vignette_v_power (gCrtP[82].x)\n"
 "#define BUFFER_WIDTH (gCrtP[83].x)\n"
 "#define BUFFER_HEIGHT (gCrtP[83].y)\n"
+"#define CRT_OVERLAY_CHECK (gCrtP[83].z > 0.5)\n"
 "static const float4x4 kCubicBezier = float4x4(\n"
 "     1.0f,  0.0f,  0.0f,  0.0f,\n"
 "    -3.0f,  3.0f,  0.0f,  0.0f,\n"
