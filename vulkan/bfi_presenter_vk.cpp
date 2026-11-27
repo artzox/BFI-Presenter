@@ -2030,6 +2030,9 @@ struct LearnRec
     double rfxMarginMs = 0.0;   // frames ready this long before the pick
     int    rfxFg = 0;           // 1 = no frame generation, 2-4 = its factor
     int    rfxGaveUp = 0;       // 1 = the alignment went round the strobe cycle (the game's frames don't follow it)
+    // Frame interpolation, Automatic (1.0.51): it settled on even pacing in an earlier session -- the next one starts on it.
+    // Not tied to the refresh rate; written on its own (g_learnIpEven).
+    int    ipEven = 0;
 };
 static SRWLOCK     g_learnLock = SRWLOCK_INIT;
 static std::string g_learnKey;          // section in use ("" = none read yet)
@@ -2039,6 +2042,7 @@ static LearnRec    g_learnOut;          // to be written to it
 static bool        g_learnDirty = false;
 // "Forget this game" in the overlay: the helper thread deletes the game's section, the presenter starts over.
 static std::atomic<bool> g_learnForgetFile{false}, g_learnForgetNow{false};
+static std::atomic<int>  g_learnIpEven{-1};   // to write: 1 = InterpolationEvenPacing, 0 = removed, -1 = nothing
 
 static void LearnPost(const LearnRec &r)
 {
@@ -2108,6 +2112,7 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
 {
     const std::string key = LearnKeyFor(exe, wnd);
     const bool forget = g_learnForgetFile.exchange(false);
+    const int ipEven = g_learnIpEven.exchange(-1);
     AcquireSRWLockExclusive(&g_learnLock);
     const bool dirty = g_learnDirty && !forget;
     const LearnRec out = g_learnOut;
@@ -2115,6 +2120,8 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
     g_learnDirty = false;
     ReleaseSRWLockExclusive(&g_learnLock);
     char b[64];
+    if (ipEven >= 0 && !cur.empty() && !forget)
+        WritePrivateProfileStringA(cur.c_str(), "InterpolationEvenPacing", ipEven ? "1" : nullptr, path);
     if (dirty && !cur.empty())
     {
         const char *sec = cur.c_str();
@@ -2164,6 +2171,7 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
         r.rfxFg       = (int)get("ReflexFrameGen", 0);
     }
     r.rfxGaveUp = (int)get("ReflexAlignGaveUp", 0);
+    r.ipEven = (int)get("InterpolationEvenPacing", 0);
     AcquireSRWLockExclusive(&g_learnLock);
     g_learnKey = key;
     g_learnRead = r;
@@ -2172,10 +2180,11 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
     ReleaseSRWLockExclusive(&g_learnLock);
 }
 #else
-struct LearnRec { int down = -1; double fsMs = 0.0, bestMs = 0.0, hz = 0.0; int frames = 0; double rfxMs = -1.0, rfxMarginMs = 0.0; int rfxFg = 0, rfxGaveUp = 0; };
+struct LearnRec { int down = -1; double fsMs = 0.0, bestMs = 0.0, hz = 0.0; int frames = 0; double rfxMs = -1.0, rfxMarginMs = 0.0; int rfxFg = 0, rfxGaveUp = 0, ipEven = 0; };
 static void LearnPost(const LearnRec &) {}
 static int LearnFetch(int, LearnRec &) { return 0; }
 static std::atomic<bool> g_learnForgetFile{false}, g_learnForgetNow{false};
+static std::atomic<int>  g_learnIpEven{-1};   // to write: 1 = InterpolationEvenPacing, 0 = removed, -1 = nothing
 #endif
 
 #ifdef _WIN32
@@ -2372,7 +2381,8 @@ static void PresenterThread(Swapchain *sc)
     // i2 (as DX i6): Automatic holds even pacing longer and stays on it from the third switch; the switch back lands on a
     // frame as rendered; leaving waits longer each time it is needed again within 30 s
     double   ipBackT = 0.0, ipLeaveT = 0.0, ipExitT = 0.0, ipExitNeed = 10.0;
-    bool     ipLeaving = false, ipEvenStick = false;
+    bool     ipLeaving = false, ipEvenStick = false, ipLearnedEven = false, ipLearnChecked = false;
+    double ipStickHiT = 0.0;   // even pacing kept: since when the game has held 0.95 or more (or needed no interpolation)
     int      ipToEven = 0;
     int      winWarpCut = 0; double winCutT = 0.0;
     double   tsPassMs = -1.0, tsDrawMs = -1.0;   // the last GPU times read back (timing log)
@@ -2615,6 +2625,29 @@ static void PresenterThread(Swapchain *sc)
                 if (ipOn && !ipAllowed) { ipOn = false; ipCycle = false; }
                 if (cycleStart && ipAllowed)
                 {
+                    // Learned (LearnPerGame): settled on even pacing in an earlier session -- Automatic starts on it. Even pacing kept
+                    // (learned or from the third switch) is let go after 2 minutes at 0.95 or more, and then forgotten for the game.
+                    if (s.warpInterp == 3 && !ipLearnChecked && s.learnPerGame && learnGen != 0)
+                    {
+                        ipLearnChecked = true;
+                        if (learnRead.ipEven)
+                        {
+                            ipEvenStick = ipLearnedEven = true; ipStickHiT = Now();
+                            if (ipOn) { ipEven = true; ipEvenT = Now(); }
+                            LOGI("BFI Presenter: frame interpolation: Automatic on even pacing from the start (it settled there for this game in an earlier session)");
+                        }
+                    }
+                    if (ipEvenStick)
+                    {
+                        if (ipOn && ipRateSlow < 0.95) ipStickHiT = Now();
+                        else if (Now() - ipStickHiT >= 120.0)
+                        {
+                            ipEvenStick = false; ipToEven = 0;
+                            LOGI("BFI Presenter: frame interpolation: the game held its rate for 2 minutes -- Automatic chooses again%s", ipLearnedEven ? " (no longer remembered for this game)" : "");
+                            if (ipLearnedEven && s.learnPerGame) g_learnIpEven = 0;
+                            ipLearnedEven = false;
+                        }
+                    }
                     if (!ipOn && lastShownId && unseen == 0 && newestId == lastShownId)
                     {
                         ipOn = true; ipP = (double)lastShownId; ipRate = 0.9; ipRateSlow = 0.95; ipTwoBehind = 0;
@@ -2644,8 +2677,9 @@ static void PresenterThread(Swapchain *sc)
                                     if (ipToEven <= 20) LOGI("BFI Presenter: frame interpolation: even pacing (%.2f game frames per strobe cycle)", ipRateSlow);
                                     if (ipToEven == 3)
                                     {
-                                        ipEvenStick = true;
-                                        LOGI("BFI Presenter: frame interpolation: even pacing from here on in this session (the game's rate kept moving around the switch point)");
+                                        ipEvenStick = true; ipStickHiT = Now();
+                                        if (s.learnPerGame && !ipLearnedEven) { g_learnIpEven = 1; ipLearnedEven = true; }
+                                        LOGI("BFI Presenter: frame interpolation: even pacing from here on (the game's rate kept moving around the switch point)%s", s.learnPerGame ? " -- remembered for this game" : "");
                                     }
                                 }
                             }
@@ -4240,6 +4274,7 @@ static void PresenterThread(Swapchain *sc)
                     fsKeptLead = -1.0; fsOffT = -1e9;
                     if (fsState != 0) { fsState = 0; sc->fsOn.store(false); sc->fsCtl.store(false); }
                     LOGI("BFI Presenter: remembered data for this game cleared -- the automatic frame cap starts over");
+                    if (ipLearnedEven) { ipEvenStick = ipLearnedEven = false; ipToEven = 0; }   // Automatic chooses again
                 }
                 learnHoldAhead = false;
                 if (s.learnPerGame)

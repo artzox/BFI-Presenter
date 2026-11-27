@@ -3260,6 +3260,9 @@ struct LearnRec
     // The CRT hand-off (1.0.50): the game was short of video memory for it (it stayed freed for a session) -- the next
     // session starts that way. Not tied to the refresh rate; written on its own (g_learnCrtShort).
     int    crtShort = 0;
+    // Frame interpolation, Automatic (1.0.51): it settled on even pacing in an earlier session -- the next one starts on it.
+    // Not tied to the refresh rate; written on its own (g_learnIpEven).
+    int    ipEven = 0;
 };
 static SRWLOCK     g_learnLock = SRWLOCK_INIT;
 static std::string g_learnKey;          // section in use ("" = none read yet)
@@ -3270,6 +3273,7 @@ static bool        g_learnDirty = false;
 // "Forget this game" in the overlay: the helper thread deletes the game's section, the presenter starts over.
 static std::atomic<bool> g_learnForgetFile{false}, g_learnForgetNow{false};
 static std::atomic<int>  g_learnCrtShort{-1};   // to write: 1 = CrtHandoffMemoryShort, 0 = removed, -1 = nothing
+static std::atomic<int>  g_learnIpEven{-1};     // to write: 1 = InterpolationEvenPacing, 0 = removed, -1 = nothing
 
 static void LearnPost(const LearnRec &r)
 {
@@ -3340,6 +3344,7 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
     const std::string key = LearnKeyFor(exe, wnd);
     const bool forget = g_learnForgetFile.exchange(false);
     const int crtShort = g_learnCrtShort.exchange(-1);
+    const int ipEven = g_learnIpEven.exchange(-1);
     AcquireSRWLockExclusive(&g_learnLock);
     const bool dirty = g_learnDirty && !forget;
     const LearnRec out = g_learnOut;
@@ -3349,6 +3354,8 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
     char b[64];
     if (crtShort >= 0 && !cur.empty() && !forget)
         WritePrivateProfileStringA(cur.c_str(), "CrtHandoffMemoryShort", crtShort ? "1" : nullptr, path);
+    if (ipEven >= 0 && !cur.empty() && !forget)
+        WritePrivateProfileStringA(cur.c_str(), "InterpolationEvenPacing", ipEven ? "1" : nullptr, path);
     if (dirty && !cur.empty() && out.frames > 0)
     {
         const char *sec = cur.c_str();
@@ -3402,6 +3409,7 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
         r.rfxGaveUp = (int)get("ReflexAlignGaveUp", 0);
     }
     r.crtShort = (int)get("CrtHandoffMemoryShort", 0);
+    r.ipEven = (int)get("InterpolationEvenPacing", 0);
     AcquireSRWLockExclusive(&g_learnLock);
     g_learnKey = key;
     g_learnRead = r;
@@ -3901,7 +3909,8 @@ static DWORD WINAPI PresenterThread(void *)
     // as rendered instead of jumping half a frame; and back to the newest frame only after longer at the strobe rate
     // each time interpolation is needed again within 30 s of leaving
     double ipBackT = 0.0, ipLeaveT = 0.0, ipExitT = 0.0, ipExitNeed = 10.0;
-    bool   ipLeaving = false, ipEvenStick = false;
+    bool   ipLeaving = false, ipEvenStick = false, ipLearnedEven = false, ipLearnChecked = false;
+    double ipStickHiT = 0.0;   // even pacing kept: since when the game has held 0.95 or more (or needed no interpolation)
     int    ipToEven = 0;
     double ipRateSlow = 1.0;                 // game frames per strobe cycle over about 3 s (Automatic decides on it)
     int    ipTwoBehind = 0;                  // only the missing frames: cycles in a row with two frames waiting
@@ -4682,6 +4691,29 @@ static DWORD WINAPI PresenterThread(void *)
             if (ipOn && !ipAllowed) { ipOn = false; ipCycle = false; }
             if (cycleStart && ipAllowed)
             {
+                // Learned (LearnPerGame): settled on even pacing in an earlier session -- Automatic starts on it. Even pacing kept
+                // (learned or from the third switch) is let go after 2 minutes at 0.95 or more, and then forgotten for the game.
+                if (s.warpInterp == 3 && !ipLearnChecked && s.learnPerGame && learnGen != 0)
+                {
+                    ipLearnChecked = true;
+                    if (learnRead.ipEven)
+                    {
+                        ipEvenStick = ipLearnedEven = true; ipStickHiT = Now();
+                        if (ipOn) { ipEven = true; ipEvenT = Now(); }
+                        LOGI("BFI Presenter: frame warp interpolation: Automatic on even pacing from the start (it settled there for this game in an earlier session)");
+                    }
+                }
+                if (ipEvenStick)
+                {
+                    if (ipOn && ipRateSlow < 0.95) ipStickHiT = Now();
+                    else if (Now() - ipStickHiT >= 120.0)
+                    {
+                        ipEvenStick = false; ipToEven = 0;
+                        LOGI("BFI Presenter: frame warp interpolation: the game held its rate for 2 minutes -- Automatic chooses again%s", ipLearnedEven ? " (no longer remembered for this game)" : "");
+                        if (ipLearnedEven && s.learnPerGame) g_learnIpEven = 0;
+                        ipLearnedEven = false;
+                    }
+                }
                 if (!ipOn && lastShownId && unseen == 0 && newestId == lastShownId)
                 {
                     // the first missing frame: this cycle shows the frame shown last once more (as without frame warp),
@@ -4719,8 +4751,9 @@ static DWORD WINAPI PresenterThread(void *)
                                 if (ipToEven <= 20) LOGI("BFI Presenter: frame warp interpolation: even pacing (%.2f game frames per strobe cycle)", ipRateSlow);
                                 if (ipToEven == 3)
                                 {
-                                    ipEvenStick = true;
-                                    LOGI("BFI Presenter: frame warp interpolation: even pacing from here on in this session (the game's rate kept moving around the switch point)");
+                                    ipEvenStick = true; ipStickHiT = Now();
+                                    if (s.learnPerGame && !ipLearnedEven) { g_learnIpEven = 1; ipLearnedEven = true; }
+                                    LOGI("BFI Presenter: frame warp interpolation: even pacing from here on (the game's rate kept moving around the switch point)%s", s.learnPerGame ? " -- remembered for this game" : "");
                                 }
                             }
                         }
@@ -6751,6 +6784,7 @@ static DWORD WINAPI PresenterThread(void *)
                     learnSavedDown = -1; learnApply = false; learnSwNow = false; learnSwReset = true;
                     if (autoCapDown || capProbe) { autoCapDown = capProbe = false; capDownSecs = capUpSecs = 0; capSwitchT = t; probeWait = 30.0; }
                     LOGI("BFI Presenter: remembered data for this game cleared -- the automatic frame cap starts over");
+                    if (ipLearnedEven) { ipEvenStick = ipLearnedEven = false; ipToEven = 0; }   // Automatic chooses again
                 }
                 learnHoldAhead = false;
                 if (s.learnPerGame)
