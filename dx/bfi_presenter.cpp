@@ -196,8 +196,9 @@ struct Settings
                               // smaller than the screen, e.g. Townfall)
     int   warpEven = 0;       // FrameWarpEvenPacing: every strobe cycle moved to where the game's motion is, where the game's
                               // own motion is used; elsewhere missing frames are filled as usual
+    int   warpInterp = 0;          // FrameWarpInterpolate: one frame behind while frames are missing, the gaps interpolated (test, 1.0.51)
     int   warpFillDebug = 0;       // FrameWarpFillUncoveredDebug: tint uncovered pixels (test)
-    int   warpFillUncovered = 1;   // FrameWarpFillUncovered: with the game's motion, what is uncovered from the background beside it (1.0.51)
+    int   warpFillUncovered = 0;   // FrameWarpFillUncovered: with the game's motion, what is uncovered from the background beside it (1.0.51)
     int   warpEdge = 0;       // FrameWarpEdge: the strip at the screen edge a moved flash has no picture for: 0 the move faded
                               // out toward the edge, 1 the picture mirrored at the edge, 2 the edge repeated (stretched, before 1.0.45)
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many
@@ -426,8 +427,9 @@ static void LoadSettings(Settings &s)
     s.warpSnapX = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapX", 0.0f)));
     s.warpSnapY = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapY", 0.0f)));
     s.warpEdge = std::max(0, std::min(2, IniInt("FrameWarpEdge", 0)));
-    s.warpFillUncovered = IniInt("FrameWarpFillUncovered", 1) ? 1 : 0;
+    s.warpFillUncovered = IniInt("FrameWarpFillUncovered", 0) ? 1 : 0;   // t1-t5: worse than without (a smear around a character as the camera turns)
     s.warpFillDebug = IniInt("FrameWarpFillUncoveredDebug", 0) ? 1 : 0;
+    s.warpInterp = IniInt("FrameWarpInterpolate", 0) ? 1 : 0;
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -684,6 +686,7 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
     IniWriteInt("FrameWarpEdge", s.warpEdge);
     IniWriteInt("FrameWarpFillUncovered", s.warpFillUncovered);
+    IniWriteInt("FrameWarpInterpolate", s.warpInterp);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -1850,9 +1853,11 @@ float4 GameFlow(float2 uv)
 // frame has it, so the vectors are read where each point is in that frame: warpLag shown frames further along its
 // motion (ep8). The picture is still moved by warp.
 static int gFillSeen = 0;   // FrameWarpFillUncoveredDebug: 1 filled (magenta), 2 uncovered, nothing in front to fill past (cyan), 3 searched, no background found (yellow)
+static bool gFromPrev = false;   // interpolation (flags & 262144): this pixel is taken from the frame before (t4)
 float2 WarpShiftGame(float2 uv)
 {
     gFillSeen = 0;
+    gFromPrev = false;
     uint w, h;
     src.GetDimensions(w, h);
     const float2 osz = float2(w, h);                      // the check below is to a pixel of the game frame
@@ -1873,6 +1878,13 @@ float2 WarpShiftGame(float2 uv)
     }
     const bool uncovered = bestNear < 0.0;
     if (uncovered) gFillSeen = 2;
+    // Interpolated (warp = -(1 - f): the newer frame moved back to f between the two): what the newer frame doesn't show here
+    // is about to be covered in it -- the frame before still shows it, moved on by f along the background's motion.
+    if ((flags & 262144) != 0 && uncovered && backNear <= 1.0)
+    {
+        gFromPrev = true;
+        return clamp(backOwn * (1.0 + warp), -0.08, 0.08);
+    }
     if (uncovered) { best = backNear <= 1.0 ? back : float2(0.0, 0.0); bestK = backK; }
     // Up to the rendered frame the motion is known (a generated frame); past it, it's a guess that it carries on: that part
     // eases off as the motion slows, so a camera coming to a stop isn't pushed past where it stops and snapped back (ep9).
@@ -2049,6 +2061,7 @@ bool FetchWarped(float2 pos, out float3 c)
     if (warpSrc != 0 && (GameFlow(cp * inv).w < -0.5 || GameFlow(p * inv).w < -0.5)) return false;
     if (Still(int2(p), size)) return false;
     gSrcPos = p;
+    if (gFromPrev) { c = srcPrev.SampleLevel(linClamp, p * inv, 0).rgb; return true; }   // interpolation: from the frame before
     // FrameWarpFillUncoveredDebug (flags & 16384): uncovered pixels tinted -- magenta filled from the background beside,
     // cyan found uncovered but not filled
     if ((flags & 16384) != 0 && gFillSeen != 0)
@@ -3867,6 +3880,17 @@ static DWORD WINAPI PresenterThread(void *)
     WarpClock warpClock;
     ID3DBlob *psWarp[kWarpShN] = {};
     double warpAhead = 0.0;                  // this strobe cycle: game frames ahead of the frame it shows
+    // Interpolation while frames are missing (FrameWarpInterpolate, test 1.0.51): at the first missing frame the presenter
+    // falls one game frame behind and shows each strobe cycle at a point between two finished frames (ipP, in frame ids):
+    // the frame as rendered where it falls on one, else the picture between the two, drawn from both (no part of it made
+    // up). Back to showing the newest frame once the game has held the strobe rate for 3 s.
+    bool   ipOn = false;
+    double ipP = 0.0, ipRate = 1.0, ipFullT = 0.0, ipOnT = 0.0, ipLogT = 0.0;
+    UINT64 ipNewestSeen = 0, ipA = 0;
+    int    ipSlotA = -1;
+    float  ipF = 0.0f;
+    bool   ipCycle = false;                  // this strobe cycle is drawn between ipA and the frame picked (ipA + 1)
+    int    ipCycles = 0, ipAsIs = 0, ipEnters = 0;
     int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
     UINT64 warpPrevId = 0;
     int    secWarpCycles = 0;
@@ -4634,7 +4658,70 @@ static DWORD WINAPI PresenterThread(void *)
             }
         }
         const bool cycleStart = (slotNow == 0) || lastShown < 0;
-        if (!cycleStart && lastShown >= 0 && g_stageId[lastShown] == lastShownId && g_stageFence[lastShown] <= done)
+        bool ipPicked = false;
+        {
+            const bool ipAllowed = s.warpInterp && s.frameWarp && warp.ok && s.warpGame && !g_status.fgActive && s.pacingMode == 0;
+            if (ipOn && !ipAllowed) { ipOn = false; ipCycle = false; }
+            if (cycleStart && ipAllowed)
+            {
+                if (!ipOn && lastShownId && unseen == 0 && newestId == lastShownId)
+                {
+                    // the first missing frame: this cycle shows the frame shown last once more (as without frame warp),
+                    // and from here the presenter stays one frame behind
+                    ipOn = true; ipP = (double)lastShownId; ipRate = 0.9; ipNewestSeen = newestId; ipFullT = ipOnT = Now(); ipEnters++;
+                    if (ipEnters <= 20) LOGI("BFI Presenter: frame warp interpolation: a frame missing -- one frame behind, gaps drawn between two frames");
+                }
+                else if (ipOn)
+                {
+                    const double got = newestId > ipNewestSeen ? (double)(newestId - ipNewestSeen) : 0.0;
+                    if (newestId > ipNewestSeen) ipNewestSeen = newestId;
+                    ipRate = 0.9 * ipRate + 0.1 * std::min(got, 3.0);       // game frames per strobe cycle
+                    ipP += ipRate;
+                    ipP += 0.15 * ((double)newestId - 1.0 - ipP);             // one frame behind the newest
+                    ipP = std::max((double)newestId - 3.0, std::min((double)newestId, ipP));
+                    if (ipRate < 0.985) ipFullT = Now();
+                    else if (Now() - ipFullT > 3.0)
+                    {
+                        ipOn = false; ipCycle = false;
+                        if (ipEnters <= 20) LOGI("BFI Presenter: frame warp interpolation: the strobe rate held for 3 s -- the newest frame again (one frame skipped)");
+                    }
+                }
+            }
+            if (ipOn && cycleStart)
+            {
+                ipCycle = false;
+                const UINT64 a = (UINT64)std::floor(ipP);
+                const float f = (float)(ipP - std::floor(ipP));
+                int sa = -1, sb = -1;
+                for (UINT i = 0; i < kStage; i++)
+                {
+                    if (g_stageFence[i] > done) continue;
+                    if (g_stageId[i] == a) sa = (int)i;
+                    if (g_stageId[i] == a + 1) sb = (int)i;
+                }
+                if (sa < 0) { ipOn = false; }                          // fell too far behind: the normal pick
+                else if (f < 1.0f / 32.0f || f > 31.0f / 32.0f || sb < 0)
+                {
+                    pick = (f > 31.0f / 32.0f && sb >= 0) ? sb : sa;   // on a frame: as rendered
+                    ipPicked = true; ipAsIs++;
+                }
+                else
+                {
+                    pick = sb; ipPicked = true; ipCycle = true; ipA = a; ipSlotA = sa; ipF = f; ipCycles++;
+                }
+            }
+            else if (ipOn && !cycleStart && lastShown >= 0 && g_stageId[lastShown] == lastShownId && g_stageFence[lastShown] <= done)
+            { pick = lastShown; ipPicked = true; }                     // rest of the cycle: the same picture
+            if (ipOn && Now() - ipLogT >= 10.0)
+            {
+                if (ipLogT > 0.0)
+                    LOGI("BFI Presenter: frame warp interpolation: last 10 s, %d strobe cycles drawn between two frames, %d on a frame as rendered "
+                         "(game frames per strobe cycle %.2f)", ipCycles, ipAsIs, ipRate);
+                ipLogT = Now(); ipCycles = ipAsIs = 0;
+            }
+        }
+        if (ipPicked) {}
+        else if (!cycleStart && lastShown >= 0 && g_stageId[lastShown] == lastShownId && g_stageFence[lastShown] <= done)
             pick = lastShown;                                     // rest of the cycle: same frame
         else if (s.pacingMode == 0 && oldestNew >= 0)
         {
@@ -4686,6 +4773,7 @@ static DWORD WINAPI PresenterThread(void *)
             warpPrev = (pick != lastShown && g_stageId[lastShown] == lastShownId) ? lastShown : -1;
             warpPrevId = warpPrev >= 0 ? lastShownId : 0;
         }
+        if (ipCycle && ipSlotA >= 0 && g_stageId[ipSlotA] == ipA) { warpPrev = ipSlotA; warpPrevId = ipA; }   // interpolation: the frame before
         g_presPrevSlot = warpPrev;
         if (pick < 0)
         {
@@ -4892,7 +4980,40 @@ static DWORD WINAPI PresenterThread(void *)
         UINT64 warpOld = 0;
         ID3D12Resource *gFlow = nullptr;                // this refresh's motion texture from the game's motion
         if (StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT) c.flags |= 1024u;
-        if (warpAhead > 0.0 && s.frameWarp && warp.ok && (warpOld = warp.PairFor(pickId, pickTime)) != 0 &&
+        bool ipDrawn = false;
+        if (ipCycle && warpPrev >= 0 && warpPrevId == ipA && g_stageId[warpPrev] == ipA && pickId == ipA + 1)
+        {
+            // Interpolated: the frame picked (ipA + 1) moved back along the game's motion by (1 - ipF) of a frame; what that
+            // can't show (hidden in it, about to be covered) is taken from the frame before, moved on by ipF (flags & 262144)
+            const int gsrc = gmo::SlotFor(pick, pickId);
+            if (gsrc)
+            {
+                const UINT fg = gmo::FlowGenNow();
+                if (fg != gameFlowGen)
+                {
+                    D3D12_CPU_DESCRIPTOR_HANDLE gh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                    gh.ptr += (SIZE_T)kGameFlowSrv * srvStride;
+                    gameFlowGen = gmo::WriteFlowSrvs(gh, srvStride);
+                }
+                gFlow = gmo::FlowFor(pick, gameFlowGen);
+            }
+            if (gsrc && gFlow)
+            {
+                ipDrawn = true;
+                c.warp = -(float)(floor((1.0 - (double)ipF) * 256.0 + 0.5) / 256.0);
+                c.warpPrevN = 1.0f; c.warpSrc = (uint32_t)gsrc; c.warpLag = 0.0f; c.warpEase = 0.0f;
+                c.flags |= 262144u;
+                if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;
+                if (s.warpStillPre && g_pre[pick] && g_pre[warpPrev] && g_preOk[pick] && g_preOk[warpPrev])
+                    c.flags |= 32768u | (pfx::OverlayOpen() ? 131072u : 0u);
+                if (s.osd && Now() - Osd::drawnT.load() < 0.5)
+                { c.osdX0 = Osd::drawnRect[0]; c.osdY0 = Osd::drawnRect[1]; c.osdX1 = Osd::drawnRect[2]; c.osdY1 = Osd::drawnRect[3]; }
+                const char *pauseWhy = nullptr;
+                if (gmo::PauseNow(pickId, s.warpPauseLb != 0, &pauseWhy)) { c.warp = 0.0f; c.warpSrc = 0; gFlow = nullptr; c.flags &= ~262144u; }
+            }
+        }
+        if (ipDrawn) {}
+        else if (warpAhead > 0.0 && !ipOn && s.frameWarp && warp.ok && (warpOld = warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrev >= 0 && warpPrev != pick && warpPrevId == warpOld && g_stageId[warpPrev] == warpOld && g_stageFence[warpPrev] <= done)
         {
             // The game's own motion (where it hands its upscaler motion vectors and depth): one game frame's motion,
@@ -14977,6 +15098,13 @@ static void draw_overlay(reshade::api::effect_runtime *)
             }
             if (s.warpGame)
             {
+                bool wi = s.warpInterp != 0;
+                if (ImGui::Checkbox("Interpolate while frames are missing (test)", &wi)) s.warpInterp = wi ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's motion, without frame generation, in Smooth pacing. At the first missing\n"
+                                                              "frame the presenter falls one game frame behind (about 17 ms more latency at 60 fps) and\n"
+                                                              "draws each strobe cycle between two finished frames: what one of them hides, the other shows,\n"
+                                                              "so nothing is made up (no ghost edges). Once the game holds the strobe rate for 3 s it shows\n"
+                                                              "the newest frame again (one frame skipped). Instead of frame warp's fill while it is on.");
                 bool fu = s.warpFillUncovered != 0;
                 if (ImGui::Checkbox("Fill uncovered areas from the background (test)", &fu)) s.warpFillUncovered = fu ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's motion: where something in front moves away, the background coming out\n"
