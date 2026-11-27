@@ -19,6 +19,8 @@ struct OsdData
     bool   bfiOn = true;
     double relFlashMs = -1.0;  // game released -> lit flash (average), -1 = not measured
     int    warpOn = 0;         // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
+    int    ipNow = 0;          // frame interpolation: 1 only the missing frames, 2 even pacing (one frame behind); 0 not now
+    int    ipCan = 0;          // 1: frame interpolation can run (ready for the first missing frame)
     int    warped = 0;         // per second: strobe cycles shown moved ahead
     double warpAhead = 0.0;    // and how far on average, in game frames
     int    warpSrc = -1;       // the motion it moves the picture with: 0 measured from the picture, 1 the game's motion
@@ -156,7 +158,9 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
                        d.repeated, g_totRep.load(), d.missed, g_totMiss.load());
     if (d.paused) { ImGui::SameLine(); ImGui::TextColored(kBad, "  BFI paused"); }
     // frame warp: how many of the second's strobe cycles were shown moved ahead (the repeated ones among them are filled)
-    if (d.warpOn == 2) ImGui::TextColored(kGood, "frame warp: %d of %.0f cycles moved (%.2f frames ahead)", d.warped, cycles, d.warpAhead);
+    if (d.ipNow > 0) ImGui::TextColored(kGood, "frame interpolation: %s (one frame behind)", d.ipNow == 2 ? "even pacing" : "only the missing frames");
+    else if (d.warpOn == 2) ImGui::TextColored(kGood, "frame warp: %d of %.0f cycles moved (%.2f frames ahead)", d.warped, cycles, d.warpAhead);
+    else if (d.warpOn == 1 && d.ipCan) ImGui::TextDisabled("frame interpolation: ready (for the first missing frame)");
     else if (d.warpOn == 1) ImGui::TextDisabled("frame warp: waiting (frame rate outside its range)");
     else if (d.warpOn < 0) ImGui::TextColored(kBad, "frame warp: not available");
     if (d.warpOn > 0 && d.warpSrc >= 0)

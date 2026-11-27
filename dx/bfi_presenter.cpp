@@ -167,7 +167,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.50"
+#define BFI_ADDON_VERSION "1.0.51"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -196,6 +196,11 @@ struct Settings
                               // smaller than the screen, e.g. Townfall)
     int   warpEven = 0;       // FrameWarpEvenPacing: every strobe cycle moved to where the game's motion is, where the game's
                               // own motion is used; elsewhere missing frames are filled as usual
+    int   warpInterp = 0;          // FrameWarpInterpolate: one frame behind while frames are missing (test, 1.0.51): 0 off,
+                                   // 1 only the missing frames drawn between two (the rest as rendered), 2 even pacing (every cycle at its time),
+                                   // 3 automatic: 1 near the strobe rate, 2 clearly below it (i4)
+    int   warpFillDebug = 0;       // FrameWarpFillUncoveredDebug: tint uncovered pixels (test)
+    int   warpFillUncovered = 0;   // FrameWarpFillUncovered: with the game's motion, what is uncovered from the background beside it (1.0.51)
     int   warpEdge = 0;       // FrameWarpEdge: the strip at the screen edge a moved flash has no picture for: 0 the move faded
                               // out toward the edge, 1 the picture mirrored at the edge, 2 the edge repeated (stretched, before 1.0.45)
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many
@@ -424,6 +429,9 @@ static void LoadSettings(Settings &s)
     s.warpSnapX = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapX", 0.0f)));
     s.warpSnapY = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapY", 0.0f)));
     s.warpEdge = std::max(0, std::min(2, IniInt("FrameWarpEdge", 0)));
+    s.warpFillUncovered = IniInt("FrameWarpFillUncovered", 0) ? 1 : 0;   // t1-t5: worse than without (a smear around a character as the camera turns)
+    s.warpFillDebug = IniInt("FrameWarpFillUncoveredDebug", 0) ? 1 : 0;
+    s.warpInterp = std::max(0, std::min(3, IniInt("FrameWarpInterpolate", 0)));   // 1 only the missing frames, 2 even pacing, 3 automatic
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -679,6 +687,8 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
     IniWriteInt("FrameWarpEdge", s.warpEdge);
+    IniWriteInt("FrameWarpFillUncovered", s.warpFillUncovered);
+    IniWriteInt("FrameWarpInterpolate", s.warpInterp);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -797,6 +807,11 @@ struct Status
     double hotArea = -1.0;                      // ABL guard: percent of the screen whose lit refresh exceeds the cap
     double ceilInUse = 0.0;                     // ABL guard: lit-refresh ceiling in effect (nits)                  // display refreshing slower than it can, with no missed refreshes
     int    warpOn = 0;                          // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
+    int    ipNow = 0;                           // frame interpolation: 0 off or not behind, 1 only the missing frames, 2 even pacing,
+                                                // -1 not with frame generation, -2 needs the game's motion
+    int    ipCan = 0;                           // 1: frame interpolation can run now (the game's motion is prepared for it even
+                                                // while frame warp itself waits -- 1.0.51-i11: 007 at 66% of the strobe rate, under
+                                                // Only from, had no game motion and its in-between pictures weren't moved)
     int    warpCycles = 0;                      // per second: strobe cycles shown moved ahead
     double warpRate = 0.0;                      // the game's frames per strobe cycle, as frame warp measures it
     double warpAvg = 0.0;                       // average distance ahead of those cycles, in game frames
@@ -1844,8 +1859,12 @@ float4 GameFlow(float2 uv)
 // With frame generation, a generated frame shows everything warpLag shown frames short of where the vectors' (rendered)
 // frame has it, so the vectors are read where each point is in that frame: warpLag shown frames further along its
 // motion (ep8). The picture is still moved by warp.
+static int gFillSeen = 0;   // FrameWarpFillUncoveredDebug: 1 filled (magenta), 2 uncovered, nothing in front to fill past (cyan), 3 searched, no background found (yellow)
+static bool gFromPrev = false;   // interpolation (flags & 262144): this pixel is taken from the frame before (t4)
 float2 WarpShiftGame(float2 uv)
 {
+    gFillSeen = 0;
+    gFromPrev = false;
     uint w, h;
     src.GetDimensions(w, h);
     const float2 osz = float2(w, h);                      // the check below is to a pixel of the game frame
@@ -1854,21 +1873,67 @@ float2 WarpShiftGame(float2 uv)
     m[0] = GameFlow(uv).xy;
     m[1] = GameFlow(uv - m[0] * L).xy;
     m[2] = GameFlow(uv - m[1] * L).xy;
-    float2 best = float2(0.0, 0.0), back = float2(0.0, 0.0);
-    float bestNear = -1.0, backNear = 2.0, bestK = 1.0, backK = 1.0;
+    float2 best = float2(0.0, 0.0), back = float2(0.0, 0.0), front = float2(0.0, 0.0), backOwn = float2(0.0, 0.0);
+    float bestNear = -1.0, backNear = 2.0, frontNear = -1.0, bestK = 1.0, backK = 1.0;
     [unroll] for (int i = 0; i < 3; i++)
     {
         float4 g = GameFlow(uv - m[i] * L);
         if (g.z < 0.5) continue;
         if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; bestK = saturate(g.z - 1.0); }
-        if (g.w < backNear) { backNear = g.w; back = m[i]; backK = saturate(g.z - 1.0); }
+        if (g.w < backNear) { backNear = g.w; back = m[i]; backOwn = g.xy; backK = saturate(g.z - 1.0); }
+        if (g.w > frontNear) { frontNear = g.w; front = g.xy; }
     }
-    if (bestNear < 0.0) { best = backNear <= 1.0 ? back : float2(0.0, 0.0); bestK = backK; }
+    const bool uncovered = bestNear < 0.0;
+    if (uncovered) gFillSeen = 2;
+    // Interpolated (warp = -(1 - f): the newer frame moved back to f between the two): what the newer frame doesn't show here
+    // is about to be covered in it -- the frame before still shows it, moved on by f along the background's motion.
+    if ((flags & 262144) != 0 && uncovered && backNear <= 1.0)
+    {
+        gFromPrev = true;
+        return clamp(backOwn * (1.0 + warp), -0.08, 0.08);
+    }
+    if (uncovered) { best = backNear <= 1.0 ? back : float2(0.0, 0.0); bestK = backK; }
     // Up to the rendered frame the motion is known (a generated frame); past it, it's a guess that it carries on: that part
     // eases off as the motion slows, so a camera coming to a stop isn't pushed past where it stops and snapped back (ep9).
     const float known = clamp(warpLag, 0.0, warp);
     const float k = warpEase > 0.001 ? pow(max(bestK, 0.0), warpEase) : 1.0;   // warpEase: the strength (1 = before 1.0.49)
-    return clamp(best * (known + (warp - known) * k), -0.08, 0.08);
+    const float s = known + (warp - known) * k;
+    // Uncovered (1.0.51 test, flags & 2048): what comes out from behind something moving in front was hidden in this frame
+    // (and, for steady motion, in every frame before it). Taking it with the background's motion takes the thing in front
+    // from where it was -- a second, ghost edge behind it. Instead the background beside it is taken: from where the
+    // background's motion leads, step back against the front's motion (relative to the background's) until the point
+    // is behind it, and take the background there -- a short smear of background instead of a copy of the edge.
+    // How near a point is (w) goes with 1 / distance, so "behind" is a ratio, not a difference: a character 3 m away and
+    // the floor behind it differ by a few thousandths (t1 tested a fixed 0.002 and found no background: all cyan).
+    if (uncovered && (flags & 2048) != 0)
+    {
+        if (backNear > 1.0) gFillSeen = 5;                    // debug: no valid point found at all (white)
+        else if (!(frontNear > backNear * 1.03)) gFillSeen = 2;   // nothing clearly in front (cyan)
+    }
+    if (uncovered && (flags & 2048) != 0 && backNear <= 1.0 && frontNear > backNear * 1.03)
+    {
+        // the two points' own motions (t1-t4 took the background's as the step that led to it -- behind a walking character
+        // that is the character's own motion, so nothing moved against anything: all blue)
+        const float2 rel = (front - backOwn) * s;             // how far the front moved against the background, uv
+        const float relPx = length(rel * osz);
+        if (relPx <= 0.5) gFillSeen = 4;                      // debug: the front barely moved against it (blue)
+        if (relPx > 0.5)
+        {
+            gFillSeen = 3;                                    // searched (debug: yellow if nothing found)
+            const float2 dir = -rel / max(length(rel), 1e-6);   // toward the side it uncovers from
+            const float2 at = uv - backOwn * s;               // where the background's motion leads, in this frame
+            const float stepUv = max(relPx / 12.0, 1.0) / max(osz.x, osz.y);
+            [loop] for (int j = 1; j <= 16; j++)
+            {
+                const float2 q = at + dir * stepUv * j;
+                const float4 g = GameFlow(q);
+                if (g.w < -0.5) break;                        // the HUD: not taken from
+                if (g.z > 0.5 && g.w < frontNear * 0.97)       // at least 3% further away than the front
+                { gFillSeen = 1; return clamp(uv - q, -0.08, 0.08); }   // the picture there is shown here
+            }
+        }
+    }
+    return clamp(best * s, -0.08, 0.08);
 }
 
 float2 WarpShift(float2 uv)
@@ -2003,6 +2068,15 @@ bool FetchWarped(float2 pos, out float3 c)
     if (warpSrc != 0 && (GameFlow(cp * inv).w < -0.5 || GameFlow(p * inv).w < -0.5)) return false;
     if (Still(int2(p), size)) return false;
     gSrcPos = p;
+    if (gFromPrev) { c = srcPrev.SampleLevel(linClamp, p * inv, 0).rgb; return true; }   // interpolation: from the frame before
+    // FrameWarpFillUncoveredDebug (flags & 16384): uncovered pixels tinted -- magenta filled from the background beside,
+    // cyan found uncovered but not filled
+    if ((flags & 16384) != 0 && gFillSeen != 0)
+    {
+        c = gFillSeen == 1 ? float3(0.8, 0.0, 0.8) : gFillSeen == 3 ? float3(0.8, 0.8, 0.0) : gFillSeen == 4 ? float3(0.0, 0.2, 1.0) :
+            gFillSeen == 5 ? float3(0.8, 0.8, 0.8) : float3(0.0, 0.8, 0.8);
+        return true;
+    }
     if (srcPerOut.x > 1.0001 || srcPerOut.y > 1.0001)
     {
         float2 o = 0.25 * srcPerOut;
@@ -3189,6 +3263,9 @@ struct LearnRec
     // The CRT hand-off (1.0.50): the game was short of video memory for it (it stayed freed for a session) -- the next
     // session starts that way. Not tied to the refresh rate; written on its own (g_learnCrtShort).
     int    crtShort = 0;
+    // Frame interpolation, Automatic (1.0.51): it settled on even pacing in an earlier session -- the next one starts on it.
+    // Not tied to the refresh rate; written on its own (g_learnIpEven).
+    int    ipEven = 0;
 };
 static SRWLOCK     g_learnLock = SRWLOCK_INIT;
 static std::string g_learnKey;          // section in use ("" = none read yet)
@@ -3199,6 +3276,7 @@ static bool        g_learnDirty = false;
 // "Forget this game" in the overlay: the helper thread deletes the game's section, the presenter starts over.
 static std::atomic<bool> g_learnForgetFile{false}, g_learnForgetNow{false};
 static std::atomic<int>  g_learnCrtShort{-1};   // to write: 1 = CrtHandoffMemoryShort, 0 = removed, -1 = nothing
+static std::atomic<int>  g_learnIpEven{-1};     // to write: 1 = InterpolationEvenPacing, 0 = removed, -1 = nothing
 
 static void LearnPost(const LearnRec &r)
 {
@@ -3269,6 +3347,7 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
     const std::string key = LearnKeyFor(exe, wnd);
     const bool forget = g_learnForgetFile.exchange(false);
     const int crtShort = g_learnCrtShort.exchange(-1);
+    const int ipEven = g_learnIpEven.exchange(-1);
     AcquireSRWLockExclusive(&g_learnLock);
     const bool dirty = g_learnDirty && !forget;
     const LearnRec out = g_learnOut;
@@ -3278,6 +3357,8 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
     char b[64];
     if (crtShort >= 0 && !cur.empty() && !forget)
         WritePrivateProfileStringA(cur.c_str(), "CrtHandoffMemoryShort", crtShort ? "1" : nullptr, path);
+    if (ipEven >= 0 && !cur.empty() && !forget)
+        WritePrivateProfileStringA(cur.c_str(), "InterpolationEvenPacing", ipEven ? "1" : nullptr, path);
     if (dirty && !cur.empty() && out.frames > 0)
     {
         const char *sec = cur.c_str();
@@ -3331,6 +3412,7 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
         r.rfxGaveUp = (int)get("ReflexAlignGaveUp", 0);
     }
     r.crtShort = (int)get("CrtHandoffMemoryShort", 0);
+    r.ipEven = (int)get("InterpolationEvenPacing", 0);
     AcquireSRWLockExclusive(&g_learnLock);
     g_learnKey = key;
     g_learnRead = r;
@@ -3813,6 +3895,29 @@ static DWORD WINAPI PresenterThread(void *)
     WarpClock warpClock;
     ID3DBlob *psWarp[kWarpShN] = {};
     double warpAhead = 0.0;                  // this strobe cycle: game frames ahead of the frame it shows
+    // Interpolation while frames are missing (FrameWarpInterpolate, test 1.0.51): at the first missing frame the presenter
+    // falls one game frame behind and shows each strobe cycle at a point between two finished frames (ipP, in frame ids):
+    // the frame as rendered where it falls on one, else the picture between the two, drawn from both (no part of it made
+    // up). Back to showing the newest frame once the game has held the strobe rate for 3 s.
+    bool   ipOn = false;
+    double ipP = 0.0, ipRate = 1.0, ipFullT = 0.0, ipOnT = 0.0, ipLogT = 0.0;
+    UINT64 ipNewestSeen = 0, ipA = 0;
+    int    ipSlotA = -1;
+    float  ipF = 0.0f;
+    bool   ipCycle = false;                  // this strobe cycle is drawn between ipA and the frame picked (ipA + 1)
+    bool   ipEven = false;                   // automatic: even pacing in use (else only the missing frames)
+    double ipEvenT = 0.0;                    // when it last switched
+    // i6 (Uncharted at 50-58 fps: 56 switches in 20 min, the 3 s average sat on 0.88-0.93): back to only the missing
+    // frames after 10 s at 0.95 or more; on it from the third switch to even pacing; the switch back waits for a frame
+    // as rendered instead of jumping half a frame; and back to the newest frame only after longer at the strobe rate
+    // each time interpolation is needed again within 30 s of leaving
+    double ipBackT = 0.0, ipLeaveT = 0.0, ipExitT = 0.0, ipExitNeed = 10.0;
+    bool   ipLeaving = false, ipEvenStick = false, ipLearnedEven = false, ipLearnChecked = false;
+    double ipStickHiT = 0.0;   // even pacing kept: since when the game has held 0.95 or more (or needed no interpolation)
+    int    ipToEven = 0;
+    double ipRateSlow = 1.0;                 // game frames per strobe cycle over about 3 s (Automatic decides on it)
+    int    ipTwoBehind = 0;                  // only the missing frames: cycles in a row with two frames waiting
+    int    ipCycles = 0, ipAsIs = 0, ipEnters = 0;
     int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
     UINT64 warpPrevId = 0;
     int    secWarpCycles = 0;
@@ -4580,7 +4685,164 @@ static DWORD WINAPI PresenterThread(void *)
             }
         }
         const bool cycleStart = (slotNow == 0) || lastShown < 0;
-        if (!cycleStart && lastShown >= 0 && g_stageId[lastShown] == lastShownId && g_stageFence[lastShown] <= done)
+        bool ipPicked = false;
+        {
+            // either pacing (i1 needed Smooth, and the default is Lowest latency: it never ran)
+            const bool ipAllowed = s.warpInterp && s.frameWarp && warp.ok && s.warpGame && !g_status.fgActive;
+            g_status.ipCan = ipAllowed ? 1 : 0;
+            g_status.ipNow = !s.warpInterp ? 0 : g_status.fgActive ? -1 : !s.warpGame ? -2 :
+                             !ipOn ? 0 : (s.warpInterp == 2 || (s.warpInterp == 3 && ipEven)) ? 2 : 1;
+            if (ipOn && !ipAllowed) { ipOn = false; ipCycle = false; }
+            if (cycleStart && ipAllowed)
+            {
+                // Learned (LearnPerGame): settled on even pacing in an earlier session -- Automatic starts on it. Even pacing kept
+                // (learned or from the third switch) is let go after 2 minutes at 0.95 or more, and then forgotten for the game.
+                if (s.warpInterp == 3 && !ipLearnChecked && s.learnPerGame && learnGen != 0)
+                {
+                    ipLearnChecked = true;
+                    if (learnRead.ipEven)
+                    {
+                        ipEvenStick = ipLearnedEven = true; ipStickHiT = Now();
+                        if (ipOn) { ipEven = true; ipEvenT = Now(); }
+                        LOGI("BFI Presenter: frame warp interpolation: Automatic on even pacing from the start (it settled there for this game in an earlier session)");
+                    }
+                }
+                if (ipEvenStick)
+                {
+                    if (ipOn && ipRateSlow < 0.95) ipStickHiT = Now();
+                    else if (Now() - ipStickHiT >= 120.0)
+                    {
+                        ipEvenStick = false; ipToEven = 0;
+                        LOGI("BFI Presenter: frame warp interpolation: the game held its rate for 2 minutes -- Automatic chooses again%s", ipLearnedEven ? " (no longer remembered for this game)" : "");
+                        if (ipLearnedEven && s.learnPerGame) g_learnIpEven = 0;
+                        ipLearnedEven = false;
+                    }
+                }
+                if (!ipOn && lastShownId && unseen == 0 && newestId == lastShownId)
+                {
+                    // the first missing frame: this cycle shows the frame shown last once more (as without frame warp),
+                    // and from here the presenter stays one frame behind
+                    ipOn = true; ipP = (double)lastShownId; ipRate = 0.9; ipRateSlow = 0.95; ipTwoBehind = 0; ipNewestSeen = newestId; ipFullT = ipOnT = Now(); ipEnters++;
+                    ipEven = false; ipEvenT = Now();
+                    ipLeaving = false; ipBackT = Now();
+                    if (ipEvenStick && s.warpInterp == 3) ipEven = true;
+                    if (ipExitT > 0.0 && Now() - ipExitT < 30.0 && ipExitNeed < 60.0)
+                    {
+                        ipExitNeed = std::min(60.0, ipExitNeed * 2.0);
+                        LOGI("BFI Presenter: frame warp interpolation: needed again %.0f s after leaving -- now leaves after %.0f s at the strobe rate", Now() - ipExitT, ipExitNeed);
+                    }
+                    if (ipEnters <= 20) LOGI("BFI Presenter: frame warp interpolation: a frame missing -- one frame behind, gaps drawn between two frames");
+                }
+                else if (ipOn)
+                {
+                    const double got = newestId > ipNewestSeen ? (double)(newestId - ipNewestSeen) : 0.0;
+                    if (newestId > ipNewestSeen) ipNewestSeen = newestId;
+                    ipRate = 0.9 * ipRate + 0.1 * std::min(got, 3.0);       // game frames per strobe cycle
+                    ipRateSlow = 0.995 * ipRateSlow + 0.005 * std::min(got, 3.0);   // the same over about 3 s
+                    // Automatic (1.0.51-i4): only the missing frames near the strobe rate (Onimusha at 60 fps: 0-32 pictures
+                    // in between per 10 s, sharp); even pacing below it, where every fourth cycle or so misses a frame and
+                    // half steps between whole ones are choppy (Oblivion at 43 fps). Below 0.88 game frames per cycle on,
+                    // above 0.93 off, each held at least 3 s.
+                    // (i5: on the 3 s average and held 5 s -- i4 switched three times in Oblivion's first 40 s, and twice in
+                    // Onimusha on short dips)
+                    if (s.warpInterp == 3 && !ipLeaving && Now() - ipEvenT >= 5.0)
+                    {
+                        if (!ipEven)
+                        {
+                            if (ipRateSlow < 0.88)
+                            {
+                                ipEven = true; ipEvenT = ipBackT = Now(); ipToEven++;
+                                if (ipToEven <= 20) LOGI("BFI Presenter: frame warp interpolation: even pacing (%.2f game frames per strobe cycle)", ipRateSlow);
+                                if (ipToEven == 3)
+                                {
+                                    ipEvenStick = true; ipStickHiT = Now();
+                                    if (s.learnPerGame && !ipLearnedEven) { g_learnIpEven = 1; ipLearnedEven = true; }
+                                    LOGI("BFI Presenter: frame warp interpolation: even pacing from here on (the game's rate kept moving around the switch point)%s", s.learnPerGame ? " -- remembered for this game" : "");
+                                }
+                            }
+                        }
+                        else if (!ipEvenStick)
+                        {
+                            if (ipRateSlow < 0.95) ipBackT = Now();
+                            else if (Now() - ipBackT >= 10.0) { ipLeaving = true; ipLeaveT = Now(); }
+                        }
+                    }
+                    if (s.warpInterp == 2 || (s.warpInterp == 3 && ipEven))
+                    {
+                        // even pacing: each cycle at its point in time, one frame behind the newest
+                        const double was = ipP;
+                        ipP += ipRate;
+                        ipP += 0.15 * ((double)newestId - 1.0 - ipP);
+                        ipP = std::max((double)newestId - 3.0, std::min((double)newestId, ipP));
+                        ipP = std::max(ipP, std::min(was, (double)newestId));  // never back to an older picture
+                        if (ipLeaving && (std::floor(ipP + 1e-6) > std::floor(was + 1e-6) || Now() - ipLeaveT > 1.0))
+                        {
+                            ipP = Now() - ipLeaveT > 1.0 ? std::floor(ipP + 0.5) : std::floor(ipP + 1e-6);   // on the frame just reached
+                            ipEven = false; ipLeaving = false; ipEvenT = Now();
+                            if (ipToEven <= 20) LOGI("BFI Presenter: frame warp interpolation: only the missing frames (%.2f game frames per strobe cycle for 10 s)", ipRateSlow);
+                        }
+                    }
+                    else
+                    {
+                        // only the missing frames (1.0.51-i3): the next frame as rendered while one more is waiting behind it;
+                        // where showing it would leave none waiting (a frame missing), half way to it instead, and it the
+                        // cycle after. Sharp frames, one in-between picture per missing frame.
+                        const UINT64 base = (UINT64)std::floor(ipP + 1e-6);
+                        const bool half = ipP - std::floor(ipP + 1e-6) > 0.25;
+                        const UINT64 next = base + 1;
+                        // two frames waiting 3 cycles in a row: back to one behind (i4 stayed two behind for seconds in
+                        // Onimusha: 60-75 ms from release to flash against 42 without, where one frame is 17 ms)
+                        ipTwoBehind = newestId >= next + 2 ? ipTwoBehind + 1 : 0;
+                        if (newestId >= next + 3 || ipTwoBehind >= 3) { ipP = (double)(newestId - 1); ipTwoBehind = 0; }
+                        else if (newestId >= next + 1) ipP = (double)next;
+                        else if (newestId == next) ipP = half ? (double)next : (double)base + 0.5;
+                        // else nothing new at all: the same picture once more
+                    }
+                    // back after 10 s at the strobe rate (i5; 3 s before: Onimusha fell behind and caught up again every few
+                    // seconds, a repeat going in and a skip coming out each time)
+                    if (ipRate < 0.985) ipFullT = Now();
+                    else if (Now() - ipFullT > ipExitNeed)
+                    {
+                        ipOn = false; ipCycle = false; ipLeaving = false; ipExitT = Now();
+                        if (ipEnters <= 20) LOGI("BFI Presenter: frame warp interpolation: the strobe rate held for %.0f s -- the newest frame again (one frame skipped)", ipExitNeed);
+                    }
+                }
+            }
+            if (ipOn && cycleStart)
+            {
+                ipCycle = false;
+                const UINT64 a = (UINT64)std::floor(ipP);
+                const float f = (float)(ipP - std::floor(ipP));
+                int sa = -1, sb = -1;
+                for (UINT i = 0; i < kStage; i++)
+                {
+                    if (g_stageFence[i] > done) continue;
+                    if (g_stageId[i] == a) sa = (int)i;
+                    if (g_stageId[i] == a + 1) sb = (int)i;
+                }
+                if (sa < 0) { ipOn = false; }                          // fell too far behind: the normal pick
+                else if (f < 1.0f / 32.0f || f > 31.0f / 32.0f || sb < 0)
+                {
+                    pick = (f > 31.0f / 32.0f && sb >= 0) ? sb : sa;   // on a frame: as rendered
+                    ipPicked = true; ipAsIs++;
+                }
+                else
+                {
+                    pick = sb; ipPicked = true; ipCycle = true; ipA = a; ipSlotA = sa; ipF = f; ipCycles++;
+                }
+            }
+            else if (ipOn && !cycleStart && lastShown >= 0 && g_stageId[lastShown] == lastShownId && g_stageFence[lastShown] <= done)
+            { pick = lastShown; ipPicked = true; }                     // rest of the cycle: the same picture
+            if (ipOn && Now() - ipLogT >= 10.0)
+            {
+                if (ipLogT > 0.0)
+                    LOGI("BFI Presenter: frame warp interpolation: last 10 s, %d strobe cycles drawn between two frames, %d on a frame as rendered "
+                         "(game frames per strobe cycle %.2f)", ipCycles, ipAsIs, ipRate);
+                ipLogT = Now(); ipCycles = ipAsIs = 0;
+            }
+        }
+        if (ipPicked) {}
+        else if (!cycleStart && lastShown >= 0 && g_stageId[lastShown] == lastShownId && g_stageFence[lastShown] <= done)
             pick = lastShown;                                     // rest of the cycle: same frame
         else if (s.pacingMode == 0 && oldestNew >= 0)
         {
@@ -4632,6 +4894,7 @@ static DWORD WINAPI PresenterThread(void *)
             warpPrev = (pick != lastShown && g_stageId[lastShown] == lastShownId) ? lastShown : -1;
             warpPrevId = warpPrev >= 0 ? lastShownId : 0;
         }
+        if (ipCycle && ipSlotA >= 0 && g_stageId[ipSlotA] == ipA) { warpPrev = ipSlotA; warpPrevId = ipA; }   // interpolation: the frame before
         g_presPrevSlot = warpPrev;
         if (pick < 0)
         {
@@ -4838,7 +5101,40 @@ static DWORD WINAPI PresenterThread(void *)
         UINT64 warpOld = 0;
         ID3D12Resource *gFlow = nullptr;                // this refresh's motion texture from the game's motion
         if (StageFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT) c.flags |= 1024u;
-        if (warpAhead > 0.0 && s.frameWarp && warp.ok && (warpOld = warp.PairFor(pickId, pickTime)) != 0 &&
+        bool ipDrawn = false;
+        if (ipCycle && warpPrev >= 0 && warpPrevId == ipA && g_stageId[warpPrev] == ipA && pickId == ipA + 1)
+        {
+            // Interpolated: the frame picked (ipA + 1) moved back along the game's motion by (1 - ipF) of a frame; what that
+            // can't show (hidden in it, about to be covered) is taken from the frame before, moved on by ipF (flags & 262144)
+            const int gsrc = gmo::SlotFor(pick, pickId);
+            if (gsrc)
+            {
+                const UINT fg = gmo::FlowGenNow();
+                if (fg != gameFlowGen)
+                {
+                    D3D12_CPU_DESCRIPTOR_HANDLE gh = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                    gh.ptr += (SIZE_T)kGameFlowSrv * srvStride;
+                    gameFlowGen = gmo::WriteFlowSrvs(gh, srvStride);
+                }
+                gFlow = gmo::FlowFor(pick, gameFlowGen);
+            }
+            if (gsrc && gFlow)
+            {
+                ipDrawn = true;
+                c.warp = -(float)(floor((1.0 - (double)ipF) * 256.0 + 0.5) / 256.0);
+                c.warpPrevN = 1.0f; c.warpSrc = (uint32_t)gsrc; c.warpLag = 0.0f; c.warpEase = 0.0f;
+                c.flags |= 262144u;
+                if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;
+                if (s.warpStillPre && g_pre[pick] && g_pre[warpPrev] && g_preOk[pick] && g_preOk[warpPrev])
+                    c.flags |= 32768u | (pfx::OverlayOpen() ? 131072u : 0u);
+                if (s.osd && Now() - Osd::drawnT.load() < 0.5)
+                { c.osdX0 = Osd::drawnRect[0]; c.osdY0 = Osd::drawnRect[1]; c.osdX1 = Osd::drawnRect[2]; c.osdY1 = Osd::drawnRect[3]; }
+                const char *pauseWhy = nullptr;
+                if (gmo::PauseNow(pickId, s.warpPauseLb != 0, &pauseWhy)) { c.warp = 0.0f; c.warpSrc = 0; gFlow = nullptr; c.flags &= ~262144u; }
+            }
+        }
+        if (ipDrawn) {}
+        else if (warpAhead > 0.0 && !ipOn && s.frameWarp && warp.ok && (warpOld = warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrev >= 0 && warpPrev != pick && warpPrevId == warpOld && g_stageId[warpPrev] == warpOld && g_stageFence[warpPrev] <= done)
         {
             // The game's own motion (where it hands its upscaler motion vectors and depth): one game frame's motion,
@@ -4870,6 +5166,8 @@ static DWORD WINAPI PresenterThread(void *)
             else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
             if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
+            if (s.warpFillUncovered) c.flags |= 2048u;          // uncovered areas from the background beside them (FrameWarpFillUncovered)
+            if (s.warpFillDebug) c.flags |= 16384u;             // and where that applies, tinted (FrameWarpFillUncoveredDebug)
             // what stands still, found in the frames from before ReShade's effects (FrameWarpStillBeforeEffects)
             if (s.warpStillPre && g_pre[pick] && g_pre[warpPrev] && g_preOk[pick] && g_preOk[warpPrev])
                 c.flags |= 32768u | (pfx::OverlayOpen() ? 131072u : 0u);   // ReShade's window open: the finished frames too
@@ -6490,6 +6788,7 @@ static DWORD WINAPI PresenterThread(void *)
                     learnSavedDown = -1; learnApply = false; learnSwNow = false; learnSwReset = true;
                     if (autoCapDown || capProbe) { autoCapDown = capProbe = false; capDownSecs = capUpSecs = 0; capSwitchT = t; probeWait = 30.0; }
                     LOGI("BFI Presenter: remembered data for this game cleared -- the automatic frame cap starts over");
+                    if (ipLearnedEven) { ipEvenStick = ipLearnedEven = false; ipToEven = 0; }   // Automatic chooses again
                 }
                 learnHoldAhead = false;
                 if (s.learnPerGame)
@@ -9178,6 +9477,10 @@ static UINT  hudW = 0, hudH = 0;
 static float hudMap[4] = {};
 static double hudCopyT = -10.0;                          // when it was last copied
 static Tag   hudLiveTag; static Res hudLiveRes; static bool hudLive = false;   // valid until the Present (no copy)
+// when the game last tagged it: read at a Present only within 0.25 s of that (1.0.51-i12: 007 stops tagging it when its
+// frame generation is switched off and frees it -- the tag kept from before was read at every Present after, and the GPU
+// hung on it once frame interpolation prepared the game's motion at 66% of the strobe rate)
+static double hudLiveT = 0.0;
 static ID3D12Resource *hudRaw[2] = {}, *hudMask = nullptr;   // the motion texture's size, R8; in PIXEL_SHADER_RESOURCE between uses
 static int  hudCur = 0;
 static bool hudMaskOk = false;                           // hudMask holds a mask from the last Presents
@@ -9306,7 +9609,7 @@ static DXGI_FORMAT MvView(DXGI_FORMAT f)
 static bool On() { return g_shared.frameWarp != 0 && g_shared.warpGame != 0 && !g_dx11.load(); }
 // With frame generation the game's motion isn't used (FrameWarpGameMotionWithFG=0, the default): its vectors, depth and
 // HUD-less picture aren't copied either (1.0.49: they were, on every upscaler call, for nothing)
-static bool FgUnused() { return (g_status.fgActive && !g_shared.warpGameFg) || g_status.warpOn == 1; }
+static bool FgUnused() { return (g_status.fgActive && !g_shared.warpGameFg) || (g_status.warpOn == 1 && !g_status.ipCan); }
 // (and while frame warp waits -- the game's frame rate outside its range, no steady rate: nothing is filled, so the
 // game's motion isn't prepared either. Returnal's loading stalls: this step took up to 75 ms of a 93 ms frame there.)
 
@@ -9413,7 +9716,7 @@ static void CopyHud(const Tag &t, void *cmd)
     if (hudState.load() < 0 || !g_device) return;
     if (!cmd)
     {
-        if (t.lifecycle == 1) { hudLiveTag = t; hudLiveRes = *t.res; hudLiveTag.res = &hudLiveRes; hudLive = true; }
+        if (t.lifecycle == 1) { hudLiveTag = t; hudLiveRes = *t.res; hudLiveTag.res = &hudLiveRes; hudLive = true; hudLiveT = Now(); }
         return;
     }
     D3D12_RESOURCE_DESC hd = {};
@@ -9803,7 +10106,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
 {
     if (s >= kStage) return;
     slotId[s] = 0; slotPend[s] = slotOk[s] = false;
-    if (!On() || g_status.warpOn == 1) { std::lock_guard<std::mutex> l(lk); pendN = 0; latest = -1; return; }
+    if (!On() || (g_status.warpOn == 1 && !g_status.ipCan)) { std::lock_guard<std::mutex> l(lk); pendN = 0; latest = -1; return; }
     Entry e, ep;
     int k;
     float scale = 1.0f, lag = 0.0f;
@@ -9862,7 +10165,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         if (g_shared.warpGameHud && hudState.load() >= 0 && psoHud && hudMask)
         {
             if (hudCopy && Now() - hudCopyT < 0.25) { hl = hudCopy; hl->AddRef(); hlState = D3D12_RESOURCE_STATE_COPY_DEST; hlFmt = hudFmt; memcpy(hlMap, hudMap, sizeof(hlMap)); }
-            else if (hudLive)
+            else if (hudLive && Now() - hudLiveT < 0.25)
             {
                 D3D12_RESOURCE_DESC d = {};
                 if ((hl = Native(hudLiveTag.res, &d)) != nullptr)
@@ -14187,6 +14490,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
     d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
     d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
     d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
+    d.ipNow = g_status.ipNow; d.ipCan = g_status.ipCan;
     // which motion: what the last second's moved cycles used, or (none moved) what the game hands over -- unless frame
     // generation is on with the game's motion off for it, as in the settings window (Townfall, 2x: the OSD switched
     // between the game's vectors and the measured motion with each second that had no cycle to fill)
@@ -14821,16 +15125,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (s.frameWarp)
         {
             ImGui::Indent(16.0f);
-            ImGui::SliderFloat("Furthest ahead (game frames)", &s.warpMax, 0.25f, 1.5f, "%.2f");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("A frame is never shown further ahead than this. Lower = fewer errors, but a\n"
-                                                          "missing frame is only partly filled.");
-            ImGui::SliderInt("Only from (% of the strobe rate)", &s.warpMinRate, 40, 95);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame warp works while the game makes at least this share of the strobe rate\n"
-                                                          "(75%% of a 60 Hz strobe = 45 fps). Below it frames repeat as without it: the\n"
-                                                          "further a frame has to be moved, the more errors show.");
             if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see ReShade.log).");
             else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
+            else if (st.ipNow > 0) ImGui::Text("At work: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
+            else if (st.ipCan && st.warpRate > 0.0) ImGui::Text("Ready: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else ImGui::Text("Waiting for the game's frame rate.");
             bool gm = s.warpGame != 0;
@@ -14840,9 +15139,71 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
                                                           "from the finished picture, which can only follow the camera. Other games keep the\n"
                                                           "measured motion. The line below says which one is in use.");
-            if (s.warpGame)
             {
-                ImGui::SameLine();
+                const bool fgOff = st.fgActive && !s.warpGameFg;   // the game's motion isn't used with frame generation
+                const int src = st.warpCycles ? st.warpSrc : (s.warpGame && !fgOff && st.warpGameState > 0 ? st.warpGameState : 0);
+                ImGui::Text("Motion used: %s%s", src == 1 ? "the game's motion vectors and depth" : src == 2 ? "the game's motion vectors (no depth)"
+                                                       : "measured from the picture",
+                            src <= 0 ? "" : st.warpGameVia == 1 ? ", from DLSS" : ", from Streamline");
+                if (s.warpGame && fgOff && st.warpGameState > 0) { ImGui::SameLine(); ImGui::TextDisabled("(the game's is off with frame generation)"); }
+                else if (s.warpGame && st.warpGameWhy[0]) { ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", st.warpGameWhy); }
+                else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("This game hasn't handed DLSS any motion data (no Streamline or DLSS call seen).");
+            }
+            // Frame interpolation (1.0.51): the one choice of how a missing frame is filled. The ini keeps 0 off, 1 only
+            // the missing frames, 2 even pacing, 3 automatic; the list shows Automatic second.
+            {
+                static const int toIni[4] = { 0, 3, 1, 2 }, toUi[4] = { 0, 2, 3, 1 };
+                int ui = toUi[std::max(0, std::min(3, s.warpInterp))];
+                if (ImGui::Combo("Frame interpolation", &ui, "Off: move the last frame (no added latency)\0Automatic\0Only the missing frames\0Even pacing\0"))
+                    s.warpInterp = toIni[ui];
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("How a strobe cycle without a new game frame is filled.\n"
+                                                              "Off: the last frame is moved along the motion (frame warp's fill). No added latency; a\n"
+                                                              "guess where something uncovers the background (ghost edges behind moving things).\n"
+                                                              "On: at the first missing frame the presenter falls one game frame behind (about 17 ms more\n"
+                                                              "latency at 60 fps) and draws each gap between the two finished frames around it -- what one\n"
+                                                              "of them hides, the other shows, so nothing is made up. Back to the newest frame once the\n"
+                                                              "game has held the strobe rate for 10 s (longer if it is\n"
+                                                              "soon needed again). Needs the game's motion vectors and depth, and no\n"
+                                                              "frame generation; elsewhere the last frame is moved.\n"
+                                                              "Only the missing frames: frames as rendered, each missing one replaced by a picture between\n"
+                                                              "the two around it (best near the strobe rate). Even pacing: every strobe cycle at its point in\n"
+                                                              "time (smoothest well below it, a little softer). Automatic: the first near the strobe rate\n"
+                                                              "(the start), even pacing below about 88%, back after 10 s at 95% or more; from the third\n"
+                                                              "switch it stays on even pacing (remembered per game). Best from about 45-50 fps up: further\n"
+                                                              "below, errors of the game's motion at edges are moved far enough to show (outlines).");
+                if (s.warpInterp)
+                {
+                    const int ip = st.ipNow;
+                    ImGui::TextDisabled("%s", ip == -1 ? "Not with frame generation: the last frame is moved instead." :
+                                              ip == -2 ? "Needs the game's motion vectors and depth (below): the last frame is moved instead." :
+                                              ip == 1 ? "In use: one frame behind, only the missing frames drawn between two." :
+                                              ip == 2 ? "In use: one frame behind, even pacing." :
+                                              "Ready: frames as rendered until one is missing.");
+                }
+            }
+            // Moving the last frame: Off, and wherever interpolation can't run (frame generation, no game motion), so its
+            // settings are always shown (i6 hid them under Off while they still applied there)
+            ImGui::SeparatorText("Moving the last frame");
+            // greyed out while frame interpolation fills the missing frames (ipNow >= 0: it can run here), so nothing in it
+            // looks as if it were at work
+            const bool moveIdle = s.warpInterp && st.ipNow >= 0;
+            {
+                if (moveIdle) ImGui::TextDisabled("Not used: frame interpolation fills the missing frames.");
+                else if (s.warpInterp) ImGui::TextDisabled("In use: frame interpolation can't run here (%s).",
+                                                           st.ipNow == -1 ? "frame generation" : "no game motion");
+                ImGui::BeginDisabled(moveIdle);
+                ImGui::Indent(16.0f);
+                ImGui::SliderFloat("Furthest ahead (game frames)", &s.warpMax, 0.25f, 1.5f, "%.2f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("A frame is never shown further ahead than this. Lower = fewer errors, but a\n"
+                                                              "missing frame is only partly filled.");
+                ImGui::SliderInt("Only from (% of the strobe rate)", &s.warpMinRate, 40, 95);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame warp works while the game makes at least this share of the strobe rate\n"
+                                                              "(75%% of a 60 Hz strobe = 45 fps). Below it frames repeat as without it: the\n"
+                                                              "further a frame has to be moved, the more errors show.");
+                if (s.warpGame)
+                {
                 bool ev = s.warpEven != 0;
                 if (ImGui::Checkbox("Even pacing", &ev)) s.warpEven = ev ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion only: every strobe cycle shows the picture where the game's motion\n"
@@ -14866,26 +15227,45 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                                   "scanlines make an overshoot easy to see), but a slowing pan is filled less too.");
                     ImGui::Unindent(16.0f);
                 }
+                }
+                ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader (e.g.\n"
+                                                              "CRT-Standalone), set it to the mask's width so the mask stays in place. 0 = off.");
+                ImGui::SliderFloat("Snap moves up and down (px)", &s.warpSnapY, 0.0f, 16.0f, s.warpSnapY > 0.0f ? "%.2f" : "off");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader,\n"
+                                                              "set it to the scanline width (e.g. CRT-Standalone's Scanline Width) so the scanlines\n"
+                                                              "don't break up where parts of the picture move by different amounts. 0 = off.");
+                if ((s.warpSnapX > 0.0f || s.warpSnapY > 0.0f) && s.crtHandoff && crt::StateNow() == 2)
+                    ImGui::TextDisabled("Snap isn't used while CRT-Standalone is applied after frame warp: its scanlines no longer move.");
+                if (s.warpGame)
+                {
+                    bool gf = s.warpGameFg != 0;
+                    if (ImGui::Checkbox("Also with frame generation", &gf)) s.warpGameFg = gf ? 1 : 0;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The game's motion vectors are for the frames it renders, not the ones frame generation\n"
+                                                                  "adds in between, so on those the edges of moving things double up (outlines around\n"
+                                                                  "characters, e.g. 007 First Light, Directive 8020). Off by default: with frame generation\n"
+                                                                  "on, frame warp uses the motion measured from the picture.");
+                    if (s.warpGameFg)
+                    {
+                        ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
+                                                                      "further ahead than this (shown frames). Further out it overshoots and snaps back.");
+                    }
+                }
+                ImGui::Unindent(16.0f);
+                ImGui::EndDisabled();
             }
-            bool pl = s.warpPauseLb != 0;
-            if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
-                                                          "screen, e.g. Townfall): its quick cuts between camera angles have no motion to follow.\n"
-                                                          "Only after full-screen play in the same session, and not once a letterbox has lasted\n"
-                                                          "10 minutes (play, in a game letterboxed by design). Turn it off for a game whose play\n"
-                                                          "switches in and out of letterbox. Right after a camera cut the game flags, frames are\n"
-                                                          "never filled either way.");
+            ImGui::SeparatorText("Both ways");
+            if (s.warpGame)
             {
-                const bool fgOff = st.fgActive && !s.warpGameFg;   // the game's motion isn't used with frame generation
-                const int src = st.warpCycles ? st.warpSrc : (s.warpGame && !fgOff && st.warpGameState > 0 ? st.warpGameState : 0);
-                ImGui::Text("Motion used: %s%s", src == 1 ? "the game's motion vectors and depth" : src == 2 ? "the game's motion vectors (no depth)"
-                                                       : "measured from the picture",
-                            src <= 0 ? "" : st.warpGameVia == 1 ? ", from DLSS" : ", from Streamline");
-                if (s.warpGame && fgOff && st.warpGameState > 0) { ImGui::SameLine(); ImGui::TextDisabled("(the game's is off with frame generation)"); }
-                else if (s.warpGame && st.warpGameWhy[0]) { ImGui::SameLine(); ImGui::TextDisabled("(?)");
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", st.warpGameWhy); }
-                else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
-                    ImGui::SetTooltip("This game hasn't handed DLSS any motion data (no Streamline or DLSS call seen).");
+                bool hud = s.warpGameHud != 0;
+                if (ImGui::Checkbox("Keep the HUD still (the game's HUD-less picture)", &hud)) s.warpGameHud = hud ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands its upscaler a picture without the HUD (e.g. 007 First Light),\n"
+                                                              "whatever differs from it is HUD and is never moved. Switches itself off if the\n"
+                                                              "two don't match (effects drawn after it, ReShade's included).");
+                if (s.warpGameHud)
+                    ImGui::TextDisabled(st.warpHud > 0 ? "HUD mask: in use" : st.warpHud < 0 ? "HUD mask: off (the HUD-less picture doesn't match the frame)"
+                                                       : "HUD mask: the game gives no HUD-less picture");
             }
             {
                 bool sp = s.warpStillPre != 0;
@@ -14901,15 +15281,6 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "behind with the background (outlines around characters). Higher reaches further, for\n"
                                                           "things close to the camera; too high and the background next to an edge moves with it\n"
                                                           "(a halo). 1 by default, 0 = off.");
-            ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader (e.g.\n"
-                                                          "CRT-Standalone), set it to the mask's width so the mask stays in place. 0 = off.");
-            ImGui::SliderFloat("Snap moves up and down (px)", &s.warpSnapY, 0.0f, 16.0f, s.warpSnapY > 0.0f ? "%.2f" : "off");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader,\n"
-                                                          "set it to the scanline width (e.g. CRT-Standalone's Scanline Width) so the scanlines\n"
-                                                          "don't break up where parts of the picture move by different amounts. 0 = off.");
-            if ((s.warpSnapX > 0.0f || s.warpSnapY > 0.0f) && s.crtHandoff && crt::StateNow() == 2)
-                ImGui::TextDisabled("Snap isn't used while CRT-Standalone is applied after frame warp: its scanlines no longer move.");
             {
                 int em = s.warpEdge;
                 if (ImGui::Combo("Screen edges", &em, "Fade the move\0Mirror the picture\0Repeat the edge\0")) s.warpEdge = em;
@@ -14919,29 +15290,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "into it. Repeat: the edge's last pixels are stretched over the strip, a smear as wide as the\n"
                                                               "move (before 1.0.45).");
             }
-            if (s.warpGame)
-            {
-                bool gf = s.warpGameFg != 0;
-                if (ImGui::Checkbox("Also with frame generation", &gf)) s.warpGameFg = gf ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("The game's motion vectors are for the frames it renders, not the ones frame generation\n"
-                                                              "adds in between, so on those the edges of moving things double up (outlines around\n"
-                                                              "characters, e.g. 007 First Light, Directive 8020). Off by default: with frame generation\n"
-                                                              "on, frame warp uses the motion measured from the picture.");
-                if (s.warpGameFg)
-                {
-                    ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
-                                                                  "further ahead than this (shown frames). Further out it overshoots and snaps back.");
-                }
-                bool hud = s.warpGameHud != 0;
-                if (ImGui::Checkbox("Keep the HUD still (the game's HUD-less picture)", &hud)) s.warpGameHud = hud ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands its upscaler a picture without the HUD (e.g. 007 First Light),\n"
-                                                              "whatever differs from it is HUD and is never moved. Switches itself off if the\n"
-                                                              "two don't match (effects drawn after it, ReShade's included).");
-                if (s.warpGameHud)
-                    ImGui::TextDisabled(st.warpHud > 0 ? "HUD mask: in use" : st.warpHud < 0 ? "HUD mask: off (the HUD-less picture doesn't match the frame)"
-                                                       : "HUD mask: the game gives no HUD-less picture");
-            }
+            bool pl = s.warpPauseLb != 0;
+            if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
+                                                          "screen, e.g. Townfall): its quick cuts between camera angles have no motion to follow.\n"
+                                                          "Only after full-screen play in the same session, and not once a letterbox has lasted\n"
+                                                          "10 minutes (play, in a game letterboxed by design). Turn it off for a game whose play\n"
+                                                          "switches in and out of letterbox. Right after a camera cut the game flags, frames are\n"
+                                                          "never filled either way.");
             ImGui::Unindent(16.0f);
         }
     }
