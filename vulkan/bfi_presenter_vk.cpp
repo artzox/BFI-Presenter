@@ -62,7 +62,7 @@
 struct Swapchain; struct DeviceData;
 namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
-#define BFI_VERSION "1.0.50"
+#define BFI_VERSION "1.0.51"
 #include <atomic>
 // ReShade's own window open (as DX 1.0.49): only then is frame warp's still test run on the finished frames as well
 static std::atomic<bool> g_rsOverlayOpen{false};
@@ -285,6 +285,7 @@ struct Settings
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this many shown frames
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many pixels
     int   warpEdge = 0;       // FrameWarpEdge (as DX): the screen-edge strip of a moved flash: 0 faded, 1 mirrored, 2 repeated
+    int   warpInterp = 0;     // FrameWarpInterpolate (as DX, 1.0.51): 0 off (move the last frame), 1 only the missing frames, 2 even pacing, 3 automatic
     int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
                               // is in the rendered frame: 1 generated frames before the rendered one, -1 after it, 0 off
@@ -420,6 +421,7 @@ static void LoadSettings(Settings &s)
     s.warpSnapY = Clamp(KvFloat(kv, "FrameWarpSnapY", 0.0f), 0.0f, 16.0f);
     s.warpEven = KvInt(kv, "FrameWarpEvenPacing", 0) ? 1 : 0;
     s.warpEdge = Clamp(KvInt(kv, "FrameWarpEdge", 0), 0, 2);
+    s.warpInterp = Clamp(KvInt(kv, "FrameWarpInterpolate", 0), 0, 3);
     s.warpFgLag = Clamp(KvInt(kv, "FrameWarpGameMotionFGLag", 1), -1, 1);
     s.warpEase = KvInt(kv, "FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = KvInt(kv, "FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
@@ -510,7 +512,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); F("FrameWarpGameMotionEaseStrength", s.warpEaseStr); I("FrameWarpGameDilate", s.warpDilate); I("FrameWarpStillBeforeEffects", s.warpStillPre); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpInterpolate", s.warpInterp); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); F("FrameWarpGameMotionEaseStrength", s.warpEaseStr); I("FrameWarpGameDilate", s.warpDilate); I("FrameWarpStillBeforeEffects", s.warpStillPre); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexLimitAtSleep", s.reflexAtSleep); I("ReflexAlign", s.reflexAlign); I("LearnReflexStart", s.learnReflex); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -546,6 +548,8 @@ struct Status
     int    late = 0, frameRepeats = 0, frameSkips = 0, slotWaits = 0, reused = 0;
     int    unevenRep = 0, unevenSkip = 0;   // per second: strobe cycles short of / ahead of the expected step
     int    warpOn = 0;                      // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
+    int    ipNow = 0;                       // frame interpolation (as DX): 0 off or not behind, 1 only the missing frames, 2 even pacing,
+                                            // -1 not with frame generation, -2 needs the game's motion
     int    warpCycles = 0;                  // per second: strobe cycles shown moved ahead
     double warpAvg = 0.0, warpRate = 0.0;   // their average offset (game frames); the game's frames per strobe cycle
     int    warpSrc = 0;                     // what moved them: 0 the measured motion, 1 the game's vectors and depth, 2 its vectors only
@@ -2358,6 +2362,13 @@ static void PresenterThread(Swapchain *sc)
     uint8_t  warpRepHist = 0; int warpRepHistN = 0;   // the warp guard: the last 8 filled repeats, bit set = drawn too late for its refresh
     double   warpRepHoldT = -1.0, warpRepHoldS = 30.0;
     double   secWarpSum = 0.0;
+    // Frame interpolation while frames are missing (as dx/bfi_presenter.cpp, 1.0.51): one game frame behind from the first
+    // missing frame, each strobe cycle at ipP (frame ids) -- on a frame as rendered, else drawn between it and the next.
+    bool     ipOn = false, ipCycle = false, ipEven = false;
+    double   ipP = 0.0, ipRate = 1.0, ipRateSlow = 1.0, ipFullT = 0.0, ipEvenT = 0.0, ipLogT = 0.0;
+    uint64_t ipNewestSeen = 0, ipA = 0;
+    int      ipSlotA = -1, ipCycles = 0, ipAsIs = 0, ipEnters = 0, ipTwoBehind = 0;
+    float    ipF = 0.0f;
     int      winWarpCut = 0; double winCutT = 0.0;
     double   tsPassMs = -1.0, tsDrawMs = -1.0;   // the last GPU times read back (timing log)
     int      tsDrawWarped = 0;
@@ -2590,7 +2601,93 @@ static void PresenterThread(Swapchain *sc)
                 }
             }
             const bool cycleStart = (slotNow == 0) || lastShown < 0;
-            if (!cycleStart && lastShown >= 0 && sc->stageId[lastShown] == lastShownId && sc->copyDone[lastShown])
+            bool ipPicked = false;
+            {
+                const int fgNow = std::max(1, g_vkFgFactor.load());
+                const bool ipAllowed = s.warpInterp && s.frameWarp && R.warp.ok && s.warpGame && fgNow <= 1 && !copyMode;
+                g_status.ipNow = !s.warpInterp ? 0 : fgNow > 1 ? -1 : (!s.warpGame || gvk::State() <= 0) ? -2 :
+                                 !ipOn ? 0 : (s.warpInterp == 2 || (s.warpInterp == 3 && ipEven)) ? 2 : 1;
+                if (ipOn && !ipAllowed) { ipOn = false; ipCycle = false; }
+                if (cycleStart && ipAllowed)
+                {
+                    if (!ipOn && lastShownId && unseen == 0 && newestId == lastShownId)
+                    {
+                        ipOn = true; ipP = (double)lastShownId; ipRate = 0.9; ipRateSlow = 0.95; ipTwoBehind = 0;
+                        ipNewestSeen = newestId; ipFullT = ipEvenT = Now(); ipEven = false; ipEnters++;
+                        if (ipEnters <= 20) LOGI("BFI Presenter: frame interpolation: a frame missing -- one frame behind, gaps drawn between two frames");
+                    }
+                    else if (ipOn)
+                    {
+                        const double got = newestId > ipNewestSeen ? (double)(newestId - ipNewestSeen) : 0.0;
+                        if (newestId > ipNewestSeen) ipNewestSeen = newestId;
+                        ipRate = 0.9 * ipRate + 0.1 * std::min(got, 3.0);
+                        ipRateSlow = 0.995 * ipRateSlow + 0.005 * std::min(got, 3.0);
+                        if (s.warpInterp == 3 && Now() - ipEvenT >= 5.0)
+                        {
+                            const bool want = ipEven ? ipRateSlow < 0.93 : ipRateSlow < 0.88;
+                            if (want != ipEven)
+                            {
+                                ipEven = want; ipEvenT = Now();
+                                if (ipEnters <= 20) LOGI("BFI Presenter: frame interpolation: %s (%.2f game frames per strobe cycle)",
+                                                         ipEven ? "even pacing" : "only the missing frames", ipRateSlow);
+                                if (!ipEven) ipP = std::floor(ipP + 0.5);
+                            }
+                        }
+                        if (s.warpInterp == 2 || (s.warpInterp == 3 && ipEven))
+                        {
+                            const double was = ipP;
+                            ipP += ipRate;
+                            ipP += 0.15 * ((double)newestId - 1.0 - ipP);
+                            ipP = std::max((double)newestId - 3.0, std::min((double)newestId, ipP));
+                            ipP = std::max(ipP, std::min(was, (double)newestId));
+                        }
+                        else
+                        {
+                            const uint64_t base = (uint64_t)std::floor(ipP + 1e-6);
+                            const bool half = ipP - std::floor(ipP + 1e-6) > 0.25;
+                            const uint64_t next = base + 1;
+                            ipTwoBehind = newestId >= next + 2 ? ipTwoBehind + 1 : 0;
+                            if (newestId >= next + 3 || ipTwoBehind >= 3) { ipP = (double)(newestId - 1); ipTwoBehind = 0; }
+                            else if (newestId >= next + 1) ipP = (double)next;
+                            else if (newestId == next) ipP = half ? (double)next : (double)base + 0.5;
+                        }
+                        if (ipRate < 0.985) ipFullT = Now();
+                        else if (Now() - ipFullT > 10.0)
+                        {
+                            ipOn = false; ipCycle = false;
+                            if (ipEnters <= 20) LOGI("BFI Presenter: frame interpolation: the strobe rate held for 10 s -- the newest frame again (one frame skipped)");
+                        }
+                    }
+                }
+                if (ipOn && cycleStart)
+                {
+                    ipCycle = false;
+                    const uint64_t a = (uint64_t)std::floor(ipP);
+                    const float f = (float)(ipP - std::floor(ipP));
+                    int sa = -1, sb = -1;
+                    for (uint32_t i = 0; i < kStage; i++)
+                    {
+                        if (!sc->copyDone[i]) continue;
+                        if (sc->stageId[i] == a) sa = (int)i;
+                        if (sc->stageId[i] == a + 1) sb = (int)i;
+                    }
+                    if (sa < 0) ipOn = false;
+                    else if (f < 1.0f / 32.0f || f > 31.0f / 32.0f || sb < 0)
+                    { pick = (f > 31.0f / 32.0f && sb >= 0) ? sb : sa; ipPicked = true; ipAsIs++; }
+                    else { pick = sb; ipPicked = true; ipCycle = true; ipA = a; ipSlotA = sa; ipF = f; ipCycles++; }
+                }
+                else if (ipOn && !cycleStart && lastShown >= 0 && sc->stageId[lastShown] == lastShownId && sc->copyDone[lastShown])
+                { pick = lastShown; ipPicked = true; }
+                if (ipOn && Now() - ipLogT >= 10.0)
+                {
+                    if (ipLogT > 0.0)
+                        LOGI("BFI Presenter: frame interpolation: last 10 s, %d strobe cycles drawn between two frames, %d on a frame as rendered "
+                             "(game frames per strobe cycle %.2f)", ipCycles, ipAsIs, ipRate);
+                    ipLogT = Now(); ipCycles = ipAsIs = 0;
+                }
+            }
+            if (ipPicked) {}
+            else if (!cycleStart && lastShown >= 0 && sc->stageId[lastShown] == lastShownId && sc->copyDone[lastShown])
                 pick = lastShown;
             else if (s.pacingMode == 0 && oldestNew >= 0)
             {
@@ -2661,6 +2758,7 @@ static void PresenterThread(Swapchain *sc)
                 warpPrev = (pick != lastShown && sc->stageId[lastShown] == lastShownId) ? lastShown : -1;
                 warpPrevId = warpPrev >= 0 ? lastShownId : 0;
             }
+            if (ipCycle && ipSlotA >= 0 && sc->stageId[ipSlotA] == ipA) { warpPrev = ipSlotA; warpPrevId = ipA; }   // interpolation: the frame before
             sc->presPrevSlot = warpPrev;
             warpPrevReady = warpPrev >= 0 && warpPrev != pick && sc->stageId[warpPrev] == warpPrevId && sc->copyDone[warpPrev];
         }
@@ -2829,7 +2927,22 @@ static void PresenterThread(Swapchain *sc)
             c.osdA = px(Osd::drawnRect[0]) | px(Osd::drawnRect[1]) << 16;
             c.osdB = px(Osd::drawnRect[2]) | px(Osd::drawnRect[3]) << 16;
         }
-        if (warpAhead > 0.0 && s.frameWarp && R.warp.ok && !copyMode && (warpOld = R.warp.PairFor(pickId, pickTime)) != 0 &&
+        bool ipDrawn = false;
+        if (ipCycle && warpPrevReady && warpPrevId == ipA && pickId == ipA + 1 && sc->gSlotId[pick] == pickId && pickId != 0)
+        {
+            // Interpolated (as DX): the frame picked (ipA + 1) moved back by (1 - ipF) of its motion; what it hides there is
+            // taken from the frame before (flags & 65536)
+            ipDrawn = true;
+            c.warp = -(float)(std::floor((1.0 - (double)ipF) * 256.0 + 0.5) / 256.0);
+            c.warpPrevN = 1.0f; c.warpSrc = sc->gSlotDepth[pick] ? 1u : 2u; c.warpLag = 0.0f;
+            c.warpSnapX = 0.0f; c.warpSnapY = 0.0f;
+            c.flags |= 65536u;
+            const uint64_t cut = sc->gCutId;
+            if ((cut && pickId >= cut && pickId < cut + 3) || (s.warpPauseLb && gvk::Letterboxed()))
+            { c.warp = 0.0f; c.warpSrc = 0; c.flags &= ~65536u; }
+        }
+        if (ipDrawn) {}
+        else if (warpAhead > 0.0 && !ipOn && s.frameWarp && R.warp.ok && !copyMode && (warpOld = R.warp.PairFor(pickId, pickTime)) != 0 &&
             warpPrevReady && warpPrevId == warpOld)
         {
             // The game's own motion (where it hands DLSS its motion vectors and depth, gvk): one game frame's motion,
@@ -8043,13 +8156,6 @@ static void draw_overlay(reshade::api::effect_runtime *)
         if (s.frameWarp)
         {
             ImGui::Indent(16.0f);
-            ImGui::SliderFloat("Furthest ahead (game frames)", &s.warpMax, 0.25f, 1.5f, "%.2f");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("A frame is never shown further ahead than this. Lower = fewer errors, but a\n"
-                                                          "missing frame is only partly filled.");
-            ImGui::SliderInt("Only from (% of the strobe rate)", &s.warpMinRate, 40, 95);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame warp works while the game makes at least this share of the strobe rate\n"
-                                                          "(75%% of a 60 Hz strobe = 45 fps). Below it frames repeat as without it: the\n"
-                                                          "further a frame has to be moved, the more errors show.");
             if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see BFIPresenterVK.log).");
             else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
@@ -8061,48 +8167,6 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "moves each part of the picture by the game's own motion for it, and where things overlap\n"
                                                           "the nearer one stays in front -- instead of the motion it measures from the picture,\n"
                                                           "which can only follow the camera. The line below says which one is in use.");
-            if (s.warpGame)
-            {
-                ImGui::SameLine();
-                bool gf = s.warpGameFg != 0;
-                if (ImGui::Checkbox("Also with frame generation", &gf)) s.warpGameFg = gf ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("The game's motion vectors are for the frames it renders, not the ones frame generation\n"
-                                                              "adds in between, so on those the edges of moving things double up. Off by default: with\n"
-                                                              "frame generation on, frame warp uses the motion measured from the picture.");
-                if (s.warpGameFg)
-                {
-                    ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
-                                                                  "further ahead than this (shown frames). Further out it overshoots and snaps back.");
-                }
-                bool ev = s.warpEven != 0;
-                if (ImGui::Checkbox("Even pacing", &ev)) s.warpEven = ev ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion only: every strobe cycle shows the picture where the game's motion\n"
-                                                              "is at that moment, not just the cycles without a new frame, so every step on screen is the same.\n"
-                                                              "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
-                                                              "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
-                                                              "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.\n"
-                                                              "Every flash is drawn moved: more GPU time than filling missing frames (see the settings guide).");
-                bool en = s.warpEaseNoFg != 0;
-                if (ImGui::Checkbox("Ease off as the motion slows", &en)) s.warpEaseNoFg = en ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
-                                                              "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
-                                                              "stop isn't carried past it and snapped back. With frame generation it is always on.");
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(140.0f);
-                ImGui::SliderFloat("Ease off strength", &s.warpEaseStr, 0.0f, 3.0f, "%.2f");
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much less a filled flash is moved as the motion slows. 0 = not at all, 1 = as before\n"
-                                                              "1.0.49, 2-3 = much less as soon as the camera slows: less overshoot when it stops (worth it in\n"
-                                                              "first-person games, where the whole picture moves with the camera, and with a CRT shader, whose\n"
-                                                              "scanlines make an overshoot easy to see), but a slowing pan is filled less too.");
-                bool pl = s.warpPauseLb != 0;
-                if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
-                                                              "screen): its quick cuts between camera angles have no motion to follow. Only after\n"
-                                                              "full-screen play in the same session, and not once a letterbox has lasted 10 minutes\n"
-                                                              "(play, in a game letterboxed by design). Right after a camera cut the game flags,\n"
-                                                              "frames are never filled either way.");
-            }
             {
                 const int src = st.warpCycles ? st.warpSrc : (s.warpGame ? st.warpGameState : 0);
                 ImGui::Text("Motion used: %s", src == 1 ? "the game's motion vectors and depth, from DLSS" : src == 2 ? "the game's motion vectors (no depth), from DLSS"
@@ -8110,6 +8174,91 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
                     ImGui::SetTooltip("This game hasn't handed DLSS (Vulkan) any motion data (no DLSS call seen).");
             }
+            // Frame interpolation (as DX 1.0.51): the one choice of how a missing frame is filled; the list shows Automatic second
+            {
+                static const int toIni[4] = { 0, 3, 1, 2 }, toUi[4] = { 0, 2, 3, 1 };
+                int ui = toUi[std::max(0, std::min(3, s.warpInterp))];
+                if (ImGui::Combo("Frame interpolation", &ui, "Off: move the last frame (no added latency)\0Automatic\0Only the missing frames\0Even pacing\0"))
+                    s.warpInterp = toIni[ui];
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("How a strobe cycle without a new game frame is filled.\n"
+                                                              "Off: the last frame is moved along the motion (frame warp's fill). No added latency; a\n"
+                                                              "guess where something uncovers the background (ghost edges behind moving things).\n"
+                                                              "On: at the first missing frame the presenter falls one game frame behind (about 17 ms more\n"
+                                                              "latency at 60 fps) and draws each gap between the two finished frames around it -- what one\n"
+                                                              "of them hides, the other shows, so nothing is made up. Back to the newest frame once the\n"
+                                                              "game has held the strobe rate for 10 s. Needs the game's motion vectors and depth (DLSS,\n"
+                                                              "64-bit), and no frame generation; elsewhere the last frame is moved.\n"
+                                                              "Only the missing frames: frames as rendered, each missing one replaced by a picture between\n"
+                                                              "the two around it (best near the strobe rate). Even pacing: every strobe cycle at its point in\n"
+                                                              "time (smoothest well below it, a little softer). Automatic: the first near the strobe rate\n"
+                                                              "(above about 93%), the second below it (under about 88%).");
+                if (s.warpInterp)
+                {
+                    const int ip = st.ipNow;
+                    ImGui::TextDisabled("%s", ip == -1 ? "Not with frame generation: the last frame is moved instead." :
+                                              ip == -2 ? "Needs the game's motion vectors and depth (above): the last frame is moved instead." :
+                                              ip == 1 ? "In use: one frame behind, only the missing frames drawn between two." :
+                                              ip == 2 ? "In use: one frame behind, even pacing." :
+                                              "Ready: frames as rendered until one is missing.");
+                }
+            }
+            // Moving the last frame: Off, and wherever interpolation can't run; greyed out while it fills the missing frames
+            ImGui::SeparatorText("Moving the last frame");
+            const bool moveIdle = s.warpInterp && st.ipNow >= 0;
+            {
+                if (moveIdle) ImGui::TextDisabled("Not used: frame interpolation fills the missing frames.");
+                else if (s.warpInterp) ImGui::TextDisabled("In use: frame interpolation can't run here (%s).", st.ipNow == -1 ? "frame generation" : "no game motion");
+                ImGui::BeginDisabled(moveIdle);
+                ImGui::Indent(16.0f);
+                ImGui::SliderFloat("Furthest ahead (game frames)", &s.warpMax, 0.25f, 1.5f, "%.2f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("A frame is never shown further ahead than this. Lower = fewer errors, but a\n"
+                                                              "missing frame is only partly filled.");
+                ImGui::SliderInt("Only from (% of the strobe rate)", &s.warpMinRate, 40, 95);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame warp works while the game makes at least this share of the strobe rate\n"
+                                                              "(75%% of a 60 Hz strobe = 45 fps). Below it frames repeat as without it: the\n"
+                                                              "further a frame has to be moved, the more errors show.");
+                if (s.warpGame)
+                {
+                    bool ev = s.warpEven != 0;
+                    if (ImGui::Checkbox("Even pacing", &ev)) s.warpEven = ev ? 1 : 0;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion only: every strobe cycle shows the picture where the game's motion\n"
+                                                                  "is at that moment, not just the cycles without a new frame, so every step on screen is the same.\n"
+                                                                  "Frames are moved a little all the time: any error shows on every flash, and the further the\n"
+                                                                  "game is from the strobe rate, the further frames are moved. Best just under it (e.g. 55-59 fps on\n"
+                                                                  "a 60 Hz strobe). Games without the game's motion fill missing frames as usual. Off by default.\n"
+                                                                  "Every flash is drawn moved: more GPU time than filling missing frames (see the settings guide).");
+                    bool en = s.warpEaseNoFg != 0;
+                    if (ImGui::Checkbox("Ease off as the motion slows", &en)) s.warpEaseNoFg = en ? 1 : 0;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion, without frame generation too: a filled flash is moved less as the\n"
+                                                                  "game's motion slows (each point's motion against the frame before), so a camera coming to a\n"
+                                                                  "stop isn't carried past it and snapped back. With frame generation it is always on.");
+                    ImGui::SliderFloat("Ease off strength", &s.warpEaseStr, 0.0f, 3.0f, "%.2f");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much less a filled flash is moved as the motion slows. 0 = not at all, 1 = as before\n"
+                                                                  "1.0.49, 2-3 = much less as soon as the camera slows: less overshoot when it stops (worth it in\n"
+                                                                  "first-person games, where the whole picture moves with the camera, and with a CRT shader, whose\n"
+                                                                  "scanlines make an overshoot easy to see), but a slowing pan is filled less too.");
+                    bool gf = s.warpGameFg != 0;
+                    if (ImGui::Checkbox("Also with frame generation", &gf)) s.warpGameFg = gf ? 1 : 0;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The game's motion vectors are for the frames it renders, not the ones frame generation\n"
+                                                                  "adds in between, so on those the edges of moving things double up. Off by default: with\n"
+                                                                  "frame generation on, frame warp uses the motion measured from the picture.");
+                    if (s.warpGameFg)
+                    {
+                        ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
+                                                                      "further ahead than this (shown frames). Further out it overshoots and snaps back.");
+                    }
+                }
+                ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader, set it\n"
+                                                              "to the mask's width so the mask stays in place. 0 = off. Ctrl+click to type a value.");
+                ImGui::SliderFloat("Snap moves up and down (px)", &s.warpSnapY, 0.0f, 16.0f, s.warpSnapY > 0.0f ? "%.2f" : "off");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader, set\n"
+                                                              "it to the scanline width. 0 = off. Ctrl+click to type a value.");
+                ImGui::Unindent(16.0f);
+                ImGui::EndDisabled();
+            }
+            ImGui::SeparatorText("Both ways");
             {
                 bool sp = s.warpStillPre != 0;
                 if (ImGui::Checkbox("Find the HUD before ReShade's effects", &sp)) s.warpStillPre = sp ? 1 : 0;
@@ -8124,12 +8273,6 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "behind with the background (outlines around characters). Higher reaches further, for\n"
                                                           "things close to the camera; too high and the background next to an edge moves with it\n"
                                                           "(a halo). 1 by default, 0 = off.");
-            ImGui::SliderFloat("Snap moves across (px)", &s.warpSnapX, 0.0f, 16.0f, s.warpSnapX > 0.0f ? "%.2f" : "off");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels sideways. With a CRT shader, set it\n"
-                                                          "to the mask's width so the mask stays in place. 0 = off. Ctrl+click to type a value.");
-            ImGui::SliderFloat("Snap moves up and down (px)", &s.warpSnapY, 0.0f, 16.0f, s.warpSnapY > 0.0f ? "%.2f" : "off");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves are rounded to whole steps of this many pixels up and down. With a CRT shader, set\n"
-                                                          "it to the scanline width. 0 = off. Ctrl+click to type a value.");
             {
                 int em = s.warpEdge;
                 if (ImGui::Combo("Screen edges", &em, "Fade the move\0Mirror the picture\0Repeat the edge\0")) s.warpEdge = em;
@@ -8138,6 +8281,16 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "strip moves a little less than the rest). Mirror: the picture next to the edge is reflected\n"
                                                               "into it. Repeat: the edge's last pixels are stretched over the strip, a smear as wide as the\n"
                                                               "move (before 1.0.45).");
+            }
+            if (s.warpGame)
+            {
+                bool pl = s.warpPauseLb != 0;
+                if (ImGui::Checkbox("Pause in letterboxed cutscenes", &pl)) s.warpPauseLb = pl ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("No frame warp while a cutscene is letterboxed through DLSS (its output smaller than the\n"
+                                                              "screen): its quick cuts between camera angles have no motion to follow. Only after\n"
+                                                              "full-screen play in the same session, and not once a letterbox has lasted 10 minutes\n"
+                                                              "(play, in a game letterboxed by design). Right after a camera cut the game flags,\n"
+                                                              "frames are never filled either way.");
             }
             ImGui::Unindent(16.0f);
         }

@@ -29,22 +29,31 @@ vec4 GameFlow(vec2 uv)
     ivec2 s = textureSize(gameFlow, 0);
     return texelFetch(gameFlow, clamp(ivec2(uv * vec2(s)), ivec2(0), s - 1), 0);
 }
+bool gFromPrev = false;   // interpolation (flags & 65536, as DX 1.0.51): this pixel is taken from the frame before (srcPrev)
 vec2 WarpShiftGame(vec2 uv)
 {
+    gFromPrev = false;
     vec2 osz = vec2(textureSize(src, 0));
     float L = pc.warp - pc.warpLag;
     vec2 m[3];
     m[0] = GameFlow(uv).xy;
     m[1] = GameFlow(uv - m[0] * L).xy;
     m[2] = GameFlow(uv - m[1] * L).xy;
-    vec2 best = vec2(0.0), back = vec2(0.0);
+    vec2 best = vec2(0.0), back = vec2(0.0), backOwn = vec2(0.0);
     float bestNear = -1.0, backNear = 2.0, bestK = 1.0, backK = 1.0;
     for (int i = 0; i < 3; i++)
     {
         vec4 g = GameFlow(uv - m[i] * L);
         if (g.z < 0.5) continue;
         if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; bestK = clamp(g.z - 1.0, 0.0, 1.0); }
-        if (g.w < backNear) { backNear = g.w; back = m[i]; backK = clamp(g.z - 1.0, 0.0, 1.0); }
+        if (g.w < backNear) { backNear = g.w; back = m[i]; backOwn = g.xy; backK = clamp(g.z - 1.0, 0.0, 1.0); }
+    }
+    // Interpolated (warp = -(1 - f)): what the newer frame doesn't show here is about to be covered in it -- the frame before
+    // still shows it, moved on by f along the background's own motion.
+    if ((pc.flags & 65536u) != 0u && bestNear < 0.0 && backNear <= 1.0)
+    {
+        gFromPrev = true;
+        return clamp(backOwn * (1.0 + pc.warp), -0.08, 0.08);
     }
     if (bestNear < 0.0) { best = backNear <= 1.0 ? back : vec2(0.0); bestK = backK; }
     // Up to the rendered frame the motion is known (a generated frame); past it, it's a guess that it carries on: that part
@@ -157,6 +166,7 @@ bool FetchWarped(vec2 fc, out vec3 c)
     if (InOsd(p)) return false;                           // and nothing moved is taken from it
     p = clamp(p, vec2(0.5), size - 0.5);
     if (Still(ivec2(p), size)) return false;
+    if (gFromPrev) { c = textureLod(srcPrev, p * inv, 0.0).rgb; return true; }   // interpolation: from the frame before
     vec2 tc = floor(p - 0.5) + 0.5;
     vec2 f = p - tc;
     vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
