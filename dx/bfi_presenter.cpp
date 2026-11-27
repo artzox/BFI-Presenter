@@ -167,7 +167,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.50"
+#define BFI_ADDON_VERSION "1.0.51"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -196,6 +196,7 @@ struct Settings
                               // smaller than the screen, e.g. Townfall)
     int   warpEven = 0;       // FrameWarpEvenPacing: every strobe cycle moved to where the game's motion is, where the game's
                               // own motion is used; elsewhere missing frames are filled as usual
+    int   warpFillUncovered = 1;   // FrameWarpFillUncovered: with the game's motion, what is uncovered from the background beside it (1.0.51)
     int   warpEdge = 0;       // FrameWarpEdge: the strip at the screen edge a moved flash has no picture for: 0 the move faded
                               // out toward the edge, 1 the picture mirrored at the edge, 2 the edge repeated (stretched, before 1.0.45)
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many
@@ -424,6 +425,7 @@ static void LoadSettings(Settings &s)
     s.warpSnapX = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapX", 0.0f)));
     s.warpSnapY = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapY", 0.0f)));
     s.warpEdge = std::max(0, std::min(2, IniInt("FrameWarpEdge", 0)));
+    s.warpFillUncovered = IniInt("FrameWarpFillUncovered", 1) ? 1 : 0;
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -679,6 +681,7 @@ static void SaveSettings(const Settings &s)
     IniWriteFloat("FrameWarpSnapX", s.warpSnapX);
     IniWriteFloat("FrameWarpSnapY", s.warpSnapY);
     IniWriteInt("FrameWarpEdge", s.warpEdge);
+    IniWriteInt("FrameWarpFillUncovered", s.warpFillUncovered);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -1854,21 +1857,48 @@ float2 WarpShiftGame(float2 uv)
     m[0] = GameFlow(uv).xy;
     m[1] = GameFlow(uv - m[0] * L).xy;
     m[2] = GameFlow(uv - m[1] * L).xy;
-    float2 best = float2(0.0, 0.0), back = float2(0.0, 0.0);
-    float bestNear = -1.0, backNear = 2.0, bestK = 1.0, backK = 1.0;
+    float2 best = float2(0.0, 0.0), back = float2(0.0, 0.0), front = float2(0.0, 0.0);
+    float bestNear = -1.0, backNear = 2.0, frontNear = -1.0, bestK = 1.0, backK = 1.0;
     [unroll] for (int i = 0; i < 3; i++)
     {
         float4 g = GameFlow(uv - m[i] * L);
         if (g.z < 0.5) continue;
         if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; bestK = saturate(g.z - 1.0); }
         if (g.w < backNear) { backNear = g.w; back = m[i]; backK = saturate(g.z - 1.0); }
+        if (g.w > frontNear) { frontNear = g.w; front = g.xy; }
     }
-    if (bestNear < 0.0) { best = backNear <= 1.0 ? back : float2(0.0, 0.0); bestK = backK; }
+    const bool uncovered = bestNear < 0.0;
+    if (uncovered) { best = backNear <= 1.0 ? back : float2(0.0, 0.0); bestK = backK; }
     // Up to the rendered frame the motion is known (a generated frame); past it, it's a guess that it carries on: that part
     // eases off as the motion slows, so a camera coming to a stop isn't pushed past where it stops and snapped back (ep9).
     const float known = clamp(warpLag, 0.0, warp);
     const float k = warpEase > 0.001 ? pow(max(bestK, 0.0), warpEase) : 1.0;   // warpEase: the strength (1 = before 1.0.49)
-    return clamp(best * (known + (warp - known) * k), -0.08, 0.08);
+    const float s = known + (warp - known) * k;
+    // Uncovered (1.0.51 test, flags & 2048): what comes out from behind something moving in front was hidden in this frame
+    // (and, for steady motion, in every frame before it). Taking it with the background's motion takes the thing in front
+    // from where it was -- a second, ghost edge behind it. Instead the background beside it is taken: from where the
+    // background's motion leads, step back against the front's motion (relative to the background's) until the point
+    // is behind it, and take the background there -- a short smear of background instead of a copy of the edge.
+    if (uncovered && (flags & 2048) != 0 && backNear <= 1.0 && frontNear > backNear + 0.002)
+    {
+        const float2 rel = (front - back) * s;                // how far the front moved against the background, uv
+        const float relPx = length(rel * osz);
+        if (relPx > 1.0)
+        {
+            const float2 dir = -rel / max(length(rel), 1e-6);   // toward the side it uncovers from
+            const float2 at = uv - back * s;                  // where the background's motion leads, in this frame
+            const float stepUv = max(relPx / 12.0, 1.0) / max(osz.x, osz.y);
+            [loop] for (int j = 1; j <= 16; j++)
+            {
+                const float2 q = at + dir * stepUv * j;
+                const float4 g = GameFlow(q);
+                if (g.w < -0.5) break;                        // the HUD: not taken from
+                if (g.z > 0.5 && g.w < frontNear - 0.002 && g.w <= backNear + 0.02)
+                    return clamp(uv - q, -0.08, 0.08);        // the picture there is shown here
+            }
+        }
+    }
+    return clamp(best * s, -0.08, 0.08);
 }
 
 float2 WarpShift(float2 uv)
@@ -4870,6 +4900,7 @@ static DWORD WINAPI PresenterThread(void *)
             else c.warp = (float)(floor(warpAhead / (double)(pickId - warpOld) * 256.0 + 0.5) / 256.0);
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
             if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
+            if (s.warpFillUncovered) c.flags |= 2048u;          // uncovered areas from the background beside them (FrameWarpFillUncovered)
             // what stands still, found in the frames from before ReShade's effects (FrameWarpStillBeforeEffects)
             if (s.warpStillPre && g_pre[pick] && g_pre[warpPrev] && g_preOk[pick] && g_preOk[warpPrev])
                 c.flags |= 32768u | (pfx::OverlayOpen() ? 131072u : 0u);   // ReShade's window open: the finished frames too
@@ -14918,6 +14949,15 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "strip moves a little less than the rest). Mirror: the picture next to the edge is reflected\n"
                                                               "into it. Repeat: the edge's last pixels are stretched over the strip, a smear as wide as the\n"
                                                               "move (before 1.0.45).");
+            }
+            if (s.warpGame)
+            {
+                bool fu = s.warpFillUncovered != 0;
+                if (ImGui::Checkbox("Fill uncovered areas from the background (test)", &fu)) s.warpFillUncovered = fu ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's motion: where something in front moves away, the background coming out\n"
+                                                              "from behind it was never drawn. Off: it is taken with the background's motion, which shows the\n"
+                                                              "thing in front a second time where it was (a ghost edge behind it). On: the background beside\n"
+                                                              "it is taken instead, a short smear of background. No latency; costs only where it applies.");
             }
             if (s.warpGame)
             {
