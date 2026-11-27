@@ -1861,14 +1861,14 @@ float2 WarpShiftGame(float2 uv)
     m[0] = GameFlow(uv).xy;
     m[1] = GameFlow(uv - m[0] * L).xy;
     m[2] = GameFlow(uv - m[1] * L).xy;
-    float2 best = float2(0.0, 0.0), back = float2(0.0, 0.0), front = float2(0.0, 0.0);
+    float2 best = float2(0.0, 0.0), back = float2(0.0, 0.0), front = float2(0.0, 0.0), backOwn = float2(0.0, 0.0);
     float bestNear = -1.0, backNear = 2.0, frontNear = -1.0, bestK = 1.0, backK = 1.0;
     [unroll] for (int i = 0; i < 3; i++)
     {
         float4 g = GameFlow(uv - m[i] * L);
         if (g.z < 0.5) continue;
         if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; bestK = saturate(g.z - 1.0); }
-        if (g.w < backNear) { backNear = g.w; back = m[i]; backK = saturate(g.z - 1.0); }
+        if (g.w < backNear) { backNear = g.w; back = m[i]; backOwn = g.xy; backK = saturate(g.z - 1.0); }
         if (g.w > frontNear) { frontNear = g.w; front = g.xy; }
     }
     const bool uncovered = bestNear < 0.0;
@@ -1893,14 +1893,16 @@ float2 WarpShiftGame(float2 uv)
     }
     if (uncovered && (flags & 2048) != 0 && backNear <= 1.0 && frontNear > backNear * 1.03)
     {
-        const float2 rel = (front - back) * s;                // how far the front moved against the background, uv
+        // the two points' own motions (t1-t4 took the background's as the step that led to it -- behind a walking character
+        // that is the character's own motion, so nothing moved against anything: all blue)
+        const float2 rel = (front - backOwn) * s;             // how far the front moved against the background, uv
         const float relPx = length(rel * osz);
         if (relPx <= 0.5) gFillSeen = 4;                      // debug: the front barely moved against it (blue)
         if (relPx > 0.5)
         {
             gFillSeen = 3;                                    // searched (debug: yellow if nothing found)
             const float2 dir = -rel / max(length(rel), 1e-6);   // toward the side it uncovers from
-            const float2 at = uv - back * s;                  // where the background's motion leads, in this frame
+            const float2 at = uv - backOwn * s;               // where the background's motion leads, in this frame
             const float stepUv = max(relPx / 12.0, 1.0) / max(osz.x, osz.y);
             [loop] for (int j = 1; j <= 16; j++)
             {
