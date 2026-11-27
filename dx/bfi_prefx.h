@@ -30,7 +30,8 @@ static bool Wanted()
 #ifndef _WIN64
     return false;                              // 32-bit: ReShade's back buffer call has another return convention there
 #else
-    return g_shared.frameWarp && g_shared.warpStillPre && g_active.load();
+    // (not while frame warp waits -- the game's frame rate outside its range: nothing is moved, so nothing needs it; 1.0.50)
+    return g_shared.frameWarp && g_shared.warpStillPre && g_active.load() && g_status.warpOn != 1;
 #endif
 }
 
@@ -132,6 +133,7 @@ static void on_begin(effect_runtime *rt, command_list *cmd, resource_view, resou
     if (!logged) { logged = true; LOGI("BFI Presenter: frame warp: what stands still is found in the frame from before ReShade's effects"); }
 }
 
+static UINT64 Bytes12() { return ResBytes(clean12); }
 // At the game's Present: this frame's copy from before the effects, without taking it (the HUD mask pass, before the copy).
 static ID3D12Resource *Peek12() { return (captured && Wanted() && !g_dx11.load()) ? clean12 : nullptr; }
 // At the game's Present: this frame's copy from before the effects, once (null if there is none this frame).

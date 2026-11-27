@@ -314,7 +314,6 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
     for (int i = 0; i < kDefN; i++) { snprintf(line, sizeof(line), "#define %s %d\n", kDefs[i].name, vals[i]); d += line; }
     {
         int post = 0;
-        for (int k = 0; k < kCrtPostN; k++) { const int di = DefIndex(kCrtPost[k].sw); if (di >= 0 && vals[di]) post++; }
         (void)post;
         // always: the pattern is drawn into a texture (with the frame, dx/bfi_crt.h Bake), the main shader reads it
         snprintf(line, sizeof(line), "#define CRT_POST %d\n", 1); d += line;
@@ -341,8 +340,32 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
 }
 
 // The game's Present, on the frame copy list: this frame's halation and glow textures into the slot.
+static void CountBytes();
+static void ReleaseIdle();
 static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s)
 {
+    // The copies of the frame before ReShade's window (one per slot, 33 MB each at 4K) are needed only while the window
+    // is open: released 5 s after it closes (1.0.49-t14: Returnal went over its video memory budget, and with part of it
+    // moved to system memory every copy and pass on the GPU took ten times as long).
+    {
+        static double closedT = -1.0;
+        if (pfx::OverlayOpen()) closedT = -1.0;
+        else if (closedT < 0.0) closedT = Now();
+        else if (Now() - closedT > 5.0)
+        {
+            bool any = cur[kBase] != nullptr;
+            for (UINT k = 0; k < kStage && !any; k++) if (slotTex[kBase][k]) any = true;
+            if (any)
+            {
+                WaitGame();
+                if (g_presFence && g_presFenceVal) WaitFence(g_presFence, g_presFenceVal, g_gameFenceEvent);
+                SafeRelease(cur[kBase]); curHas[kBase] = false;
+                for (UINT k = 0; k < kStage; k++) SafeRelease(slotTex[kBase][k]);
+                slotGen++;
+            }
+        }
+    }
+    ReleaseIdle();
     bool ok = false;
     if (state.load() == 2 && curOk && Wanted())
     {
@@ -383,6 +406,7 @@ static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s)
     }
     slotOk[s] = ok;
     curOk = false;
+    CountBytes();
 }
 
 // The presenter: the texture bound for slot s, view k (null: compiled out of the shader).
@@ -423,7 +447,10 @@ static const char kCrtGlue[] =
     "#if CRT_POST\n"
     "Texture2D<float4> crtPrev : register(t11);\n"       // the passes after the pattern: the pass before
     "Texture2D<float4> crtGrainRaw : register(t12);\n"   // and the grain pass's own texture
-    "float4 CrtPrev(float2 uv) { return crtPrev.SampleLevel(linClamp, uv, 0); }\n"
+    // PSCrtTail: each folded pass reads its own pixel of the one before from crtFused, not from a texture
+    "static float4 crtFused = 0.0;\n"
+    "static bool crtFusing = false;\n"
+    "float4 CrtPrev(float2 uv) { if (crtFusing) return crtFused; return crtPrev.SampleLevel(linClamp, uv, 0); }\n"
     "float4 CrtGrainRaw(float2 uv) { return crtGrainRaw.SampleLevel(linClamp, uv, 0); }\n"
     "#endif\n";
 static const char kCrtApply[] =
@@ -442,6 +469,29 @@ static const char kCrtApply[] =
     "{\n"
     "    const float3 c = Fetch(pos.xy / srcPerOut);\n"
     "    return float4(CrtApply(c, pos.xy), 1.0);\n"
+    "}\n"
+    // Grain's second half, the noise floor, gamut and the corners in one pass (1.0.50): all but grain read only their
+    // own pixel of the pass before, so each takes the one before's result as it is -- three full-screen passes fewer
+    "float4 PSCrtTail(float4 pos : SV_Position) : SV_Target\n"
+    "{\n"
+    "    const float2 uv = pos.xy * CrtPixelSize;\n"
+    "    float4 o;\n"
+    "#if ENABLE_GRAIN\n"
+    "    crt_grain_diffuse_PS(pos, uv, o);\n"
+    "#else\n"
+    "    o = CrtPrev(uv);\n"
+    "#endif\n"
+    "    crtFusing = true;\n"
+    "#if ENABLE_NOISE_FLOOR\n"
+    "    crtFused = o; crt_noise_floor_PS(pos, uv, o);\n"
+    "#endif\n"
+    "#if ENABLE_GAMUT_EXPAND\n"
+    "    crtFused = o; crt_gamut_expand_PS(pos, uv, o);\n"
+    "#endif\n"
+    "#if ENABLE_CORNER_ROUND\n"
+    "    crtFused = o; crt_corner_round_PS(pos, uv, o);\n"
+    "#endif\n"
+    "    return o;\n"
     "}\n"
     "float3 CrtColour(float2 pos)\n"
     "{\n"
@@ -466,6 +516,126 @@ static DXGI_FORMAT PassFormat()
     }
 }
 
+// The compiled shaders kept on disk (1.0.50): BFIPresenter_crt.bin next to the ini, the last four builds, each keyed
+// to its exact source (CRT-Standalone's switches are compiled in; its sliders are not, so they never cost a build).
+// "BFICRT01", a count, then per build its key (8 bytes) and kBlobN blobs, each a 4-byte size (0 = not built) and its bytes.
+static const int kCacheN = 4;
+static void CachePath(char *out, size_t n)
+{
+    snprintf(out, n, "%s", g_iniPath);
+    if (char *e = strrchr(out, '\\')) e[1] = '\0'; else out[0] = '\0';
+    strncat(out, "BFIPresenter_crt.bin", n - strlen(out) - 1);
+}
+static uint64_t CacheKey(const std::string &full)
+{
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const void *p, size_t n) { const uint8_t *b = (const uint8_t *)p; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; } };
+    mix(full.data(), full.size());
+    const UINT fl[2] = { D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCOMPILE_OPTIMIZATION_LEVEL1 };
+    mix(fl, sizeof(fl));
+    for (int e = 0; e < kBlobN; e++) { const char *en = e == 0 ? "PSMain" : e == 1 ? "PSCrtPattern" : kCrtPost[e - 2].entry; mix(en, strlen(en)); }
+    return h;
+}
+static bool CacheRead(std::vector<uint8_t> &d)
+{
+    if (!g_iniPath[0]) return false;
+    char path[MAX_PATH]; CachePath(path, sizeof(path));
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz = {};
+    bool ok = GetFileSizeEx(f, &sz) && sz.QuadPart >= 12 && sz.QuadPart < 64 * 1024 * 1024;
+    DWORD got = 0;
+    if (ok) { d.resize((size_t)sz.QuadPart); ok = ReadFile(f, d.data(), (DWORD)d.size(), &got, nullptr) && got == d.size(); }
+    CloseHandle(f);
+    return ok && memcmp(d.data(), "BFICRT01", 8) == 0;
+}
+// Each build in the file: where it starts and ends (the key first)
+static std::vector<std::pair<size_t, size_t>> CacheBuilds(const std::vector<uint8_t> &d)
+{
+    std::vector<std::pair<size_t, size_t>> r;
+    uint32_t n = 0; memcpy(&n, d.data() + 8, 4);
+    size_t at = 12;
+    for (uint32_t i = 0; i < n && i < kCacheN; i++)
+    {
+        const size_t b0 = at;
+        if (at + 8 > d.size()) break;
+        at += 8;
+        bool ok = true;
+        for (int e = 0; e < kBlobN && ok; e++)
+        {
+            uint32_t m = 0;
+            if (at + 4 > d.size()) { ok = false; break; }
+            memcpy(&m, d.data() + at, 4); at += 4;
+            if (at + m > d.size()) ok = false; else at += m;
+        }
+        if (!ok) break;
+        r.push_back({ b0, at });
+    }
+    return r;
+}
+static bool CacheLoad(uint64_t key, ID3DBlob *out[kBlobN])
+{
+    std::vector<uint8_t> d;
+    if (!CacheRead(d)) return false;
+    HMODULE dc = GetModuleHandleA("d3dcompiler_47.dll");
+    typedef HRESULT (WINAPI *PFN_CreateBlob)(SIZE_T, ID3DBlob **);
+    PFN_CreateBlob mk = dc ? (PFN_CreateBlob)(void *)GetProcAddress(dc, "D3DCreateBlob") : nullptr;
+    if (!mk) return false;
+    for (const auto &b : CacheBuilds(d))
+    {
+        uint64_t k = 0; memcpy(&k, d.data() + b.first, 8);
+        if (k != key) continue;
+        size_t at = b.first + 8;
+        for (int e = 0; e < kBlobN; e++)
+        {
+            uint32_t m = 0; memcpy(&m, d.data() + at, 4); at += 4;
+            out[e] = nullptr;
+            if (m && SUCCEEDED(mk(m, &out[e])) && out[e]) memcpy(out[e]->GetBufferPointer(), d.data() + at, m);
+            at += m;
+        }
+        if (out[0]) return true;
+        for (int e = 0; e < kBlobN; e++) SafeRelease(out[e]);
+        return false;
+    }
+    return false;
+}
+static void CacheSave(uint64_t key, ID3DBlob *const got[kBlobN])
+{
+    if (!g_iniPath[0]) return;
+    std::vector<uint8_t> old, d(12);
+    const bool had = CacheRead(old);
+    memcpy(d.data(), "BFICRT01", 8);
+    uint32_t n = 1;
+    d.resize(d.size() + 8); memcpy(d.data() + 12, &key, 8);
+    for (int e = 0; e < kBlobN; e++)
+    {
+        const uint32_t m = got[e] ? (uint32_t)got[e]->GetBufferSize() : 0;
+        const size_t at = d.size();
+        d.resize(at + 4 + m);
+        memcpy(d.data() + at, &m, 4);
+        if (m) memcpy(d.data() + at + 4, got[e]->GetBufferPointer(), m);
+    }
+    if (had)
+        for (const auto &b : CacheBuilds(old))                // the newest first: up to kCacheN, without this key's old one
+        {
+            if (n >= kCacheN) break;
+            uint64_t k = 0; memcpy(&k, old.data() + b.first, 8);
+            if (k == key) continue;
+            d.insert(d.end(), old.begin() + (ptrdiff_t)b.first, old.begin() + (ptrdiff_t)b.second);
+            n++;
+        }
+    memcpy(d.data() + 8, &n, 4);
+    char path[MAX_PATH], tmp[MAX_PATH + 8];
+    CachePath(path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    HANDLE f = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;                 // a read-only game folder: built each session instead
+    DWORD wr = 0;
+    const bool ok = WriteFile(f, d.data(), (DWORD)d.size(), &wr, nullptr) && wr == d.size();
+    CloseHandle(f);
+    if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileA(tmp);
+}
+
 static DWORD WINAPI CompileThread(void *)
 {
     for (;;)
@@ -484,7 +654,15 @@ static DWORD WINAPI CompileThread(void *)
         const size_t at = srcText.find(marker);
         ID3DBlob *got[kBlobN] = {};
         bool failed = !compile || at == std::string::npos;
+        bool cached = false;
+        uint64_t key = 0;
         if (!failed)
+        {
+            std::string full = "#define CRT_HANDOFF 1\n" + defs + srcText.substr(0, at) + kCrtGlue + kCrtHlsl + kCrtApply + srcText.substr(at + strlen(marker));
+            key = CacheKey(full);
+            cached = CacheLoad(key, got);
+        }
+        if (!failed && !cached)
         {
             std::string full = "#define CRT_HANDOFF 1\n" + defs + srcText.substr(0, at) + kCrtGlue + kCrtHlsl + kCrtApply + srcText.substr(at + strlen(marker));
             const bool post = defs.find("#define CRT_POST 1") != std::string::npos;
@@ -494,8 +672,17 @@ static DWORD WINAPI CompileThread(void *)
                 if (e >= 1 && !post) continue;
                 if (e >= 2)
                 {
-                    char sw[96]; snprintf(sw, sizeof(sw), "#define %s 1\n", kCrtPost[e - 2].sw);
-                    if (defs.find(sw) == std::string::npos) continue;      // its switch off: not drawn
+                    // its switch off (any of them, for one with several: a|b): not drawn
+                    bool any = false;
+                    std::string sws = kCrtPost[e - 2].sw;
+                    for (size_t a = 0; a <= sws.size() && !any; )
+                    {
+                        size_t b = sws.find('|', a); if (b == std::string::npos) b = sws.size();
+                        const std::string sw = "#define " + sws.substr(a, b - a) + " 1\n";
+                        if (defs.find(sw) != std::string::npos) any = true;
+                        a = b + 1;
+                    }
+                    if (!any) continue;
                 }
                 ID3DBlob *b = nullptr, *err = nullptr;
                 HRESULT hr = compile(full.data(), full.size(), "bfi_presenter_crt", nullptr, nullptr, entry, "ps_5_0",
@@ -511,6 +698,7 @@ static DWORD WINAPI CompileThread(void *)
             }
         }
         if (failed) for (int e = 0; e < kBlobN; e++) SafeRelease(got[e]);
+        else if (!cached && got[0]) CacheSave(key, got);
         {
             std::lock_guard<std::mutex> l(blobLk);
             for (int e = 0; e < kBlobN; e++) { SafeRelease(blobs[e]); blobs[e] = got[e]; }
@@ -518,7 +706,7 @@ static DWORD WINAPI CompileThread(void *)
             blobGen++;
         }
         ID3DBlob *b = got[0];
-        if (b) LOGI("BFI Presenter: CRT hand-off: shader built in %.0f ms", (Now() - t0) * 1000.0);
+        if (b) LOGI("BFI Presenter: CRT hand-off: shader %s in %.0f ms", cached ? "loaded from BFIPresenter_crt.bin" : "built (kept in BFIPresenter_crt.bin for the next start)", (Now() - t0) * 1000.0);
     }
 }
 static void StartCompile()
@@ -557,6 +745,10 @@ static bool PostOn(int k, const float *cp)
     if (!strcmp(e, "PSCrtNoiseFloor")) return ParamOf(cp, "crt_noise_floor") > 0.001f;
     if (!strcmp(e, "PSCrtGamut"))      return ParamOf(cp, "crt_gamut_expand_strength") >= 0.001f;
     if (!strcmp(e, "PSCrtCorner"))     return ParamOf(cp, "crt_corner_size") >= 0.001f || ParamOf(cp, "crt_corner_border") >= 0.001f;
+    if (!strcmp(e, "PSCrtTail"))       // the folded passes: drawn when any of them changes the picture
+        return ParamOf(cp, "crt_grain_intensity") > 0.001f || ParamOf(cp, "crt_noise_floor") > 0.001f ||
+               ParamOf(cp, "crt_gamut_expand_strength") >= 0.001f ||
+               ParamOf(cp, "crt_corner_size") >= 0.001f || ParamOf(cp, "crt_corner_border") >= 0.001f;
     return true;
 }
 // The presenter: this frame's settings, with the frame size (w, h).
@@ -583,10 +775,21 @@ static ID3D12RootSignature *bRoot = nullptr;
 static ID3D12PipelineState *bPso[1 + kCrtPostN] = {};
 static UINT bBlobGen = 0;
 static ID3D12DescriptorHeap *bHeap = nullptr, *bRtvHeap = nullptr;
-static ID3D12Resource *bRt[3] = {};                 // [0] [1] in turn, [2] grain's (the game's queue only)
+static ID3D12Resource *bRt[4] = {};                 // [0] [1] in turn (the game's queue only), [2] [3] grain's in turn
+// Grain's first half, kept for the presenter (1.0.50): a flash moved by frame warp takes its frame's grain from here
+// instead of making it again (0.68 ms of its 1.2 in Onimusha with grain on). Two in turn, each with the bake it is from
+// (tag; 0 while rewritten) and the presenter's fence it was last read at -- the game's queue waits for that before
+// drawing into it again. Kept in COMMON between uses (read on the presenter's queue).
+static std::atomic<UINT64> bGrainTag[2] = {}, bGrainRead[2] = {}, bSlotTag[kStage] = {};
+static UINT64 bTagNext = 0;
+static int bRing = 0;
+static std::atomic<UINT> bRingGen{0};
 static ID3D12Resource *bOut[kStage] = {};           // the slot's CRT picture (COMMON between uses)
-static bool bOk[kStage] = {};
+static std::atomic<bool> bOk[kStage] = {};   // read by the presenter while the game's Present changes it
 static std::atomic<UINT> bOutGen{0};
+// 1.0.50: the picture is recorded in its own list, submitted after the frame is published -- so its passes (1.2 ms in
+// Onimusha) don't make the frame late; until its fence is done the presenter draws the flash's CRT picture itself
+static std::atomic<UINT64> bFence[kStage] = {};
 static ID3D12Resource *bCb = nullptr;
 static uint8_t *bCbMap = nullptr;
 static ID3D12Resource *bSeenSrc[kStage] = {}, *bSeenTex[kStage][kTexN] = {};
@@ -594,13 +797,25 @@ static UINT bSrvStride = 0, bRtvStride = 0;
 static DXGI_FORMAT bFmt = DXGI_FORMAT_UNKNOWN;     // the format bPso were made for
 static bool bFailed = false;
 static std::atomic<bool> bSkip{false};              // most flashes are shown moved: not made (SetBakeSkip)
+// Video memory (1.0.50): the per-frame CRT picture keeps one full-size texture per slot and three to draw in (about 330 MB
+// at 4K). With the game close to its video memory budget it isn't made, and its textures are freed: each refresh then
+// draws its CRT picture itself, once per new picture (as 1.0.49-t6), which costs GPU time on the strobe's deadline instead.
+static std::atomic<bool> bTight{false};
+static bool bFreed = true;
+static void SetMemoryTight(bool tight)
+{
+    if (bTight.exchange(tight) != tight)
+        LOGI("BFI Presenter: CRT hand-off: %s", tight ? "the game is close to its video memory budget -- the CRT picture is no longer made with each frame (its textures freed; with grain on, the grain still is); each refresh draws it"
+                                                      : "video memory to spare again -- the CRT picture is made with each frame");
+}
 static void SetBakeSkip(bool skip)
 {
     if (bSkip.exchange(skip) != skip)
-        LOGI("BFI Presenter: CRT hand-off: %s", skip ? "most flashes are moved by frame warp -- each draws its CRT picture, none is made with the frame"
+        LOGI("BFI Presenter: CRT hand-off: %s", skip ? "most flashes are moved by frame warp -- each draws its CRT picture, none is made with the frame (with grain on it still is: moved flashes take its grain)"
                                                      : "the CRT picture is made with each frame again (most flashes shown as rendered)");
 }
-// heap: [s] the slot's frame (t0..t6), [kStage + 4 s ..] its four textures (t7-t10), [5 kStage + v] the pairs (t11 t12)
+// heap: [s] the slot's frame (t0..t6), [kStage + 4 s ..] its four textures (t7-t10), [5 kStage + 4 g + 2 from] the pairs
+// (t11 t12: bRt[from], grain's bRt[2 + g])
 
 static bool BakeSetup()
 {
@@ -637,9 +852,9 @@ static bool BakeSetup()
                   SUCCEEDED(g_device->CreateRootSignature(0, rb->GetBufferPointer(), rb->GetBufferSize(), IID_PPV_ARGS(&bRoot)));
         SafeRelease(rb); SafeRelease(re);
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 5 * kStage + 4; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 5 * kStage + 8; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&bHeap)));
-        D3D12_DESCRIPTOR_HEAP_DESC rh = {}; rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rh.NumDescriptors = 3 + kStage;   // bRt, then bOut
+        D3D12_DESCRIPTOR_HEAP_DESC rh = {}; rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rh.NumDescriptors = 4 + kStage;   // bRt, then bOut
         ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&bRtvHeap)));
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bd = {};
@@ -692,16 +907,69 @@ static void BakeWaitGame() { WaitGame(); }
 
 // The game's Present, on the frame copy list after CopyAtPresent: slot s's CRT picture into bOut[s].
 // waitRead: the presenter's fence value it may still be reading slot s at (its bOut[s] is remade only after it).
-static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead)
+static bool Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead, UINT64 *presWait)
 {
     bOk[s] = false;
-    if (bSkip.load() || !(state.load() == 2 && slotOk[s] && Wanted() && stage) || !BakeSetup()) return;
+    bFence[s] = UINT64_MAX;                          // not shown until the submission it is recorded in is done
+    if (bTight.load())
+    {
+        if (!bFreed)
+        {
+            // no slot's picture offered any more first; then wait until the presenter has drawn all it reserved (it
+            // reserves its fence value before it asks for a picture, so a draw that still got one is covered)
+            for (UINT j = 0; j < kStage; j++) bOk[j] = false;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            WaitGame();
+            const UINT64 drawn = g_presFenceVal;
+            if (g_presFence && drawn) WaitFence(g_presFence, drawn, g_gameFenceEvent);
+            for (UINT j = 0; j < kStage; j++) SafeRelease(bOut[j]);
+            bOutGen++;
+            bFreed = true;
+        }
+        // grain's first half is still made with the frame (four textures of the eleven; 1.0.50-t8): each refresh draws
+        // the rest of its CRT picture, with the frame's grain -- without grain nothing is, and they are freed too
+        float q[kCrtSlots * 4];
+        ParamsFor(q, 1.0f, 1.0f);
+        if (!(ParamOf(q, "crt_grain_intensity") > 0.001f))
+        {
+            bSlotTag[s] = 0;
+            if (bRt[0] || bRt[2])
+            {
+                for (int g = 0; g < 2; g++) bGrainTag[g] = 0;
+                for (UINT j = 0; j < kStage; j++) bSlotTag[j] = 0;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                WaitGame();
+                if (g_presFence && g_presFenceVal) WaitFence(g_presFence, g_presFenceVal, g_gameFenceEvent);
+                for (int k = 0; k < 4; k++) SafeRelease(bRt[k]);
+                bRingGen++;
+            }
+            return false;
+        }
+    }
+    const bool tight = bTight.load();
+    bSlotTag[s] = 0;
+    // Most flashes moved: not made -- unless grain is on: moved flashes take their frame's grain from it (1.0.50)
+    bool skip = bSkip.load();
+    if (skip)
+    {
+        float q[kCrtSlots * 4];
+        ParamsFor(q, 1.0f, 1.0f);
+        if (ParamOf(q, "crt_grain_intensity") > 0.001f) skip = false;
+    }
+    if (skip || !(state.load() == 2 && slotOk[s] && Wanted() && stage) || !BakeSetup()) return false;
+    if (!tight) bFreed = false;
     const D3D12_RESOURCE_DESC sd = stage->GetDesc();
     const UINT fw = (UINT)sd.Width, fh = sd.Height;
     // the working textures (the game's queue only) and the slot's output
     const DXGI_FORMAT pf = PassFormat();
     if (bRt[0] && (bRt[0]->GetDesc().Width != fw || bRt[0]->GetDesc().Height != fh || bRt[0]->GetDesc().Format != pf))
-    { WaitGame(); for (int k = 0; k < 3; k++) SafeRelease(bRt[k]); }
+    {
+        WaitGame();
+        if (g_presFence && g_presFenceVal) WaitFence(g_presFence, g_presFenceVal, g_gameFenceEvent);   // grain's: the presenter's too
+        for (int g = 0; g < 2; g++) bGrainTag[g] = 0;
+        for (int k = 0; k < 4; k++) SafeRelease(bRt[k]);
+        bRingGen++;
+    }
     if (bOut[s] && (bOut[s]->GetDesc().Width != fw || bOut[s]->GetDesc().Height != fh || bOut[s]->GetDesc().Format != pf))
     {
         if (waitRead && g_presFence) WaitFence(g_presFence, waitRead, g_gameFenceEvent);
@@ -712,12 +980,14 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = fw; rd.Height = fh; rd.DepthOrArraySize = 1;
     rd.MipLevels = 1; rd.Format = pf; rd.SampleDesc.Count = 1;
     bool madeRt = false;
-    for (int k = 0; k < 3; k++)
+    for (int k = 0; k < 4; k++)
     {
         if (bRt[k]) continue;
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&bRt[k]))))
-        { bRt[k] = nullptr; return; }
+        const D3D12_RESOURCE_STATES st = k < 2 ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, st, nullptr, IID_PPV_ARGS(&bRt[k]))))
+        { bRt[k] = nullptr; return false; }
+        if (k >= 2) bRingGen++;
         bRt[k]->SetName(L"BFI CRT-Standalone hand-off (game side)");
         D3D12_CPU_DESCRIPTOR_HANDLE h = bRtvHeap->GetCPUDescriptorHandleForHeapStart();
         h.ptr += (SIZE_T)k * bRtvStride;
@@ -726,22 +996,24 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     }
     if (madeRt)
     {
-        const int order[4] = { 0, 2, 1, 2 };
-        for (int v = 0; v < 4; v++)
-        {
-            D3D12_CPU_DESCRIPTOR_HANDLE h = bHeap->GetCPUDescriptorHandleForHeapStart();
-            h.ptr += (SIZE_T)(5 * kStage + v) * bSrvStride;
-            g_device->CreateShaderResourceView(bRt[order[v]], nullptr, h);
-        }
+        // (bRt[from], bRt[2 + g]) at 5 kStage + 4 g + 2 from
+        for (int g = 0; g < 2; g++)
+            for (int from = 0; from < 2; from++)
+                for (int v = 0; v < 2; v++)
+                {
+                    D3D12_CPU_DESCRIPTOR_HANDLE h = bHeap->GetCPUDescriptorHandleForHeapStart();
+                    h.ptr += (SIZE_T)(5 * kStage + 4 * g + 2 * from + v) * bSrvStride;
+                    g_device->CreateShaderResourceView(bRt[v ? 2 + g : from], nullptr, h);
+                }
     }
-    if (!bOut[s])
+    if (!bOut[s] && !tight)
     {
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;       // the last pass draws into it (t10: drawn, then copied)
         if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&bOut[s]))))
-        { bOut[s] = nullptr; return; }
+        { bOut[s] = nullptr; return false; }
         bOut[s]->SetName(L"BFI CRT-Standalone hand-off (the slot's CRT picture)");
         D3D12_CPU_DESCRIPTOR_HANDLE h = bRtvHeap->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += (SIZE_T)(3 + s) * bRtvStride;
+        h.ptr += (SIZE_T)(4 + s) * bRtvStride;
         g_device->CreateRenderTargetView(bOut[s], nullptr, h);
         bOutGen++;
     }
@@ -798,48 +1070,154 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
         if (slotTex[t][s]) in[nin++] = Transition(slotTex[t][s], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     list->ResourceBarrier(nin, in);
 
-    // t: 0 1 2 = bRt, 3 = bOut[s] (the last pass draws straight into it)
+    int steps[kCrtPostN], ns = 0, lastMain = -1;      // the passes drawn, in order; the last that isn't grain's first half
+    bool grain = false;
+    for (int p = 0; p < kCrtPostN; p++)
+        if (bPso[1 + p] && PostOn(p, cp)) { steps[ns++] = p; if (!PostIsGrainRaw(p)) lastMain = ns - 1; else grain = true; }
+    if (tight)
+    {
+        // up to grain's first half only, nothing into bOut (freed)
+        if (!grain) return false;
+        int n = 0;
+        while (n < ns && !PostIsGrainRaw(steps[n])) n++;
+        ns = n + 1;
+        lastMain = -2;
+    }
+    // grain's texture: the one of the two not read by the presenter last (it waits for the read it may still do)
+    const int g = bRing;
+    if (grain)
+    {
+        bRing ^= 1;
+        bGrainTag[g] = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const UINT64 r = bGrainRead[g].load();
+        if (presWait && r > *presWait) *presWait = r;
+    }
+    // t: 0 1 = bRt in turn, 2 = grain's (bRt[2 + g]), 3 = bOut[s] (the last pass draws straight into it)
     auto into = [&](int t, ID3D12PipelineState *pp, int from)
     {
-        ID3D12Resource *r = t < 3 ? bRt[t] : bOut[s];
-        const D3D12_RESOURCE_STATES idle = t < 3 ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
+        ID3D12Resource *r = t < 2 ? bRt[t] : t == 2 ? bRt[2 + g] : bOut[s];
+        const D3D12_RESOURCE_STATES idle = t < 2 ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
+        const D3D12_RESOURCE_STATES after = t == 2 ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : idle;   // grain's: read next
         D3D12_RESOURCE_BARRIER b = Transition(r, idle, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->ResourceBarrier(1, &b);
-        D3D12_GPU_DESCRIPTOR_HANDLE ph = g0; ph.ptr += (UINT64)(5 * kStage + 2 * (UINT)(from >= 0 ? from : 1)) * bSrvStride;
+        D3D12_GPU_DESCRIPTOR_HANDLE ph = g0; ph.ptr += (UINT64)(5 * kStage + 4 * g + 2 * (UINT)(from >= 0 ? from : 1)) * bSrvStride;
         list->SetGraphicsRootDescriptorTable(10, ph);
         D3D12_CPU_DESCRIPTOR_HANDLE rh = bRtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rh.ptr += (SIZE_T)(t < 3 ? t : 3 + (int)s) * bRtvStride;
+        rh.ptr += (SIZE_T)(t < 2 ? t : t == 2 ? 2 + g : 4 + (int)s) * bRtvStride;
         list->OMSetRenderTargets(1, &rh, FALSE, nullptr);
         list->SetPipelineState(pp);
         list->DrawInstanced(3, 1, 0, 0);
-        b = Transition(r, D3D12_RESOURCE_STATE_RENDER_TARGET, idle);
+        b = Transition(r, D3D12_RESOURCE_STATE_RENDER_TARGET, after);
         list->ResourceBarrier(1, &b);
     };
-    int steps[kCrtPostN], ns = 0, lastMain = -1;      // the passes drawn, in order; the last that isn't grain's first half
-    for (int p = 0; p < kCrtPostN; p++)
-        if (bPso[1 + p] && PostOn(p, cp)) { steps[ns++] = p; if (!PostIsGrainRaw(p)) lastMain = ns - 1; }
     int last = 0;
-    into(lastMain < 0 ? 3 : 0, bPso[0], -1);
+    gt::Mark(list, gt::Q_B0);
+    into(lastMain == -1 ? 3 : 0, bPso[0], -1);
+    gt::Mark(list, gt::Q_B0 + 1);                                    // each pass timed (the timing log): the pattern
     for (int i = 0; i < ns; i++)
     {
         const int p = steps[i];
-        if (PostIsGrainRaw(p)) { into(2, bPso[1 + p], last); continue; }
-        into(i == lastMain ? 3 : 1 - last, bPso[1 + p], last);
-        last = 1 - last;
+        if (PostIsGrainRaw(p)) into(2, bPso[1 + p], last);
+        else { into(i == lastMain ? 3 : 1 - last, bPso[1 + p], last); last = 1 - last; }
+        gt::Mark(list, gt::Q_B0 + 2 + p);                            // and each pass after it
     }
     for (UINT i = 0; i < nin; i++) std::swap(in[i].Transition.StateBefore, in[i].Transition.StateAfter);
     list->ResourceBarrier(nin, in);
-    bOk[s] = true;
+    if (grain)
+    {
+        D3D12_RESOURCE_BARRIER gb = Transition(bRt[2 + g], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        list->ResourceBarrier(1, &gb);
+        const UINT64 tag = ++bTagNext;
+        bSlotTag[s] = tag;
+        bGrainTag[g] = tag;                              // the presenter takes it once the bake's fence is done
+    }
+    else bSlotTag[s] = 0;
+    bOk[s] = !tight;                                 // shown once its own fence is done (BakeSubmitted, BakeReady)
     static bool logged = false;
-    if (!logged) { logged = true; LOGI("BFI Presenter: CRT hand-off: each frame's CRT picture is drawn with the frame (the game's queue); flashes moved by frame warp draw their own"); }
+    if (!logged && !tight) { logged = true; LOGI("BFI Presenter: CRT hand-off: each frame's CRT picture is drawn with the frame (the game's queue); flashes moved by frame warp draw their own"); }
+    return true;
+}
+// The game side's video memory, once a second (the settings window and the OSD show it)
+static void CountBytes()
+{
+    static double countT = 0.0;
+    const double tn = Now();
+    if (tn - countT <= 1.0) return;
+    countT = tn;
+    UINT64 n = 0;
+    for (int k = 0; k < kTexN; k++) { n += ResBytes(cur[k]); for (UINT j = 0; j < kStage; j++) n += ResBytes(slotTex[k][j]); }
+    for (UINT j = 0; j < kStage; j++) n += ResBytes(bOut[j]);
+    for (int k = 0; k < 4; k++) n += ResBytes(bRt[k]);
+    g_bytesCrtGame = n;
+}
+static void ReleaseIdle()
+{
+    // Not in use (the hand-off off, or CRT-Standalone not handing off) for 5 s: all of its textures freed (1.0.50-t8:
+    // Returnal kept 291 MB after CRT-Standalone stopped handing off, while the game was over its budget)
+    {
+        static double idleT = -1.0;
+        if (state.load() == 2 && Wanted()) idleT = -1.0;
+        else if (idleT < 0.0) idleT = Now();
+        else if (Now() - idleT > 5.0)
+        {
+            bool any = false;
+            for (int k = 0; k < kTexN; k++) { if (cur[k]) any = true; for (UINT j = 0; j < kStage; j++) if (slotTex[k][j]) any = true; }
+            for (UINT j = 0; j < kStage; j++) if (bOut[j]) any = true;
+            for (int k = 0; k < 4; k++) if (bRt[k]) any = true;
+            if (any)
+            {
+                const double mb = (double)g_bytesCrtGame.load() / 1048576.0;
+                for (UINT j = 0; j < kStage; j++) { bOk[j] = false; slotOk[j] = false; bSlotTag[j] = 0; }
+                for (int g = 0; g < 2; g++) bGrainTag[g] = 0;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                WaitGame();
+                if (g_presFence && g_presFenceVal) WaitFence(g_presFence, g_presFenceVal, g_gameFenceEvent);
+                for (int k = 0; k < kTexN; k++) { SafeRelease(cur[k]); curHas[k] = false; for (UINT j = 0; j < kStage; j++) SafeRelease(slotTex[k][j]); }
+                curOk = false;
+                for (UINT j = 0; j < kStage; j++) { SafeRelease(bOut[j]); bSeenSrc[j] = nullptr; for (int t = 0; t < kTexN; t++) bSeenTex[j][t] = nullptr; }
+                for (int k = 0; k < 4; k++) SafeRelease(bRt[k]);
+                bFreed = true;
+                slotGen++; bOutGen++; bRingGen++;
+                g_bytesCrtGame = 0;
+                LOGI("BFI Presenter: CRT hand-off not in use -- its textures freed (%.0f MB)", mb);
+            }
+        }
+    }
 }
 static ID3D12Resource *BakeOut(UINT s) { return s < kStage ? bOut[s] : nullptr; }
-static bool BakeReady(UINT s) { return s < kStage && bOk[s] && bOut[s]; }
+static bool BakeReady(UINT s)
+{
+    return s < kStage && bOk[s] && bOut[s] && g_gameFence && g_gameFence->GetCompletedValue() >= bFence[s].load();
+}
+static void BakeSubmitted(UINT s, UINT64 fence) { if (s < kStage) bFence[s] = fence; }
+// The presenter, for a moved flash of slot s, about to read at its fence value pres: which of grain's two textures holds
+// that frame's grain (-1: none -- it makes it itself). Its read is noted before the tag is checked again, so the game's
+// queue either sees it (and waits) or has already marked the texture as rewritten (and this returns -1).
+static int GrainFor(UINT s, UINT64 pres)
+{
+    if (s >= kStage || !g_gameFence) return -1;
+    const UINT64 tag = bSlotTag[s].load();
+    if (!tag || g_gameFence->GetCompletedValue() < bFence[s].load()) return -1;
+    for (int g = 0; g < 2; g++)
+    {
+        if (bGrainTag[g].load() != tag) continue;
+        if (pres > bGrainRead[g].load()) bGrainRead[g] = pres;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        return bGrainTag[g].load() == tag && bRt[2 + g] ? g : -1;
+    }
+    return -1;
+}
+static ID3D12Resource *GrainTex(int g) { return g >= 0 && g < 2 ? bRt[2 + g] : nullptr; }
+static UINT RingGen() { return bRingGen.load(); }
 static UINT BakeGen() { return bOutGen.load(); }
 static void BakeRelease()
 {
     for (int k = 0; k <= kCrtPostN; k++) SafeRelease(bPso[k]);
-    for (int k = 0; k < 3; k++) SafeRelease(bRt[k]);
+    for (int g = 0; g < 2; g++) bGrainTag[g] = 0;
+    for (UINT j = 0; j < kStage; j++) bSlotTag[j] = 0;
+    for (int k = 0; k < 4; k++) SafeRelease(bRt[k]);
+    bRingGen++;
     for (UINT s = 0; s < kStage; s++) { SafeRelease(bOut[s]); bOk[s] = false; bSeenSrc[s] = nullptr; for (int t = 0; t < kTexN; t++) bSeenTex[s][t] = nullptr; }
     if (bCb && bCbMap) bCb->Unmap(0, nullptr);
     bCbMap = nullptr;

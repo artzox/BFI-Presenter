@@ -62,7 +62,7 @@
 struct Swapchain; struct DeviceData;
 namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
-#define BFI_VERSION "1.0.49"
+#define BFI_VERSION "1.0.50"
 #include <atomic>
 // ReShade's own window open (as DX 1.0.49): only then is frame warp's still test run on the finished frames as well
 static std::atomic<bool> g_rsOverlayOpen{false};
@@ -7483,6 +7483,7 @@ static void on_begin_effects(reshade::api::effect_runtime *rt, reshade::api::com
 {
 #ifdef _WIN64
     if (!rt || !cmd || !g_shared.frameWarp || !g_shared.warpStillPre) return;
+    if (g_status.warpOn == 1) return;   // frame warp waits (frame rate outside its range): nothing is moved (as DX 1.0.50)
     {
         static int on = -1;
         static unsigned n = 0;
@@ -7547,6 +7548,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
         d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
         d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running;
         d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
+        d.vramUse = g_status.vramUse; d.vramBudget = g_status.vramBudget;   // (BFI Presenter's own share isn't counted here)
     }
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
 }

@@ -24,6 +24,9 @@ struct OsdData
     int    warpSrc = -1;       // the motion it moves the picture with: 0 measured from the picture, 1 the game's motion
                                // vectors and depth, 2 its motion vectors only; -1 = not reported (the picture's own)
     int    warpVia = 0;        // the game's motion came through 0 Streamline, 1 DLSS directly (NGX)
+    double vramUse = 0.0, vramBudget = 0.0;   // MB: the game's video memory use and the budget Windows gives it (0: unknown)
+    double ownMB = -1.0;       // MB of it that BFI Presenter holds (-1: not counted, e.g. the Vulkan layer)
+    double crtMB = 0.0;        // of that, the CRT hand-off's
     double now = 0.0;          // Now() seconds, for the totals' time
 };
 
@@ -166,6 +169,18 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
         ImGui::TextDisabled("(totals for %d:%02d:%02d, Ctrl+Shift+Z resets)", el / 3600, el / 60 % 60, el % 60);
     }
     if (d.relFlashMs > 0.0) ImGui::TextDisabled("release to flash %.1f ms", d.relFlashMs);
+    if (d.vramBudget > 0.0)
+    {
+        // the game's video memory against what Windows gives it: over it, part of it goes to system memory (stalls)
+        const ImVec4 vc = d.vramUse > d.vramBudget ? kBad : d.vramUse > d.vramBudget - 512.0 ? kWarn : kGood;
+        char own[96] = "";
+        if (d.ownMB >= 0.0)
+        {
+            if (d.crtMB >= 1.0) snprintf(own, sizeof(own), "  (BFI Presenter %.1f, CRT hand-off %.1f)", d.ownMB / 1024.0, d.crtMB / 1024.0);
+            else snprintf(own, sizeof(own), "  (BFI Presenter %.1f)", d.ownMB / 1024.0);
+        }
+        ImGui::TextColored(vc, "video memory %.1f of %.1f GB%s", d.vramUse / 1024.0, d.vramBudget / 1024.0, own);
+    }
     if (graph)
     {
         float v[kHist];
