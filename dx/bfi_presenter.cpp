@@ -15109,8 +15109,14 @@ static void draw_overlay(reshade::api::effect_runtime *)
             // Moving the last frame: Off, and wherever interpolation can't run (frame generation, no game motion), so its
             // settings are always shown (i6 hid them under Off while they still applied there)
             ImGui::SeparatorText("Moving the last frame");
+            // greyed out while frame interpolation fills the missing frames (ipNow >= 0: it can run here), so nothing in it
+            // looks as if it were at work
+            const bool moveIdle = s.warpInterp && st.ipNow >= 0;
             {
-                if (s.warpInterp) ImGui::TextDisabled("Used where frame interpolation can't run (frame generation, or no game motion).");
+                if (moveIdle) ImGui::TextDisabled("Not used: frame interpolation fills the missing frames.");
+                else if (s.warpInterp) ImGui::TextDisabled("In use: frame interpolation can't run here (%s).",
+                                                           st.ipNow == -1 ? "frame generation" : "no game motion");
+                ImGui::BeginDisabled(moveIdle);
                 ImGui::Indent(16.0f);
                 ImGui::SliderFloat("Furthest ahead (game frames)", &s.warpMax, 0.25f, 1.5f, "%.2f");
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("A frame is never shown further ahead than this. Lower = fewer errors, but a\n"
@@ -15170,6 +15176,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                     }
                 }
                 ImGui::Unindent(16.0f);
+                ImGui::EndDisabled();
             }
             ImGui::SeparatorText("Both ways");
             if (s.warpGame)
