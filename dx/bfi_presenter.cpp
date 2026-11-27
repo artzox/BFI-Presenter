@@ -6070,11 +6070,14 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     // the CRT hand-off's per-frame picture only with video memory to spare (1 GB under the budget; again
                     // once 1.5 GB is free, counting what it would take back)
+                    // (each switch held 10 s, so a game's memory swinging during loading doesn't free and remake it over and over)
                     static bool tight = false;
-                    if (vbud > 0.0)
+                    static ULONGLONG tightAt = 0;
+                    const ULONGLONG nowMs = GetTickCount64();
+                    if (vbud > 0.0 && nowMs - tightAt >= 10000)
                     {
-                        if (!tight && vu > vbud - 1024.0) tight = true;
-                        else if (tight && vu < vbud - 1536.0) tight = false;
+                        if (!tight && vu > vbud - 1024.0) { tight = true; tightAt = nowMs; }
+                        else if (tight && vu < vbud - 1536.0) { tight = false; tightAt = nowMs; }
                     }
                     crt::SetMemoryTight(tight);
                 }

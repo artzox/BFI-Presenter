@@ -608,7 +608,7 @@ static UINT bBlobGen = 0;
 static ID3D12DescriptorHeap *bHeap = nullptr, *bRtvHeap = nullptr;
 static ID3D12Resource *bRt[3] = {};                 // [0] [1] in turn, [2] grain's (the game's queue only)
 static ID3D12Resource *bOut[kStage] = {};           // the slot's CRT picture (COMMON between uses)
-static bool bOk[kStage] = {};
+static std::atomic<bool> bOk[kStage] = {};   // read by the presenter while the game's Present changes it
 static std::atomic<UINT> bOutGen{0};
 static ID3D12Resource *bCb = nullptr;
 static uint8_t *bCbMap = nullptr;
@@ -733,10 +733,14 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     {
         if (!bFreed)
         {
-            // the presenter may still read a slot's picture: wait until it has drawn all it reserved
+            // no slot's picture offered any more first; then wait until the presenter has drawn all it reserved (it
+            // reserves its fence value before it asks for a picture, so a draw that still got one is covered)
+            for (UINT j = 0; j < kStage; j++) bOk[j] = false;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
             WaitGame();
-            if (g_presFence && g_presFenceVal) WaitFence(g_presFence, g_presFenceVal, g_gameFenceEvent);
-            for (UINT j = 0; j < kStage; j++) { SafeRelease(bOut[j]); bOk[j] = false; }
+            const UINT64 drawn = g_presFenceVal;
+            if (g_presFence && drawn) WaitFence(g_presFence, drawn, g_gameFenceEvent);
+            for (UINT j = 0; j < kStage; j++) SafeRelease(bOut[j]);
             for (int k = 0; k < 3; k++) SafeRelease(bRt[k]);
             bOutGen++;
             bFreed = true;
