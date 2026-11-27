@@ -2369,6 +2369,11 @@ static void PresenterThread(Swapchain *sc)
     uint64_t ipNewestSeen = 0, ipA = 0;
     int      ipSlotA = -1, ipCycles = 0, ipAsIs = 0, ipEnters = 0, ipTwoBehind = 0;
     float    ipF = 0.0f;
+    // i2 (as DX i6): Automatic holds even pacing longer and stays on it from the third switch; the switch back lands on a
+    // frame as rendered; leaving waits longer each time it is needed again within 30 s
+    double   ipBackT = 0.0, ipLeaveT = 0.0, ipExitT = 0.0, ipExitNeed = 10.0;
+    bool     ipLeaving = false, ipEvenStick = false;
+    int      ipToEven = 0;
     int      winWarpCut = 0; double winCutT = 0.0;
     double   tsPassMs = -1.0, tsDrawMs = -1.0;   // the last GPU times read back (timing log)
     int      tsDrawWarped = 0;
@@ -2614,6 +2619,13 @@ static void PresenterThread(Swapchain *sc)
                     {
                         ipOn = true; ipP = (double)lastShownId; ipRate = 0.9; ipRateSlow = 0.95; ipTwoBehind = 0;
                         ipNewestSeen = newestId; ipFullT = ipEvenT = Now(); ipEven = false; ipEnters++;
+                        ipLeaving = false; ipBackT = Now();
+                        if (ipEvenStick && s.warpInterp == 3) ipEven = true;
+                        if (ipExitT > 0.0 && Now() - ipExitT < 30.0 && ipExitNeed < 60.0)
+                        {
+                            ipExitNeed = std::min(60.0, ipExitNeed * 2.0);
+                            LOGI("BFI Presenter: frame interpolation: needed again %.0f s after leaving -- now leaves after %.0f s at the strobe rate", Now() - ipExitT, ipExitNeed);
+                        }
                         if (ipEnters <= 20) LOGI("BFI Presenter: frame interpolation: a frame missing -- one frame behind, gaps drawn between two frames");
                     }
                     else if (ipOn)
@@ -2622,15 +2634,25 @@ static void PresenterThread(Swapchain *sc)
                         if (newestId > ipNewestSeen) ipNewestSeen = newestId;
                         ipRate = 0.9 * ipRate + 0.1 * std::min(got, 3.0);
                         ipRateSlow = 0.995 * ipRateSlow + 0.005 * std::min(got, 3.0);
-                        if (s.warpInterp == 3 && Now() - ipEvenT >= 5.0)
+                        if (s.warpInterp == 3 && !ipLeaving && Now() - ipEvenT >= 5.0)
                         {
-                            const bool want = ipEven ? ipRateSlow < 0.93 : ipRateSlow < 0.88;
-                            if (want != ipEven)
+                            if (!ipEven)
                             {
-                                ipEven = want; ipEvenT = Now();
-                                if (ipEnters <= 20) LOGI("BFI Presenter: frame interpolation: %s (%.2f game frames per strobe cycle)",
-                                                         ipEven ? "even pacing" : "only the missing frames", ipRateSlow);
-                                if (!ipEven) ipP = std::floor(ipP + 0.5);
+                                if (ipRateSlow < 0.88)
+                                {
+                                    ipEven = true; ipEvenT = ipBackT = Now(); ipToEven++;
+                                    if (ipToEven <= 20) LOGI("BFI Presenter: frame interpolation: even pacing (%.2f game frames per strobe cycle)", ipRateSlow);
+                                    if (ipToEven == 3)
+                                    {
+                                        ipEvenStick = true;
+                                        LOGI("BFI Presenter: frame interpolation: even pacing from here on in this session (the game's rate kept moving around the switch point)");
+                                    }
+                                }
+                            }
+                            else if (!ipEvenStick)
+                            {
+                                if (ipRateSlow < 0.95) ipBackT = Now();
+                                else if (Now() - ipBackT >= 10.0) { ipLeaving = true; ipLeaveT = Now(); }
                             }
                         }
                         if (s.warpInterp == 2 || (s.warpInterp == 3 && ipEven))
@@ -2640,6 +2662,12 @@ static void PresenterThread(Swapchain *sc)
                             ipP += 0.15 * ((double)newestId - 1.0 - ipP);
                             ipP = std::max((double)newestId - 3.0, std::min((double)newestId, ipP));
                             ipP = std::max(ipP, std::min(was, (double)newestId));
+                            if (ipLeaving && (std::floor(ipP + 1e-6) > std::floor(was + 1e-6) || Now() - ipLeaveT > 1.0))
+                            {
+                                ipP = Now() - ipLeaveT > 1.0 ? std::floor(ipP + 0.5) : std::floor(ipP + 1e-6);   // on the frame just reached
+                                ipEven = false; ipLeaving = false; ipEvenT = Now();
+                                if (ipToEven <= 20) LOGI("BFI Presenter: frame interpolation: only the missing frames (%.2f game frames per strobe cycle for 10 s)", ipRateSlow);
+                            }
                         }
                         else
                         {
@@ -2652,10 +2680,10 @@ static void PresenterThread(Swapchain *sc)
                             else if (newestId == next) ipP = half ? (double)next : (double)base + 0.5;
                         }
                         if (ipRate < 0.985) ipFullT = Now();
-                        else if (Now() - ipFullT > 10.0)
+                        else if (Now() - ipFullT > ipExitNeed)
                         {
-                            ipOn = false; ipCycle = false;
-                            if (ipEnters <= 20) LOGI("BFI Presenter: frame interpolation: the strobe rate held for 10 s -- the newest frame again (one frame skipped)");
+                            ipOn = false; ipCycle = false; ipLeaving = false; ipExitT = Now();
+                            if (ipEnters <= 20) LOGI("BFI Presenter: frame interpolation: the strobe rate held for %.0f s -- the newest frame again (one frame skipped)", ipExitNeed);
                         }
                     }
                 }

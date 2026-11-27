@@ -3896,6 +3896,13 @@ static DWORD WINAPI PresenterThread(void *)
     bool   ipCycle = false;                  // this strobe cycle is drawn between ipA and the frame picked (ipA + 1)
     bool   ipEven = false;                   // automatic: even pacing in use (else only the missing frames)
     double ipEvenT = 0.0;                    // when it last switched
+    // i6 (Uncharted at 50-58 fps: 56 switches in 20 min, the 3 s average sat on 0.88-0.93): back to only the missing
+    // frames after 10 s at 0.95 or more; on it from the third switch to even pacing; the switch back waits for a frame
+    // as rendered instead of jumping half a frame; and back to the newest frame only after longer at the strobe rate
+    // each time interpolation is needed again within 30 s of leaving
+    double ipBackT = 0.0, ipLeaveT = 0.0, ipExitT = 0.0, ipExitNeed = 10.0;
+    bool   ipLeaving = false, ipEvenStick = false;
+    int    ipToEven = 0;
     double ipRateSlow = 1.0;                 // game frames per strobe cycle over about 3 s (Automatic decides on it)
     int    ipTwoBehind = 0;                  // only the missing frames: cycles in a row with two frames waiting
     int    ipCycles = 0, ipAsIs = 0, ipEnters = 0;
@@ -4681,6 +4688,13 @@ static DWORD WINAPI PresenterThread(void *)
                     // and from here the presenter stays one frame behind
                     ipOn = true; ipP = (double)lastShownId; ipRate = 0.9; ipRateSlow = 0.95; ipTwoBehind = 0; ipNewestSeen = newestId; ipFullT = ipOnT = Now(); ipEnters++;
                     ipEven = false; ipEvenT = Now();
+                    ipLeaving = false; ipBackT = Now();
+                    if (ipEvenStick && s.warpInterp == 3) ipEven = true;
+                    if (ipExitT > 0.0 && Now() - ipExitT < 30.0 && ipExitNeed < 60.0)
+                    {
+                        ipExitNeed = std::min(60.0, ipExitNeed * 2.0);
+                        LOGI("BFI Presenter: frame warp interpolation: needed again %.0f s after leaving -- now leaves after %.0f s at the strobe rate", Now() - ipExitT, ipExitNeed);
+                    }
                     if (ipEnters <= 20) LOGI("BFI Presenter: frame warp interpolation: a frame missing -- one frame behind, gaps drawn between two frames");
                 }
                 else if (ipOn)
@@ -4695,16 +4709,25 @@ static DWORD WINAPI PresenterThread(void *)
                     // above 0.93 off, each held at least 3 s.
                     // (i5: on the 3 s average and held 5 s -- i4 switched three times in Oblivion's first 40 s, and twice in
                     // Onimusha on short dips)
-                    if (s.warpInterp == 3 && Now() - ipEvenT >= 5.0)
+                    if (s.warpInterp == 3 && !ipLeaving && Now() - ipEvenT >= 5.0)
                     {
-                        const bool want = ipEven ? ipRateSlow < 0.93 : ipRateSlow < 0.88;
-                        if (want != ipEven)
+                        if (!ipEven)
                         {
-                            ipEven = want; ipEvenT = Now();
-                            if (ipEnters <= 20)
-                                LOGI("BFI Presenter: frame warp interpolation: %s (%.2f game frames per strobe cycle)",
-                                     ipEven ? "even pacing" : "only the missing frames", ipRateSlow);
-                            if (!ipEven) ipP = std::floor(ipP + 0.5);         // back onto a frame
+                            if (ipRateSlow < 0.88)
+                            {
+                                ipEven = true; ipEvenT = ipBackT = Now(); ipToEven++;
+                                if (ipToEven <= 20) LOGI("BFI Presenter: frame warp interpolation: even pacing (%.2f game frames per strobe cycle)", ipRateSlow);
+                                if (ipToEven == 3)
+                                {
+                                    ipEvenStick = true;
+                                    LOGI("BFI Presenter: frame warp interpolation: even pacing from here on in this session (the game's rate kept moving around the switch point)");
+                                }
+                            }
+                        }
+                        else if (!ipEvenStick)
+                        {
+                            if (ipRateSlow < 0.95) ipBackT = Now();
+                            else if (Now() - ipBackT >= 10.0) { ipLeaving = true; ipLeaveT = Now(); }
                         }
                     }
                     if (s.warpInterp == 2 || (s.warpInterp == 3 && ipEven))
@@ -4715,6 +4738,12 @@ static DWORD WINAPI PresenterThread(void *)
                         ipP += 0.15 * ((double)newestId - 1.0 - ipP);
                         ipP = std::max((double)newestId - 3.0, std::min((double)newestId, ipP));
                         ipP = std::max(ipP, std::min(was, (double)newestId));  // never back to an older picture
+                        if (ipLeaving && (std::floor(ipP + 1e-6) > std::floor(was + 1e-6) || Now() - ipLeaveT > 1.0))
+                        {
+                            ipP = Now() - ipLeaveT > 1.0 ? std::floor(ipP + 0.5) : std::floor(ipP + 1e-6);   // on the frame just reached
+                            ipEven = false; ipLeaving = false; ipEvenT = Now();
+                            if (ipToEven <= 20) LOGI("BFI Presenter: frame warp interpolation: only the missing frames (%.2f game frames per strobe cycle for 10 s)", ipRateSlow);
+                        }
                     }
                     else
                     {
@@ -4735,10 +4764,10 @@ static DWORD WINAPI PresenterThread(void *)
                     // back after 10 s at the strobe rate (i5; 3 s before: Onimusha fell behind and caught up again every few
                     // seconds, a repeat going in and a skip coming out each time)
                     if (ipRate < 0.985) ipFullT = Now();
-                    else if (Now() - ipFullT > 10.0)
+                    else if (Now() - ipFullT > ipExitNeed)
                     {
-                        ipOn = false; ipCycle = false;
-                        if (ipEnters <= 20) LOGI("BFI Presenter: frame warp interpolation: the strobe rate held for 10 s -- the newest frame again (one frame skipped)");
+                        ipOn = false; ipCycle = false; ipLeaving = false; ipExitT = Now();
+                        if (ipEnters <= 20) LOGI("BFI Presenter: frame warp interpolation: the strobe rate held for %.0f s -- the newest frame again (one frame skipped)", ipExitNeed);
                     }
                 }
             }
