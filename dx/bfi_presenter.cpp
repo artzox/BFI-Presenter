@@ -15058,6 +15058,25 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
             else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else ImGui::Text("Waiting for the game's frame rate.");
+            bool gm = s.warpGame != 0;
+            if (ImGui::Checkbox("Use the game's own motion vectors and depth", &gm)) s.warpGame = gm ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (through Streamline or directly, DX12) its motion vectors and\n"
+                                                          "depth, frame warp moves each part of the picture by the game's own motion for it, and\n"
+                                                          "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
+                                                          "from the finished picture, which can only follow the camera. Other games keep the\n"
+                                                          "measured motion. The line below says which one is in use.");
+            {
+                const bool fgOff = st.fgActive && !s.warpGameFg;   // the game's motion isn't used with frame generation
+                const int src = st.warpCycles ? st.warpSrc : (s.warpGame && !fgOff && st.warpGameState > 0 ? st.warpGameState : 0);
+                ImGui::Text("Motion used: %s%s", src == 1 ? "the game's motion vectors and depth" : src == 2 ? "the game's motion vectors (no depth)"
+                                                       : "measured from the picture",
+                            src <= 0 ? "" : st.warpGameVia == 1 ? ", from DLSS" : ", from Streamline");
+                if (s.warpGame && fgOff && st.warpGameState > 0) { ImGui::SameLine(); ImGui::TextDisabled("(the game's is off with frame generation)"); }
+                else if (s.warpGame && st.warpGameWhy[0]) { ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", st.warpGameWhy); }
+                else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("This game hasn't handed DLSS any motion data (no Streamline or DLSS call seen).");
+            }
             // Frame interpolation (1.0.51): the one choice of how a missing frame is filled. The ini keeps 0 off, 1 only
             // the missing frames, 2 even pacing, 3 automatic; the list shows Automatic second.
             {
@@ -15087,9 +15106,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                               "Ready: frames as rendered until one is missing.");
                 }
             }
-            if (!s.warpInterp)
+            // Moving the last frame: Off, and wherever interpolation can't run (frame generation, no game motion), so its
+            // settings are always shown (i6 hid them under Off while they still applied there)
+            ImGui::SeparatorText("Moving the last frame");
             {
-                // moving the last frame: its own settings
+                if (s.warpInterp) ImGui::TextDisabled("Used where frame interpolation can't run (frame generation, or no game motion).");
                 ImGui::Indent(16.0f);
                 ImGui::SliderFloat("Furthest ahead (game frames)", &s.warpMax, 0.25f, 1.5f, "%.2f");
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("A frame is never shown further ahead than this. Lower = fewer errors, but a\n"
@@ -15133,42 +15154,26 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "don't break up where parts of the picture move by different amounts. 0 = off.");
                 if ((s.warpSnapX > 0.0f || s.warpSnapY > 0.0f) && s.crtHandoff && crt::StateNow() == 2)
                     ImGui::TextDisabled("Snap isn't used while CRT-Standalone is applied after frame warp: its scanlines no longer move.");
+                if (s.warpGame)
+                {
+                    bool gf = s.warpGameFg != 0;
+                    if (ImGui::Checkbox("Also with frame generation", &gf)) s.warpGameFg = gf ? 1 : 0;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The game's motion vectors are for the frames it renders, not the ones frame generation\n"
+                                                                  "adds in between, so on those the edges of moving things double up (outlines around\n"
+                                                                  "characters, e.g. 007 First Light, Directive 8020). Off by default: with frame generation\n"
+                                                                  "on, frame warp uses the motion measured from the picture.");
+                    if (s.warpGameFg)
+                    {
+                        ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
+                                                                      "further ahead than this (shown frames). Further out it overshoots and snaps back.");
+                    }
+                }
                 ImGui::Unindent(16.0f);
             }
             ImGui::SeparatorText("Both ways");
-            bool gm = s.warpGame != 0;
-            if (ImGui::Checkbox("Use the game's own motion vectors and depth", &gm)) s.warpGame = gm ? 1 : 0;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands DLSS (through Streamline or directly, DX12) its motion vectors and\n"
-                                                          "depth, frame warp moves each part of the picture by the game's own motion for it, and\n"
-                                                          "where things overlap the nearer one stays in front -- instead of the motion it measures\n"
-                                                          "from the finished picture, which can only follow the camera. Other games keep the\n"
-                                                          "measured motion. The line below says which one is in use.");
-            {
-                const bool fgOff = st.fgActive && !s.warpGameFg;   // the game's motion isn't used with frame generation
-                const int src = st.warpCycles ? st.warpSrc : (s.warpGame && !fgOff && st.warpGameState > 0 ? st.warpGameState : 0);
-                ImGui::Text("Motion used: %s%s", src == 1 ? "the game's motion vectors and depth" : src == 2 ? "the game's motion vectors (no depth)"
-                                                       : "measured from the picture",
-                            src <= 0 ? "" : st.warpGameVia == 1 ? ", from DLSS" : ", from Streamline");
-                if (s.warpGame && fgOff && st.warpGameState > 0) { ImGui::SameLine(); ImGui::TextDisabled("(the game's is off with frame generation)"); }
-                else if (s.warpGame && st.warpGameWhy[0]) { ImGui::SameLine(); ImGui::TextDisabled("(?)");
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", st.warpGameWhy); }
-                else if (s.warpGame && st.warpGameState == 0 && ImGui::IsItemHovered())
-                    ImGui::SetTooltip("This game hasn't handed DLSS any motion data (no Streamline or DLSS call seen).");
-            }
             if (s.warpGame)
             {
-                bool gf = s.warpGameFg != 0;
-                if (ImGui::Checkbox("Also with frame generation", &gf)) s.warpGameFg = gf ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("The game's motion vectors are for the frames it renders, not the ones frame generation\n"
-                                                              "adds in between, so on those the edges of moving things double up (outlines around\n"
-                                                              "characters, e.g. 007 First Light, Directive 8020). Off by default: with frame generation\n"
-                                                              "on, frame warp uses the motion measured from the picture.");
-                if (s.warpGameFg)
-                {
-                    ImGui::SliderFloat("Furthest ahead with frame generation", &s.warpMaxGameFg, 0.1f, 1.5f, "%.2f");
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's own motion and frame generation on, a frame is never shown\n"
-                                                                  "further ahead than this (shown frames). Further out it overshoots and snaps back.");
-                }
                 bool hud = s.warpGameHud != 0;
                 if (ImGui::Checkbox("Keep the HUD still (the game's HUD-less picture)", &hud)) s.warpGameHud = hud ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the game hands its upscaler a picture without the HUD (e.g. 007 First Light),\n"
