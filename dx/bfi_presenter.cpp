@@ -809,6 +809,9 @@ struct Status
     int    warpOn = 0;                          // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
     int    ipNow = 0;                           // frame interpolation: 0 off or not behind, 1 only the missing frames, 2 even pacing,
                                                 // -1 not with frame generation, -2 needs the game's motion
+    int    ipCan = 0;                           // 1: frame interpolation can run now (the game's motion is prepared for it even
+                                                // while frame warp itself waits -- 1.0.51-i11: 007 at 66% of the strobe rate, under
+                                                // Only from, had no game motion and its in-between pictures weren't moved)
     int    warpCycles = 0;                      // per second: strobe cycles shown moved ahead
     double warpRate = 0.0;                      // the game's frames per strobe cycle, as frame warp measures it
     double warpAvg = 0.0;                       // average distance ahead of those cycles, in game frames
@@ -4686,6 +4689,7 @@ static DWORD WINAPI PresenterThread(void *)
         {
             // either pacing (i1 needed Smooth, and the default is Lowest latency: it never ran)
             const bool ipAllowed = s.warpInterp && s.frameWarp && warp.ok && s.warpGame && !g_status.fgActive;
+            g_status.ipCan = ipAllowed ? 1 : 0;
             g_status.ipNow = !s.warpInterp ? 0 : g_status.fgActive ? -1 : !s.warpGame ? -2 :
                              !ipOn ? 0 : (s.warpInterp == 2 || (s.warpInterp == 3 && ipEven)) ? 2 : 1;
             if (ipOn && !ipAllowed) { ipOn = false; ipCycle = false; }
@@ -9601,7 +9605,7 @@ static DXGI_FORMAT MvView(DXGI_FORMAT f)
 static bool On() { return g_shared.frameWarp != 0 && g_shared.warpGame != 0 && !g_dx11.load(); }
 // With frame generation the game's motion isn't used (FrameWarpGameMotionWithFG=0, the default): its vectors, depth and
 // HUD-less picture aren't copied either (1.0.49: they were, on every upscaler call, for nothing)
-static bool FgUnused() { return (g_status.fgActive && !g_shared.warpGameFg) || g_status.warpOn == 1; }
+static bool FgUnused() { return (g_status.fgActive && !g_shared.warpGameFg) || (g_status.warpOn == 1 && !g_status.ipCan); }
 // (and while frame warp waits -- the game's frame rate outside its range, no steady rate: nothing is filled, so the
 // game's motion isn't prepared either. Returnal's loading stalls: this step took up to 75 ms of a 93 ms frame there.)
 
@@ -10098,7 +10102,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
 {
     if (s >= kStage) return;
     slotId[s] = 0; slotPend[s] = slotOk[s] = false;
-    if (!On() || g_status.warpOn == 1) { std::lock_guard<std::mutex> l(lk); pendN = 0; latest = -1; return; }
+    if (!On() || (g_status.warpOn == 1 && !g_status.ipCan)) { std::lock_guard<std::mutex> l(lk); pendN = 0; latest = -1; return; }
     Entry e, ep;
     int k;
     float scale = 1.0f, lag = 0.0f;
@@ -14482,6 +14486,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
     d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
     d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
     d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
+    d.ipNow = g_status.ipNow; d.ipCan = g_status.ipCan;
     // which motion: what the last second's moved cycles used, or (none moved) what the game hands over -- unless frame
     // generation is on with the game's motion off for it, as in the settings window (Townfall, 2x: the OSD switched
     // between the game's vectors and the measured motion with each second that had no cycle to fill)
@@ -15119,6 +15124,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see ReShade.log).");
             else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
+            else if (st.ipNow > 0) ImGui::Text("At work: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
+            else if (st.ipCan && st.warpRate > 0.0) ImGui::Text("Ready: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else ImGui::Text("Waiting for the game's frame rate.");
             bool gm = s.warpGame != 0;

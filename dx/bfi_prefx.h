@@ -31,7 +31,7 @@ static bool Wanted()
     return false;                              // 32-bit: ReShade's back buffer call has another return convention there
 #else
     // (not while frame warp waits -- the game's frame rate outside its range: nothing is moved, so nothing needs it; 1.0.50)
-    return g_shared.frameWarp && g_shared.warpStillPre && g_active.load() && g_status.warpOn != 1;
+    return g_shared.frameWarp && g_shared.warpStillPre && g_active.load() && (g_status.warpOn != 1 || g_status.ipCan);
 #endif
 }
 

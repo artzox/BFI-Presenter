@@ -550,6 +550,8 @@ struct Status
     int    warpOn = 0;                      // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
     int    ipNow = 0;                       // frame interpolation (as DX): 0 off or not behind, 1 only the missing frames, 2 even pacing,
                                             // -1 not with frame generation, -2 needs the game's motion
+    int    ipCan = 0;                       // 1: frame interpolation can run now (as DX: what it needs is prepared even while
+                                            // frame warp itself waits)
     int    warpCycles = 0;                  // per second: strobe cycles shown moved ahead
     double warpAvg = 0.0, warpRate = 0.0;   // their average offset (game frames); the game's frames per strobe cycle
     int    warpSrc = 0;                     // what moved them: 0 the measured motion, 1 the game's vectors and depth, 2 its vectors only
@@ -2620,6 +2622,7 @@ static void PresenterThread(Swapchain *sc)
             {
                 const int fgNow = std::max(1, g_vkFgFactor.load());
                 const bool ipAllowed = s.warpInterp && s.frameWarp && R.warp.ok && s.warpGame && fgNow <= 1 && !copyMode;
+                g_status.ipCan = ipAllowed ? 1 : 0;
                 g_status.ipNow = !s.warpInterp ? 0 : fgNow > 1 ? -1 : (!s.warpGame || gvk::State() <= 0) ? -2 :
                                  !ipOn ? 0 : (s.warpInterp == 2 || (s.warpInterp == 3 && ipEven)) ? 2 : 1;
                 if (ipOn && !ipAllowed) { ipOn = false; ipCycle = false; }
@@ -7659,7 +7662,7 @@ static void on_begin_effects(reshade::api::effect_runtime *rt, reshade::api::com
 {
 #ifdef _WIN64
     if (!rt || !cmd || !g_shared.frameWarp || !g_shared.warpStillPre) return;
-    if (g_status.warpOn == 1) return;   // frame warp waits (frame rate outside its range): nothing is moved (as DX 1.0.50)
+    if (g_status.warpOn == 1 && !g_status.ipCan) return;   // frame warp waits (frame rate outside its range): nothing is moved (as DX 1.0.50)
     {
         static int on = -1;
         static unsigned n = 0;
@@ -7724,6 +7727,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
         d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
         d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running;
         d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
+        d.ipNow = g_status.ipNow; d.ipCan = g_status.ipCan;
         d.vramUse = g_status.vramUse; d.vramBudget = g_status.vramBudget;   // (BFI Presenter's own share isn't counted here)
     }
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
@@ -8222,6 +8226,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see BFIPresenterVK.log).");
             else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
+            else if (st.ipNow > 0) ImGui::Text("At work: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
+            else if (st.ipCan && st.warpRate > 0.0) ImGui::Text("Ready: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else ImGui::Text("Waiting for the game's frame rate.");
             bool gm = s.warpGame != 0;
