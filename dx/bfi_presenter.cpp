@@ -3894,6 +3894,8 @@ static DWORD WINAPI PresenterThread(void *)
     bool   ipCycle = false;                  // this strobe cycle is drawn between ipA and the frame picked (ipA + 1)
     bool   ipEven = false;                   // automatic: even pacing in use (else only the missing frames)
     double ipEvenT = 0.0;                    // when it last switched
+    double ipRateSlow = 1.0;                 // game frames per strobe cycle over about 3 s (Automatic decides on it)
+    int    ipTwoBehind = 0;                  // only the missing frames: cycles in a row with two frames waiting
     int    ipCycles = 0, ipAsIs = 0, ipEnters = 0;
     int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
     UINT64 warpPrevId = 0;
@@ -4673,7 +4675,7 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     // the first missing frame: this cycle shows the frame shown last once more (as without frame warp),
                     // and from here the presenter stays one frame behind
-                    ipOn = true; ipP = (double)lastShownId; ipRate = 0.9; ipNewestSeen = newestId; ipFullT = ipOnT = Now(); ipEnters++;
+                    ipOn = true; ipP = (double)lastShownId; ipRate = 0.9; ipRateSlow = 0.95; ipTwoBehind = 0; ipNewestSeen = newestId; ipFullT = ipOnT = Now(); ipEnters++;
                     ipEven = false; ipEvenT = Now();
                     if (ipEnters <= 20) LOGI("BFI Presenter: frame warp interpolation: a frame missing -- one frame behind, gaps drawn between two frames");
                 }
@@ -4682,19 +4684,22 @@ static DWORD WINAPI PresenterThread(void *)
                     const double got = newestId > ipNewestSeen ? (double)(newestId - ipNewestSeen) : 0.0;
                     if (newestId > ipNewestSeen) ipNewestSeen = newestId;
                     ipRate = 0.9 * ipRate + 0.1 * std::min(got, 3.0);       // game frames per strobe cycle
+                    ipRateSlow = 0.995 * ipRateSlow + 0.005 * std::min(got, 3.0);   // the same over about 3 s
                     // Automatic (1.0.51-i4): only the missing frames near the strobe rate (Onimusha at 60 fps: 0-32 pictures
                     // in between per 10 s, sharp); even pacing below it, where every fourth cycle or so misses a frame and
                     // half steps between whole ones are choppy (Oblivion at 43 fps). Below 0.88 game frames per cycle on,
                     // above 0.93 off, each held at least 3 s.
-                    if (s.warpInterp == 3 && Now() - ipEvenT >= 3.0)
+                    // (i5: on the 3 s average and held 5 s -- i4 switched three times in Oblivion's first 40 s, and twice in
+                    // Onimusha on short dips)
+                    if (s.warpInterp == 3 && Now() - ipEvenT >= 5.0)
                     {
-                        const bool want = ipEven ? ipRate < 0.93 : ipRate < 0.88;
+                        const bool want = ipEven ? ipRateSlow < 0.93 : ipRateSlow < 0.88;
                         if (want != ipEven)
                         {
                             ipEven = want; ipEvenT = Now();
                             if (ipEnters <= 20)
                                 LOGI("BFI Presenter: frame warp interpolation: %s (%.2f game frames per strobe cycle)",
-                                     ipEven ? "even pacing" : "only the missing frames", ipRate);
+                                     ipEven ? "even pacing" : "only the missing frames", ipRateSlow);
                             if (!ipEven) ipP = std::floor(ipP + 0.5);         // back onto a frame
                         }
                     }
@@ -4715,16 +4720,21 @@ static DWORD WINAPI PresenterThread(void *)
                         const UINT64 base = (UINT64)std::floor(ipP + 1e-6);
                         const bool half = ipP - std::floor(ipP + 1e-6) > 0.25;
                         const UINT64 next = base + 1;
-                        if (newestId >= next + 3) ipP = (double)(newestId - 1);          // fallen behind: one behind again
+                        // two frames waiting 3 cycles in a row: back to one behind (i4 stayed two behind for seconds in
+                        // Onimusha: 60-75 ms from release to flash against 42 without, where one frame is 17 ms)
+                        ipTwoBehind = newestId >= next + 2 ? ipTwoBehind + 1 : 0;
+                        if (newestId >= next + 3 || ipTwoBehind >= 3) { ipP = (double)(newestId - 1); ipTwoBehind = 0; }
                         else if (newestId >= next + 1) ipP = (double)next;
                         else if (newestId == next) ipP = half ? (double)next : (double)base + 0.5;
                         // else nothing new at all: the same picture once more
                     }
+                    // back after 10 s at the strobe rate (i5; 3 s before: Onimusha fell behind and caught up again every few
+                    // seconds, a repeat going in and a skip coming out each time)
                     if (ipRate < 0.985) ipFullT = Now();
-                    else if (Now() - ipFullT > 3.0)
+                    else if (Now() - ipFullT > 10.0)
                     {
                         ipOn = false; ipCycle = false;
-                        if (ipEnters <= 20) LOGI("BFI Presenter: frame warp interpolation: the strobe rate held for 3 s -- the newest frame again (one frame skipped)");
+                        if (ipEnters <= 20) LOGI("BFI Presenter: frame warp interpolation: the strobe rate held for 10 s -- the newest frame again (one frame skipped)");
                     }
                 }
             }
@@ -15146,7 +15156,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "With the game's motion, without frame generation. At the first missing\n"
                                                               "frame the presenter falls one game frame behind (about 17 ms more latency at 60 fps) and\n"
                                                               "draws each strobe cycle between two finished frames: what one of them hides, the other shows,\n"
-                                                              "so nothing is made up (no ghost edges). Once the game holds the strobe rate for 3 s it shows\n"
+                                                              "so nothing is made up (no ghost edges). Once the game holds the strobe rate for 10 s it shows\n"
                                                               "the newest frame again (one frame skipped). Instead of frame warp's fill while it is on.");
                 bool fu = s.warpFillUncovered != 0;
                 if (ImGui::Checkbox("Fill uncovered areas from the background (test)", &fu)) s.warpFillUncovered = fu ? 1 : 0;
