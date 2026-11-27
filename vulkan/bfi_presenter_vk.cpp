@@ -62,7 +62,7 @@
 struct Swapchain; struct DeviceData;
 namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
-#define BFI_VERSION "1.0.51"
+#define BFI_VERSION "1.0.52"
 #include <atomic>
 // ReShade's own window open (as DX 1.0.49): only then is frame warp's still test run on the finished frames as well
 static std::atomic<bool> g_rsOverlayOpen{false};
