@@ -9477,6 +9477,10 @@ static UINT  hudW = 0, hudH = 0;
 static float hudMap[4] = {};
 static double hudCopyT = -10.0;                          // when it was last copied
 static Tag   hudLiveTag; static Res hudLiveRes; static bool hudLive = false;   // valid until the Present (no copy)
+// when the game last tagged it: read at a Present only within 0.25 s of that (1.0.51-i12: 007 stops tagging it when its
+// frame generation is switched off and frees it -- the tag kept from before was read at every Present after, and the GPU
+// hung on it once frame interpolation prepared the game's motion at 66% of the strobe rate)
+static double hudLiveT = 0.0;
 static ID3D12Resource *hudRaw[2] = {}, *hudMask = nullptr;   // the motion texture's size, R8; in PIXEL_SHADER_RESOURCE between uses
 static int  hudCur = 0;
 static bool hudMaskOk = false;                           // hudMask holds a mask from the last Presents
@@ -9712,7 +9716,7 @@ static void CopyHud(const Tag &t, void *cmd)
     if (hudState.load() < 0 || !g_device) return;
     if (!cmd)
     {
-        if (t.lifecycle == 1) { hudLiveTag = t; hudLiveRes = *t.res; hudLiveTag.res = &hudLiveRes; hudLive = true; }
+        if (t.lifecycle == 1) { hudLiveTag = t; hudLiveRes = *t.res; hudLiveTag.res = &hudLiveRes; hudLive = true; hudLiveT = Now(); }
         return;
     }
     D3D12_RESOURCE_DESC hd = {};
@@ -10161,7 +10165,7 @@ static void AtPresent(ID3D12GraphicsCommandList *list, UINT s)
         if (g_shared.warpGameHud && hudState.load() >= 0 && psoHud && hudMask)
         {
             if (hudCopy && Now() - hudCopyT < 0.25) { hl = hudCopy; hl->AddRef(); hlState = D3D12_RESOURCE_STATE_COPY_DEST; hlFmt = hudFmt; memcpy(hlMap, hudMap, sizeof(hlMap)); }
-            else if (hudLive)
+            else if (hudLive && Now() - hudLiveT < 0.25)
             {
                 D3D12_RESOURCE_DESC d = {};
                 if ((hl = Native(hudLiveTag.res, &d)) != nullptr)
