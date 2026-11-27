@@ -196,6 +196,7 @@ struct Settings
                               // smaller than the screen, e.g. Townfall)
     int   warpEven = 0;       // FrameWarpEvenPacing: every strobe cycle moved to where the game's motion is, where the game's
                               // own motion is used; elsewhere missing frames are filled as usual
+    int   warpFillDebug = 0;       // FrameWarpFillUncoveredDebug: tint uncovered pixels (test)
     int   warpFillUncovered = 1;   // FrameWarpFillUncovered: with the game's motion, what is uncovered from the background beside it (1.0.51)
     int   warpEdge = 0;       // FrameWarpEdge: the strip at the screen edge a moved flash has no picture for: 0 the move faded
                               // out toward the edge, 1 the picture mirrored at the edge, 2 the edge repeated (stretched, before 1.0.45)
@@ -426,6 +427,7 @@ static void LoadSettings(Settings &s)
     s.warpSnapY = std::max(0.0f, std::min(16.0f, IniFloat("FrameWarpSnapY", 0.0f)));
     s.warpEdge = std::max(0, std::min(2, IniInt("FrameWarpEdge", 0)));
     s.warpFillUncovered = IniInt("FrameWarpFillUncovered", 1) ? 1 : 0;
+    s.warpFillDebug = IniInt("FrameWarpFillUncoveredDebug", 0) ? 1 : 0;
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -1847,8 +1849,10 @@ float4 GameFlow(float2 uv)
 // With frame generation, a generated frame shows everything warpLag shown frames short of where the vectors' (rendered)
 // frame has it, so the vectors are read where each point is in that frame: warpLag shown frames further along its
 // motion (ep8). The picture is still moved by warp.
+static int gFillSeen = 0;   // FrameWarpFillUncoveredDebug: 1 filled from the background beside, 2 uncovered and not filled
 float2 WarpShiftGame(float2 uv)
 {
+    gFillSeen = 0;
     uint w, h;
     src.GetDimensions(w, h);
     const float2 osz = float2(w, h);                      // the check below is to a pixel of the game frame
@@ -1868,6 +1872,7 @@ float2 WarpShiftGame(float2 uv)
         if (g.w > frontNear) { frontNear = g.w; front = g.xy; }
     }
     const bool uncovered = bestNear < 0.0;
+    if (uncovered) gFillSeen = 2;
     if (uncovered) { best = backNear <= 1.0 ? back : float2(0.0, 0.0); bestK = backK; }
     // Up to the rendered frame the motion is known (a generated frame); past it, it's a guess that it carries on: that part
     // eases off as the motion slows, so a camera coming to a stop isn't pushed past where it stops and snapped back (ep9).
@@ -1894,7 +1899,7 @@ float2 WarpShiftGame(float2 uv)
                 const float4 g = GameFlow(q);
                 if (g.w < -0.5) break;                        // the HUD: not taken from
                 if (g.z > 0.5 && g.w < frontNear - 0.002 && g.w <= backNear + 0.02)
-                    return clamp(uv - q, -0.08, 0.08);        // the picture there is shown here
+                { gFillSeen = 1; return clamp(uv - q, -0.08, 0.08); }   // the picture there is shown here
             }
         }
     }
@@ -2033,6 +2038,9 @@ bool FetchWarped(float2 pos, out float3 c)
     if (warpSrc != 0 && (GameFlow(cp * inv).w < -0.5 || GameFlow(p * inv).w < -0.5)) return false;
     if (Still(int2(p), size)) return false;
     gSrcPos = p;
+    // FrameWarpFillUncoveredDebug (flags & 16384): uncovered pixels tinted -- magenta filled from the background beside,
+    // cyan found uncovered but not filled
+    if ((flags & 16384) != 0 && gFillSeen != 0) { c = gFillSeen == 1 ? float3(0.8, 0.0, 0.8) : float3(0.0, 0.8, 0.8); return true; }
     if (srcPerOut.x > 1.0001 || srcPerOut.y > 1.0001)
     {
         float2 o = 0.25 * srcPerOut;
@@ -4901,6 +4909,7 @@ static DWORD WINAPI PresenterThread(void *)
             c.warpSnapX = s.warpSnapX; c.warpSnapY = s.warpSnapY;
             if (s.warpEdge == 0) c.flags |= 8192u; else if (s.warpEdge == 1) c.flags |= 4096u;   // the screen edges (FrameWarpEdge)
             if (s.warpFillUncovered) c.flags |= 2048u;          // uncovered areas from the background beside them (FrameWarpFillUncovered)
+            if (s.warpFillDebug) c.flags |= 16384u;             // and where that applies, tinted (FrameWarpFillUncoveredDebug)
             // what stands still, found in the frames from before ReShade's effects (FrameWarpStillBeforeEffects)
             if (s.warpStillPre && g_pre[pick] && g_pre[warpPrev] && g_preOk[pick] && g_preOk[warpPrev])
                 c.flags |= 32768u | (pfx::OverlayOpen() ? 131072u : 0u);   // ReShade's window open: the finished frames too
@@ -14958,6 +14967,11 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "from behind it was never drawn. Off: it is taken with the background's motion, which shows the\n"
                                                               "thing in front a second time where it was (a ghost edge behind it). On: the background beside\n"
                                                               "it is taken instead, a short smear of background. No latency; costs only where it applies.");
+                bool fd = s.warpFillDebug != 0;
+                ImGui::SameLine();
+                if (ImGui::Checkbox("Show them##fillDbg", &fd)) s.warpFillDebug = fd ? 1 : 0;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Test: on moved flashes, uncovered pixels are tinted -- magenta where they were filled from\n"
+                                                              "the background beside, cyan where they were found uncovered but not filled.");
             }
             if (s.warpGame)
             {
