@@ -6077,7 +6077,11 @@ static DWORD WINAPI PresenterThread(void *)
                     static int backs = 0;
                     static ULONGLONG tightAt = 0;
                     const ULONGLONG nowMs = GetTickCount64();
-                    if (vbud > 0.0)
+                    // nothing in the first 30 s after the presenter starts: loading makes the game's memory jump (1.0.50-t3)
+                    static ULONGLONG startAt = 0, seenAt = 0;
+                    if (!seenAt || nowMs - seenAt > 3000) startAt = nowMs;   // not run for a while: the presenter (re)started
+                    seenAt = nowMs;
+                    if (vbud > 0.0 && nowMs - startAt >= 30000)
                     {
                         if (!tight && vu > vbud - 1024.0 && nowMs - tightAt >= 10000)
                         {
