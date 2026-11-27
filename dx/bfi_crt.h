@@ -314,7 +314,6 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
     for (int i = 0; i < kDefN; i++) { snprintf(line, sizeof(line), "#define %s %d\n", kDefs[i].name, vals[i]); d += line; }
     {
         int post = 0;
-        for (int k = 0; k < kCrtPostN; k++) { const int di = DefIndex(kCrtPost[k].sw); if (di >= 0 && vals[di]) post++; }
         (void)post;
         // always: the pattern is drawn into a texture (with the frame, dx/bfi_crt.h Bake), the main shader reads it
         snprintf(line, sizeof(line), "#define CRT_POST %d\n", 1); d += line;
@@ -446,7 +445,10 @@ static const char kCrtGlue[] =
     "#if CRT_POST\n"
     "Texture2D<float4> crtPrev : register(t11);\n"       // the passes after the pattern: the pass before
     "Texture2D<float4> crtGrainRaw : register(t12);\n"   // and the grain pass's own texture
-    "float4 CrtPrev(float2 uv) { return crtPrev.SampleLevel(linClamp, uv, 0); }\n"
+    // PSCrtTail: each folded pass reads its own pixel of the one before from crtFused, not from a texture
+    "static float4 crtFused = 0.0;\n"
+    "static bool crtFusing = false;\n"
+    "float4 CrtPrev(float2 uv) { if (crtFusing) return crtFused; return crtPrev.SampleLevel(linClamp, uv, 0); }\n"
     "float4 CrtGrainRaw(float2 uv) { return crtGrainRaw.SampleLevel(linClamp, uv, 0); }\n"
     "#endif\n";
 static const char kCrtApply[] =
@@ -465,6 +467,29 @@ static const char kCrtApply[] =
     "{\n"
     "    const float3 c = Fetch(pos.xy / srcPerOut);\n"
     "    return float4(CrtApply(c, pos.xy), 1.0);\n"
+    "}\n"
+    // Grain's second half, the noise floor, gamut and the corners in one pass (1.0.50): all but grain read only their
+    // own pixel of the pass before, so each takes the one before's result as it is -- three full-screen passes fewer
+    "float4 PSCrtTail(float4 pos : SV_Position) : SV_Target\n"
+    "{\n"
+    "    const float2 uv = pos.xy * CrtPixelSize;\n"
+    "    float4 o;\n"
+    "#if ENABLE_GRAIN\n"
+    "    crt_grain_diffuse_PS(pos, uv, o);\n"
+    "#else\n"
+    "    o = CrtPrev(uv);\n"
+    "#endif\n"
+    "    crtFusing = true;\n"
+    "#if ENABLE_NOISE_FLOOR\n"
+    "    crtFused = o; crt_noise_floor_PS(pos, uv, o);\n"
+    "#endif\n"
+    "#if ENABLE_GAMUT_EXPAND\n"
+    "    crtFused = o; crt_gamut_expand_PS(pos, uv, o);\n"
+    "#endif\n"
+    "#if ENABLE_CORNER_ROUND\n"
+    "    crtFused = o; crt_corner_round_PS(pos, uv, o);\n"
+    "#endif\n"
+    "    return o;\n"
     "}\n"
     "float3 CrtColour(float2 pos)\n"
     "{\n"
@@ -517,8 +542,17 @@ static DWORD WINAPI CompileThread(void *)
                 if (e >= 1 && !post) continue;
                 if (e >= 2)
                 {
-                    char sw[96]; snprintf(sw, sizeof(sw), "#define %s 1\n", kCrtPost[e - 2].sw);
-                    if (defs.find(sw) == std::string::npos) continue;      // its switch off: not drawn
+                    // its switch off (any of them, for one with several: a|b): not drawn
+                    bool any = false;
+                    std::string sws = kCrtPost[e - 2].sw;
+                    for (size_t a = 0; a <= sws.size() && !any; )
+                    {
+                        size_t b = sws.find('|', a); if (b == std::string::npos) b = sws.size();
+                        const std::string sw = "#define " + sws.substr(a, b - a) + " 1\n";
+                        if (defs.find(sw) != std::string::npos) any = true;
+                        a = b + 1;
+                    }
+                    if (!any) continue;
                 }
                 ID3DBlob *b = nullptr, *err = nullptr;
                 HRESULT hr = compile(full.data(), full.size(), "bfi_presenter_crt", nullptr, nullptr, entry, "ps_5_0",
@@ -580,6 +614,10 @@ static bool PostOn(int k, const float *cp)
     if (!strcmp(e, "PSCrtNoiseFloor")) return ParamOf(cp, "crt_noise_floor") > 0.001f;
     if (!strcmp(e, "PSCrtGamut"))      return ParamOf(cp, "crt_gamut_expand_strength") >= 0.001f;
     if (!strcmp(e, "PSCrtCorner"))     return ParamOf(cp, "crt_corner_size") >= 0.001f || ParamOf(cp, "crt_corner_border") >= 0.001f;
+    if (!strcmp(e, "PSCrtTail"))       // the folded passes: drawn when any of them changes the picture
+        return ParamOf(cp, "crt_grain_intensity") > 0.001f || ParamOf(cp, "crt_noise_floor") > 0.001f ||
+               ParamOf(cp, "crt_gamut_expand_strength") >= 0.001f ||
+               ParamOf(cp, "crt_corner_size") >= 0.001f || ParamOf(cp, "crt_corner_border") >= 0.001f;
     return true;
 }
 // The presenter: this frame's settings, with the frame size (w, h).
@@ -872,13 +910,15 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     for (int p = 0; p < kCrtPostN; p++)
         if (bPso[1 + p] && PostOn(p, cp)) { steps[ns++] = p; if (!PostIsGrainRaw(p)) lastMain = ns - 1; }
     int last = 0;
+    gt::Mark(list, gt::Q_B0);
     into(lastMain < 0 ? 3 : 0, bPso[0], -1);
+    gt::Mark(list, gt::Q_B0 + 1);                                    // each pass timed (the timing log): the pattern
     for (int i = 0; i < ns; i++)
     {
         const int p = steps[i];
-        if (PostIsGrainRaw(p)) { into(2, bPso[1 + p], last); continue; }
-        into(i == lastMain ? 3 : 1 - last, bPso[1 + p], last);
-        last = 1 - last;
+        if (PostIsGrainRaw(p)) into(2, bPso[1 + p], last);
+        else { into(i == lastMain ? 3 : 1 - last, bPso[1 + p], last); last = 1 - last; }
+        gt::Mark(list, gt::Q_B0 + 2 + p);                            // and each pass after it
     }
     for (UINT i = 0; i < nin; i++) std::swap(in[i].Transition.StateBefore, in[i].Transition.StateAfter);
     list->ResourceBarrier(nin, in);

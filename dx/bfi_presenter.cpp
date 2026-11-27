@@ -7434,7 +7434,8 @@ static HRESULT ResizeOnPresenterQueue(IDXGISwapChain3 *sc, UINT cnt, UINT w, UIN
 // few frames later and logged every 10 s, so their cost can be told apart from the game's.
 namespace gt
 {
-enum { Q_PFX0, Q_PFX1, Q_FIN0, Q_FIN1, Q_P0, Q_P1, Q_P2, Q_P3, Q_P4, kQ };
+// Q_B0..: the CRT hand-off's picture made with the frame -- before it, after the pattern, after each kCrtPost pass
+enum { Q_PFX0, Q_PFX1, Q_FIN0, Q_FIN1, Q_P0, Q_P1, Q_P2, Q_P3, Q_P4, Q_B0, kQ = Q_B0 + 2 + kCrtPostN };
 static const int kR = 16;
 static ID3D12QueryHeap *heap = nullptr;
 static ID3D12Resource *rb = nullptr;
@@ -7446,6 +7447,7 @@ static bool used[kR][kQ] = {};
 static UINT64 fenceOf[kR] = {};
 static bool pending[kR] = {};
 static double sum[6] = {}; static int cnt[6] = {}; static int frames = 0;
+static double bSum[1 + kCrtPostN] = {}; static int bCnt[1 + kCrtPostN] = {};   // the hand-off's passes: [0] the pattern
 static double logT = 0.0;
 static bool On() { return g_shared.log != 0 && g_device && g_gameQueue && !g_dx11.load(); }
 static bool Ensure()
@@ -7488,6 +7490,15 @@ static void Collect()
         auto d = [&](int a, int b) { return (used[r][a] && used[r][b] && t[b] >= t[a]) ? (double)(t[b] - t[a]) * 1000.0 / freq : -1.0; };
         const double v[6] = { d(Q_PFX0, Q_PFX1), d(Q_FIN0, Q_FIN1), d(Q_P0, Q_P1), d(Q_P1, Q_P2), d(Q_P2, Q_P3), d(Q_P3, Q_P4) };
         for (int i = 0; i < 6; i++) if (v[i] >= 0.0 && v[i] < 100.0) { sum[i] += v[i]; cnt[i]++; }
+        // each hand-off pass: from the mark before it (the last one used) to its own
+        for (int k = 0, prev = used[r][Q_B0] ? Q_B0 : -1; k <= kCrtPostN && prev >= 0; k++)
+        {
+            const int q = Q_B0 + 1 + k;
+            if (!used[r][q]) continue;
+            const double ms = d(prev, q);
+            if (ms >= 0.0 && ms < 100.0) { bSum[k] += ms; bCnt[k]++; }
+            prev = q;
+        }
         frames++;
         pending[r] = false;
         for (int q = 0; q < kQ; q++) used[r][q] = false;
@@ -7502,6 +7513,20 @@ static void Collect()
              "the game's motion %.3f (%.0f%%); frame before the effects: at the effects %.3f (%.0f%%), into the slot %.3f (%.0f%%); "
              "CRT hand-off: after the effects %.3f (%.0f%%), at the Present %.3f (%.0f%%)",
              tn - logT, frames, a(2), a(3), n(3), a(0), n(0), a(4), n(4), a(1), n(1), a(5), n(5));
+        if (bCnt[0])
+        {
+            std::string pl;
+            char one[96];
+            for (int k = 0; k <= kCrtPostN; k++)
+            {
+                if (!bCnt[k]) continue;
+                const char *nm = k == 0 ? "PSCrtPattern" : kCrtPost[k - 1].entry;
+                snprintf(one, sizeof(one), "%s%s %.3f (%.0f%%)", pl.empty() ? "" : ", ", nm + 5, bSum[k] / bCnt[k], 100.0 * bCnt[k] / frames);
+                pl += one;
+            }
+            LOGI("BFI Presenter: CRT hand-off, its passes at the Present (ms, %% of frames): %s", pl.c_str());
+        }
+        for (int k = 0; k <= kCrtPostN; k++) { bSum[k] = 0.0; bCnt[k] = 0; }
         for (int i = 0; i < 6; i++) { sum[i] = 0.0; cnt[i] = 0; }
         frames = 0; logT = tn;
     }

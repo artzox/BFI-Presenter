@@ -1717,9 +1717,6 @@ static const CrtPost kCrtPost[] = {
     { "ENABLE_SHARPEN", "PSCrtSharpen" },
     { "ENABLE_SCANLINE_SOFTEN", "PSCrtSoften" },
     { "ENABLE_GRAIN", "PSCrtGrainRaw" },
-    { "ENABLE_GRAIN", "PSCrtGrain" },
-    { "ENABLE_NOISE_FLOOR", "PSCrtNoiseFloor" },
-    { "ENABLE_GAMUT_EXPAND", "PSCrtGamut" },
-    { "ENABLE_CORNER_ROUND", "PSCrtCorner" },
+    { "ENABLE_GRAIN|ENABLE_NOISE_FLOOR|ENABLE_GAMUT_EXPAND|ENABLE_CORNER_ROUND", "PSCrtTail" },
 };
-static const int kCrtPostN = 7;
+static const int kCrtPostN = 4;

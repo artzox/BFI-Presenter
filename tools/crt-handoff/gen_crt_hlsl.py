@@ -105,6 +105,11 @@ out.append('#if CRT_POST')
 out.append(ptext)
 out.append('#endif')
 post_names = [(sw, nm) for sw, fn, nm in POST]
+# Grain's second half, the noise floor, gamut and the corners each read only their own pixel of the pass before: drawn
+# as one pass (PSCrtTail in dx/bfi_crt.h, 1.0.50), its switch any of theirs. Each one's own entry is still generated.
+TAIL = ('Grain', 'NoiseFloor', 'Gamut', 'Corner')
+tail_sw = '|'.join(dict.fromkeys(sw for sw, nm in post_names if nm in TAIL))
+post_names = [(sw, nm) for sw, nm in post_names if nm not in TAIL] + [(tail_sw, 'Tail')]
 text = '\n'.join(out)
 text = text.replace('tex2D(ReShade::BackBuffer, ', 'CrtBB(').replace('ReShade::PixelSize', 'CrtPixelSize')
 text = text.replace('tex2D(crt_halation_v_sampler, ', 'CrtHalo(').replace('tex2D(crt_glow_v_sampler, ', 'CrtGlow(')
