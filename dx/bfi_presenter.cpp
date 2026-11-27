@@ -1849,7 +1849,7 @@ float4 GameFlow(float2 uv)
 // With frame generation, a generated frame shows everything warpLag shown frames short of where the vectors' (rendered)
 // frame has it, so the vectors are read where each point is in that frame: warpLag shown frames further along its
 // motion (ep8). The picture is still moved by warp.
-static int gFillSeen = 0;   // FrameWarpFillUncoveredDebug: 1 filled from the background beside, 2 uncovered and not filled
+static int gFillSeen = 0;   // FrameWarpFillUncoveredDebug: 1 filled (magenta), 2 uncovered, nothing in front to fill past (cyan), 3 searched, no background found (yellow)
 float2 WarpShiftGame(float2 uv)
 {
     gFillSeen = 0;
@@ -1884,12 +1884,15 @@ float2 WarpShiftGame(float2 uv)
     // from where it was -- a second, ghost edge behind it. Instead the background beside it is taken: from where the
     // background's motion leads, step back against the front's motion (relative to the background's) until the point
     // is behind it, and take the background there -- a short smear of background instead of a copy of the edge.
-    if (uncovered && (flags & 2048) != 0 && backNear <= 1.0 && frontNear > backNear + 0.002)
+    // How near a point is (w) goes with 1 / distance, so "behind" is a ratio, not a difference: a character 3 m away and
+    // the floor behind it differ by a few thousandths (t1 tested a fixed 0.002 and found no background: all cyan).
+    if (uncovered && (flags & 2048) != 0 && backNear <= 1.0 && frontNear > backNear * 1.03)
     {
         const float2 rel = (front - back) * s;                // how far the front moved against the background, uv
         const float relPx = length(rel * osz);
-        if (relPx > 1.0)
+        if (relPx > 0.5)
         {
+            gFillSeen = 3;                                    // searched (debug: yellow if nothing found)
             const float2 dir = -rel / max(length(rel), 1e-6);   // toward the side it uncovers from
             const float2 at = uv - back * s;                  // where the background's motion leads, in this frame
             const float stepUv = max(relPx / 12.0, 1.0) / max(osz.x, osz.y);
@@ -1898,7 +1901,7 @@ float2 WarpShiftGame(float2 uv)
                 const float2 q = at + dir * stepUv * j;
                 const float4 g = GameFlow(q);
                 if (g.w < -0.5) break;                        // the HUD: not taken from
-                if (g.z > 0.5 && g.w < frontNear - 0.002 && g.w <= backNear + 0.02)
+                if (g.z > 0.5 && g.w < frontNear * 0.97)       // at least 3% further away than the front
                 { gFillSeen = 1; return clamp(uv - q, -0.08, 0.08); }   // the picture there is shown here
             }
         }
@@ -2040,7 +2043,8 @@ bool FetchWarped(float2 pos, out float3 c)
     gSrcPos = p;
     // FrameWarpFillUncoveredDebug (flags & 16384): uncovered pixels tinted -- magenta filled from the background beside,
     // cyan found uncovered but not filled
-    if ((flags & 16384) != 0 && gFillSeen != 0) { c = gFillSeen == 1 ? float3(0.8, 0.0, 0.8) : float3(0.0, 0.8, 0.8); return true; }
+    if ((flags & 16384) != 0 && gFillSeen != 0)
+    { c = gFillSeen == 1 ? float3(0.8, 0.0, 0.8) : gFillSeen == 3 ? float3(0.8, 0.8, 0.0) : float3(0.0, 0.8, 0.8); return true; }
     if (srcPerOut.x > 1.0001 || srcPerOut.y > 1.0001)
     {
         float2 o = 0.25 * srcPerOut;
@@ -14970,8 +14974,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 bool fd = s.warpFillDebug != 0;
                 ImGui::SameLine();
                 if (ImGui::Checkbox("Show them##fillDbg", &fd)) s.warpFillDebug = fd ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Test: on moved flashes, uncovered pixels are tinted -- magenta where they were filled from\n"
-                                                              "the background beside, cyan where they were found uncovered but not filled.");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Test: on moved flashes, uncovered pixels are tinted -- magenta: filled from the background\n"
+                                                              "beside; yellow: searched, no background found; cyan: nothing clearly in front to fill past.");
             }
             if (s.warpGame)
             {
