@@ -4676,9 +4676,11 @@ static DWORD WINAPI PresenterThread(void *)
                     const double got = newestId > ipNewestSeen ? (double)(newestId - ipNewestSeen) : 0.0;
                     if (newestId > ipNewestSeen) ipNewestSeen = newestId;
                     ipRate = 0.9 * ipRate + 0.1 * std::min(got, 3.0);       // game frames per strobe cycle
+                    const double was = ipP;
                     ipP += ipRate;
                     ipP += 0.15 * ((double)newestId - 1.0 - ipP);             // one frame behind the newest
                     ipP = std::max((double)newestId - 3.0, std::min((double)newestId, ipP));
+                    ipP = std::max(ipP, std::min(was, (double)newestId));      // never back to an older picture
                     if (ipRate < 0.985) ipFullT = Now();
                     else if (Now() - ipFullT > 3.0)
                     {
