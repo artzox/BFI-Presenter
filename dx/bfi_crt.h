@@ -341,6 +341,7 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
 
 // The game's Present, on the frame copy list: this frame's halation and glow textures into the slot.
 static void CountBytes();
+static void ReleaseIdle();
 static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s)
 {
     // The copies of the frame before ReShade's window (one per slot, 33 MB each at 4K) are needed only while the window
@@ -364,6 +365,7 @@ static void CopyAtPresent(ID3D12GraphicsCommandList *list, UINT s)
             }
         }
     }
+    ReleaseIdle();
     bool ok = false;
     if (state.load() == 2 && curOk && Wanted())
     {
@@ -674,7 +676,7 @@ static bool bFreed = true;
 static void SetMemoryTight(bool tight)
 {
     if (bTight.exchange(tight) != tight)
-        LOGI("BFI Presenter: CRT hand-off: %s", tight ? "the game is close to its video memory budget -- the CRT picture is no longer made with each frame (its textures freed); each refresh draws it"
+        LOGI("BFI Presenter: CRT hand-off: %s", tight ? "the game is close to its video memory budget -- the CRT picture is no longer made with each frame (its textures freed; with grain on, the grain still is); each refresh draws it"
                                                       : "video memory to spare again -- the CRT picture is made with each frame");
 }
 static void SetBakeSkip(bool skip)
@@ -792,14 +794,30 @@ static bool Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
             const UINT64 drawn = g_presFenceVal;
             if (g_presFence && drawn) WaitFence(g_presFence, drawn, g_gameFenceEvent);
             for (UINT j = 0; j < kStage; j++) SafeRelease(bOut[j]);
-            for (int g = 0; g < 2; g++) bGrainTag[g] = 0;
-            for (UINT j = 0; j < kStage; j++) bSlotTag[j] = 0;
-            for (int k = 0; k < 4; k++) SafeRelease(bRt[k]);
-            bOutGen++; bRingGen++;
+            bOutGen++;
             bFreed = true;
         }
-        return false;
+        // grain's first half is still made with the frame (four textures of the eleven; 1.0.50-t8): each refresh draws
+        // the rest of its CRT picture, with the frame's grain -- without grain nothing is, and they are freed too
+        float q[kCrtSlots * 4];
+        ParamsFor(q, 1.0f, 1.0f);
+        if (!(ParamOf(q, "crt_grain_intensity") > 0.001f))
+        {
+            bSlotTag[s] = 0;
+            if (bRt[0] || bRt[2])
+            {
+                for (int g = 0; g < 2; g++) bGrainTag[g] = 0;
+                for (UINT j = 0; j < kStage; j++) bSlotTag[j] = 0;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                WaitGame();
+                if (g_presFence && g_presFenceVal) WaitFence(g_presFence, g_presFenceVal, g_gameFenceEvent);
+                for (int k = 0; k < 4; k++) SafeRelease(bRt[k]);
+                bRingGen++;
+            }
+            return false;
+        }
     }
+    const bool tight = bTight.load();
     bSlotTag[s] = 0;
     // Most flashes moved: not made -- unless grain is on: moved flashes take their frame's grain from it (1.0.50)
     bool skip = bSkip.load();
@@ -810,7 +828,7 @@ static bool Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
         if (ParamOf(q, "crt_grain_intensity") > 0.001f) skip = false;
     }
     if (skip || !(state.load() == 2 && slotOk[s] && Wanted() && stage) || !BakeSetup()) return false;
-    bFreed = false;
+    if (!tight) bFreed = false;
     const D3D12_RESOURCE_DESC sd = stage->GetDesc();
     const UINT fw = (UINT)sd.Width, fh = sd.Height;
     // the working textures (the game's queue only) and the slot's output
@@ -859,7 +877,7 @@ static bool Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
                     g_device->CreateShaderResourceView(bRt[v ? 2 + g : from], nullptr, h);
                 }
     }
-    if (!bOut[s])
+    if (!bOut[s] && !tight)
     {
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;       // the last pass draws into it (t10: drawn, then copied)
         if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&bOut[s]))))
@@ -927,6 +945,15 @@ static bool Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     bool grain = false;
     for (int p = 0; p < kCrtPostN; p++)
         if (bPso[1 + p] && PostOn(p, cp)) { steps[ns++] = p; if (!PostIsGrainRaw(p)) lastMain = ns - 1; else grain = true; }
+    if (tight)
+    {
+        // up to grain's first half only, nothing into bOut (freed)
+        if (!grain) return false;
+        int n = 0;
+        while (n < ns && !PostIsGrainRaw(steps[n])) n++;
+        ns = n + 1;
+        lastMain = -2;
+    }
     // grain's texture: the one of the two not read by the presenter last (it waits for the read it may still do)
     const int g = bRing;
     if (grain)
@@ -957,7 +984,7 @@ static bool Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     };
     int last = 0;
     gt::Mark(list, gt::Q_B0);
-    into(lastMain < 0 ? 3 : 0, bPso[0], -1);
+    into(lastMain == -1 ? 3 : 0, bPso[0], -1);
     gt::Mark(list, gt::Q_B0 + 1);                                    // each pass timed (the timing log): the pattern
     for (int i = 0; i < ns; i++)
     {
@@ -977,9 +1004,9 @@ static bool Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
         bGrainTag[g] = tag;                              // the presenter takes it once the bake's fence is done
     }
     else bSlotTag[s] = 0;
-    bOk[s] = true;                                   // shown once its own fence is done (BakeSubmitted, BakeReady)
+    bOk[s] = !tight;                                 // shown once its own fence is done (BakeSubmitted, BakeReady)
     static bool logged = false;
-    if (!logged) { logged = true; LOGI("BFI Presenter: CRT hand-off: each frame's CRT picture is drawn with the frame (the game's queue); flashes moved by frame warp draw their own"); }
+    if (!logged && !tight) { logged = true; LOGI("BFI Presenter: CRT hand-off: each frame's CRT picture is drawn with the frame (the game's queue); flashes moved by frame warp draw their own"); }
     return true;
 }
 // The game side's video memory, once a second (the settings window and the OSD show it)
@@ -994,6 +1021,40 @@ static void CountBytes()
     for (UINT j = 0; j < kStage; j++) n += ResBytes(bOut[j]);
     for (int k = 0; k < 4; k++) n += ResBytes(bRt[k]);
     g_bytesCrtGame = n;
+}
+static void ReleaseIdle()
+{
+    // Not in use (the hand-off off, or CRT-Standalone not handing off) for 5 s: all of its textures freed (1.0.50-t8:
+    // Returnal kept 291 MB after CRT-Standalone stopped handing off, while the game was over its budget)
+    {
+        static double idleT = -1.0;
+        if (state.load() == 2 && Wanted()) idleT = -1.0;
+        else if (idleT < 0.0) idleT = Now();
+        else if (Now() - idleT > 5.0)
+        {
+            bool any = false;
+            for (int k = 0; k < kTexN; k++) { if (cur[k]) any = true; for (UINT j = 0; j < kStage; j++) if (slotTex[k][j]) any = true; }
+            for (UINT j = 0; j < kStage; j++) if (bOut[j]) any = true;
+            for (int k = 0; k < 4; k++) if (bRt[k]) any = true;
+            if (any)
+            {
+                const double mb = (double)g_bytesCrtGame.load() / 1048576.0;
+                for (UINT j = 0; j < kStage; j++) { bOk[j] = false; slotOk[j] = false; bSlotTag[j] = 0; }
+                for (int g = 0; g < 2; g++) bGrainTag[g] = 0;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                WaitGame();
+                if (g_presFence && g_presFenceVal) WaitFence(g_presFence, g_presFenceVal, g_gameFenceEvent);
+                for (int k = 0; k < kTexN; k++) { SafeRelease(cur[k]); curHas[k] = false; for (UINT j = 0; j < kStage; j++) SafeRelease(slotTex[k][j]); }
+                curOk = false;
+                for (UINT j = 0; j < kStage; j++) { SafeRelease(bOut[j]); bSeenSrc[j] = nullptr; for (int t = 0; t < kTexN; t++) bSeenTex[j][t] = nullptr; }
+                for (int k = 0; k < 4; k++) SafeRelease(bRt[k]);
+                bFreed = true;
+                slotGen++; bOutGen++; bRingGen++;
+                g_bytesCrtGame = 0;
+                LOGI("BFI Presenter: CRT hand-off not in use -- its textures freed (%.0f MB)", mb);
+            }
+        }
+    }
 }
 static ID3D12Resource *BakeOut(UINT s) { return s < kStage ? bOut[s] : nullptr; }
 static bool BakeReady(UINT s)

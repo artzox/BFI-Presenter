@@ -5395,7 +5395,8 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     crtKeyC = kc; memcpy(crtKeyP, cp, sizeof(cp)); crtKeyId = pickId; crtKeyPrev = kPrev;
                     // A moved flash takes its frame's grain (made with the frame, dx/bfi_crt.h) instead of making it again
-                    const int ring = (c.warp != 0.0f && reserve) ? crt::GrainFor((UINT)pick, reserve) : -1;
+                    // (and so does any flash whose picture wasn't made with the frame: memory short, or not done yet)
+                    const int ring = reserve ? crt::GrainFor((UINT)pick, reserve) : -1;
                     ID3D12Resource *ringTex = crt::GrainTex(ring);
                     if (ring >= 0 && (ringGenSeen != crt::RingGen() || ringRtSeen != ringRtGen))
                     {
@@ -5457,7 +5458,7 @@ static DWORD WINAPI PresenterThread(void *)
                         list->ResourceBarrier(1, &gb);
                         crtGrainReused++;
                     }
-                    else if (c.warp != 0.0f) crtGrainMade++;
+                    else crtGrainMade++;
                     list->RSSetViewports(1, &vp);
                     list->RSSetScissorRects(1, &sc);
                     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -5470,7 +5471,7 @@ static DWORD WINAPI PresenterThread(void *)
             if (crtGrainReused + crtGrainMade && Now() - crtGrainLogT > 10.0)
             {
                 if (crtGrainLogT > 0.0)
-                    LOGI("BFI Presenter: CRT hand-off: last 10 s, moved flashes with their frame's grain %u, that made their own %u",
+                    LOGI("BFI Presenter: CRT hand-off: last 10 s, CRT pictures drawn by the presenter (moved flashes, ...) with their frame's grain %u, that made their own %u",
                          crtGrainReused, crtGrainMade);
                 crtGrainLogT = Now(); crtGrainReused = crtGrainMade = 0;
             }
