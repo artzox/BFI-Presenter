@@ -196,7 +196,8 @@ struct Settings
                               // smaller than the screen, e.g. Townfall)
     int   warpEven = 0;       // FrameWarpEvenPacing: every strobe cycle moved to where the game's motion is, where the game's
                               // own motion is used; elsewhere missing frames are filled as usual
-    int   warpInterp = 0;          // FrameWarpInterpolate: one frame behind while frames are missing, the gaps interpolated (test, 1.0.51)
+    int   warpInterp = 0;          // FrameWarpInterpolate: one frame behind while frames are missing (test, 1.0.51): 0 off,
+                                   // 1 only the missing frames drawn between two (the rest as rendered), 2 even pacing (every cycle at its time)
     int   warpFillDebug = 0;       // FrameWarpFillUncoveredDebug: tint uncovered pixels (test)
     int   warpFillUncovered = 0;   // FrameWarpFillUncovered: with the game's motion, what is uncovered from the background beside it (1.0.51)
     int   warpEdge = 0;       // FrameWarpEdge: the strip at the screen edge a moved flash has no picture for: 0 the move faded
@@ -429,7 +430,7 @@ static void LoadSettings(Settings &s)
     s.warpEdge = std::max(0, std::min(2, IniInt("FrameWarpEdge", 0)));
     s.warpFillUncovered = IniInt("FrameWarpFillUncovered", 0) ? 1 : 0;   // t1-t5: worse than without (a smear around a character as the camera turns)
     s.warpFillDebug = IniInt("FrameWarpFillUncoveredDebug", 0) ? 1 : 0;
-    s.warpInterp = IniInt("FrameWarpInterpolate", 0) ? 1 : 0;
+    s.warpInterp = std::max(0, std::min(2, IniInt("FrameWarpInterpolate", 0)));   // 1 only the missing frames, 2 even pacing
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -4677,11 +4678,28 @@ static DWORD WINAPI PresenterThread(void *)
                     const double got = newestId > ipNewestSeen ? (double)(newestId - ipNewestSeen) : 0.0;
                     if (newestId > ipNewestSeen) ipNewestSeen = newestId;
                     ipRate = 0.9 * ipRate + 0.1 * std::min(got, 3.0);       // game frames per strobe cycle
-                    const double was = ipP;
-                    ipP += ipRate;
-                    ipP += 0.15 * ((double)newestId - 1.0 - ipP);             // one frame behind the newest
-                    ipP = std::max((double)newestId - 3.0, std::min((double)newestId, ipP));
-                    ipP = std::max(ipP, std::min(was, (double)newestId));      // never back to an older picture
+                    if (s.warpInterp == 2)
+                    {
+                        // even pacing: each cycle at its point in time, one frame behind the newest
+                        const double was = ipP;
+                        ipP += ipRate;
+                        ipP += 0.15 * ((double)newestId - 1.0 - ipP);
+                        ipP = std::max((double)newestId - 3.0, std::min((double)newestId, ipP));
+                        ipP = std::max(ipP, std::min(was, (double)newestId));  // never back to an older picture
+                    }
+                    else
+                    {
+                        // only the missing frames (1.0.51-i3): the next frame as rendered while one more is waiting behind it;
+                        // where showing it would leave none waiting (a frame missing), half way to it instead, and it the
+                        // cycle after. Sharp frames, one in-between picture per missing frame.
+                        const UINT64 base = (UINT64)std::floor(ipP + 1e-6);
+                        const bool half = ipP - std::floor(ipP + 1e-6) > 0.25;
+                        const UINT64 next = base + 1;
+                        if (newestId >= next + 3) ipP = (double)(newestId - 1);          // fallen behind: one behind again
+                        else if (newestId >= next + 1) ipP = (double)next;
+                        else if (newestId == next) ipP = half ? (double)next : (double)base + 0.5;
+                        // else nothing new at all: the same picture once more
+                    }
                     if (ipRate < 0.985) ipFullT = Now();
                     else if (Now() - ipFullT > 3.0)
                     {
@@ -15101,9 +15119,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
             }
             if (s.warpGame)
             {
-                bool wi = s.warpInterp != 0;
-                if (ImGui::Checkbox("Interpolate while frames are missing (test)", &wi)) s.warpInterp = wi ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's motion, without frame generation. At the first missing\n"
+                ImGui::Combo("Interpolate while frames are missing (test)", &s.warpInterp, "Off\0Only the missing frames\0Even pacing\0");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Only the missing frames: frames as rendered, each missing one replaced by a picture between the\n"
+                                                              "two around it. Even pacing: every strobe cycle at its point in time (smoothest, softer).\n"
+                                                              "With the game's motion, without frame generation. At the first missing\n"
                                                               "frame the presenter falls one game frame behind (about 17 ms more latency at 60 fps) and\n"
                                                               "draws each strobe cycle between two finished frames: what one of them hides, the other shows,\n"
                                                               "so nothing is made up (no ghost edges). Once the game holds the strobe rate for 3 s it shows\n"
