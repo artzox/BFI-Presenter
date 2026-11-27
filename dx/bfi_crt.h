@@ -648,6 +648,9 @@ static ID3D12Resource *bRt[3] = {};                 // [0] [1] in turn, [2] grai
 static ID3D12Resource *bOut[kStage] = {};           // the slot's CRT picture (COMMON between uses)
 static std::atomic<bool> bOk[kStage] = {};   // read by the presenter while the game's Present changes it
 static std::atomic<UINT> bOutGen{0};
+// 1.0.50: the picture is recorded in its own list, submitted after the frame is published -- so its passes (1.2 ms in
+// Onimusha) don't make the frame late; until its fence is done the presenter draws the flash's CRT picture itself
+static std::atomic<UINT64> bFence[kStage] = {};
 static ID3D12Resource *bCb = nullptr;
 static uint8_t *bCbMap = nullptr;
 static ID3D12Resource *bSeenSrc[kStage] = {}, *bSeenTex[kStage][kTexN] = {};
@@ -764,9 +767,10 @@ static void BakeWaitGame() { WaitGame(); }
 
 // The game's Present, on the frame copy list after CopyAtPresent: slot s's CRT picture into bOut[s].
 // waitRead: the presenter's fence value it may still be reading slot s at (its bOut[s] is remade only after it).
-static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead)
+static bool Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead)
 {
     bOk[s] = false;
+    bFence[s] = UINT64_MAX;                          // not shown until the submission it is recorded in is done
     if (bTight.load())
     {
         if (!bFreed)
@@ -783,9 +787,9 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
             bOutGen++;
             bFreed = true;
         }
-        return;
+        return false;
     }
-    if (bSkip.load() || !(state.load() == 2 && slotOk[s] && Wanted() && stage) || !BakeSetup()) return;
+    if (bSkip.load() || !(state.load() == 2 && slotOk[s] && Wanted() && stage) || !BakeSetup()) return false;
     bFreed = false;
     const D3D12_RESOURCE_DESC sd = stage->GetDesc();
     const UINT fw = (UINT)sd.Width, fh = sd.Height;
@@ -808,7 +812,7 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
         if (bRt[k]) continue;
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&bRt[k]))))
-        { bRt[k] = nullptr; return; }
+        { bRt[k] = nullptr; return false; }
         bRt[k]->SetName(L"BFI CRT-Standalone hand-off (game side)");
         D3D12_CPU_DESCRIPTOR_HANDLE h = bRtvHeap->GetCPUDescriptorHandleForHeapStart();
         h.ptr += (SIZE_T)k * bRtvStride;
@@ -829,7 +833,7 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     {
         rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;       // the last pass draws into it (t10: drawn, then copied)
         if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&bOut[s]))))
-        { bOut[s] = nullptr; return; }
+        { bOut[s] = nullptr; return false; }
         bOut[s]->SetName(L"BFI CRT-Standalone hand-off (the slot's CRT picture)");
         D3D12_CPU_DESCRIPTOR_HANDLE h = bRtvHeap->GetCPUDescriptorHandleForHeapStart();
         h.ptr += (SIZE_T)(3 + s) * bRtvStride;
@@ -922,9 +926,10 @@ static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage,
     }
     for (UINT i = 0; i < nin; i++) std::swap(in[i].Transition.StateBefore, in[i].Transition.StateAfter);
     list->ResourceBarrier(nin, in);
-    bOk[s] = true;
+    bOk[s] = true;                                   // shown once its own fence is done (BakeSubmitted, BakeReady)
     static bool logged = false;
     if (!logged) { logged = true; LOGI("BFI Presenter: CRT hand-off: each frame's CRT picture is drawn with the frame (the game's queue); flashes moved by frame warp draw their own"); }
+    return true;
 }
 // The game side's video memory, once a second (the settings window and the OSD show it)
 static void CountBytes()
@@ -940,7 +945,11 @@ static void CountBytes()
     g_bytesCrtGame = n;
 }
 static ID3D12Resource *BakeOut(UINT s) { return s < kStage ? bOut[s] : nullptr; }
-static bool BakeReady(UINT s) { return s < kStage && bOk[s] && bOut[s]; }
+static bool BakeReady(UINT s)
+{
+    return s < kStage && bOk[s] && bOut[s] && g_gameFence && g_gameFence->GetCompletedValue() >= bFence[s].load();
+}
+static void BakeSubmitted(UINT s, UINT64 fence) { if (s < kStage) bFence[s] = fence; }
 static UINT BakeGen() { return bOutGen.load(); }
 static void BakeRelease()
 {

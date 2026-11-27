@@ -113,7 +113,8 @@ static const int kBlobN = 2 + kCrtPostN;
 static bool TakeBlobs(UINT *gen, ID3DBlob *out[kBlobN]);
 static bool PostIsGrainRaw(int k);
 static bool PostOn(int k, const float *cp);
-static void Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead);
+static bool Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead);
+static void BakeSubmitted(UINT s, UINT64 fence);
 static ID3D12Resource *BakeOut(UINT s);
 static bool BakeReady(UINT s);
 static UINT BakeGen();
@@ -1083,6 +1084,9 @@ static UINT64                 g_recentFence[8] = {};      // copy fence of the l
 // game-queue copy resources
 static ID3D12CommandAllocator    *g_copyAlloc[kStage] = {};
 static ID3D12GraphicsCommandList *g_copyList = nullptr;
+static ID3D12CommandAllocator    *g_bakeAlloc[kStage] = {};    // the CRT hand-off's picture: its own list after the copy (1.0.50)
+static ID3D12GraphicsCommandList *g_bakeList = nullptr;
+static UINT64                     g_bakeDone[kStage] = {};     // the game-queue fence value of slot s's last one
 static ID3D12Fence               *g_gameFence = nullptr;
 static UINT64                     g_gameFenceVal = 0;
 static HANDLE                     g_gameFenceEvent = nullptr;
@@ -7728,9 +7732,13 @@ static HRESULT SubmitGameFrameLocked()
         }
     }
     crt::CopyAtPresent(g_copyList, s);        // CRT-Standalone's halation and glow, for the CRT hand-off
-    crt::Bake(g_copyList, s, g_stage[s], waitRead);   // and the frame's CRT picture with them (shown as is; a moved flash draws its own)
-    gt::Mark(g_copyList, gt::Q_P4);
-    gt::EndFrame(g_copyList, g_gameFenceVal + 1);
+    const bool bakeList = g_bakeList && g_bakeAlloc[s];
+    if (!bakeList)
+    {
+        crt::Bake(g_copyList, s, g_stage[s], waitRead);   // and the frame's CRT picture with them (shown as is; a moved flash draws its own)
+        gt::Mark(g_copyList, gt::Q_P4);
+        gt::EndFrame(g_copyList, g_gameFenceVal + 1);
+    }
     {
         const HRESULT ch = g_copyList->Close();
         static bool once = false;
@@ -7756,6 +7764,27 @@ static HRESULT SubmitGameFrameLocked()
     g_stageTime[s]  = Now();
     LeaveCriticalSection(&g_lock);
     LrStaged(g_frameId, g_gameFenceVal);
+    if (bakeList)
+    {
+        // The frame's CRT picture (the CRT hand-off), after the frame is published: the frame counts as arrived without
+        // its passes; until this list is done a flash of it draws its CRT picture itself (crt::BakeReady)
+        const UINT64 published = g_gameFenceVal;
+        WaitFence(g_gameFence, g_bakeDone[s], g_gameFenceEvent);   // its allocator idle (long done: one frame per slot)
+        g_bakeAlloc[s]->Reset();
+        g_bakeList->Reset(g_bakeAlloc[s], nullptr);
+        const bool baked = crt::Bake(g_bakeList, s, g_stage[s], waitRead);
+        gt::Mark(g_bakeList, gt::Q_P4);
+        gt::EndFrame(g_bakeList, published + 1);
+        const bool timed = gt::On();
+        if (SUCCEEDED(g_bakeList->Close()) && (baked || timed))
+        {
+            ID3D12CommandList *bl[] = { g_bakeList };
+            g_gameQueue->ExecuteCommandLists(1, bl);
+            g_gameQueue->Signal(g_gameFence, ++g_gameFenceVal);
+            g_bakeDone[s] = g_gameFenceVal;
+            crt::BakeSubmitted(s, g_gameFenceVal);
+        }
+    }
     g_gtCopy = Now();
 
     g_stageNext = (s + 1) % kStage;
@@ -11361,8 +11390,9 @@ static void ReleaseAll()
     g_rfxWantLimitUs.store(0);
 #endif
     ReleaseFrameResources();
-    for (UINT s = 0; s < kStage; s++) SafeRelease(g_copyAlloc[s]);
+    for (UINT s = 0; s < kStage; s++) { SafeRelease(g_copyAlloc[s]); SafeRelease(g_bakeAlloc[s]); g_bakeDone[s] = 0; }
     SafeRelease(g_copyList);
+    SafeRelease(g_bakeList);
     for (UINT i = 0; i < kMaxBuf; i++) SafeRelease(g_fbAlloc[i]);
     SafeRelease(g_fbList);
     SafeRelease(g_gameFence);
@@ -13837,14 +13867,19 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     bool ok = SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_gameFence))) &&
               SUCCEEDED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_presFence)));
     for (UINT s = 0; s < kStage && ok; s++)
-        ok = SUCCEEDED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_copyAlloc[s])));
+        ok = SUCCEEDED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_copyAlloc[s]))) &&
+             SUCCEEDED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_bakeAlloc[s])));
     if (ok)
         ok = SUCCEEDED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_copyAlloc[0], nullptr,
-                                                   IID_PPV_ARGS(&g_copyList)));
+                                                   IID_PPV_ARGS(&g_copyList))) &&
+             SUCCEEDED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_bakeAlloc[0], nullptr,
+                                                   IID_PPV_ARGS(&g_bakeList)));
     if (ok)
     {
         g_copyList->SetName(L"BFI frame copy list");
         g_copyList->Close();
+        g_bakeList->SetName(L"BFI CRT hand-off picture list");
+        g_bakeList->Close();
     }
     if (ok && g_presQueue)
     {
