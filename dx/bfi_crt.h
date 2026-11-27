@@ -516,6 +516,126 @@ static DXGI_FORMAT PassFormat()
     }
 }
 
+// The compiled shaders kept on disk (1.0.50): BFIPresenter_crt.bin next to the ini, the last four builds, each keyed
+// to its exact source (CRT-Standalone's switches are compiled in; its sliders are not, so they never cost a build).
+// "BFICRT01", a count, then per build its key (8 bytes) and kBlobN blobs, each a 4-byte size (0 = not built) and its bytes.
+static const int kCacheN = 4;
+static void CachePath(char *out, size_t n)
+{
+    snprintf(out, n, "%s", g_iniPath);
+    if (char *e = strrchr(out, '\\')) e[1] = '\0'; else out[0] = '\0';
+    strncat(out, "BFIPresenter_crt.bin", n - strlen(out) - 1);
+}
+static uint64_t CacheKey(const std::string &full)
+{
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const void *p, size_t n) { const uint8_t *b = (const uint8_t *)p; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; } };
+    mix(full.data(), full.size());
+    const UINT fl[2] = { D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCOMPILE_OPTIMIZATION_LEVEL1 };
+    mix(fl, sizeof(fl));
+    for (int e = 0; e < kBlobN; e++) { const char *en = e == 0 ? "PSMain" : e == 1 ? "PSCrtPattern" : kCrtPost[e - 2].entry; mix(en, strlen(en)); }
+    return h;
+}
+static bool CacheRead(std::vector<uint8_t> &d)
+{
+    if (!g_iniPath[0]) return false;
+    char path[MAX_PATH]; CachePath(path, sizeof(path));
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz = {};
+    bool ok = GetFileSizeEx(f, &sz) && sz.QuadPart >= 12 && sz.QuadPart < 64 * 1024 * 1024;
+    DWORD got = 0;
+    if (ok) { d.resize((size_t)sz.QuadPart); ok = ReadFile(f, d.data(), (DWORD)d.size(), &got, nullptr) && got == d.size(); }
+    CloseHandle(f);
+    return ok && memcmp(d.data(), "BFICRT01", 8) == 0;
+}
+// Each build in the file: where it starts and ends (the key first)
+static std::vector<std::pair<size_t, size_t>> CacheBuilds(const std::vector<uint8_t> &d)
+{
+    std::vector<std::pair<size_t, size_t>> r;
+    uint32_t n = 0; memcpy(&n, d.data() + 8, 4);
+    size_t at = 12;
+    for (uint32_t i = 0; i < n && i < kCacheN; i++)
+    {
+        const size_t b0 = at;
+        if (at + 8 > d.size()) break;
+        at += 8;
+        bool ok = true;
+        for (int e = 0; e < kBlobN && ok; e++)
+        {
+            uint32_t m = 0;
+            if (at + 4 > d.size()) { ok = false; break; }
+            memcpy(&m, d.data() + at, 4); at += 4;
+            if (at + m > d.size()) ok = false; else at += m;
+        }
+        if (!ok) break;
+        r.push_back({ b0, at });
+    }
+    return r;
+}
+static bool CacheLoad(uint64_t key, ID3DBlob *out[kBlobN])
+{
+    std::vector<uint8_t> d;
+    if (!CacheRead(d)) return false;
+    HMODULE dc = GetModuleHandleA("d3dcompiler_47.dll");
+    typedef HRESULT (WINAPI *PFN_CreateBlob)(SIZE_T, ID3DBlob **);
+    PFN_CreateBlob mk = dc ? (PFN_CreateBlob)(void *)GetProcAddress(dc, "D3DCreateBlob") : nullptr;
+    if (!mk) return false;
+    for (const auto &b : CacheBuilds(d))
+    {
+        uint64_t k = 0; memcpy(&k, d.data() + b.first, 8);
+        if (k != key) continue;
+        size_t at = b.first + 8;
+        for (int e = 0; e < kBlobN; e++)
+        {
+            uint32_t m = 0; memcpy(&m, d.data() + at, 4); at += 4;
+            out[e] = nullptr;
+            if (m && SUCCEEDED(mk(m, &out[e])) && out[e]) memcpy(out[e]->GetBufferPointer(), d.data() + at, m);
+            at += m;
+        }
+        if (out[0]) return true;
+        for (int e = 0; e < kBlobN; e++) SafeRelease(out[e]);
+        return false;
+    }
+    return false;
+}
+static void CacheSave(uint64_t key, ID3DBlob *const got[kBlobN])
+{
+    if (!g_iniPath[0]) return;
+    std::vector<uint8_t> old, d(12);
+    const bool had = CacheRead(old);
+    memcpy(d.data(), "BFICRT01", 8);
+    uint32_t n = 1;
+    d.resize(d.size() + 8); memcpy(d.data() + 12, &key, 8);
+    for (int e = 0; e < kBlobN; e++)
+    {
+        const uint32_t m = got[e] ? (uint32_t)got[e]->GetBufferSize() : 0;
+        const size_t at = d.size();
+        d.resize(at + 4 + m);
+        memcpy(d.data() + at, &m, 4);
+        if (m) memcpy(d.data() + at + 4, got[e]->GetBufferPointer(), m);
+    }
+    if (had)
+        for (const auto &b : CacheBuilds(old))                // the newest first: up to kCacheN, without this key's old one
+        {
+            if (n >= kCacheN) break;
+            uint64_t k = 0; memcpy(&k, old.data() + b.first, 8);
+            if (k == key) continue;
+            d.insert(d.end(), old.begin() + (ptrdiff_t)b.first, old.begin() + (ptrdiff_t)b.second);
+            n++;
+        }
+    memcpy(d.data() + 8, &n, 4);
+    char path[MAX_PATH], tmp[MAX_PATH + 8];
+    CachePath(path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    HANDLE f = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;                 // a read-only game folder: built each session instead
+    DWORD wr = 0;
+    const bool ok = WriteFile(f, d.data(), (DWORD)d.size(), &wr, nullptr) && wr == d.size();
+    CloseHandle(f);
+    if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileA(tmp);
+}
+
 static DWORD WINAPI CompileThread(void *)
 {
     for (;;)
@@ -534,7 +654,15 @@ static DWORD WINAPI CompileThread(void *)
         const size_t at = srcText.find(marker);
         ID3DBlob *got[kBlobN] = {};
         bool failed = !compile || at == std::string::npos;
+        bool cached = false;
+        uint64_t key = 0;
         if (!failed)
+        {
+            std::string full = "#define CRT_HANDOFF 1\n" + defs + srcText.substr(0, at) + kCrtGlue + kCrtHlsl + kCrtApply + srcText.substr(at + strlen(marker));
+            key = CacheKey(full);
+            cached = CacheLoad(key, got);
+        }
+        if (!failed && !cached)
         {
             std::string full = "#define CRT_HANDOFF 1\n" + defs + srcText.substr(0, at) + kCrtGlue + kCrtHlsl + kCrtApply + srcText.substr(at + strlen(marker));
             const bool post = defs.find("#define CRT_POST 1") != std::string::npos;
@@ -570,6 +698,7 @@ static DWORD WINAPI CompileThread(void *)
             }
         }
         if (failed) for (int e = 0; e < kBlobN; e++) SafeRelease(got[e]);
+        else if (!cached && got[0]) CacheSave(key, got);
         {
             std::lock_guard<std::mutex> l(blobLk);
             for (int e = 0; e < kBlobN; e++) { SafeRelease(blobs[e]); blobs[e] = got[e]; }
@@ -577,7 +706,7 @@ static DWORD WINAPI CompileThread(void *)
             blobGen++;
         }
         ID3DBlob *b = got[0];
-        if (b) LOGI("BFI Presenter: CRT hand-off: shader built in %.0f ms", (Now() - t0) * 1000.0);
+        if (b) LOGI("BFI Presenter: CRT hand-off: shader %s in %.0f ms", cached ? "loaded from BFIPresenter_crt.bin" : "built (kept in BFIPresenter_crt.bin for the next start)", (Now() - t0) * 1000.0);
     }
 }
 static void StartCompile()

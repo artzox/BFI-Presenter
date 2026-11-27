@@ -3186,6 +3186,9 @@ struct LearnRec
     double rfxMarginMs = 0.0;   // frames ready this long before the pick (the alignment's target then)
     int    rfxFg = 0;       // 1 = no frame generation, 2-4 = its factor
     int    rfxGaveUp = 0;   // 1 = the alignment went round the strobe cycle (the game's frames don't follow it)
+    // The CRT hand-off (1.0.50): the game was short of video memory for it (it stayed freed for a session) -- the next
+    // session starts that way. Not tied to the refresh rate; written on its own (g_learnCrtShort).
+    int    crtShort = 0;
 };
 static SRWLOCK     g_learnLock = SRWLOCK_INIT;
 static std::string g_learnKey;          // section in use ("" = none read yet)
@@ -3195,6 +3198,7 @@ static LearnRec    g_learnOut;          // to be written to it
 static bool        g_learnDirty = false;
 // "Forget this game" in the overlay: the helper thread deletes the game's section, the presenter starts over.
 static std::atomic<bool> g_learnForgetFile{false}, g_learnForgetNow{false};
+static std::atomic<int>  g_learnCrtShort{-1};   // to write: 1 = CrtHandoffMemoryShort, 0 = removed, -1 = nothing
 
 static void LearnPost(const LearnRec &r)
 {
@@ -3264,6 +3268,7 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
 {
     const std::string key = LearnKeyFor(exe, wnd);
     const bool forget = g_learnForgetFile.exchange(false);
+    const int crtShort = g_learnCrtShort.exchange(-1);
     AcquireSRWLockExclusive(&g_learnLock);
     const bool dirty = g_learnDirty && !forget;
     const LearnRec out = g_learnOut;
@@ -3271,7 +3276,9 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
     g_learnDirty = false;
     ReleaseSRWLockExclusive(&g_learnLock);
     char b[64];
-    if (dirty && !cur.empty())
+    if (crtShort >= 0 && !cur.empty() && !forget)
+        WritePrivateProfileStringA(cur.c_str(), "CrtHandoffMemoryShort", crtShort ? "1" : nullptr, path);
+    if (dirty && !cur.empty() && out.frames > 0)
     {
         const char *sec = cur.c_str();
         // Whole numbers (us, mHz): a game that sets its own locale reads "120.000" as 120 thousand or 120.
@@ -3323,6 +3330,7 @@ static void LearnTick(const char *path, const char *exe, HWND wnd)
         }
         r.rfxGaveUp = (int)get("ReflexAlignGaveUp", 0);
     }
+    r.crtShort = (int)get("CrtHandoffMemoryShort", 0);
     AcquireSRWLockExclusive(&g_learnLock);
     g_learnKey = key;
     g_learnRead = r;
@@ -6135,16 +6143,43 @@ static DWORD WINAPI PresenterThread(void *)
                     const ULONGLONG nowMs = GetTickCount64();
                     // nothing in the first 30 s after the presenter starts: loading makes the game's memory jump (1.0.50-t3)
                     static ULONGLONG startAt = 0, seenAt = 0;
-                    if (!seenAt || nowMs - seenAt > 3000) startAt = nowMs;   // not run for a while: the presenter (re)started
+                    static bool learnedTight = false, learnedChecked = false;
+                    if (!seenAt || nowMs - seenAt > 3000) { startAt = nowMs; learnedChecked = false; }   // not run for a while: the presenter (re)started
                     seenAt = nowMs;
-                    if (vbud > 0.0 && nowMs - startAt >= 30000)
+                    const bool inUse = crt::StateNow() == 2;
+                    // Short of it in an earlier session (LearnPerGame): starts that way, without the 30 s wait and the
+                    // switches; back once 1.5 GB is free for 60 s, and then forgotten for the game.
+                    if (!learnedChecked && s.learnPerGame && learnGen != 0 && inUse)
+                    {
+                        learnedChecked = true;
+                        learnedTight = learnRead.crtShort != 0;
+                        if (learnedTight && !tight)
+                        {
+                            tight = true; tightAt = nowMs; backs = 0;
+                            LOGI("BFI Presenter: CRT hand-off: the game was short of video memory for it in an earlier session -- the CRT "
+                                 "picture is drawn by each refresh from the start (the grain still made with the frame)");
+                        }
+                    }
+                    if (vbud > 0.0 && (nowMs - startAt >= 30000 || (learnedTight && tight)))
                     {
                         if (!tight && vu > vbud - 1024.0 && nowMs - tightAt >= 10000)
                         {
                             tight = true; tightAt = nowMs;
-                            if (backs >= 1) LOGI("BFI Presenter: CRT hand-off: video memory was short again -- the CRT picture stays drawn by each refresh for this session");
+                            if (backs >= 1)
+                            {
+                                LOGI("BFI Presenter: CRT hand-off: video memory was short again -- the CRT picture stays drawn by each refresh for this session");
+                                if (s.learnPerGame && inUse && !learnedTight) { g_learnCrtShort = 1; learnedTight = true; }
+                            }
                         }
-                        else if (tight && backs < 1 && vu < vbud - 1536.0 && nowMs - tightAt >= 60000) { tight = false; tightAt = nowMs; backs++; }
+                        else if (tight && backs < 1 && vu < vbud - 1536.0 && nowMs - tightAt >= 60000)
+                        {
+                            tight = false; tightAt = nowMs; backs++;
+                            if (learnedTight && s.learnPerGame)
+                            {
+                                g_learnCrtShort = 0; learnedTight = false;
+                                LOGI("BFI Presenter: CRT hand-off: video memory to spare for it now -- no longer remembered as short for this game");
+                            }
+                        }
                     }
                     crt::SetMemoryTight(tight);
                 }
