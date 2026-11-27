@@ -15164,12 +15164,15 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "On: at the first missing frame the presenter falls one game frame behind (about 17 ms more\n"
                                                               "latency at 60 fps) and draws each gap between the two finished frames around it -- what one\n"
                                                               "of them hides, the other shows, so nothing is made up. Back to the newest frame once the\n"
-                                                              "game has held the strobe rate for 10 s. Needs the game's motion vectors and depth, and no\n"
+                                                              "game has held the strobe rate for 10 s (longer if it is\n"
+                                                              "soon needed again). Needs the game's motion vectors and depth, and no\n"
                                                               "frame generation; elsewhere the last frame is moved.\n"
                                                               "Only the missing frames: frames as rendered, each missing one replaced by a picture between\n"
                                                               "the two around it (best near the strobe rate). Even pacing: every strobe cycle at its point in\n"
                                                               "time (smoothest well below it, a little softer). Automatic: the first near the strobe rate\n"
-                                                              "(above about 93%), the second below it (under about 88%).");
+                                                              "(the start), even pacing below about 88%, back after 10 s at 95% or more; from the third\n"
+                                                              "switch it stays on even pacing (remembered per game). Best from about 45-50 fps up: further\n"
+                                                              "below, errors of the game's motion at edges are moved far enough to show (outlines).");
                 if (s.warpInterp)
                 {
                     const int ip = st.ipNow;
