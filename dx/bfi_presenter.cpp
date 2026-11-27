@@ -1886,10 +1886,16 @@ float2 WarpShiftGame(float2 uv)
     // is behind it, and take the background there -- a short smear of background instead of a copy of the edge.
     // How near a point is (w) goes with 1 / distance, so "behind" is a ratio, not a difference: a character 3 m away and
     // the floor behind it differ by a few thousandths (t1 tested a fixed 0.002 and found no background: all cyan).
+    if (uncovered && (flags & 2048) != 0)
+    {
+        if (backNear > 1.0) gFillSeen = 5;                    // debug: no valid point found at all (white)
+        else if (!(frontNear > backNear * 1.03)) gFillSeen = 2;   // nothing clearly in front (cyan)
+    }
     if (uncovered && (flags & 2048) != 0 && backNear <= 1.0 && frontNear > backNear * 1.03)
     {
         const float2 rel = (front - back) * s;                // how far the front moved against the background, uv
         const float relPx = length(rel * osz);
+        if (relPx <= 0.5) gFillSeen = 4;                      // debug: the front barely moved against it (blue)
         if (relPx > 0.5)
         {
             gFillSeen = 3;                                    // searched (debug: yellow if nothing found)
@@ -2044,7 +2050,11 @@ bool FetchWarped(float2 pos, out float3 c)
     // FrameWarpFillUncoveredDebug (flags & 16384): uncovered pixels tinted -- magenta filled from the background beside,
     // cyan found uncovered but not filled
     if ((flags & 16384) != 0 && gFillSeen != 0)
-    { c = gFillSeen == 1 ? float3(0.8, 0.0, 0.8) : gFillSeen == 3 ? float3(0.8, 0.8, 0.0) : float3(0.0, 0.8, 0.8); return true; }
+    {
+        c = gFillSeen == 1 ? float3(0.8, 0.0, 0.8) : gFillSeen == 3 ? float3(0.8, 0.8, 0.0) : gFillSeen == 4 ? float3(0.0, 0.2, 1.0) :
+            gFillSeen == 5 ? float3(0.8, 0.8, 0.8) : float3(0.0, 0.8, 0.8);
+        return true;
+    }
     if (srcPerOut.x > 1.0001 || srcPerOut.y > 1.0001)
     {
         float2 o = 0.25 * srcPerOut;
@@ -14975,7 +14985,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                 ImGui::SameLine();
                 if (ImGui::Checkbox("Show them##fillDbg", &fd)) s.warpFillDebug = fd ? 1 : 0;
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Test: on moved flashes, uncovered pixels are tinted -- magenta: filled from the background\n"
-                                                              "beside; yellow: searched, no background found; cyan: nothing clearly in front to fill past.");
+                                                              "beside; yellow: searched, no background found; cyan: nothing clearly in front to fill past;\n"
+                                                              "blue: the front barely moved against the background; white: no valid motion around it.");
             }
             if (s.warpGame)
             {
