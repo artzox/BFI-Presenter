@@ -14809,7 +14809,8 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                           "after frame warp, so a moved frame doesn't move them with the picture (moire, mostly in the\n"
                                                           "sky). Needs BFI_PRESENTER_HANDOFF=1 in CRT-Standalone's preprocessor definitions too: its\n"
                                                           "settings stay in its own window. DirectX 12; not with its PIPELINE 1/2 or ENABLE_SCANLINE_SS=1 yet.\n"
-                                                          "Costs GPU time: the CRT picture once per frame, and again on every flash frame warp moves.");
+                                                          "Costs GPU time (the CRT picture once per frame, and again on every flash frame warp moves) and\n"
+                                                          "video memory: only turn it on in a game where the moire is visible, and leave it off elsewhere.");
             if (s.crtHandoff)
             {
                 const int cs = crt::StateNow();

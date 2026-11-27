@@ -5,8 +5,8 @@
 #include <vector>
 #include <functional>
 
-#define MANAGER_VERSION "1.3.21"
-#define MANAGER_VERSION_W L"1.3.21"
+#define MANAGER_VERSION "1.3.22"
+#define MANAGER_VERSION_W L"1.3.22"
 
 namespace bfi {
 

@@ -7,6 +7,24 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.50] — 2026-11-27
+
+**The CRT hand-off costs less: a moved flash takes its frame's grain, its passes no longer make frames late, and it steps back near the video memory budget; the on-screen display shows video memory.**
+
+- **[DX] CRT hand-off: moved flashes take their frame's grain.** Grain's first pass is the largest part of CRT-Standalone's work after the mask (0.68 of about 1.2 ms at 4K), and every flash moved by frame warp made it again. It is now kept from the CRT picture made with the frame, and a moved flash draws only the mask, scanlines and the passes after grain with it: about 0.7 ms instead of 1.1 ms per moved flash. With grain on, that picture is made with every frame even when most flashes are moved. Onimusha: Way of the Sword (60 fps, a few ms to spare) went into stretches of 30–50 filled flashes a second with flicker; now "ran great": late flashes down from 87–149 a minute to 17–52. The grain looks the same; on a moved flash it is the frame's own rather than a new one.
+- **[DX] CRT hand-off: its passes no longer make frames late.** The CRT picture made with the frame is recorded in a list of its own, after the frame counts as arrived; a flash that comes before it is finished draws its CRT picture itself.
+- **[DX] CRT hand-off: four passes after grain drawn as one.** Grain's second half, the noise floor, gamut expansion and corner rounding each read only their own pixel: one full-screen pass instead of four (0.27 ms at 4K for all four, or 0.13 ms without grain).
+- **[DX] CRT hand-off near the video memory budget.** It keeps about 0.6 GB at 4K (more while ReShade's window is open). Within 1 GB of the game's budget it stops making the CRT picture with each frame and frees most of it (grain's first pass stays, about 0.13 GB), and each refresh draws the rest: Returnal went over its budget with it, and with part of its memory moved to system memory every pass took ten times as long. Not in the first 30 s (loading), back after 60 s with 1.5 GB to spare, and the second time it stays that way for the session (Oblivion Remastered switched every 10 s and stalled each time). With `LearnPerGame`, a game where that happened starts that way the next time (`CrtHandoffMemoryShort` in `BFIPresenter_learned.ini`). 5 s after the hand-off stops being used (turned off, or CRT-Standalone no longer handing off) all of its memory is freed: Returnal kept 291 MB after CRT-Standalone stopped handing off.
+- **[DX] CRT hand-off: its shaders kept on disk.** Compiled once (5–7 s) and kept in `BFIPresenter_crt.bin` next to the ini, the last four builds by CRT-Standalone's switches (its sliders don't need a new build): from the second start the mask shows from the first frames (Oblivion Remastered: 5569 ms, then 1 ms).
+- **[DX] [Vulkan] On-screen display: video memory.** The game's video memory against what Windows gives it, with BFI Presenter's share and the CRT hand-off's (DX): green, amber within 0.5 GB of the budget, red over it. The over-budget warning in the settings window and the log says how much of it is BFI Presenter's.
+- **[DX] [Vulkan] Frame warp: nothing prepared while it waits.** While frame warp waits (a frame rate outside its range, loading), the frame from before ReShade's effects and the game's motion are no longer copied for it (Returnal's loading stalls).
+- **[DX] Timing log: each CRT hand-off pass timed.** Every 10 s, the GPU time of the mask and each pass after it at the Present, and how many CRT pictures drawn by the presenter took their frame's grain.
+- **[Docs]** Settings guide: the CRT hand-off is only for games where the moiré is visible (it costs GPU time and video memory, so leave it off elsewhere), what it costs pass by pass, its video memory and what it does near the budget, the shader cache, the video memory line in the on-screen display, what Remember per game keeps for it. Example ini: `CrtStandaloneHandoff`.
+
+## [Manager 1.3.22] — 2026-11-27
+
+- **[Manager] Fixed: the settings guide wasn't updated after 1.0.49.** The release was first tagged `v.10.49`, and a guide downloaded then was taken for version 10.49, newer than any release since. That tag is now read as 1.0.49, so the next guide is downloaded.
+
 ## [1.0.49] — 2026-11-26
 
 **CRT-Standalone's mask and scanlines can be drawn after frame warp, so they no longer break up on filled flashes; how hard frame warp eases off is adjustable; ReShade's window no longer moves with the scene.**
