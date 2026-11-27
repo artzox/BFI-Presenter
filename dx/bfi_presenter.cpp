@@ -4660,7 +4660,8 @@ static DWORD WINAPI PresenterThread(void *)
         const bool cycleStart = (slotNow == 0) || lastShown < 0;
         bool ipPicked = false;
         {
-            const bool ipAllowed = s.warpInterp && s.frameWarp && warp.ok && s.warpGame && !g_status.fgActive && s.pacingMode == 0;
+            // either pacing (i1 needed Smooth, and the default is Lowest latency: it never ran)
+            const bool ipAllowed = s.warpInterp && s.frameWarp && warp.ok && s.warpGame && !g_status.fgActive;
             if (ipOn && !ipAllowed) { ipOn = false; ipCycle = false; }
             if (cycleStart && ipAllowed)
             {
@@ -15102,7 +15103,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
             {
                 bool wi = s.warpInterp != 0;
                 if (ImGui::Checkbox("Interpolate while frames are missing (test)", &wi)) s.warpInterp = wi ? 1 : 0;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's motion, without frame generation, in Smooth pacing. At the first missing\n"
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("With the game's motion, without frame generation. At the first missing\n"
                                                               "frame the presenter falls one game frame behind (about 17 ms more latency at 60 fps) and\n"
                                                               "draws each strobe cycle between two finished frames: what one of them hides, the other shows,\n"
                                                               "so nothing is made up (no ghost edges). Once the game holds the strobe rate for 3 s it shows\n"
