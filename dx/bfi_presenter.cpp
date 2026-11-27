@@ -6070,14 +6070,21 @@ static DWORD WINAPI PresenterThread(void *)
                 {
                     // the CRT hand-off's per-frame picture only with video memory to spare (1 GB under the budget; again
                     // once 1.5 GB is free, counting what it would take back)
-                    // (each switch held 10 s, so a game's memory swinging during loading doesn't free and remake it over and over)
+                    // Each switch stalls the game's Present (freeing waits for the GPU; remaking them took 8 ms in Oblivion), and
+                    // a game whose memory follows what is free flips it over and over (Oblivion: every 10 s, 1.0.50-t2). So: back
+                    // only after 60 s with room to spare, and after it was needed a second time it stays freed for the session.
                     static bool tight = false;
+                    static int backs = 0;
                     static ULONGLONG tightAt = 0;
                     const ULONGLONG nowMs = GetTickCount64();
-                    if (vbud > 0.0 && nowMs - tightAt >= 10000)
+                    if (vbud > 0.0)
                     {
-                        if (!tight && vu > vbud - 1024.0) { tight = true; tightAt = nowMs; }
-                        else if (tight && vu < vbud - 1536.0) { tight = false; tightAt = nowMs; }
+                        if (!tight && vu > vbud - 1024.0 && nowMs - tightAt >= 10000)
+                        {
+                            tight = true; tightAt = nowMs;
+                            if (backs >= 1) LOGI("BFI Presenter: CRT hand-off: video memory was short again -- the CRT picture stays drawn by each refresh for this session");
+                        }
+                        else if (tight && backs < 1 && vu < vbud - 1536.0 && nowMs - tightAt >= 60000) { tight = false; tightAt = nowMs; backs++; }
                     }
                     crt::SetMemoryTight(tight);
                 }
