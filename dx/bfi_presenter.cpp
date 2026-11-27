@@ -113,8 +113,11 @@ static const int kBlobN = 2 + kCrtPostN;
 static bool TakeBlobs(UINT *gen, ID3DBlob *out[kBlobN]);
 static bool PostIsGrainRaw(int k);
 static bool PostOn(int k, const float *cp);
-static bool Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead);
+static bool Bake(ID3D12GraphicsCommandList *list, UINT s, ID3D12Resource *stage, UINT64 waitRead, UINT64 *presWait);
 static void BakeSubmitted(UINT s, UINT64 fence);
+static int GrainFor(UINT s, UINT64 pres);
+static ID3D12Resource *GrainTex(int g);
+static UINT RingGen();
 static ID3D12Resource *BakeOut(UINT s);
 static bool BakeReady(UINT s);
 static UINT BakeGen();
@@ -3849,6 +3852,11 @@ static DWORD WINAPI PresenterThread(void *)
     int    crtKeyPrev = -2, crtKeyLast = -1;
     const UINT kBakeSrv = kCrtPostSrv + 4;                       // each slot's CRT picture made with the frame (dx/bfi_crt.h Bake), twice (t11 t12)
     UINT   bakeGenSeen = ~0u;
+    // a moved flash with its frame's grain (dx/bfi_crt.h GrainFor): (crtRt[from], grain's g) at kRingSrv + 4 g + 2 from
+    const UINT kRingSrv = kBakeSrv + 2 * kStage;
+    UINT   ringGenSeen = ~0u, ringRtGen = 0, ringRtSeen = ~0u;
+    UINT   crtGrainReused = 0, crtGrainMade = 0;                // moved flashes: with their frame's grain, with their own
+    double crtGrainLogT = 0.0;
     bool   crtSnapLogged = false;
     ID3D12Resource *crtCb = nullptr;                             // its settings: an upload ring, one entry per draw
     uint8_t *crtCbMap = nullptr;
@@ -3881,7 +3889,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage + 4 * kStage + 4 + 2 * kStage;   // the stage frames, the APL Limiter's cells and its 1x1 average,
+    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage + 4 * kStage + 4 + 2 * kStage + 8;   // the stage frames, the APL Limiter's cells and its 1x1 average,
                                                                        // frame warp's textures, the game's own motion per stage slot
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
@@ -5371,7 +5379,7 @@ static DWORD WINAPI PresenterThread(void *)
                         g_device->CreateShaderResourceView(crtRt[order[v]], nullptr, h);
                     }
                 }
-                if (made) crtKeyLast = -1;
+                if (made) { crtKeyLast = -1; ringRtGen++; }
                 Constants kc = c;                                    // what the pattern and the passes depend on
                 kc.slot = 0; kc.method = 0; kc.soften = 0.0f; kc.phase = 0.0f; kc.gain = 0.0f; kc.dfloor = 0.0f;
                 const int kPrev = c.warp != 0.0f ? warpPrev : -1;
@@ -5386,6 +5394,30 @@ static DWORD WINAPI PresenterThread(void *)
                 else if (rok)
                 {
                     crtKeyC = kc; memcpy(crtKeyP, cp, sizeof(cp)); crtKeyId = pickId; crtKeyPrev = kPrev;
+                    // A moved flash takes its frame's grain (made with the frame, dx/bfi_crt.h) instead of making it again
+                    const int ring = (c.warp != 0.0f && reserve) ? crt::GrainFor((UINT)pick, reserve) : -1;
+                    ID3D12Resource *ringTex = crt::GrainTex(ring);
+                    if (ring >= 0 && (ringGenSeen != crt::RingGen() || ringRtSeen != ringRtGen))
+                    {
+                        ringGenSeen = crt::RingGen(); ringRtSeen = ringRtGen;
+                        for (int g = 0; g < 2; g++)
+                            for (int from = 0; from < 2; from++)
+                                for (int v = 0; v < 2; v++)
+                                {
+                                    ID3D12Resource *r = v ? crt::GrainTex(g) : crtRt[from];
+                                    D3D12_SHADER_RESOURCE_VIEW_DESC rv = {};
+                                    rv.Format = r ? r->GetDesc().Format : crt::PassFormat(); rv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                                    rv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; rv.Texture2D.MipLevels = 1;
+                                    D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                                    h.ptr += (SIZE_T)(kRingSrv + 4 * g + 2 * from + v) * srvStride;
+                                    g_device->CreateShaderResourceView(r, &rv, h);
+                                }
+                    }
+                    if (ring >= 0 && ringTex)
+                    {
+                        D3D12_RESOURCE_BARRIER gb = Transition(ringTex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        list->ResourceBarrier(1, &gb);
+                    }
                     D3D12_VIEWPORT pvp = { 0.0f, 0.0f, (float)fw, (float)fh, 0.0f, 1.0f };
                     D3D12_RECT psc = { 0, 0, (LONG)fw, (LONG)fh };
                     list->RSSetViewports(1, &pvp);
@@ -5395,7 +5427,8 @@ static DWORD WINAPI PresenterThread(void *)
                         D3D12_RESOURCE_BARRIER rb = Transition(crtRt[t], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
                         list->ResourceBarrier(1, &rb);
                         D3D12_GPU_DESCRIPTOR_HANDLE ph = srvHeap->GetGPUDescriptorHandleForHeapStart();
-                        ph.ptr += (UINT64)(kCrtPostSrv + 2 * (UINT)(from >= 0 ? from : 1)) * srvStride;   // the pattern pass: any (not read)
+                        const UINT fv = (UINT)(from >= 0 ? from : 1);                                        // the pattern pass: any (not read)
+                        ph.ptr += (UINT64)(ring >= 0 && ringTex ? kRingSrv + 4 * (UINT)ring + 2 * fv : kCrtPostSrv + 2 * fv) * srvStride;
                         list->SetGraphicsRootDescriptorTable(10, ph);
                         D3D12_CPU_DESCRIPTOR_HANDLE rh = crtRtvHeap->GetCPUDescriptorHandleForHeapStart();
                         rh.ptr += (SIZE_T)t * rtvStride;
@@ -5410,10 +5443,21 @@ static DWORD WINAPI PresenterThread(void *)
                     for (int k = 0; k < kCrtPostN; k++)
                     {
                         if (!psoCrtPass[1 + k] || !crt::PostOn(k, cp)) continue;   // compiled out, or at its off value
-                        if (crt::PostIsGrainRaw(k)) { into(2, psoCrtPass[1 + k], crtLast); continue; }
+                        if (crt::PostIsGrainRaw(k))
+                        {
+                            if (!(ring >= 0 && ringTex)) into(2, psoCrtPass[1 + k], crtLast);   // else: the frame's own
+                            continue;
+                        }
                         into(1 - crtLast, psoCrtPass[1 + k], crtLast);
                         crtLast = 1 - crtLast;
                     }
+                    if (ring >= 0 && ringTex)
+                    {
+                        D3D12_RESOURCE_BARRIER gb = Transition(ringTex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                        list->ResourceBarrier(1, &gb);
+                        crtGrainReused++;
+                    }
+                    else if (c.warp != 0.0f) crtGrainMade++;
                     list->RSSetViewports(1, &vp);
                     list->RSSetScissorRects(1, &sc);
                     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -5422,6 +5466,13 @@ static DWORD WINAPI PresenterThread(void *)
                     list->SetGraphicsRootDescriptorTable(10, ph);
                     crtKeyLast = crtLast;
                 }
+            }
+            if (crtGrainReused + crtGrainMade && Now() - crtGrainLogT > 10.0)
+            {
+                if (crtGrainLogT > 0.0)
+                    LOGI("BFI Presenter: CRT hand-off: last 10 s, moved flashes with their frame's grain %u, that made their own %u",
+                         crtGrainReused, crtGrainMade);
+                crtGrainLogT = Now(); crtGrainReused = crtGrainMade = 0;
             }
             if (!psoCrtPass[0] || crtLast >= 0) list->SetPipelineState(psoCrt);   // else the textures could not be made: as without the hand-off
             list->DrawInstanced(3, 1, 0, 0);
@@ -7735,7 +7786,9 @@ static HRESULT SubmitGameFrameLocked()
     const bool bakeList = g_bakeList && g_bakeAlloc[s];
     if (!bakeList)
     {
-        crt::Bake(g_copyList, s, g_stage[s], waitRead);   // and the frame's CRT picture with them (shown as is; a moved flash draws its own)
+        UINT64 pw = 0;
+        crt::Bake(g_copyList, s, g_stage[s], waitRead, &pw);   // and the frame's CRT picture with them (shown as is; a moved flash draws its own)
+        if (pw > waitRead) waitRead = pw;
         gt::Mark(g_copyList, gt::Q_P4);
         gt::EndFrame(g_copyList, g_gameFenceVal + 1);
     }
@@ -7772,13 +7825,15 @@ static HRESULT SubmitGameFrameLocked()
         WaitFence(g_gameFence, g_bakeDone[s], g_gameFenceEvent);   // its allocator idle (long done: one frame per slot)
         g_bakeAlloc[s]->Reset();
         g_bakeList->Reset(g_bakeAlloc[s], nullptr);
-        const bool baked = crt::Bake(g_bakeList, s, g_stage[s], waitRead);
+        UINT64 presWait = 0;                                        // grain's texture: the presenter's last read of it
+        const bool baked = crt::Bake(g_bakeList, s, g_stage[s], waitRead, &presWait);
         gt::Mark(g_bakeList, gt::Q_P4);
         gt::EndFrame(g_bakeList, published + 1);
         const bool timed = gt::On();
         if (SUCCEEDED(g_bakeList->Close()) && (baked || timed))
         {
             ID3D12CommandList *bl[] = { g_bakeList };
+            if (presWait) g_gameQueue->Wait(g_presFence, presWait);
             g_gameQueue->ExecuteCommandLists(1, bl);
             g_gameQueue->Signal(g_gameFence, ++g_gameFenceVal);
             g_bakeDone[s] = g_gameFenceVal;
