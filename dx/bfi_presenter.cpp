@@ -197,7 +197,8 @@ struct Settings
     int   warpEven = 0;       // FrameWarpEvenPacing: every strobe cycle moved to where the game's motion is, where the game's
                               // own motion is used; elsewhere missing frames are filled as usual
     int   warpInterp = 0;          // FrameWarpInterpolate: one frame behind while frames are missing (test, 1.0.51): 0 off,
-                                   // 1 only the missing frames drawn between two (the rest as rendered), 2 even pacing (every cycle at its time)
+                                   // 1 only the missing frames drawn between two (the rest as rendered), 2 even pacing (every cycle at its time),
+                                   // 3 automatic: 1 near the strobe rate, 2 clearly below it (i4)
     int   warpFillDebug = 0;       // FrameWarpFillUncoveredDebug: tint uncovered pixels (test)
     int   warpFillUncovered = 0;   // FrameWarpFillUncovered: with the game's motion, what is uncovered from the background beside it (1.0.51)
     int   warpEdge = 0;       // FrameWarpEdge: the strip at the screen edge a moved flash has no picture for: 0 the move faded
@@ -430,7 +431,7 @@ static void LoadSettings(Settings &s)
     s.warpEdge = std::max(0, std::min(2, IniInt("FrameWarpEdge", 0)));
     s.warpFillUncovered = IniInt("FrameWarpFillUncovered", 0) ? 1 : 0;   // t1-t5: worse than without (a smear around a character as the camera turns)
     s.warpFillDebug = IniInt("FrameWarpFillUncoveredDebug", 0) ? 1 : 0;
-    s.warpInterp = std::max(0, std::min(2, IniInt("FrameWarpInterpolate", 0)));   // 1 only the missing frames, 2 even pacing
+    s.warpInterp = std::max(0, std::min(3, IniInt("FrameWarpInterpolate", 0)));   // 1 only the missing frames, 2 even pacing, 3 automatic
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -3891,6 +3892,8 @@ static DWORD WINAPI PresenterThread(void *)
     int    ipSlotA = -1;
     float  ipF = 0.0f;
     bool   ipCycle = false;                  // this strobe cycle is drawn between ipA and the frame picked (ipA + 1)
+    bool   ipEven = false;                   // automatic: even pacing in use (else only the missing frames)
+    double ipEvenT = 0.0;                    // when it last switched
     int    ipCycles = 0, ipAsIs = 0, ipEnters = 0;
     int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
     UINT64 warpPrevId = 0;
@@ -4671,6 +4674,7 @@ static DWORD WINAPI PresenterThread(void *)
                     // the first missing frame: this cycle shows the frame shown last once more (as without frame warp),
                     // and from here the presenter stays one frame behind
                     ipOn = true; ipP = (double)lastShownId; ipRate = 0.9; ipNewestSeen = newestId; ipFullT = ipOnT = Now(); ipEnters++;
+                    ipEven = false; ipEvenT = Now();
                     if (ipEnters <= 20) LOGI("BFI Presenter: frame warp interpolation: a frame missing -- one frame behind, gaps drawn between two frames");
                 }
                 else if (ipOn)
@@ -4678,7 +4682,23 @@ static DWORD WINAPI PresenterThread(void *)
                     const double got = newestId > ipNewestSeen ? (double)(newestId - ipNewestSeen) : 0.0;
                     if (newestId > ipNewestSeen) ipNewestSeen = newestId;
                     ipRate = 0.9 * ipRate + 0.1 * std::min(got, 3.0);       // game frames per strobe cycle
-                    if (s.warpInterp == 2)
+                    // Automatic (1.0.51-i4): only the missing frames near the strobe rate (Onimusha at 60 fps: 0-32 pictures
+                    // in between per 10 s, sharp); even pacing below it, where every fourth cycle or so misses a frame and
+                    // half steps between whole ones are choppy (Oblivion at 43 fps). Below 0.88 game frames per cycle on,
+                    // above 0.93 off, each held at least 3 s.
+                    if (s.warpInterp == 3 && Now() - ipEvenT >= 3.0)
+                    {
+                        const bool want = ipEven ? ipRate < 0.93 : ipRate < 0.88;
+                        if (want != ipEven)
+                        {
+                            ipEven = want; ipEvenT = Now();
+                            if (ipEnters <= 20)
+                                LOGI("BFI Presenter: frame warp interpolation: %s (%.2f game frames per strobe cycle)",
+                                     ipEven ? "even pacing" : "only the missing frames", ipRate);
+                            if (!ipEven) ipP = std::floor(ipP + 0.5);         // back onto a frame
+                        }
+                    }
+                    if (s.warpInterp == 2 || (s.warpInterp == 3 && ipEven))
                     {
                         // even pacing: each cycle at its point in time, one frame behind the newest
                         const double was = ipP;
@@ -15119,9 +15139,10 @@ static void draw_overlay(reshade::api::effect_runtime *)
             }
             if (s.warpGame)
             {
-                ImGui::Combo("Interpolate while frames are missing (test)", &s.warpInterp, "Off\0Only the missing frames\0Even pacing\0");
+                ImGui::Combo("Interpolate while frames are missing (test)", &s.warpInterp, "Off\0Only the missing frames\0Even pacing\0Automatic\0");
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Only the missing frames: frames as rendered, each missing one replaced by a picture between the\n"
                                                               "two around it. Even pacing: every strobe cycle at its point in time (smoothest, softer).\n"
+                                                              "Automatic: only the missing frames near the strobe rate, even pacing well below it.\n"
                                                               "With the game's motion, without frame generation. At the first missing\n"
                                                               "frame the presenter falls one game frame behind (about 17 ms more latency at 60 fps) and\n"
                                                               "draws each strobe cycle between two finished frames: what one of them hides, the other shows,\n"
