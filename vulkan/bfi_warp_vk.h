@@ -54,6 +54,21 @@ struct WarpVk
     uint64_t id[2] = {};
     double   t[2] = {};
     uint64_t flowNew = 0, flowOld = 0;
+    // Frame interpolation (1.0.54 test): the newer frame's motion pushed forward to the moment shown (shaders/ipsplat.comp),
+    // at the game motion texture's size: two r32ui landing textures and the resolved motion (set 2 binding 6).
+    VkImage        ipImg[3] = {};
+    VkDeviceMemory ipMem[3] = {};
+    VkImageView    ipView[3] = {};
+    uint32_t       ipW = 0, ipH = 0;
+    VkDescriptorSetLayout dslI = VK_NULL_HANDLE;
+    VkPipelineLayout      plI = VK_NULL_HANDLE;
+    static const int      kIpPasses = 4;
+    VkShaderModule        csI[kIpPasses] = {};
+    VkPipeline            psoI[kIpPasses] = {};       // clear, land, write, fill (s2)
+    VkDescriptorPool      dpI = VK_NULL_HANDLE;
+    VkDescriptorSet       setI[kStage] = {};          // gFlow = the game motion texture of slot s
+    bool     ipOk = false;
+    uint64_t ipLastId = 0; float ipLastBack = -1.0f;
 
     static int Luma(int p, int l) { return p * kLevels + l; }
     static int Flow(int l) { return 2 * kLevels + l; }
@@ -62,8 +77,8 @@ struct WarpVk
     // Set 2's layout: made before the BFI pipelines' layouts, which include it.
     bool CreateLayout(DeviceData *d)
     {
-        VkDescriptorSetLayoutBinding b[6] = {};
-        for (int i = 0; i < 6; i++)
+        VkDescriptorSetLayoutBinding b[8] = {};
+        for (int i = 0; i < 8; i++)
         {
             b[i].binding = (uint32_t)i;
             b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -71,10 +86,79 @@ struct WarpVk
             b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
         }
         VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        dli.bindingCount = 6;                          // binding 3: the game's own motion for the frame (gvk); 4, 5: the frames
+        dli.bindingCount = 8;                          // binding 7: the CRT hand-off's picture (bfi_crt_vk.h, 1.0.54); binding 6: frame interpolation's motion at the moment shown; binding 3: the game's own motion for the frame (gvk); 4, 5: the frames
                                                        // from before ReShade's effects (FrameWarpStillBeforeEffects)
         dli.pBindings = b;
         return d->CreateDescriptorSetLayout(d->device, &dli, nullptr, &dslW) == VK_SUCCESS;
+    }
+
+    bool MakeImgFmt(DeviceData *d, VkFormat fmt, VkImageUsageFlags use, uint32_t iw, uint32_t ih, VkImage *im, VkDeviceMemory *mm, VkImageView *vw)
+    {
+        VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        ici.imageType = VK_IMAGE_TYPE_2D; ici.format = fmt; ici.extent = { iw, ih, 1 };
+        ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL; ici.usage = use;
+        if (!CreateImageMem(d, ici, im, mm)) return false;
+        VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vci.image = *im; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = fmt;
+        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        return d->CreateImageView(d->device, &vci, nullptr, vw) == VK_SUCCESS;
+    }
+    // Frame interpolation's passes (optional: without them the search in the BFI shader is used).
+    bool InitSplat(DeviceData *d, const VkImageView *gameFlowView)
+    {
+        if (!gameFlowView || !d->CreateComputePipelines || !d->CmdDispatch) return false;
+        for (uint32_t i = 0; i < kStage; i++) if (!gameFlowView[i]) return false;
+        VkDevice dev = d->device;
+        bool p = MakeImgFmt(d, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_STORAGE_BIT, ipW, ipH, &ipImg[0], &ipMem[0], &ipView[0]) &&
+                 MakeImgFmt(d, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_STORAGE_BIT, ipW, ipH, &ipImg[1], &ipMem[1], &ipView[1]);
+        VkDescriptorSetLayoutBinding b[4] = {};
+        for (int i = 0; i < 4; i++)
+        {
+            b[i].binding = (uint32_t)i;
+            b[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        dli.bindingCount = 4; dli.pBindings = b;
+        p = p && d->CreateDescriptorSetLayout(dev, &dli, nullptr, &dslI) == VK_SUCCESS;
+        VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 16 };
+        VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        pli.setLayoutCount = 1; pli.pSetLayouts = &dslI; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pr;
+        p = p && d->CreatePipelineLayout(dev, &pli, nullptr, &plI) == VK_SUCCESS;
+        const uint32_t *code[kIpPasses] = { kIpSplat0Spv, kIpSplat1Spv, kIpSplat2Spv, kIpSplat3Spv };
+        const size_t bytes[kIpPasses] = { sizeof(kIpSplat0Spv), sizeof(kIpSplat1Spv), sizeof(kIpSplat2Spv), sizeof(kIpSplat3Spv) };
+        for (int i = 0; p && i < kIpPasses; i++)
+        {
+            csI[i] = MakeShader(d, code[i], bytes[i]);
+            psoI[i] = csI[i] ? MakeComputePipeline(d, plI, csI[i]) : VK_NULL_HANDLE;
+            p = psoI[i] != VK_NULL_HANDLE;
+        }
+        if (p)
+        {
+            VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kStage }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 * kStage } };
+            VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            dpi.maxSets = kStage; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
+            p = d->CreateDescriptorPool(dev, &dpi, nullptr, &dpI) == VK_SUCCESS;
+            VkDescriptorSetLayout l[kStage];
+            for (uint32_t i = 0; i < kStage; i++) l[i] = dslI;
+            VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            dai.descriptorPool = dpI; dai.descriptorSetCount = kStage; dai.pSetLayouts = l;
+            p = p && d->AllocateDescriptorSets(dev, &dai, setI) == VK_SUCCESS;
+            for (uint32_t sl = 0; p && sl < kStage; sl++)
+            {
+                VkDescriptorImageInfo ii[4] = { { lin, gameFlowView[sl], VK_IMAGE_LAYOUT_GENERAL }, { VK_NULL_HANDLE, ipView[0], VK_IMAGE_LAYOUT_GENERAL },
+                                                { VK_NULL_HANDLE, ipView[1], VK_IMAGE_LAYOUT_GENERAL }, { VK_NULL_HANDLE, ipView[2], VK_IMAGE_LAYOUT_GENERAL } };
+                VkWriteDescriptorSet wr[4] = {};
+                for (int k = 0; k < 4; k++)
+                {
+                    wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[k].dstSet = setI[sl]; wr[k].dstBinding = (uint32_t)k;
+                    wr[k].descriptorCount = 1; wr[k].pImageInfo = &ii[k];
+                    wr[k].descriptorType = k == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                }
+                d->UpdateDescriptorSets(dev, 4, wr, 0, nullptr);
+            }
+        }
+        return p;
     }
 
     bool MakeImage(DeviceData *d, int i, uint32_t iw, uint32_t ih)
@@ -116,7 +200,8 @@ struct WarpVk
 
     // stageView: the staging ring's views (SHADER_READ_ONLY_OPTIMAL). Set 2 is required (false = the BFI pipelines
     // can't be used); the passes are optional (ok).
-    bool Init(DeviceData *d, const VkImageView *stageView, const VkImageView *gameFlowView, const VkImageView *preView, uint32_t frameW, uint32_t frameH)
+    bool Init(DeviceData *d, const VkImageView *stageView, const VkImageView *gameFlowView, const VkImageView *preView, uint32_t frameW, uint32_t frameH,
+              VkImageView crtFinal = VK_NULL_HANDLE)
     {
         VkDevice dev = d->device;
         srcW = frameW; srcH = frameH;
@@ -128,9 +213,12 @@ struct WarpVk
         smi.maxLod = 0.0f;
         bool r = d->CreateSampler(dev, &smi, nullptr, &lin) == VK_SUCCESS;
         r = r && MakeImage(d, Out(), w[kOut], h[kOut]);
+        ipW = (frameW + 1) / 2; ipH = (frameH + 1) / 2;   // as the game motion texture (Swapchain gW, gH)
+        const bool ipImgOk = r && MakeImgFmt(d, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                             ipW, ipH, &ipImg[2], &ipMem[2], &ipView[2]);
         if (r)
         {
-            VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 * kStage * kStage };
+            VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8 * kStage * kStage };
             VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             dpi.maxSets = kStage * kStage;
             dpi.poolSizeCount = 1;
@@ -164,6 +252,17 @@ struct WarpVk
                         pw[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; pw[k].pImageInfo = &pi[k];
                     }
                     d->UpdateDescriptorSets(d->device, 2, pw, 0, nullptr);
+                    VkDescriptorImageInfo si = { lin, ipImgOk ? ipView[2] : view[Out()], VK_IMAGE_LAYOUT_GENERAL };
+                    VkWriteDescriptorSet sw = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                    sw.dstSet = dsW[a][b]; sw.dstBinding = 6; sw.descriptorCount = 1;
+                    sw.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; sw.pImageInfo = &si;
+                    d->UpdateDescriptorSets(d->device, 1, &sw, 0, nullptr);
+                    // the CRT hand-off's picture (read only with flags & 524288; the evened-out motion as a stand-in without it)
+                    VkDescriptorImageInfo ci = { lin, crtFinal ? crtFinal : view[Out()], VK_IMAGE_LAYOUT_GENERAL };
+                    VkWriteDescriptorSet cw = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                    cw.dstSet = dsW[a][b]; cw.dstBinding = 7; cw.descriptorCount = 1;
+                    cw.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; cw.pImageInfo = &ci;
+                    d->UpdateDescriptorSets(d->device, 1, &cw, 0, nullptr);
                 }
         }
         ready = r;
@@ -252,6 +351,8 @@ struct WarpVk
             }
         }
         ok = p;
+        ipOk = ipImgOk && InitSplat(d, gameFlowView);
+        ipLastId = 0; ipLastBack = -1.0f;
         cur = 0; id[0] = id[1] = 0; t[0] = t[1] = 0.0; flowNew = flowOld = 0; inGeneral = false;
         return true;
     }
@@ -278,12 +379,30 @@ struct WarpVk
             if (mem[i]) d->FreeMemory(dev, mem[i], nullptr);
             view[i] = VK_NULL_HANDLE; img[i] = VK_NULL_HANDLE; mem[i] = VK_NULL_HANDLE;
         }
+        for (int i = 0; i < kIpPasses; i++)
+        {
+            if (psoI[i]) d->DestroyPipeline(dev, psoI[i], nullptr);
+            if (csI[i]) d->DestroyShaderModule(dev, csI[i], nullptr);
+            psoI[i] = VK_NULL_HANDLE; csI[i] = VK_NULL_HANDLE;
+        }
+        for (int i = 0; i < 3; i++)
+        {
+            if (ipView[i]) d->DestroyImageView(dev, ipView[i], nullptr);
+            if (ipImg[i]) d->DestroyImage(dev, ipImg[i], nullptr);
+            if (ipMem[i]) d->FreeMemory(dev, ipMem[i], nullptr);
+            ipView[i] = VK_NULL_HANDLE; ipImg[i] = VK_NULL_HANDLE; ipMem[i] = VK_NULL_HANDLE;
+        }
+        if (dpI) d->DestroyDescriptorPool(dev, dpI, nullptr);
+        if (plI) d->DestroyPipelineLayout(dev, plI, nullptr);
+        if (dslI) d->DestroyDescriptorSetLayout(dev, dslI, nullptr);
+        dpI = VK_NULL_HANDLE; plI = VK_NULL_HANDLE; dslI = VK_NULL_HANDLE;
+        ipOk = false;
         if (lin) d->DestroySampler(dev, lin, nullptr);
         lin = VK_NULL_HANDLE;
         ready = ok = false;
     }
 
-    void Forget() { id[0] = id[1] = 0; flowNew = flowOld = 0; }
+    void Forget() { id[0] = id[1] = 0; flowNew = flowOld = 0; ipLastId = 0; }
 
     // The frame the motion of frameId would be measured from (as in DX): 0 = none usable.
     uint64_t PairFor(uint64_t frameId, double frameT) const
@@ -299,11 +418,14 @@ struct WarpVk
     void ToGeneral(DeviceData *d, VkCommandBuffer cb)
     {
         if (inGeneral) return;
-        VkImageMemoryBarrier b[kImgs];
+        VkImageMemoryBarrier b[kImgs + 3];
         uint32_t n = 0;
         for (int i = 0; i < kImgs; i++)
             if (img[i]) b[n++] = ImgBarrier(img[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
                                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        for (int i = 0; i < 3; i++)   // frame interpolation's (the resolved one is in set 2 from the start)
+            if (ipImg[i]) b[n++] = ImgBarrier(ipImg[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                               0, 0, nullptr, 0, nullptr, n, b);
         inGeneral = true;
@@ -362,6 +484,32 @@ struct WarpVk
         wp.mode = 1u;
         Pass(d, cb, 3, setSmooth, wp, w[kOut], h[kOut]);
         flowNew = id[cur]; flowOld = id[1 - cur];
+    }
+
+    // Frame interpolation: the motion of the frame in `slot` pushed forward to the moment shown (back = 1 - f). Once per
+    // frame and moment (a strobe cycle's dark refresh reuses it).
+    bool RecordSplat(DeviceData *d, VkCommandBuffer cb, uint32_t slot, uint64_t frameId, float back)
+    {
+        if (!ipOk || slot >= kStage) return false;
+        if (frameId == ipLastId && back == ipLastBack) return true;
+        ToGeneral(d, cb);
+        // the BFI pass of an earlier refresh read the resolved motion; the passes below write it again
+        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        mb.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              0, 1, &mb, 0, nullptr, 0, nullptr);
+        struct { float back; uint32_t pad[3]; } pc = { back, { 0, 0, 0 } };
+        for (int i = 0; i < kIpPasses; i++)
+        {
+            d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, psoI[i]);
+            d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, plI, 0, 1, &setI[slot], 0, nullptr);
+            d->CmdPushConstants(cb, plI, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            d->CmdDispatch(cb, (ipW + 7) / 8, (ipH + 7) / 8, 1);
+            Between(d, cb);
+        }
+        ipLastId = frameId; ipLastBack = back;
+        return true;
     }
 
     // After the passes, before the BFI pass reads the motion.
