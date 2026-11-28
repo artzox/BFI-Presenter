@@ -778,6 +778,7 @@ struct Status
     double driftFps = 0.0, driftHz = 0.0, driftSuggest = 0.0, driftSlip = 0.0;
     int    late = 0, repeats = 0;
     int    frameRepeats = 0, frameSkips = 0;
+    int    ipBetween = 0;    // per second: strobe cycles frame interpolation drew between two frames (1.0.53)
     int    picRepeats = 0;   // per second: strobe cycles that lit the same picture again (frame interpolation draws
                              // a frame number twice at different points; 1.0.53)
     double alignSlackMs = -1.0, alignShiftMs = 0.0;   // ReflexAlign: frames ready before the pick (10th percentile), total shift
@@ -6352,6 +6353,7 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.repeats    = rep > 0 ? rep : 0;
             g_status.frameRepeats = secFrameRepeats;
             g_status.picRepeats = secPicRepeats;
+            g_status.ipBetween = secIpBetween;
             g_status.warpOn       = !s.frameWarp ? 0 : !warp.ok ? -1 : warpClock.engaged ? 2 : 1;
             g_status.warpCycles   = secWarpCycles;
             // CRT hand-off: when most cycles are shown moved (e.g. with frame generation), the picture made with each frame
@@ -14529,7 +14531,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
     d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
     d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
     d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
-    d.ipNow = g_status.ipNow; d.ipCan = g_status.ipCan;
+    d.ipNow = g_status.ipNow; d.ipCan = g_status.ipCan; d.ipBetween = g_status.ipBetween;
     // which motion: what the last second's moved cycles used, or (none moved) what the game hands over -- unless frame
     // generation is on with the game's motion off for it, as in the settings window (Townfall, 2x: the OSD switched
     // between the game's vectors and the measured motion with each second that had no cycle to fill)
@@ -15167,7 +15169,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see ReShade.log).");
             else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
-            else if (st.ipNow > 0) ImGui::Text("At work: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
+            else if (st.ipNow > 0) ImGui::Text("At work: frame interpolation, game at %.0f%% of the strobe rate, %d cycles a second drawn between frames.", st.warpRate * 100.0, st.ipBetween);
             else if (st.ipCan && st.warpRate > 0.0) ImGui::Text("Ready: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else ImGui::Text("Waiting for the game's frame rate.");

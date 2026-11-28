@@ -546,6 +546,7 @@ struct Status
     int    driftOn = 0;                     // the game runs on a clock of its own, a little off the display (common/bfi_clockdrift.h)
     double driftFps = 0.0, driftHz = 0.0, driftSuggest = 0.0, driftSlip = 0.0;
     int    late = 0, frameRepeats = 0, frameSkips = 0, slotWaits = 0, reused = 0;
+    int    ipBetween = 0;               // per second: strobe cycles drawn between two frames (as DX, 1.0.53)
     int    picRepeats = 0;              // per second: the same picture lit again (as DX, 1.0.53)
     int    unevenRep = 0, unevenSkip = 0;   // per second: strobe cycles short of / ahead of the expected step
     int    warpOn = 0;                      // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
@@ -2284,7 +2285,7 @@ static void PresenterThread(Swapchain *sc)
     bool bufValid[kMaxImg] = {};
     uint32_t acqIdx = 0;
     int secFrameRepeats = 0, secFrameSkips = 0, extraCycles = 0, secReused = 0;
-    int secPicRepeats = 0, cycPicRep = 0; double picShownP = -1.0;   // the same picture lit again (as DX)
+    int secPicRepeats = 0, cycPicRep = 0, secIpBetween = 0; double picShownP = -1.0;   // the same picture lit again (as DX)
     int secRepU = 0, secSkipU = 0;      // strobe cycles short of / ahead of the expected step (DX12 add-on v0.78)
     // Frame start timing (automatic frame cap): new game frames lit this second, their release -> flash, and how long
     // each was ready before the pick.
@@ -2741,7 +2742,7 @@ static void PresenterThread(Swapchain *sc)
                     if (sa < 0) ipOn = false;
                     else if (f < 1.0f / 32.0f || f > 31.0f / 32.0f || sb < 0)
                     { pick = (f > 31.0f / 32.0f && sb >= 0) ? sb : sa; ipPicked = true; ipAsIs++; }
-                    else { pick = sb; ipPicked = true; ipCycle = true; ipA = a; ipSlotA = sa; ipF = f; ipCycles++; }
+                    else { pick = sb; ipPicked = true; ipCycle = true; ipA = a; ipSlotA = sa; ipF = f; ipCycles++; secIpBetween++; }
                 }
                 else if (ipOn && !cycleStart && lastShown >= 0 && sc->stageId[lastShown] == lastShownId && sc->copyDone[lastShown])
                 { pick = lastShown; ipPicked = true; }
@@ -3736,6 +3737,7 @@ static void PresenterThread(Swapchain *sc)
             }
             g_status.frameRepeats = secFrameRepeats;
             g_status.picRepeats = secPicRepeats;
+            g_status.ipBetween = secIpBetween;
             g_status.frameSkips   = secFrameSkips;
             {
                 const int wOn = !s.frameWarp ? 0 : !R.warp.ok ? -1 : warpClock.engaged ? 2 : 1;
@@ -4665,7 +4667,7 @@ static void PresenterThread(Swapchain *sc)
                 secRelN = secReadyN = 0; secRelSum = 0.0;
             }
             secFrameRepeats = secFrameSkips = secReused = 0;
-            secPicRepeats = 0;
+            secPicRepeats = secIpBetween = 0;
             secRepU = secSkipU = 0;
             secStart = t; secPresents = 0; secLate = 0; ageSum = 0.0;
         }
@@ -7738,7 +7740,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
         d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
         d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running;
         d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
-        d.ipNow = g_status.ipNow; d.ipCan = g_status.ipCan;
+        d.ipNow = g_status.ipNow; d.ipCan = g_status.ipCan; d.ipBetween = g_status.ipBetween;
         d.vramUse = g_status.vramUse; d.vramBudget = g_status.vramBudget;   // (BFI Presenter's own share isn't counted here)
     }
     if (on) Osd::Draw(d, corner, graph != 0, loads != 0, scale);
@@ -8237,7 +8239,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see BFIPresenterVK.log).");
             else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
-            else if (st.ipNow > 0) ImGui::Text("At work: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
+            else if (st.ipNow > 0) ImGui::Text("At work: frame interpolation, game at %.0f%% of the strobe rate, %d cycles a second drawn between frames.", st.warpRate * 100.0, st.ipBetween);
             else if (st.ipCan && st.warpRate > 0.0) ImGui::Text("Ready: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else ImGui::Text("Waiting for the game's frame rate.");
