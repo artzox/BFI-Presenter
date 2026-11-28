@@ -1957,44 +1957,65 @@ float4 GameFlow(float2 uv)
 // motion (ep8). The picture is still moved by warp.
 static int gFillSeen = 0;   // FrameWarpFillUncoveredDebug: 1 filled (magenta), 2 uncovered, nothing in front to fill past (cyan), 3 searched, no background found (yellow)
 static bool gFromPrev = false;   // interpolation (flags & 262144): this pixel is taken from the frame before (t4)
-static int gIpDbg = 0;           // FrameWarpInterpolateDebug (flags & 1048576): 1 newer frame, 2 frame before, 3 searched
+static int gIpDbg = 0;           // FrameWarpInterpolateDebug (flags & 1048576): 1 pushed forward won, 2 frame before (pushed forward), 3 nothing valid, 4 the search won
 float2 WarpShiftGame(float2 uv)
 {
     gFillSeen = 0;
     gFromPrev = false;
     gIpDbg = 0;
-    if ((flags & 524288) != 0)
-    {
-        uint iw, ih;
-        ipFlow.GetDimensions(iw, ih);
-        const float4 sp = ipFlow.Load(int3(clamp(int2(uv * float2(iw, ih)), int2(0, 0), int2(iw, ih) - 1), 0));
-        // the newer frame is at uv + m (1 - f) = uv - m warp; the frame before at uv - m f
-        if (sp.z > 0.75) { gIpDbg = 1; return clamp(sp.xy * warp, -0.08, 0.08); }
-        if (sp.z > 0.1) { gIpDbg = 2; gFromPrev = true; return clamp(sp.xy * (1.0 + warp), -0.08, 0.08); }
-        gIpDbg = 3;
-    }
     uint w, h;
     src.GetDimensions(w, h);
     const float2 osz = float2(w, h);                      // the check below is to a pixel of the game frame
     const float L = warp - warpLag;                       // where along its motion the vectors are read
-    float2 m[3];
+    // Candidates for where this pixel comes from: three steps of the search along the motion, and (s3, frame interpolation
+    // with flags & 524288) the motion pushed forward to the moment shown here and at the four places around (kIpShader).
+    // Each is checked the same way -- does the point it leads to really move onto this pixel? -- and the nearest that does
+    // wins. s1-s2 took the pushed-forward motion as it was: its texels are coarser than the frame and the nearest point won
+    // the whole texel, so in fine detail with gaps (hair against the sky as the camera turns) blocks moved with the character.
+    float2 m[8];
+    int n = 3;
     m[0] = GameFlow(uv).xy;
     m[1] = GameFlow(uv - m[0] * L).xy;
     m[2] = GameFlow(uv - m[1] * L).xy;
+    m[3] = m[4] = m[5] = m[6] = m[7] = float2(0.0, 0.0);
+    float4 sp = float4(0.0, 0.0, 0.0, 0.0);
+    if ((flags & 524288) != 0)
+    {
+        uint iw, ih;
+        ipFlow.GetDimensions(iw, ih);
+        const int2 ic = clamp(int2(uv * float2(iw, ih)), int2(0, 0), int2(iw, ih) - 1);
+        sp = ipFlow.Load(int3(ic, 0));
+        const int2 io[5] = { int2(0, 0), int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
+        [unroll] for (int j = 0; j < 5; j++)
+        {
+            const float4 t = ipFlow.Load(int3(clamp(ic + io[j], int2(0, 0), int2(iw, ih) - 1), 0));
+            if (t.z > 0.75) { m[3 + j] = t.xy; n = 4 + j; }
+            else m[3 + j] = m[0];                         // no candidate: a repeat of the first (checked again, no harm)
+        }
+    }
     float2 best = float2(0.0, 0.0), back = float2(0.0, 0.0), front = float2(0.0, 0.0), backOwn = float2(0.0, 0.0);
     float bestNear = -1.0, backNear = 2.0, frontNear = -1.0, bestK = 1.0, backK = 1.0;
-    [unroll] for (int i = 0; i < 3; i++)
+    int bestI = -1;
+    [unroll] for (int i = 0; i < 8; i++)
     {
+        if (i >= n) break;
         float4 g = GameFlow(uv - m[i] * L);
         if (g.z < 0.5) continue;
-        if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; bestK = saturate(g.z - 1.0); }
-        if (g.w < backNear) { backNear = g.w; back = m[i]; backOwn = g.xy; backK = saturate(g.z - 1.0); }
-        if (g.w > frontNear) { frontNear = g.w; front = g.xy; }
+        if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; bestK = saturate(g.z - 1.0); bestI = i; }
+        if (i < 3 && g.w < backNear) { backNear = g.w; back = m[i]; backOwn = g.xy; backK = saturate(g.z - 1.0); }
+        if (i < 3 && g.w > frontNear) { frontNear = g.w; front = g.xy; }
     }
+    if ((flags & 524288) != 0) gIpDbg = bestI >= 3 ? 1 : bestI >= 0 ? 4 : (sp.z > 0.1 && sp.z < 0.75) ? 2 : 3;
     const bool uncovered = bestNear < 0.0;
     if (uncovered) gFillSeen = 2;
     // Interpolated (warp = -(1 - f): the newer frame moved back to f between the two): what the newer frame doesn't show here
-    // is about to be covered in it -- the frame before still shows it, moved on by f along the background's motion.
+    // is about to be covered in it -- the frame before still shows it, moved on by f along the background's motion (pushed
+    // forward: the farthest point landed nearby, which also covers a band wider than the search reaches).
+    if ((flags & 262144) != 0 && uncovered && (flags & 524288) != 0 && sp.z > 0.1 && sp.z < 0.75)
+    {
+        gFromPrev = true;
+        return clamp(sp.xy * (1.0 + warp), -0.08, 0.08);
+    }
     if ((flags & 262144) != 0 && uncovered && backNear <= 1.0)
     {
         gFromPrev = true;
@@ -2224,7 +2245,7 @@ float3 Fetch(float2 pos)
         float3 m;
         if (FetchWarped(pos, m))
         {
-            if ((flags & 1048576) != 0 && gIpDbg >= 2) m = lerp(m, gIpDbg == 2 ? float3(1.0, 0.0, 1.0) : float3(1.0, 1.0, 0.0), 0.5);
+            if ((flags & 1048576) != 0 && (gIpDbg == 2 || gIpDbg == 3)) m = lerp(m, gIpDbg == 2 ? float3(1.0, 0.0, 1.0) : float3(1.0, 1.0, 0.0), 0.5);
             return m;
         }
         gSrcPos = pos * srcPerOut;
