@@ -259,7 +259,8 @@ function analyse(s){
       // 1.0.53: frame interpolation in use (ip_state 1 only the missing frames, 2 even pacing): a row of its own, and
       // frame warp's own "waiting" doesn't apply then.
       const ip=r.ip_state>0?r.ip_state:0;
-      const wwait=!ip && r.warp_state===1?1:0;
+      // frame warp's own state (1.0.53: 2 moving the last frame, 1 waiting, 0 off; not while interpolation draws)
+      const wwait=ip?0:r.warp_state===2?2:r.warp_state===1?1:0;
       const key=[r.cap_set,per,r.pacing,r.fg_active?1:0,rl?1:0,hold,wwait,ip].join("|");
       secRows.push({t:r.time_s,key,r,per,rl});
     }
@@ -276,8 +277,9 @@ function analyse(s){
   // reflex_limit_us does in the DX reflex CSV: "... Reflex sleep on (33333 us per rendered frame, frame generation 2x)".
   let vkLim=[];
   if(!R && s.rs && s.rs.vk) for(const e of s.rs.ev){ const m=e.text.match(/^frame limit at the game's Reflex sleep (on|off) \((\d+) us per rendered frame, frame generation (\d+)x\)/);
-    if(m) vkLim.push({t:e.rel*1000,us:m[1]==="on"?(+m[2])/Math.max(1,+m[3]):0}); }
+    if(m) vkLim.push({t:e.rel*1000,us:m[1]==="on"?(+m[2])/Math.max(1,+m[3]):0,fg:+m[3]>1?1:0}); }
   function vkLimitAt(tms){ let us=0; for(const e of vkLim){ if(e.t<=tms) us=e.us; else break; } return us; }
+  function vkFgAt(tms){ let fg=0; for(const e of vkLim){ if(e.t<=tms) fg=e.fg; else break; } return fg; }   // 1.0.53: frame generation only where its factor is over 1
   function keyAt(tms){
     if(!secRows.length) return null;
     let lo=0,hi=secRows.length-1; const ts=tms/1000;
@@ -294,7 +296,8 @@ function analyse(s){
       let key, per;
       if(sr){ if(sr.r.game_fps<3) continue; key=sr.key; per=sr.per; }
       else { per=capPeriod(a.cap,a.frames); const lu=vkLimitAt(b.time_ms); if(lu>0 && hz>0) per=Math.max(1,Math.round(lu*hz/1e6));
-        key=[a.cap,per,a.pacing,lu>0?1:-1,lu>0?1:-1,0,vkState(b.time_ms)===1?1:0].join("|"); }
+        const vip=b.ip>=1?3:0, vst=vkState(b.time_ms);   // Vulkan: interpolation from the log CSV's ip column (mode not logged per refresh)
+        key=[a.cap,per,a.pacing,lu>0?vkFgAt(b.time_ms):-1,lu>0?1:-1,0,vip?0:vst,vip].join("|"); }
       const st=litStats[key]||(litStats[key]={n:0,rep:0,skip:0,off:0,per,frames:a.frames,secs:0,runFrames:0,runOff:0,run:0,last:null});
       st.n++; st.secs+=dt/1000;
       if(b.release_to_flash_ms>0){st.r2fSum=(st.r2fSum||0)+b.release_to_flash_ms; st.r2fN=(st.r2fN||0)+1;}
@@ -345,7 +348,7 @@ function analyse(s){
       const armed=rows.filter(r=>r.warp_state===2);
       if(armed.length){ const wr=rows.reduce((a,r)=>a+(r.frame_repeats>0?r.frame_repeats:0),0), wf=rows.reduce((a,r)=>a+(r.warp_filled>0?r.warp_filled:0),0);
         repAfter=isNaN(rep)?NaN:(wr>0?rep*Math.max(0,1-wf/wr):rep); }
-      else if(wwait) repAfter=rep;   // waiting: nothing filled
+      else if(wwait===1) repAfter=rep;   // waiting: nothing filled
       if(ip>0) repAfter=NaN;          // interpolation: cycles are drawn between frames, not repeated or filled
     } else if(ls && ls.vkW && ls.n && !isNaN(rep)) repAfter=Math.max(0,(ls.rep-(ls.wfill||0))/ls.n*100);   // Vulkan, per refresh
     sg.m={cap,per,pac,fg,rl,hold,wwait,ip,repAfter,startMs,ready,presented,rendered,shown,ideal,r2f,s2p,i2f:(s2p>0&&r2f>0)?s2p+r2f:NaN,submit,gpu,autoCap,jitLimit,rep,skip,uneven,target:per>0?hz/per:hz};
@@ -434,8 +437,9 @@ function modeLabel(m,hz,frames){
   if(m.hold===1) parts.push("auto cap → "+Math.round(hz/m.per)+" fps, held at the frame start"+(m.startMs>0?" +"+m.startMs.toFixed(1)+" ms into the cycle":""));
   else if(m.cap===1 && m.per>1) parts.push((m.rl===1?"Reflex limit":"auto cap")+" → "+Math.round(hz/m.per)+" fps"+(m.rl===1?"":", held at the present"));
   else if(m.rl===1) parts.push("Reflex frame limit");
-  if(m.wwait===1) parts.push("frame warp waiting: frame rate outside its range (menus, loading)");
-  if(m.ip>0) parts.push("frame interpolation: "+(m.ip===2?"even pacing":"only the missing frames")+", one frame behind");
+  if(m.ip>0) parts.push("frame interpolation"+(m.ip===2?": even pacing":m.ip===1?": only the missing frames":"")+", one frame behind");
+  else if(m.wwait===2) parts.push("frame warp: moving the last frame");
+  else if(m.wwait===1) parts.push("frame warp waiting: frame rate outside its range (menus, loading)");
   return {main:name+(m.pac in PACING?" + "+PACING[m.pac]:""), sub:[(m.fg===1?"frame generation on":m.fg===0?"frame generation off":null),...parts].filter(Boolean).join(" · ")};
 }
 function f0(v){return isNaN(v)?"–":Math.round(v).toString()}
