@@ -7,6 +7,12 @@ BFI Presenter has two parts, released together with one version number:
 
 Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply to both. Before 1.0.0 the two were versioned separately (DX 0.x, Vulkan 0.x.y); their histories follow the 1.0.0 entry.
 
+## [1.0.53] — unreleased
+
+- **[DX] [Vulkan] Timing log: frame interpolation.** The DX reflex CSV has, per second, `ip_state` (-3 off, -2 no game motion, -1 frame generation, 0 ready, 1 only the missing frames, 2 even pacing), `ip_between` (strobe cycles drawn between two frames) and `ip_asis` (on a frame as rendered); the Vulkan log CSV has `ip` per refresh (2 drawn between two frames, 1 a frame as rendered, 0 not behind, -3 off).
+- **[Tools] Log analyzer: frame interpolation.** Seconds with it in use get a row of their own (not "frame warp waiting", and no repeated or filled counts), and a finding says how long it was in use, in which mode, how many strobe cycles it drew between frames, and release to flash with it against without in the same session.
+- **[DX] [Vulkan] Fixed: the Frame interpolation tooltip** showed a stray number where it gives the percentages.
+
 ## [1.0.52] — 2026-11-27
 
 **Fixed: a game that changed its swap chain during the first start could crash.**

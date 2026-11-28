@@ -167,7 +167,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.52"
+#define BFI_ADDON_VERSION "1.0.53"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -3937,6 +3937,7 @@ static DWORD WINAPI PresenterThread(void *)
     double ipRateSlow = 1.0;                 // game frames per strobe cycle over about 3 s (Automatic decides on it)
     int    ipTwoBehind = 0;                  // only the missing frames: cycles in a row with two frames waiting
     int    ipCycles = 0, ipAsIs = 0, ipEnters = 0;
+    int    secIpBetween = 0, secIpAsIs = 0;   // this second, for the timing log (ip_between, ip_asis; 1.0.53)
     int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
     UINT64 warpPrevId = 0;
     int    secWarpCycles = 0;
@@ -4569,7 +4570,7 @@ static DWORD WINAPI PresenterThread(void *)
                               "rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,"
                               "rfx_gpu_active_ms,rfx_sim_ms,rfx_submit_ms,rfx_queue_ms,rendered_fps,align_slack_p10_ms,align_shift_ms,"
                               "frame_repeats,warp_state,warp_filled,warp_ahead,warp_pass_gpu_ms,warp_passes,draw_gpu_ms,draw_warped_gpu_ms,"
-                              "sec_block_ms,rfx_tick_ms,vram_ms,stats_max_ms\n");
+                              "sec_block_ms,rfx_tick_ms,vram_ms,stats_max_ms,ip_state,ip_between,ip_asis\n");
         }
         else if (!s.log && logf)
         {
@@ -4847,11 +4848,11 @@ static DWORD WINAPI PresenterThread(void *)
                 else if (f < 1.0f / 32.0f || f > 31.0f / 32.0f || sb < 0)
                 {
                     pick = (f > 31.0f / 32.0f && sb >= 0) ? sb : sa;   // on a frame: as rendered
-                    ipPicked = true; ipAsIs++;
+                    ipPicked = true; ipAsIs++; secIpAsIs++;
                 }
                 else
                 {
-                    pick = sb; ipPicked = true; ipCycle = true; ipA = a; ipSlotA = sa; ipF = f; ipCycles++;
+                    pick = sb; ipPicked = true; ipCycle = true; ipA = a; ipSlotA = sa; ipF = f; ipCycles++; secIpBetween++;
                 }
             }
             else if (ipOn && !cycleStart && lastShown >= 0 && g_stageId[lastShown] == lastShownId && g_stageFence[lastShown] <= done)
@@ -7504,7 +7505,7 @@ static DWORD WINAPI PresenterThread(void *)
                 LeaveCriticalSection(&g_cfgLock);
                 if (rfxf)
                 {
-                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d\n",
                             t, stNow.gameFps, userCap, perNow, stNow.autoCapDown, stNow.autoCapProbe, stNow.fgActive, s.pacingMode,
                             s.capJit, stNow.lrState, stNow.lrEst, stNow.aheadInUse, rs.limitUs,
                             relN ? relSum / relN : -1.0, relN ? relMax : -1.0, relN, rs.frames, rs.simGpuMs, rs.simPresentMs,
@@ -7515,12 +7516,14 @@ static DWORD WINAPI PresenterThread(void *)
                             secWarpPassN ? secWarpPassMs / secWarpPassN : -1.0, secWarpPassN,
                             secDrawPlainN ? secDrawPlainMs / secDrawPlainN : -1.0,
                             secDrawWarpN ? secDrawWarpMs / secDrawWarpN : -1.0,
-                            (Now() - t) * 1000.0, g_rtMs.load(), secVramMs, secStatsMs);
+                            (Now() - t) * 1000.0, g_rtMs.load(), secVramMs, secStatsMs,
+                            !s.warpInterp ? -3 : stNow.ipNow, secIpBetween, secIpAsIs);
                     secWarpPassMs = secDrawWarpMs = secDrawPlainMs = 0.0;
                     secWarpPassN = secDrawWarpN = secDrawPlainN = 0;
                     fflush(rfxf);
                 }
                 relSum = relMax = 0.0; relN = 0;
+                secIpBetween = secIpAsIs = 0;
             }
             secStatsMs = 0.0;
             secStart = t; secPresents = 0; secLate = 0; ageSum = 0.0; secSlowPres = 0;
@@ -15193,7 +15196,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "Only the missing frames: frames as rendered, each missing one replaced by a picture between\n"
                                                               "the two around it (best near the strobe rate). Even pacing: every strobe cycle at its point in\n"
                                                               "time (smoothest well below it, a little softer). Automatic: the first near the strobe rate\n"
-                                                              "(the start), even pacing below about 88%, back after 10 s at 95% or more; from the third\n"
+                                                              "(the start), even pacing below about 88%%, back after 10 s at 95%% or more; from the third\n"
                                                               "switch it stays on even pacing (remembered per game). Best from about 45-50 fps up: further\n"
                                                               "below, errors of the game's motion at edges are moved far enough to show (outlines).");
                 if (s.warpInterp)

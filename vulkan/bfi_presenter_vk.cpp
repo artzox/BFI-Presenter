@@ -62,7 +62,7 @@
 struct Swapchain; struct DeviceData;
 namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
-#define BFI_VERSION "1.0.52"
+#define BFI_VERSION "1.0.53"
 #include <atomic>
 // ReShade's own window open (as DX 1.0.49): only then is frame warp's still test run on the finished frames as well
 static std::atomic<bool> g_rsOverlayOpen{false};
@@ -2476,7 +2476,7 @@ static void PresenterThread(Swapchain *sc)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,bfi,method,frames,gain,floor,rolloff,"
                               "pacing,cap,ahead,vblank,wait_vblank_ms,acquire_ms,wait_gpu_ms,submit_ms,present_ms,reused,"
                               "hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,queue_ahead,smooth_catchup,"
-                              "release_to_flash_ms,ready_before_pick_ms,warp_ahead,warp_pass_gpu_ms,draw_gpu_ms,draw_was_warped\n");
+                              "release_to_flash_ms,ready_before_pick_ms,warp_ahead,warp_pass_gpu_ms,draw_gpu_ms,draw_was_warped,ip\n");
                 LOGI("BFI Presenter: timing log started: %s", path.c_str());
             }
         }
@@ -4666,13 +4666,14 @@ static void PresenterThread(Swapchain *sc)
                 std::lock_guard<std::mutex> l(g_cfgLock);
                 lrSt = g_status.lrState; lrE = g_status.lrEst; lrM = g_status.lrMargin;
             }
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d\n",
                     t * 1000.0, (unsigned long long)presents, c.slot, (unsigned long long)pickId, (t - pickTime) * 1000.0,
                     (t - lastT) * 1000.0, s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     sc->maxAhead.load(), vblank ? 1 : 0, (tVb - tLoop0) * 1000.0, (tAcq - tVb) * 1000.0, (tFence - tAcq) * 1000.0,
                     (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, reuse ? 1 : 0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f,
                     litAvg, rawAvg, lrSt, sc->lrLead.load() * 1000.0, lrE, lrM, qa ? (primeIter ? 2 : qaPrimed ? 1 : 0) : -1, s.smoothCatchUp,
-                    relFlashMs, pickReadyMs, c.warp != 0.0f ? warpAhead : 0.0, tsPassMs, tsDrawMs, tsDrawWarped);
+                    relFlashMs, pickReadyMs, c.warp != 0.0f ? warpAhead : 0.0, tsPassMs, tsDrawMs, tsDrawWarped,
+                    ipOn ? (ipCycle ? 2 : 1) : (s.warpInterp ? 0 : -3));   // ip (1.0.53): 2 drawn between two frames, 1 a frame as rendered, 0 not behind, -3 off
             tsPassMs = tsDrawMs = -1.0;
             if ((presents % 120) == 0) fflush(logf);
         }
@@ -8261,7 +8262,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "Only the missing frames: frames as rendered, each missing one replaced by a picture between\n"
                                                               "the two around it (best near the strobe rate). Even pacing: every strobe cycle at its point in\n"
                                                               "time (smoothest well below it, a little softer). Automatic: the first near the strobe rate\n"
-                                                              "(the start), even pacing below about 88%, back after 10 s at 95% or more; from the third\n"
+                                                              "(the start), even pacing below about 88%%, back after 10 s at 95%% or more; from the third\n"
                                                               "switch it stays on even pacing (remembered per game). Best from about 45-50 fps up: further\n"
                                                               "below, errors of the game's motion at edges are moved far enough to show (outlines).");
                 if (s.warpInterp)
