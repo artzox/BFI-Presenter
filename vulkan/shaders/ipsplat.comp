@@ -1,0 +1,72 @@
+#version 450
+// Frame interpolation, motion at the in-between moment (1.0.54 test, FrameWarpInterpolateSplat): the newer frame's
+// motion texture (gameflow.comp: xy = how far each point moved from the frame before, z valid, w how near) is pushed
+// forward to where each point is at the moment shown, instead of searched for from the output pixel. Where two points
+// land on one place, the nearer wins (atomic max of nearness in the high bits). The search (bfi_shade.glsl,
+// WarpShiftGame) took three steps along the motion; with frames far apart (35-45 fps) they often missed the edge of
+// something moving, the pixel was taken as uncovered and filled from the frame before with the background's motion,
+// and an outline showed beside it, the further the faster it moved.
+//   PASS 0: clear the landing texture
+//   PASS 1: every point of the newer frame lands at uv - m * back (back = 1 - f: how far the newer frame is moved back),
+//           on the 2x2 texels around it (so a stretched surface leaves no gaps): the nearest point's nearness kept
+//           (atomic max of its full 32 bits: s2 kept 15 bits and the x and y of the motion apart, so two points at
+//           the same quantized distance could give one texel the x of one and the y of the other)
+//   PASS 2: the point that won each texel writes its motion there (z = 1: the newer frame shows it)
+//   PASS 3: where nothing landed: a gap inside a stretched surface (filled all around: its own motion, z = 1), or
+//           what comes out from behind something in front (z = 0.25: the frame before, with the background's motion
+//           -- the farthest point landed nearby, looked for up to 256 texels away: s1 looked 32, and behind a
+//           character the camera turns past quickly the band is wider; where nothing was found the search took over
+//           in the middle of it)
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D gFlow;
+layout(set = 0, binding = 1, r32ui) uniform uimage2D landX;
+layout(set = 0, binding = 2, r32ui) uniform uimage2D landY;   // unused since s2 (kept: the same set layout)
+layout(set = 0, binding = 3, rgba16f) uniform image2D outImg;   // pass 3 reads the motion pass 2 wrote
+layout(push_constant) uniform P { float back; uint pad0, pad1, pad2; } pc;
+
+void main()
+{
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(landX);
+    if (q.x >= sz.x || q.y >= sz.y) return;
+#if PASS == 0
+    imageStore(landX, q, uvec4(0u));
+#elif PASS == 1 || PASS == 2
+    vec4 g = texelFetch(gFlow, q, 0);
+    if (g.z < 0.5) return;                                    // no vector here
+    vec2 S = vec2(sz);
+    vec2 uvT = (vec2(q) + 0.5) / S - g.xy * pc.back;          // where this point is at the moment shown
+    ivec2 b = ivec2(floor(uvT * S - 0.5));
+    uint pr = floatBitsToUint(clamp(g.w, 0.0, 1.0)) + 1u;     // nearer wins (positive floats order as their bits); 0 = nothing landed
+    for (int y = 0; y < 2; y++)
+        for (int x = 0; x < 2; x++)
+        {
+            ivec2 t = b + ivec2(x, y);
+            if (t.x < 0 || t.y < 0 || t.x >= sz.x || t.y >= sz.y) continue;
+#if PASS == 1
+            imageAtomicMax(landX, t, pr);
+#else
+            if (imageLoad(landX, t).r == pr) imageStore(outImg, t, vec4(g.xy, 1.0, clamp(g.w, 0.0, 1.0)));
+#endif
+        }
+#else
+    if (imageLoad(landX, q).r != 0u) return;                  // landed: written by pass 2
+    const ivec2 dirs[8] = ivec2[8](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1), ivec2(1, 1), ivec2(-1, 1), ivec2(1, -1), ivec2(-1, -1));
+    uint bestP = 0xFFFFFFFFu, p1 = 0xFFFFFFFFu;
+    ivec2 bt = ivec2(-1), t1 = ivec2(-1);
+    int near1 = 0;
+    for (int r = 1; r <= 256; r *= 2)
+        for (int k = 0; k < 8; k++)
+        {
+            ivec2 t = q + dirs[k] * r;
+            if (t.x < 0 || t.y < 0 || t.x >= sz.x || t.y >= sz.y) continue;
+            uint tp = imageLoad(landX, t).r;
+            if (tp == 0u) continue;
+            if (r == 1) { near1++; if (tp < p1) { p1 = tp; t1 = t; } }
+            if (tp < bestP) { bestP = tp; bt = t; }
+        }
+    if (near1 >= 6) { imageStore(outImg, q, vec4(imageLoad(outImg, t1).xy, 1.0, 0.0)); return; }
+    if (bt.x < 0) { imageStore(outImg, q, vec4(0.0)); return; }
+    imageStore(outImg, q, vec4(imageLoad(outImg, bt).xy, 0.25, 0.0));
+#endif
+}

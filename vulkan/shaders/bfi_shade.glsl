@@ -13,9 +13,14 @@ layout(set = 2, binding = 3) uniform sampler2D gameFlow;   // the game's own mot
 // still is found (a CRT shader's blur and glow over a HUD made it look as if it moved). Otherwise the stage frames.
 layout(set = 2, binding = 4) uniform sampler2D preCur;
 layout(set = 2, binding = 5) uniform sampler2D prePrev;
+// Frame interpolation (1.0.54 test, flags & 131072): the newer frame's motion pushed forward to the moment shown
+// (ipsplat.comp, same size as gameFlow): z = 1 the newer frame shows it, z = 0.25 the frame before (with the
+// background's motion), z = 0 not known (the search below is used).
+layout(set = 2, binding = 6) uniform sampler2D ipFlow;
+int gIpDbg = 0;   // FrameWarpInterpolateDebug (flags & 262144): 1 pushed forward won, 2 frame before (pushed forward), 3 nothing valid, 4 the search won
 // CRT hand-off (CrtStandaloneHandoff, 1.0.54 test; flags & 524288): CRT-Standalone's pattern and the passes after it,
 // drawn by the presenter after frame warp (bfi_crt_vk.h: crtwarp.comp, then crt.hlsl) -- the picture shown instead of Fetch
-layout(set = 2, binding = 6) uniform sampler2D crtFinal;
+layout(set = 2, binding = 7) uniform sampler2D crtFinal;
 vec2 gSrcPos = vec2(0.0);   // where the pixel shown was taken from in the game's frame (pixels): the CRT pattern's halation
                             // and glow are read there, its mask and scanlines at the screen's pixel
 // 1.0.49 (as DX): and, while ReShade's window is open (flags & 32768), where it stands still in the finished frames too
@@ -38,23 +43,52 @@ bool gFromPrev = false;   // interpolation (flags & 65536, as DX 1.0.51): this p
 vec2 WarpShiftGame(vec2 uv)
 {
     gFromPrev = false;
+    gIpDbg = 0;
     vec2 osz = vec2(textureSize(src, 0));
     float L = pc.warp - pc.warpLag;
-    vec2 m[3];
+    // Candidates for where this pixel comes from: three steps of the search along the motion, and (s3, frame
+    // interpolation with flags & 131072) the motion pushed forward to the moment shown at this place and the four places
+    // around it (ipsplat.comp). Each is checked the same way -- does the point it leads to really move onto this pixel?
+    // -- and the nearest that does wins. s1-s2 took the pushed-forward motion as it was: its texels are half the
+    // frame's size and the nearest point won the whole texel, so in fine detail with gaps (hair against the sky as the
+    // camera turns) blocks of the background moved with the character.
+    vec2 m[8];
+    int n = 3;
     m[0] = GameFlow(uv).xy;
     m[1] = GameFlow(uv - m[0] * L).xy;
     m[2] = GameFlow(uv - m[1] * L).xy;
+    vec4 sp = vec4(0.0);
+    if ((pc.flags & 131072u) != 0u)
+    {
+        ivec2 isz = textureSize(ipFlow, 0);
+        ivec2 c = clamp(ivec2(uv * vec2(isz)), ivec2(0), isz - 1);
+        sp = texelFetch(ipFlow, c, 0);
+        const ivec2 o[5] = ivec2[5](ivec2(0, 0), ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+        for (int j = 0; j < 5; j++)
+        {
+            vec4 t = texelFetch(ipFlow, clamp(c + o[j], ivec2(0), isz - 1), 0);
+            if (t.z > 0.75) m[n++] = t.xy;
+        }
+    }
     vec2 best = vec2(0.0), back = vec2(0.0), backOwn = vec2(0.0);
     float bestNear = -1.0, backNear = 2.0, bestK = 1.0, backK = 1.0;
-    for (int i = 0; i < 3; i++)
+    int bestI = -1;
+    for (int i = 0; i < n; i++)
     {
         vec4 g = GameFlow(uv - m[i] * L);
         if (g.z < 0.5) continue;
-        if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; bestK = clamp(g.z - 1.0, 0.0, 1.0); }
-        if (g.w < backNear) { backNear = g.w; back = m[i]; backOwn = g.xy; backK = clamp(g.z - 1.0, 0.0, 1.0); }
+        if (length((g.xy - m[i]) * abs(L) * osz) < 2.0 && g.w > bestNear) { bestNear = g.w; best = m[i]; bestK = clamp(g.z - 1.0, 0.0, 1.0); bestI = i; }
+        if (i < 3 && g.w < backNear) { backNear = g.w; back = m[i]; backOwn = g.xy; backK = clamp(g.z - 1.0, 0.0, 1.0); }
     }
+    if ((pc.flags & 131072u) != 0u) gIpDbg = bestI >= 3 ? 1 : bestI >= 0 ? 4 : (sp.z > 0.1 && sp.z < 0.75) ? 2 : 3;
     // Interpolated (warp = -(1 - f)): what the newer frame doesn't show here is about to be covered in it -- the frame before
-    // still shows it, moved on by f along the background's own motion.
+    // still shows it, moved on by f along the background's own motion (pushed forward: the farthest point landed nearby,
+    // which also covers a band wider than the search reaches).
+    if ((pc.flags & 65536u) != 0u && bestNear < 0.0 && (pc.flags & 131072u) != 0u && sp.z > 0.1 && sp.z < 0.75)
+    {
+        gFromPrev = true;
+        return clamp(sp.xy * (1.0 + pc.warp), -0.08, 0.08);
+    }
     if ((pc.flags & 65536u) != 0u && bestNear < 0.0 && backNear <= 1.0)
     {
         gFromPrev = true;
@@ -172,7 +206,12 @@ bool FetchWarped(vec2 fc, out vec3 c)
     p = clamp(p, vec2(0.5), size - 0.5);
     if (Still(ivec2(p), size)) return false;
     gSrcPos = p;
-    if (gFromPrev) { c = textureLod(srcPrev, p * inv, 0.0).rgb; return true; }   // interpolation: from the frame before
+    if (gFromPrev)   // interpolation: from the frame before
+    {
+        c = textureLod(srcPrev, p * inv, 0.0).rgb;
+        if ((pc.flags & 262144u) != 0u && (gIpDbg == 2 || gIpDbg == 3)) c = mix(c, gIpDbg == 2 ? vec3(1.0, 0.0, 1.0) : vec3(1.0, 1.0, 0.0), 0.5);
+        return true;
+    }
     vec2 tc = floor(p - 0.5) + 0.5;
     vec2 f = p - tc;
     vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
@@ -190,6 +229,7 @@ bool FetchWarped(vec2 fc, out vec3 c)
     c += textureLod(srcLin, vec2(t0.x,  t3.y),  0.0).rgb * (w0.x  * w3.y);
     c += textureLod(srcLin, vec2(t12.x, t3.y),  0.0).rgb * (w12.x * w3.y);
     c += textureLod(srcLin, vec2(t3.x,  t3.y),  0.0).rgb * (w3.x  * w3.y);
+    if ((pc.flags & 262144u) != 0u && gIpDbg == 3) c = mix(c, vec3(1.0, 1.0, 0.0), 0.5);   // searched: yellow
     return true;
 }
 // The game's frame at output pixel fc (same size), moved ahead on a filled strobe cycle.

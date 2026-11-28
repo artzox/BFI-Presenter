@@ -28,6 +28,8 @@ if command -v glslangValidator >/dev/null 2>&1; then
         glslangValidator -V -D -S comp -e CSPattern -DBEAM=$b shaders/crt.hlsl -o "$tmp/crtPattern$b.spv" >/dev/null
         python3 tools/spvfmt.py "$tmp/crtPattern$b.spv" 4 2>/dev/null
     done
+    # frame interpolation: the newer frame's motion pushed forward to the moment shown (clear, land, write, fill)
+    for n in 0 1 2 3; do glslangValidator -V -DPASS=$n shaders/ipsplat.comp -o "$tmp/ipsplat$n.comp.spv" >/dev/null; done
     python3 tools/genspv.py "$tmp" shaders_spv.h
     rm -rf "$tmp"
     echo "shaders recompiled into shaders_spv.h"
