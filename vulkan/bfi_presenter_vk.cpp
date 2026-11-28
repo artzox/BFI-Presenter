@@ -2292,7 +2292,7 @@ static void PresenterThread(Swapchain *sc)
     // whose times (when the game presented them) are around it. Uncharted's frames came 16 or 25 ms apart (the cap's
     // 120 Hz grid) and each carries the motion of its own gap; spaced by frame number, steps alternated fast and slow.
     double ipD = 0.0, ipT = 0.0, ipLagHist[120] = {}, ipDSum = 0.0, ipGapSum = 0.0, ipGapMax = 0.0;
-    int    ipLagN = 0, ipLagAt = 0, ipDN = 0, ipGapN = 0, ipStalls = 0; double picShownP = -1.0;   // the same picture lit again (as DX)
+    int    ipLagN = 0, ipLagAt = 0, ipDN = 0, ipGapN = 0, ipStalls = 0, ipResyncs = 0; double picShownP = -1.0;   // the same picture lit again (as DX)
     int secRepU = 0, secSkipU = 0;      // strobe cycles short of / ahead of the expected step (DX12 add-on v0.78)
     // Frame start timing (automatic frame cap): new game frames lit this second, their release -> flash, and how long
     // each was ready before the pick.
@@ -2486,7 +2486,7 @@ static void PresenterThread(Swapchain *sc)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,bfi,method,frames,gain,floor,rolloff,"
                               "pacing,cap,ahead,vblank,wait_vblank_ms,acquire_ms,wait_gpu_ms,submit_ms,present_ms,reused,"
                               "hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,queue_ahead,smooth_catchup,"
-                              "release_to_flash_ms,ready_before_pick_ms,warp_ahead,warp_pass_gpu_ms,draw_gpu_ms,draw_was_warped,ip,pic_rep\n");
+                              "release_to_flash_ms,ready_before_pick_ms,warp_ahead,warp_pass_gpu_ms,draw_gpu_ms,draw_was_warped,ip,pic_rep,ip_pos\n");
                 LOGI("BFI Presenter: timing log started: %s", path.c_str());
             }
         }
@@ -2718,11 +2718,20 @@ static void PresenterThread(Swapchain *sc)
                                 {
                                     ipLagHist[ipLagAt] = tn - tsNew; ipLagAt = (ipLagAt + 1) % 120; if (ipLagN < 120) ipLagN++;
                                 }
-                                double lagMax = 0.0;
-                                for (int i = 0; i < ipLagN; i++) lagMax = std::max(lagMax, ipLagHist[i]);
-                                const double target = std::min(0.1, lagMax + 0.001);
+                                // t6: the 95th percentile of the last 2 s, not the largest (one hitch of 120 ms held the
+                                // delay near 90 ms for 8 s, and running it back down sped the picture up); the delay moves
+                                // at most 0.15 ms a cycle (under 1% of speed) unless frames are waited for, and after a
+                                // hitch it jumps back to the target in one step instead of drifting there
+                                double srt[120]; int ns = 0;
+                                for (int i = 0; i < ipLagN; i++) srt[ns++] = ipLagHist[i];
+                                std::sort(srt, srt + ns);
+                                const double lagP = ns ? srt[std::min(ns - 1, (int)(0.95 * ns))] : 0.0;
+                                const double target = std::min(0.1, lagP + 0.001);
+                                const bool waiting = tsNew > 0.0 && tn - ipD > tsNew;   // the picture would be past the newest frame
                                 if (ipD <= 0.0) { ipD = target; ipT = tn - ipD; }
-                                else ipD += (target > ipD ? 0.25 : 0.01) * (target - ipD);
+                                else if (ipD > target + 0.03) { ipD = target; ipResyncs++; }   // after a hitch: back in one step
+                                else if (waiting) ipD += 0.25 * std::max(0.0, (tn - tsNew) - ipD);
+                                else ipD += std::max(-0.00015, std::min(0.00015, target - ipD));
                                 const double T = std::max(ipT, tn - ipD);
                                 ipT = T;
                                 ipDSum += ipD; ipDN++;
@@ -2809,9 +2818,9 @@ static void PresenterThread(Swapchain *sc)
                              "(game frames per strobe cycle %.2f)", ipCycles, ipAsIs, ipRate);
                     if (ipLogT > 0.0 && ipDN > 0)
                         LOGI("BFI Presenter: frame interpolation by time: %.1f ms behind on average, game frames %.1f ms apart (%.1f at most), "
-                             "%d cycles waited at the newest frame", ipDSum / ipDN * 1000.0, ipGapN ? ipGapSum / ipGapN * 1000.0 : 0.0,
-                             ipGapMax * 1000.0, ipStalls);
-                    ipDSum = ipGapSum = ipGapMax = 0.0; ipDN = ipGapN = ipStalls = 0;
+                             "%d cycles waited at the newest frame, %d jumps back after a hitch", ipDSum / ipDN * 1000.0, ipGapN ? ipGapSum / ipGapN * 1000.0 : 0.0,
+                             ipGapMax * 1000.0, ipStalls, ipResyncs);
+                    ipDSum = ipGapSum = ipGapMax = 0.0; ipDN = ipGapN = ipStalls = ipResyncs = 0;
                     ipLogT = Now(); ipCycles = ipAsIs = 0;
                 }
             }
@@ -4739,14 +4748,14 @@ static void PresenterThread(Swapchain *sc)
                 std::lock_guard<std::mutex> l(g_cfgLock);
                 lrSt = g_status.lrState; lrE = g_status.lrEst; lrM = g_status.lrMargin;
             }
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d\n",
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%.4f\n",
                     t * 1000.0, (unsigned long long)presents, c.slot, (unsigned long long)pickId, (t - pickTime) * 1000.0,
                     (t - lastT) * 1000.0, s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     sc->maxAhead.load(), vblank ? 1 : 0, (tVb - tLoop0) * 1000.0, (tAcq - tVb) * 1000.0, (tFence - tAcq) * 1000.0,
                     (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, reuse ? 1 : 0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f,
                     litAvg, rawAvg, lrSt, sc->lrLead.load() * 1000.0, lrE, lrM, qa ? (primeIter ? 2 : qaPrimed ? 1 : 0) : -1, s.smoothCatchUp,
                     relFlashMs, pickReadyMs, c.warp != 0.0f ? warpAhead : 0.0, tsPassMs, tsDrawMs, tsDrawWarped,
-                    ipOn ? (ipCycle ? 2 : 1) : (s.warpInterp ? 0 : -3), cycPicRep);   // ip (1.0.53): 2 drawn between two frames, 1 a frame as rendered, 0 not behind, -3 off
+                    ipOn ? (ipCycle ? 2 : 1) : (s.warpInterp ? 0 : -3), cycPicRep, ipOn ? ipP : -1.0);   // ip (1.0.53): 2 drawn between two frames, 1 a frame as rendered, 0 not behind, -3 off
             tsPassMs = tsDrawMs = -1.0;
             if ((presents % 120) == 0) fflush(logf);
         }
