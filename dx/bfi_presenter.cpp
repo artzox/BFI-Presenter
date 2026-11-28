@@ -2906,6 +2906,12 @@ static void ShaderCacheSave(uint64_t key)
 static bool Compile(PFN_D3DCompile compile, const char *entry, const char *target, ID3DBlob **out);
 static DWORD WINAPI ShaderThread(void *self)
 {
+    // ShaderTestDelayMs (diagnostic, ini only, 0 = off): hold the shaders back this long, as a slow first compile would
+    // (to test a game that changes its swap chain while the presenter waits for them, #142)
+    {
+        const int d = (int)GetPrivateProfileIntA("BFI", "ShaderTestDelayMs", 0, g_iniPath);
+        if (d > 0) { LOGI("BFI Presenter: shaders held back %d ms (ShaderTestDelayMs)", d); Sleep((DWORD)std::min(d, 60000)); }
+    }
     const double t0 = Now();
     HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
     const uint64_t key = ShaderKey();
