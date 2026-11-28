@@ -8717,13 +8717,13 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "flash, and a CRT shader's mask moves with the picture. Details: the settings guide.");
         {
             bool ch = s.crtHandoff != 0;
-            if (ImGui::Checkbox("Apply CRT-Standalone after frame warp (test)", &ch)) s.crtHandoff = ch ? 1 : 0;
+            if (ImGui::Checkbox("Apply CRT-Standalone after frame warp", &ch)) s.crtHandoff = ch ? 1 : 0;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("CRT-Standalone's mask, scanlines, halation and glow -- and its passes after them: sharpen,\n"
                                                           "scanline soften, grain, noise floor, gamut expand, corner round -- are drawn by the presenter\n"
                                                           "after frame warp, so a moved frame doesn't move them with the picture (moire, mostly in the\n"
                                                           "sky). Needs BFI_PRESENTER_HANDOFF=1 in CRT-Standalone's preprocessor definitions too: its\n"
                                                           "settings stay in its own window. Not with its PIPELINE 1/2 or ENABLE_SCANLINE_SS=1, nor\n"
-                                                          "10-bit or HDR games yet. Takes effect when the presenter next starts (the game's next swap\n"
+                                                          "10-bit or HDR games, nor without the realtime compute queue (64-bit only) yet. Takes effect when the presenter next starts (the game's next swap\n"
                                                           "chain). Costs GPU time (the CRT picture for every flash with a new picture) and about 230 MB\n"
                                                           "of video memory at 4K: only turn it on in a game where the moire is visible.");
             if (s.crtHandoff)
