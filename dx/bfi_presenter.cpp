@@ -167,7 +167,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.53"
+#define BFI_ADDON_VERSION "1.0.54"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -200,6 +200,8 @@ struct Settings
                                    // 1 only the missing frames drawn between two (the rest as rendered), 2 even pacing (every cycle at its time),
                                    // 3 automatic: 1 near the strobe rate, 2 clearly below it (i4)
     int   warpInterpTime = 1;      // FrameWarpInterpolateByTime (1.0.53): even pacing by the frames' times, not their numbers
+    int   warpInterpSplat = 1;     // FrameWarpInterpolateSplat (1.0.54 test): the newer frame's motion pushed forward to the moment shown
+    int   warpInterpDebug = 0;     // FrameWarpInterpolateDebug (1.0.54 test): tint -- magenta from the frame before, yellow searched
     int   warpFillDebug = 0;       // FrameWarpFillUncoveredDebug: tint uncovered pixels (test)
     int   warpFillUncovered = 0;   // FrameWarpFillUncovered: with the game's motion, what is uncovered from the background beside it (1.0.51)
     int   warpEdge = 0;       // FrameWarpEdge: the strip at the screen edge a moved flash has no picture for: 0 the move faded
@@ -434,6 +436,8 @@ static void LoadSettings(Settings &s)
     s.warpFillDebug = IniInt("FrameWarpFillUncoveredDebug", 0) ? 1 : 0;
     s.warpInterp = std::max(0, std::min(3, IniInt("FrameWarpInterpolate", 0)));   // 1 only the missing frames, 2 even pacing, 3 automatic
     s.warpInterpTime = IniInt("FrameWarpInterpolateByTime", 1) ? 1 : 0;
+    s.warpInterpSplat = IniInt("FrameWarpInterpolateSplat", 1) ? 1 : 0;
+    s.warpInterpDebug = IniInt("FrameWarpInterpolateDebug", 0) ? 1 : 0;
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -692,6 +696,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarpFillUncovered", s.warpFillUncovered);
     IniWriteInt("FrameWarpInterpolate", s.warpInterp);
     IniWriteInt("FrameWarpInterpolateByTime", s.warpInterpTime);
+    IniWriteInt("FrameWarpInterpolateSplat", s.warpInterpSplat);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -1798,6 +1803,84 @@ static void DumpDeviceRemoved(ID3D12Device *device, const char *where)
     if (f) fclose(f);
 }
 
+// ---------------------------------------------------------------- frame interpolation: motion at the moment shown
+// (1.0.54 test, FrameWarpInterpolateSplat; as vulkan/shaders/ipsplat.comp). The newer frame's motion texture (xy how
+// far each point moved from the frame before, z valid, w how near) pushed forward to where each point is at the moment
+// shown, the nearer point winning where two land on one place, instead of searched for from the output pixel: with
+// frames far apart (35-45 fps) the search's three steps often missed the edge of something moving, and the pixel was
+// filled from the frame before with the background's motion -- an outline beside it, the further the faster it moved.
+// Clear; land (each point on the 2x2 texels around where it is at the moment shown); resolve (z = 1 the newer frame,
+// z = 0.25 what comes out from behind: the frame before with the background's motion, z = 0 not known: the search).
+static const char kIpShader[] = R"HLSL(
+cbuffer P : register(b0) { float back; uint ip0, ip1, ip2; };   // back = 1 - f: how far the newer frame is moved back
+Texture2D<float4> gFlow : register(t0);
+RWTexture2D<uint> landX : register(u0);
+RWTexture2D<uint> landY : register(u1);
+RWTexture2D<float4> ipOut : register(u2);
+
+[numthreads(8, 8, 1)]
+void CSIpClear(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h; landX.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    landX[id.xy] = 0u; landY[id.xy] = 0u;
+}
+
+[numthreads(8, 8, 1)]
+void CSIpLand(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h; landX.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    float4 g = gFlow.Load(int3(id.xy, 0));
+    if (g.z < 0.5) return;                                   // no vector here
+    float2 S = float2(w, h);
+    float2 uvT = (float2(id.xy) + 0.5) / S - g.xy * back;    // where this point is at the moment shown
+    int2 b = int2(floor(uvT * S - 0.5));
+    uint pr = (uint(saturate(g.w) * 32766.0) + 1u) << 16;     // nearer wins; 0 = nothing landed
+    uint hx = f32tof16(g.x) & 0xFFFFu, hy = f32tof16(g.y) & 0xFFFFu;
+    [unroll] for (int y = 0; y < 2; y++)
+        [unroll] for (int x = 0; x < 2; x++)
+        {
+            int2 t = b + int2(x, y);
+            if (t.x < 0 || t.y < 0 || t.x >= (int)w || t.y >= (int)h) continue;
+            uint o;
+            InterlockedMax(landX[t], pr | hx, o);
+            InterlockedMax(landY[t], pr | hy, o);
+        }
+}
+
+static const int2 kIpDir[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1) };
+[numthreads(8, 8, 1)]
+void CSIpResolve(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h; landX.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    uint x = landX[id.xy], y = landY[id.xy];
+    if (x != 0u && y != 0u)
+    {
+        ipOut[id.xy] = float4(f16tof32(x & 0xFFFFu), f16tof32(y & 0xFFFFu), 1.0, float((x >> 16) - 1u) / 32766.0);
+        return;
+    }
+    // nothing landed: a gap in a stretched surface (filled all around: its own motion, from the newer frame), or what
+    // comes out from behind something in front (the farthest point nearby: the background's motion, the frame before)
+    uint bestP = 0xFFFFFFFFu, bx = 0u, by = 0u, p1 = 0xFFFFFFFFu, x1 = 0u, y1 = 0u;
+    int near1 = 0;
+    const int2 sz = int2(w, h);
+    for (int r = 1; r <= 32; r *= 2)
+        [unroll] for (int k = 0; k < 8; k++)
+        {
+            int2 t = clamp(int2(id.xy) + kIpDir[k] * r, int2(0, 0), sz - 1);
+            uint tx = landX[t], ty = landY[t];
+            if (tx == 0u || ty == 0u) continue;
+            if (r == 1) { near1++; if ((tx >> 16) < p1) { p1 = tx >> 16; x1 = tx; y1 = ty; } }
+            if ((tx >> 16) < bestP) { bestP = tx >> 16; bx = tx; by = ty; }
+        }
+    if (near1 >= 6) { bx = x1; by = y1; bestP = p1; }
+    if (bx == 0u) { ipOut[id.xy] = float4(0.0, 0.0, 0.0, 0.0); return; }
+    ipOut[id.xy] = float4(f16tof32(bx & 0xFFFFu), f16tof32(by & 0xFFFFu), near1 >= 6 ? 1.0 : 0.25, float(bestP - 1u) / 32766.0);
+}
+)HLSL";
+
 // ---------------------------------------------------------------- per-refresh shader
 static const char kShader[] = R"HLSL(
 cbuffer C : register(b0)
@@ -1845,6 +1928,8 @@ Texture2D<float4> srcPrev : register(t4); // frame warp: the game frame shown be
 Texture2D<float4> preCur  : register(t5); // FrameWarpStillBeforeEffects (flags & 32768): this frame from before ReShade's effects
 Texture2D<float4> prePrev : register(t6); // and the frame shown before, likewise
 Texture2D<float4> flowTex : register(t3); // frame warp: xy = how far the picture moved since the frame before (uv), z = confidence
+Texture2D<float4> ipFlow  : register(t13); // frame interpolation (flags & 524288, 1.0.54 test): the newer frame's motion at the moment shown
+                                           // (kIpShader): z = 1 the newer frame shows it, 0.25 the frame before, 0 not known (searched)
 SamplerState linClamp : register(s0);
 
 // Frame warp (dx/bfi_warp.h): how far back along its motion the picture shown at uv is taken from, in uv. The vector
@@ -1867,10 +1952,22 @@ float4 GameFlow(float2 uv)
 // motion (ep8). The picture is still moved by warp.
 static int gFillSeen = 0;   // FrameWarpFillUncoveredDebug: 1 filled (magenta), 2 uncovered, nothing in front to fill past (cyan), 3 searched, no background found (yellow)
 static bool gFromPrev = false;   // interpolation (flags & 262144): this pixel is taken from the frame before (t4)
+static int gIpDbg = 0;           // FrameWarpInterpolateDebug (flags & 1048576): 1 newer frame, 2 frame before, 3 searched
 float2 WarpShiftGame(float2 uv)
 {
     gFillSeen = 0;
     gFromPrev = false;
+    gIpDbg = 0;
+    if ((flags & 524288) != 0)
+    {
+        uint iw, ih;
+        ipFlow.GetDimensions(iw, ih);
+        const float4 sp = ipFlow.Load(int3(clamp(int2(uv * float2(iw, ih)), int2(0, 0), int2(iw, ih) - 1), 0));
+        // the newer frame is at uv + m (1 - f) = uv - m warp; the frame before at uv - m f
+        if (sp.z > 0.75) { gIpDbg = 1; return clamp(sp.xy * warp, -0.08, 0.08); }
+        if (sp.z > 0.1) { gIpDbg = 2; gFromPrev = true; return clamp(sp.xy * (1.0 + warp), -0.08, 0.08); }
+        gIpDbg = 3;
+    }
     uint w, h;
     src.GetDimensions(w, h);
     const float2 osz = float2(w, h);                      // the check below is to a pixel of the game frame
@@ -2120,7 +2217,11 @@ float3 Fetch(float2 pos)
     if (warp != 0.0)
     {
         float3 m;
-        if (FetchWarped(pos, m)) return m;
+        if (FetchWarped(pos, m))
+        {
+            if ((flags & 1048576) != 0 && gIpDbg >= 2) m = lerp(m, gIpDbg == 2 ? float3(1.0, 0.0, 1.0) : float3(1.0, 1.0, 0.0), 0.5);
+            return m;
+        }
         gSrcPos = pos * srcPerOut;
     }
     if (srcPerOut.x <= 1.0001 && srcPerOut.y <= 1.0001) return src.Load(int3(pos, 0)).rgb;
@@ -2787,7 +2888,10 @@ static bool Compile(PFN_D3DCompile compile, const char *entry, const char *targe
 {
     ID3DBlob *err = nullptr;
     const bool warpSrc = strncmp(entry, "PSWarp", 6) == 0;     // frame warp's passes have a source of their own
-    HRESULT hr = compile(warpSrc ? kWarpShader : kShader, (warpSrc ? sizeof(kWarpShader) : sizeof(kShader)) - 1, "bfi_presenter",
+    const bool ipSrc = strncmp(entry, "CSIp", 4) == 0;         // and frame interpolation's
+    const char *srcTxt = ipSrc ? kIpShader : warpSrc ? kWarpShader : kShader;
+    const size_t srcLen = (ipSrc ? sizeof(kIpShader) : warpSrc ? sizeof(kWarpShader) : sizeof(kShader)) - 1;
+    HRESULT hr = compile(srcTxt, srcLen, "bfi_presenter",
                          nullptr, nullptr, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out, &err);
     if (FAILED(hr))
     {
@@ -2830,9 +2934,12 @@ static void Trace(const char *fmt, ...)
 // they are usually ready), and kept on disk in BFIPresenter_shaders.bin next to the ini, keyed to the exact source and
 // compile flags: from the second start of a version there is no compile at all.
 static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce",
-                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud" };   // the last six: kWarpShader (dx/bfi_warp.h)
-static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0" };
-static const int kShN = 11;
+                                         "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud",   // six: kWarpShader (dx/bfi_warp.h)
+                                         "CSIpClear", "CSIpLand", "CSIpResolve" };   // frame interpolation (kIpShader, 1.0.54 test)
+static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0",
+                                         "cs_5_0", "cs_5_0", "cs_5_0" };
+static const int kShN = 14;
+static const int kShIp = 11;                     // first of frame interpolation's compute shaders
 static const int kShWarpGame = 9;                // frame warp from the game's own motion vectors and depth
 static const int kShWarpHud = 10;                // and its HUD mask from the game's HUD-less picture
 static const int kShWarp = 5;                    // first of the frame warp shaders
@@ -2848,6 +2955,7 @@ static uint64_t ShaderKey()
     auto mix = [&](const void *p, size_t n) { const uint8_t *b = (const uint8_t *)p; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; } };
     mix(kShader, sizeof(kShader) - 1);
     mix(kWarpShader, sizeof(kWarpShader) - 1);
+    mix(kIpShader, sizeof(kIpShader) - 1);
     const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
     mix(&flags, sizeof(flags));
     for (int i = 0; i < kShN; i++) { mix(kShEntry[i], strlen(kShEntry[i])); mix(kShTarget[i], strlen(kShTarget[i])); }
@@ -3919,6 +4027,16 @@ static DWORD WINAPI PresenterThread(void *)
     WarpGpu warp;
     WarpClock warpClock;
     ID3DBlob *psWarp[kWarpShN] = {};
+    // Frame interpolation, the newer frame's motion pushed forward to the moment shown (kIpShader, 1.0.54 test): its own
+    // compute root signature and passes; two r32 landing textures and the resolved motion (t13), the game motion's size
+    ID3DBlob *csIp[3] = {};
+    ID3D12RootSignature *ipRs = nullptr;
+    ID3D12PipelineState *ipPso[3] = {};
+    ID3D12Resource *ipRes[3] = {};
+    UINT   ipW = 0, ipH = 0;
+    UINT64 ipLastId = 0;
+    float  ipLastBack = -1.0f;
+    bool   ipFailed = false, ipLogged = false, ipOutSrv = false;   // ipOutSrv: the resolved motion is in PIXEL_SHADER_RESOURCE
     double warpAhead = 0.0;                  // this strobe cycle: game frames ahead of the frame it shows
     // Interpolation while frames are missing (FrameWarpInterpolate, test 1.0.51): at the first missing frame the presenter
     // falls one game frame behind and shows each strobe cycle at a point between two finished frames (ipP, in frame ids):
@@ -3998,6 +4116,7 @@ static DWORD WINAPI PresenterThread(void *)
     UINT   bakeGenSeen = ~0u;
     // a moved flash with its frame's grain (dx/bfi_crt.h GrainFor): (crtRt[from], grain's g) at kRingSrv + 4 g + 2 from
     const UINT kRingSrv = kBakeSrv + 2 * kStage;
+    const UINT kIpSrv = kRingSrv + 8;                            // frame interpolation: u0-u2 (landing x, y, resolved), then the resolved as t13
     UINT   ringGenSeen = ~0u, ringRtGen = 0, ringRtSeen = ~0u;
     UINT   crtGrainReused = 0, crtGrainMade = 0;                // moved flashes: with their frame's grain, with their own
     double crtGrainLogT = 0.0;
@@ -4033,7 +4152,7 @@ static DWORD WINAPI PresenterThread(void *)
     hd.NumDescriptors = n;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage + 4 * kStage + 4 + 2 * kStage + 8;   // the stage frames, the APL Limiter's cells and its 1x1 average,
+    hd.NumDescriptors = kStage + 2 + WarpGpu::kSrvCount + kStage + kStage + 4 * kStage + 4 + 2 * kStage + 8 + 4;   // + 4: frame interpolation's   // the stage frames, the APL Limiter's cells and its 1x1 average,
                                                                        // frame warp's textures, the game's own motion per stage slot
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ok = ok && SUCCEEDED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
@@ -4077,6 +4196,7 @@ static DWORD WINAPI PresenterThread(void *)
         ok = ShaderGet(sh, &shStopped);
         vs = sh[0]; ps = sh[1]; psMeas = sh[2]; psAplC = sh[3]; psAplR = sh[4];   // ABL guard, APL Limiter optional
         for (int i = 0; i < kWarpShN; i++) psWarp[i] = sh[kShWarp + i];             // frame warp optional
+        for (int i = 0; i < 3; i++) csIp[i] = sh[kShIp + i];                        // frame interpolation's passes optional
         if (!ok && !shStopped) LOGE("BFI Presenter: the presenter's shaders are not available");
     }
 
@@ -4102,7 +4222,9 @@ static DWORD WINAPI PresenterThread(void *)
         rangeCrt.BaseShaderRegister = 7; rangeCrt.NumDescriptors = 4;   // t7-t10: CRT hand-off's halation, glow, wide glow, the frame before ReShade's window
         D3D12_DESCRIPTOR_RANGE rangeCrtPost = range;
         rangeCrtPost.BaseShaderRegister = 11; rangeCrtPost.NumDescriptors = 2;   // t11-t12: CRT hand-off's pass before, grain's texture
-        D3D12_ROOT_PARAMETER params[11] = {};
+        D3D12_DESCRIPTOR_RANGE rangeIp = range;
+        rangeIp.BaseShaderRegister = 13;                   // t13: frame interpolation's motion at the moment shown (1.0.54 test)
+        D3D12_ROOT_PARAMETER params[12] = {};
         params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
         params[0].Constants.Num32BitValues = sizeof(Constants) / 4;
@@ -4130,6 +4252,8 @@ static DWORD WINAPI PresenterThread(void *)
         params[9].ShaderVisibility          = D3D12_SHADER_VISIBILITY_PIXEL;
         params[10] = params[1];
         params[10].DescriptorTable.pDescriptorRanges  = &rangeCrtPost;
+        params[11] = params[1];
+        params[11].DescriptorTable.pDescriptorRanges  = &rangeIp;
         D3D12_STATIC_SAMPLER_DESC samp = {};
         samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -4137,13 +4261,41 @@ static DWORD WINAPI PresenterThread(void *)
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rsd = {};
-        rsd.NumParameters = 11;
+        rsd.NumParameters = 12;
         rsd.pParameters   = params;
         rsd.NumStaticSamplers = 1;
         rsd.pStaticSamplers   = &samp;
         ok = SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsBlob, &rsErr));
         ok = ok && SUCCEEDED(g_device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
                                                            IID_PPV_ARGS(&rootSig)));
+    }
+    if (ok && csIp[0] && csIp[1] && csIp[2])
+    {
+        // frame interpolation's passes: b0 4 constants, t0 the game's motion, u0-u2
+        D3D12_DESCRIPTOR_RANGE rt = {}; rt.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rt.NumDescriptors = 1;
+        D3D12_DESCRIPTOR_RANGE ru = {}; ru.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ru.NumDescriptors = 3;
+        D3D12_ROOT_PARAMETER ip[3] = {};
+        ip[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; ip[0].Constants.Num32BitValues = 4;
+        ip[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; ip[1].DescriptorTable.NumDescriptorRanges = 1; ip[1].DescriptorTable.pDescriptorRanges = &rt;
+        ip[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; ip[2].DescriptorTable.NumDescriptorRanges = 1; ip[2].DescriptorTable.pDescriptorRanges = &ru;
+        D3D12_ROOT_SIGNATURE_DESC ird = {}; ird.NumParameters = 3; ird.pParameters = ip;
+        ID3DBlob *ib = nullptr, *ie = nullptr;
+        bool iok = SUCCEEDED(D3D12SerializeRootSignature(&ird, D3D_ROOT_SIGNATURE_VERSION_1, &ib, &ie)) &&
+                   SUCCEEDED(g_device->CreateRootSignature(0, ib->GetBufferPointer(), ib->GetBufferSize(), IID_PPV_ARGS(&ipRs)));
+        SafeRelease(ib); SafeRelease(ie);
+        for (int i = 0; iok && i < 3; i++)
+        {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
+            cd.pRootSignature = ipRs;
+            cd.CS = { csIp[i]->GetBufferPointer(), csIp[i]->GetBufferSize() };
+            iok = SUCCEEDED(g_device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&ipPso[i])));
+        }
+        if (!iok)
+        {
+            for (int i = 0; i < 3; i++) SafeRelease(ipPso[i]);
+            SafeRelease(ipRs);
+            LOGW("BFI Presenter: frame interpolation: the passes that push the motion forward could not be made -- the search is used");
+        }
     }
     if (ok)
     {
@@ -5434,6 +5586,7 @@ static DWORD WINAPI PresenterThread(void *)
         list->SetGraphicsRootSignature(rootSig);
         list->SetGraphicsRoot32BitConstants(0, sizeof(Constants) / 4, &c, 0);
         list->SetGraphicsRootDescriptorTable(1, srv);
+        list->SetGraphicsRootDescriptorTable(11, srv);                     // t13: read only with flags & 524288 (set below)
         D3D12_GPU_DESCRIPTOR_HANDLE aplSrv = srv;                          // unused unless the limiter is on
         if (aplOk)
         {
@@ -5579,6 +5732,89 @@ static DWORD WINAPI PresenterThread(void *)
                     chkPending = true; chkFence = reserve; chkFrames = pickId - warpOld; chkT = Now(); chkSrc = (int)c.warpSrc;
                     static int nRec = 0;
                     if (nRec++ < 3) LOGI("BFI Presenter: frame warp check: both motions copied for reading back (fence %llu)", (unsigned long long)reserve);
+                }
+            }
+            // Frame interpolation (1.0.54 test): the newer frame's motion pushed forward to the moment shown
+            if ((c.flags & 262144u) && c.warpSrc == 1 && gFlow && s.warpInterpSplat && ipRs && !ipFailed)
+            {
+                const D3D12_RESOURCE_DESC gd = gFlow->GetDesc();
+                if (!ipRes[0] || ipW != (UINT)gd.Width || ipH != gd.Height)
+                {
+                    for (int i = 0; i < 3; i++) SafeRelease(ipRes[i]);
+                    ipW = (UINT)gd.Width; ipH = gd.Height;
+                    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    bool rok = true;
+                    for (int i = 0; rok && i < 3; i++)
+                    {
+                        D3D12_RESOURCE_DESC rd = {};
+                        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = ipW; rd.Height = ipH; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+                        rd.Format = i < 2 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT; rd.SampleDesc.Count = 1;
+                        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                        rok = SUCCEEDED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                                          nullptr, IID_PPV_ARGS(&ipRes[i])));
+                        if (rok)
+                        {
+                            D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {}; ud.Format = rd.Format; ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                            D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                            h.ptr += (SIZE_T)(kIpSrv + (UINT)i) * srvStride;
+                            g_device->CreateUnorderedAccessView(ipRes[i], nullptr, &ud, h);
+                        }
+                    }
+                    if (rok)
+                    {
+                        D3D12_SHADER_RESOURCE_VIEW_DESC sv = {}; sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Texture2D.MipLevels = 1;
+                        D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart();
+                        h.ptr += (SIZE_T)(kIpSrv + 3) * srvStride;
+                        g_device->CreateShaderResourceView(ipRes[2], &sv, h);
+                    }
+                    else
+                    {
+                        for (int i = 0; i < 3; i++) SafeRelease(ipRes[i]);
+                        ipFailed = true;
+                        LOGW("BFI Presenter: frame interpolation: the textures to push the motion forward could not be made -- the search is used");
+                    }
+                    ipOutSrv = false; ipLastId = 0;
+                }
+                if (ipRes[0])
+                {
+                    const float back = -c.warp;
+                    if (pickId != ipLastId || back != ipLastBack)   // once per frame and moment (the cycle's dark refresh reuses it)
+                    {
+                        D3D12_RESOURCE_BARRIER b0[2] = { Transition(gFlow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                                                         Transition(ipRes[2], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) };
+                        list->ResourceBarrier(ipOutSrv ? 2 : 1, b0);
+                        list->SetComputeRootSignature(ipRs);
+                        const struct { float back; UINT pad[3]; } ipc = { back, { 0, 0, 0 } };
+                        list->SetComputeRoot32BitConstants(0, 4, &ipc, 0);
+                        D3D12_GPU_DESCRIPTOR_HANDLE gt = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                        gt.ptr += (UINT64)(kGameFlowSrv + (UINT)pick) * srvStride;
+                        list->SetComputeRootDescriptorTable(1, gt);
+                        D3D12_GPU_DESCRIPTOR_HANDLE ut = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                        ut.ptr += (UINT64)kIpSrv * srvStride;
+                        list->SetComputeRootDescriptorTable(2, ut);
+                        D3D12_RESOURCE_BARRIER ub = {}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;   // all UAVs
+                        for (int i = 0; i < 3; i++)
+                        {
+                            list->SetPipelineState(ipPso[i]);
+                            list->Dispatch((ipW + 7) / 8, (ipH + 7) / 8, 1);
+                            list->ResourceBarrier(1, &ub);
+                        }
+                        D3D12_RESOURCE_BARRIER b1[2] = { Transition(gFlow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                                                         Transition(ipRes[2], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) };
+                        list->ResourceBarrier(2, b1);
+                        ipOutSrv = true; ipLastId = pickId; ipLastBack = back;
+                        touched = true;
+                    }
+                    c.flags |= 524288u;
+                    if (s.warpInterpDebug) c.flags |= 1048576u;
+                    touched = true;
+                    D3D12_GPU_DESCRIPTOR_HANDLE it = srvHeap->GetGPUDescriptorHandleForHeapStart();
+                    it.ptr += (UINT64)(kIpSrv + 3) * srvStride;
+                    list->SetGraphicsRootDescriptorTable(11, it);                   // t13
+                    if (!ipLogged) { ipLogged = true; LOGI("BFI Presenter: frame interpolation: the newer frame's motion is pushed forward to the moment shown (FrameWarpInterpolateSplat)"); }
                 }
             }
             warpTouched = touched;
@@ -7681,6 +7917,8 @@ static DWORD WINAPI PresenterThread(void *)
     warp.Release();
     SafeRelease(chkRb[0]); SafeRelease(chkRb[1]);
     for (int i = 0; i < kWarpShN; i++) SafeRelease(psWarp[i]);
+    for (int i = 0; i < 3; i++) { SafeRelease(csIp[i]); SafeRelease(ipPso[i]); SafeRelease(ipRes[i]); }
+    SafeRelease(ipRs);
     SafeRelease(rootSig);
     SafeRelease(rsBlob);
     SafeRelease(rsErr);
