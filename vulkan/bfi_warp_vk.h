@@ -62,8 +62,8 @@ struct WarpVk
     // Set 2's layout: made before the BFI pipelines' layouts, which include it.
     bool CreateLayout(DeviceData *d)
     {
-        VkDescriptorSetLayoutBinding b[6] = {};
-        for (int i = 0; i < 6; i++)
+        VkDescriptorSetLayoutBinding b[7] = {};
+        for (int i = 0; i < 7; i++)
         {
             b[i].binding = (uint32_t)i;
             b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -71,7 +71,7 @@ struct WarpVk
             b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
         }
         VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        dli.bindingCount = 6;                          // binding 3: the game's own motion for the frame (gvk); 4, 5: the frames
+        dli.bindingCount = 7;                          // binding 6: the CRT hand-off's picture (bfi_crt_vk.h, 1.0.54); binding 3: the game's own motion for the frame (gvk); 4, 5: the frames
                                                        // from before ReShade's effects (FrameWarpStillBeforeEffects)
         dli.pBindings = b;
         return d->CreateDescriptorSetLayout(d->device, &dli, nullptr, &dslW) == VK_SUCCESS;
@@ -116,7 +116,8 @@ struct WarpVk
 
     // stageView: the staging ring's views (SHADER_READ_ONLY_OPTIMAL). Set 2 is required (false = the BFI pipelines
     // can't be used); the passes are optional (ok).
-    bool Init(DeviceData *d, const VkImageView *stageView, const VkImageView *gameFlowView, const VkImageView *preView, uint32_t frameW, uint32_t frameH)
+    bool Init(DeviceData *d, const VkImageView *stageView, const VkImageView *gameFlowView, const VkImageView *preView, uint32_t frameW, uint32_t frameH,
+              VkImageView crtFinal = VK_NULL_HANDLE)
     {
         VkDevice dev = d->device;
         srcW = frameW; srcH = frameH;
@@ -130,7 +131,7 @@ struct WarpVk
         r = r && MakeImage(d, Out(), w[kOut], h[kOut]);
         if (r)
         {
-            VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 * kStage * kStage };
+            VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 7 * kStage * kStage };
             VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             dpi.maxSets = kStage * kStage;
             dpi.poolSizeCount = 1;
@@ -164,6 +165,12 @@ struct WarpVk
                         pw[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; pw[k].pImageInfo = &pi[k];
                     }
                     d->UpdateDescriptorSets(d->device, 2, pw, 0, nullptr);
+                    // the CRT hand-off's picture (read only with flags & 524288; the evened-out motion as a stand-in without it)
+                    VkDescriptorImageInfo ci = { lin, crtFinal ? crtFinal : view[Out()], VK_IMAGE_LAYOUT_GENERAL };
+                    VkWriteDescriptorSet cw = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                    cw.dstSet = dsW[a][b]; cw.dstBinding = 6; cw.descriptorCount = 1;
+                    cw.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; cw.pImageInfo = &ci;
+                    d->UpdateDescriptorSets(d->device, 1, &cw, 0, nullptr);
                 }
         }
         ready = r;

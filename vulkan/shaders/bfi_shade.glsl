@@ -13,6 +13,11 @@ layout(set = 2, binding = 3) uniform sampler2D gameFlow;   // the game's own mot
 // still is found (a CRT shader's blur and glow over a HUD made it look as if it moved). Otherwise the stage frames.
 layout(set = 2, binding = 4) uniform sampler2D preCur;
 layout(set = 2, binding = 5) uniform sampler2D prePrev;
+// CRT hand-off (CrtStandaloneHandoff, 1.0.54 test; flags & 524288): CRT-Standalone's pattern and the passes after it,
+// drawn by the presenter after frame warp (bfi_crt_vk.h: crtwarp.comp, then crt.hlsl) -- the picture shown instead of Fetch
+layout(set = 2, binding = 6) uniform sampler2D crtFinal;
+vec2 gSrcPos = vec2(0.0);   // where the pixel shown was taken from in the game's frame (pixels): the CRT pattern's halation
+                            // and glow are read there, its mask and scanlines at the screen's pixel
 // 1.0.49 (as DX): and, while ReShade's window is open (flags & 32768), where it stands still in the finished frames too
 // -- ReShade's window, drawn after the effects, is only in those (it was moved with the scene in 1.0.48).
 bool gStillPre = false;
@@ -166,6 +171,7 @@ bool FetchWarped(vec2 fc, out vec3 c)
     if (InOsd(p)) return false;                           // and nothing moved is taken from it
     p = clamp(p, vec2(0.5), size - 0.5);
     if (Still(ivec2(p), size)) return false;
+    gSrcPos = p;
     if (gFromPrev) { c = textureLod(srcPrev, p * inv, 0.0).rgb; return true; }   // interpolation: from the frame before
     vec2 tc = floor(p - 0.5) + 0.5;
     vec2 f = p - tc;
@@ -189,11 +195,13 @@ bool FetchWarped(vec2 fc, out vec3 c)
 // The game's frame at output pixel fc (same size), moved ahead on a filled strobe cycle.
 vec3 Fetch(vec2 fc)
 {
+    if ((pc.flags & 524288u) != 0u) return texelFetch(crtFinal, ivec2(fc), 0).rgb;   // the CRT hand-off's picture
     if (pc.warp != 0.0)
     {
         vec3 m;
         if (FetchWarped(fc, m)) return m;
     }
+    gSrcPos = fc;
     return texelFetch(src, ivec2(fc), 0).rgb;
 }
 

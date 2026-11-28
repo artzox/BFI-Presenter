@@ -1,0 +1,21 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// CRT hand-off (CrtStandaloneHandoff, 1.0.54 test; bfi_crt_vk.h): the frame as the BFI pass would take it -- moved by
+// frame warp where it is -- into W, and where each pixel came from into S (the offset, as two halves), for CRT-Standalone's
+// pattern (crt.hlsl) to draw on. Same sets 0-2 and push constants as the BFI pass (bfi.comp), set 3 its outputs.
+#include "common.glsl"
+#include "bfi_shade.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 3, binding = 0, rgba8) uniform writeonly image2D outW;   // 8-bit, as the game's frame and ReShade's back buffer CRT-Standalone draws into
+layout(set = 3, binding = 1, r32ui) uniform writeonly uimage2D outS;
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(outW);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    vec2 fc = vec2(p) + 0.5;
+    vec3 c = Fetch(fc);
+    imageStore(outW, p, vec4(c, 1.0));
+    imageStore(outS, p, uvec4(packHalf2x16(gSrcPos - fc)));
+}

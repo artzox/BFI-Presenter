@@ -286,6 +286,8 @@ struct Settings
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many pixels
     int   warpEdge = 0;       // FrameWarpEdge (as DX): the screen-edge strip of a moved flash: 0 faded, 1 mirrored, 2 repeated
     int   warpInterpTime = 1; // FrameWarpInterpolateByTime (1.0.53): even pacing by the frames' times, not their numbers
+    int   crtHandoff = 0;     // CrtStandaloneHandoff (1.0.54 test, as DX 1.0.49): CRT-Standalone's mask, scanlines and glow drawn by
+                              // the presenter after frame warp (bfi_crt_vk.h); read when the presenter starts
     int   warpInterp = 0;     // FrameWarpInterpolate (as DX, 1.0.51): 0 off (move the last frame), 1 only the missing frames, 2 even pacing, 3 automatic
     int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
@@ -424,6 +426,7 @@ static void LoadSettings(Settings &s)
     s.warpEdge = Clamp(KvInt(kv, "FrameWarpEdge", 0), 0, 2);
     s.warpInterp = Clamp(KvInt(kv, "FrameWarpInterpolate", 0), 0, 3);
     s.warpInterpTime = KvInt(kv, "FrameWarpInterpolateByTime", 1) ? 1 : 0;
+    s.crtHandoff = KvInt(kv, "CrtStandaloneHandoff", 0) ? 1 : 0;
     s.warpFgLag = Clamp(KvInt(kv, "FrameWarpGameMotionFGLag", 1), -1, 1);
     s.warpEase = KvInt(kv, "FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = KvInt(kv, "FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
@@ -514,7 +517,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpInterpolate", s.warpInterp); I("FrameWarpInterpolateByTime", s.warpInterpTime); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); F("FrameWarpGameMotionEaseStrength", s.warpEaseStr); I("FrameWarpGameDilate", s.warpDilate); I("FrameWarpStillBeforeEffects", s.warpStillPre); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpInterpolate", s.warpInterp); I("FrameWarpInterpolateByTime", s.warpInterpTime); I("CrtStandaloneHandoff", s.crtHandoff); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); F("FrameWarpGameMotionEaseStrength", s.warpEaseStr); I("FrameWarpGameDilate", s.warpDilate); I("FrameWarpStillBeforeEffects", s.warpStillPre); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexLimitAtSleep", s.reflexAtSleep); I("ReflexAlign", s.reflexAlign); I("LearnReflexStart", s.learnReflex); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -952,6 +955,22 @@ struct Swapchain
     VkDeviceMemory cleanMem = VK_NULL_HANDLE;
     std::atomic<bool> preCaptured{false};       // `clean` holds this frame's (set at reshade_begin_effects, taken at present)
 
+    // CRT hand-off (CrtStandaloneHandoff, 1.0.54 test; bfi_crt_vk.h): CRT-Standalone's halation, glow and wide glow --
+    // copied at reshade_finish_effects into crtCur (on ReShade's command buffer), then at the game's present into the slot
+    VkImage        crtCur[3] = {};
+    VkDeviceMemory crtCurMem[3] = {};
+    VkFormat       crtFmt[3] = {};
+    uint32_t       crtW[3] = {}, crtH[3] = {};
+    bool           crtCurHas[3] = {};           // in the shader (compiled out: none)
+    bool           crtCurFailed = false;
+    std::atomic<bool> crtCurOk{false};          // copied this frame
+    VkImage        crtSlot[3][kStage] = {};
+    VkDeviceMemory crtSlotMem[3][kStage] = {};
+    VkImageView    crtSlotView[3][kStage] = {};
+    std::atomic<bool> crtSlotOk[kStage] = {};   // the slot's frame has its copies
+    bool           crtSlotsMade = false, crtSlotsFailed = false, crtSlotsInit = false;
+    std::atomic<uint32_t> crtSlotGen{0};
+
     // presenter
     uint32_t       nReal = 0;
     VkImage        realImg[kMaxImg] = {};
@@ -1234,6 +1253,7 @@ static bool KeyCombo(int vk)
 static VkShaderModule MakeShader(DeviceData *d, const uint32_t *code, size_t bytes);
 static VkPipeline MakeComputePipeline(DeviceData *d, VkPipelineLayout pl, VkShaderModule cs);
 #include "bfi_warp_vk.h"   // frame warp: the motion passes and the BFI shader's set 2
+#include "bfi_crt_vk.h"    // CRT hand-off: CRT-Standalone's pattern after frame warp
 
 struct PresenterRes
 {
@@ -1293,6 +1313,7 @@ struct PresenterRes
     // Frame warp (bfi_warp_vk.h) and its GPU time (timing log): four timestamps per real image -- around frame warp's
     // passes and around the BFI pass -- read back when that image's command buffer is next recorded.
     WarpVk                warp;
+    CrtGpu                crt;                     // CRT hand-off (bfi_crt_vk.h)
     VkQueryPool           tsPool = VK_NULL_HANDLE;
     double                tsToMs = 0.0;
     bool                  tsPending[kMaxImg] = {}, tsPasses[kMaxImg] = {}, tsWarped[kMaxImg] = {};
@@ -1826,7 +1847,10 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
     if (p)
     {
         // Frame warp: set 2 is needed by the BFI pipelines; its passes are optional.
-        p = R.warp.Init(d, sc->stageView, sc->gFlowView, sc->preView, sc->extent.width, sc->extent.height);
+        // CRT hand-off: its textures first (the final one is set 2 binding 6); its passes after the realtime queue's resources
+        if (g_shared.crtHandoff && !R.crt.InitImages(d, sc->extent.width, sc->extent.height))
+            LOGW("BFI Presenter: CRT hand-off: its textures could not be made -- off");
+        p = R.warp.Init(d, sc->stageView, sc->gFlowView, sc->preView, sc->extent.width, sc->extent.height, R.crt.FinalView());
         if (p && !R.warp.ok) LOGW("BFI Presenter: frame warp unavailable (its compute passes could not be created)");
     }
     if (!p)
@@ -1918,6 +1942,17 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         R.measPtr = nullptr;
     }
     CreateRtRes(sc, R);
+    if (R.crt.imgOk)
+    {
+#ifdef _WIN64
+        const bool cok = R.rt && R.crt.InitPasses(d, R.dslC, R.dslN, R.warp.dslW, (uint32_t)sizeof(Constants), sc->nReal);
+        if (cok) LOGI("BFI Presenter: CRT hand-off ready: CRT-Standalone's pattern drawn after frame warp when the shader hands it off");
+        else LOGW("BFI Presenter: CRT hand-off: %s -- off", R.rt ? "its passes could not be made" : "only with the realtime compute queue so far");
+        if (!cok) R.crt.Release(d);
+#else
+        R.crt.Release(d);
+#endif
+    }
     // Frame warp's GPU time (timing log): timestamps on the queue the presenter records for, if it has them.
     if (d->CreateQueryPool && d->CmdWriteTimestamp && d->CmdResetQueryPool && d->GetQueryPoolResults)
     {
@@ -1943,6 +1978,7 @@ static void DestroyPresenterRes(DeviceData *d, PresenterRes &R)
 {
     VkDevice dev = d->device;
     R.warp.Release(d);
+    R.crt.Release(d);
     if (R.tsPool && d->DestroyQueryPool) d->DestroyQueryPool(dev, R.tsPool, nullptr);
     R.tsPool = VK_NULL_HANDLE;
     for (uint32_t i = 0; i < kMaxImg; i++)
@@ -3204,6 +3240,15 @@ static void PresenterThread(Swapchain *sc)
                     if (c.warp != 0.0f && c.warpSrc == 0 && (R.warp.flowNew != pickId || R.warp.flowOld != warpOld)) { R.warp.RecordFlow(d, cb); warpTouched = true; }
                     if (warpTouched) R.warp.ToShade(d, cb);
                 }
+            }
+            // CRT hand-off (1.0.54 test): CRT-Standalone's pattern drawn after frame warp, into the final texture the BFI
+            // pass then shows (flags & 524288); with the shader handing off, every picture is drawn here
+            if (s.crtHandoff && R.crt.ok && R.rt && !copyMode && crtvk::state.load() == 2 && sc->crtSlotOk[pick].load() &&
+                (c.flags & 1024u) == 0 && c.outType != 3 && c.outType != 5 && R.warp.ready)   // 8-bit sRGB-encoded frames (as CRT-Standalone's PIPELINE 0)
+            {
+                const int pv = c.warp != 0.0f ? warpPrev : pick;
+                if (R.crt.Record(d, cb, sc, c, (uint32_t)pick, pickId, pv, idx, R.plC, R.dsC[pick], R.dsN[pickNew2], R.warp.dsW[pick][pv]))
+                    c.flags |= 524288u;
             }
             if (tsOn) d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, R.tsPool, 4 * idx + 1);
             VkDescriptorSet warpSet = R.warp.ready ? R.warp.dsW[pick][c.warp != 0.0f ? warpPrev : pick] : VK_NULL_HANDLE;
@@ -6041,6 +6086,7 @@ static VkResult GameFrame(Swapchain *sc, VkQueue queue, uint32_t nWait, const Vk
         sc->preOk[slot] = preOk;
     }
     gvk::AtPresent(d, sc, (uint32_t)slot, cb);       // frame warp: the game's own motion for this frame
+    crtvk::CopyAtPresent(d, sc, cb, (uint32_t)slot);  // CRT hand-off: this frame's halation and glow
     d->EndCommandBuffer(cb);
 
     std::vector<VkPipelineStageFlags> stg(nWait, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -6205,6 +6251,8 @@ static void DestroySCResources(Swapchain *sc)
     if (sc->clean) d->DestroyImage(dev, sc->clean, nullptr);
     if (sc->cleanMem) d->FreeMemory(dev, sc->cleanMem, nullptr);
     sc->clean = VK_NULL_HANDLE; sc->cleanMem = VK_NULL_HANDLE; sc->preCaptured = false;
+    crtvk::DestroySlots(d, sc);
+    sc->crtCurFailed = false;
     for (uint32_t i = 0; i < kStage; i++)
     {
         if (sc->stageView[i]) d->DestroyImageView(dev, sc->stageView[i], nullptr);
@@ -7789,6 +7837,294 @@ static void on_begin_effects(reshade::api::effect_runtime *rt, reshade::api::com
 #endif
 }
 
+// CRT hand-off (CrtStandaloneHandoff, 1.0.54 test; bfi_crt_vk.h; as DX's dx/bfi_crt.h on_finish): at
+// reshade_finish_effects, CRT-Standalone's switches and settings for this frame, and its halation, glow and wide glow
+// textures copied into the swap chain's crtCur on ReShade's command buffer.
+namespace crtvk
+{
+#ifdef _WIN64
+using namespace reshade::api;
+static const char *const kEffect = "CRT-Standalone.fx";
+static const char *const kTexName[3] = { "crt_halation_v_tex", "crt_glow_v_tex", "crt_glow_wide_v_tex" };
+struct Def { const char *name; int def; };
+// the switches, with CRT-Standalone 1.7.0's defaults (ReShade reports only those set in the preset or globally)
+static const Def kDefs[] = {
+    { "BFI_PRESENTER_HANDOFF", 0 }, { "PIPELINE", 0 }, { "ENABLE_MASK", 1 }, { "ENABLE_BEAM_MODULATION", 1 },
+    { "ENABLE_HALATION", 1 }, { "ENABLE_GLOW", 1 }, { "ENABLE_VIGNETTE", 1 }, { "ENABLE_CORNER_ROUND", 0 },
+    { "ENABLE_BURNIN_PHASE", 1 }, { "ENABLE_BURNIN_ORBIT", 1 }, { "ENABLE_INTERLACE", 0 }, { "ENABLE_SCANLINE_SS", 0 },
+    { "ENABLE_DECAY", 0 }, { "ENABLE_PREBLUR", 1 }, { "ENABLE_GEOMETRY", 0 }, { "SCANLINE_REFERENCE_HEIGHT", 0 },
+    { "ENABLE_SHARPEN", 1 }, { "ENABLE_SCANLINE_SOFTEN", 1 }, { "ENABLE_GRAIN", 1 }, { "ENABLE_NOISE_FLOOR", 0 },
+    { "ENABLE_GAMUT_EXPAND", 0 },
+};
+static const int kDefN = (int)(sizeof(kDefs) / sizeof(kDefs[0]));
+static int DefAt(const int *vals, const char *name) { for (int i = 0; i < kDefN; i++) if (!strcmp(kDefs[i].name, name)) return vals[i]; return 0; }
+// ReShade's calls that return a handle or struct return it through a hidden pointer after `this` (MSVC); MinGW expects
+// a register for small ones. Called through the vtable as ReShade expects (as dx/bfi_crt.h).
+template <class PMF> static size_t Slot(PMF pmf)
+{
+    uintptr_t raw[2] = {};
+    memcpy(raw, &pmf, sizeof(raw) < sizeof(pmf) ? sizeof(raw) : sizeof(pmf));
+    return (raw[0] - 1) / sizeof(void *);
+}
+static effect_uniform_variable FindUniform(effect_runtime *rt, const char *effect, const char *name)
+{
+    typedef effect_uniform_variable *(*Fn)(const effect_runtime *, effect_uniform_variable *, const char *, const char *);
+    static const size_t k = Slot(&effect_runtime::find_uniform_variable);
+    effect_uniform_variable v = { 0 };
+    reinterpret_cast<Fn>((*reinterpret_cast<void ***>(rt))[k])(rt, &v, effect, name);
+    return v;
+}
+static effect_texture_variable FindTexture(effect_runtime *rt, const char *effect, const char *name)
+{
+    typedef effect_texture_variable *(*Fn)(const effect_runtime *, effect_texture_variable *, const char *, const char *);
+    static const size_t k = Slot(&effect_runtime::find_texture_variable);
+    effect_texture_variable v = { 0 };
+    reinterpret_cast<Fn>((*reinterpret_cast<void ***>(rt))[k])(rt, &v, effect, name);
+    return v;
+}
+static resource ResourceFromView(device *dev, resource_view view)
+{
+    typedef resource *(*Fn)(const device *, resource *, resource_view);
+    static const size_t k = Slot(&device::get_resource_from_view);
+    resource r = { 0 };
+    reinterpret_cast<Fn>((*reinterpret_cast<void ***>(dev))[k])(dev, &r, view);
+    return r;
+}
+static resource_desc ResourceDesc(device *dev, resource r)
+{
+    typedef resource_desc *(*Fn)(const device *, resource_desc *, resource);
+    static const size_t k = Slot(&device::get_resource_desc);
+    resource_desc dsc = {};
+    reinterpret_cast<Fn>((*reinterpret_cast<void ***>(dev))[k])(dev, &dsc, r);
+    return dsc;
+}
+static VkFormat VkFmt(format f)
+{
+    switch (f)
+    {
+    case format::r16g16b16a16_float: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case format::r8g8b8a8_unorm: return VK_FORMAT_R8G8B8A8_UNORM;
+    case format::b8g8r8a8_unorm: return VK_FORMAT_B8G8R8A8_UNORM;
+    case format::r10g10b10a2_unorm: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case format::r11g11b10_float: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    case format::r32g32b32a32_float: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case format::r16g16_float: return VK_FORMAT_R16G16_SFLOAT;
+    case format::r16_float: return VK_FORMAT_R16_SFLOAT;
+    case format::r8_unorm: return VK_FORMAT_R8_UNORM;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+static int DefValue(effect_runtime *rt, const Def &d)
+{
+    char v[64] = ""; size_t n = sizeof(v);
+    if (rt->get_preprocessor_definition_for_effect(kEffect, d.name, v, &n) && v[0]) return atoi(v);
+    n = sizeof(v); v[0] = 0;
+    if (rt->get_preprocessor_definition(d.name, v, &n) && v[0]) return atoi(v);
+    return d.def;
+}
+// ReShade's performance mode compiles the settings in as constants: then taken from the preset (as DX)
+static std::map<std::string, std::vector<float>> presetVals;
+static std::string presetPath;
+static FILETIME presetTime = {};
+static double presetChecked = -1.0;
+static void ReadPreset(effect_runtime *rt)
+{
+    const double t = Now();
+    if (presetChecked >= 0.0 && t - presetChecked < 0.5) return;
+    presetChecked = t;
+    char path[1024] = ""; size_t n = sizeof(path);
+    rt->get_current_preset_path(path, &n);
+    WIN32_FILE_ATTRIBUTE_DATA fa = {};
+    if (!path[0] || !GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) { presetVals.clear(); presetPath.clear(); return; }
+    if (presetPath == path && CompareFileTime(&fa.ftLastWriteTime, &presetTime) == 0) return;
+    presetPath = path; presetTime = fa.ftLastWriteTime;
+    presetVals.clear();
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char line[4096];
+    bool in = false;
+    while (fgets(line, sizeof(line), f))
+    {
+        char *e = line + strlen(line);
+        while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+        char *b = line;
+        while (*b == ' ' || *b == '\t') b++;
+        if (*b == '[') { in = _stricmp(b, "[CRT-Standalone.fx]") == 0; continue; }
+        if (!in) continue;
+        char *eq = strchr(b, '=');
+        if (!eq) continue;
+        *eq = 0;
+        std::string key(b);
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+        std::vector<float> v;
+        for (char *c = eq + 1; *c;)
+        {
+            while (*c == ' ' || *c == ',') c++;
+            if (!*c) break;
+            if (!_strnicmp(c, "true", 4)) { v.push_back(1.0f); c += 4; continue; }
+            if (!_strnicmp(c, "false", 5)) { v.push_back(0.0f); c += 5; continue; }
+            char *end = nullptr;
+            const float x = strtof(c, &end);
+            if (end == c) break;
+            v.push_back(x); c = end;
+        }
+        if (!v.empty()) presetVals[key] = v;
+    }
+    fclose(f);
+}
+// A switch that is off, given its off value instead (the passes are compiled with every switch on)
+static void SetParam(float *p, const char *name, float v) { const int i = ParamIndex(name); if (i >= 0) p[i * 4] = v; }
+static void SwitchesOff(float *p, const int *vals)
+{
+    if (!DefAt(vals, "ENABLE_MASK")) { SetParam(p, "crt_mask_strength", 0.0f); SetParam(p, "crt_mask_boost", 1.0f); SetParam(p, "crt_phosphor_dot", 0.0f); }
+    if (!DefAt(vals, "ENABLE_BURNIN_PHASE")) SetParam(p, "crt_burnin_phase_amp", 0.0f);
+    if (!DefAt(vals, "ENABLE_BURNIN_ORBIT")) SetParam(p, "crt_burnin_orbit_radius", 0.0f);
+    if (!DefAt(vals, "ENABLE_INTERLACE")) SetParam(p, "crt_interlace_strength", 0.0f);
+    if (!DefAt(vals, "ENABLE_VIGNETTE")) SetParam(p, "crt_vignette_strength", 0.0f);
+    if (!DefAt(vals, "ENABLE_CORNER_ROUND")) { SetParam(p, "crt_corner_shadow", 0.0f); SetParam(p, "crt_corner_size", 0.0f); SetParam(p, "crt_corner_border", 0.0f); }
+    if (!DefAt(vals, "ENABLE_HALATION")) SetParam(p, "crt_halation_strength", 0.0f);
+    if (!DefAt(vals, "ENABLE_GLOW")) { SetParam(p, "crt_glow_strength", 0.0f); SetParam(p, "crt_glow_wide_strength", 0.0f); }
+    if (!DefAt(vals, "ENABLE_SHARPEN")) SetParam(p, "crt_sharpen_strength", 0.0f);
+    if (!DefAt(vals, "ENABLE_SCANLINE_SOFTEN")) SetParam(p, "crt_soften_strength", 0.0f);
+    if (!DefAt(vals, "ENABLE_GRAIN")) SetParam(p, "crt_grain_intensity", 0.0f);
+    if (!DefAt(vals, "ENABLE_NOISE_FLOOR")) SetParam(p, "crt_noise_floor", 0.0f);
+    if (!DefAt(vals, "ENABLE_GAMUT_EXPAND")) SetParam(p, "crt_gamut_expand_strength", 0.0f);
+}
+// A copy of ReShade's texture r (in SHADER_READ_ONLY_OPTIMAL between its passes, left so) into crtCur[k], on its command buffer
+static bool CopyCur(DeviceData *d, Swapchain *sc, VkCommandBuffer cb, int k, VkImage r, VkFormat f, uint32_t w, uint32_t h)
+{
+    if (sc->crtCur[k] && (sc->crtFmt[k] != f || sc->crtW[k] != w || sc->crtH[k] != h))
+    {
+        static bool logged = false;
+        if (!logged) { logged = true; LOGW("BFI Presenter: CRT hand-off: CRT-Standalone's textures changed size -- off until the swap chain is made again"); }
+        sc->crtCurFailed = true;
+        return false;
+    }
+    const bool fresh = !sc->crtCur[k];
+    if (fresh)
+    {
+        VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        ici.imageType = VK_IMAGE_TYPE_2D; ici.format = f; ici.extent = { w, h, 1 }; ici.mipLevels = 1; ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ici.sharingMode = d->families.size() > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+        ici.queueFamilyIndexCount = d->families.size() > 1 ? (uint32_t)d->families.size() : 0;
+        ici.pQueueFamilyIndices = d->families.size() > 1 ? d->families.data() : nullptr;
+        if (!CreateImageMem(d, ici, &sc->crtCur[k], &sc->crtCurMem[k])) { sc->crtCurFailed = true; return false; }
+        sc->crtFmt[k] = f; sc->crtW[k] = w; sc->crtH[k] = h;
+    }
+    VkImageMemoryBarrier b[2] = {
+        ImgBarrier(r, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT),
+        ImgBarrier(sc->crtCur[k], fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT) };
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+    VkImageCopy ic = {};
+    ic.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    ic.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    ic.extent = { w, h, 1 };
+    d->CmdCopyImage(cb, r, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc->crtCur[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    b[0] = ImgBarrier(r, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
+    b[1] = ImgBarrier(sc->crtCur[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+    return true;
+}
+static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, resource_view)
+{
+    if (!rt || !cmd || !g_shared.crtHandoff) { if (!g_shared.crtHandoff) state = 0; return; }
+    Swapchain *sc = GetSC((VkSwapchainKHR)rt->get_native());
+    if (!sc || !sc->d) return;
+    bool on = false;
+    rt->enumerate_techniques(kEffect, [&](effect_runtime *r, effect_technique t) { if (r->get_technique_state(t)) on = true; });
+    int vals[kDefN];
+    for (int i = 0; i < kDefN; i++) vals[i] = DefValue(rt, kDefs[i]);
+    int st = (!on || DefAt(vals, "BFI_PRESENTER_HANDOFF") != 1) ? 1 : 2;
+    if (st == 2 && (DefAt(vals, "PIPELINE") != 0 || DefAt(vals, "ENABLE_SCANLINE_SS") != 0)) st = -1;
+    if (st == 2 && sc->crtCurFailed) st = -2;
+    static int lastState = -9;
+    if (st != lastState)
+    {
+        lastState = st;
+        if (st == 2) LOGI("BFI Presenter: CRT-Standalone hands its mask and scanlines to the presenter -- drawn after frame warp");
+        else if (st == 1) LOGI("BFI Presenter: CRT hand-off on, but CRT-Standalone %s", on ? "doesn't hand off (BFI_PRESENTER_HANDOFF=1 in its preprocessor definitions)" : "isn't on");
+        else if (st == -1) LOGW("BFI Presenter: CRT hand-off: not with CRT-Standalone's PIPELINE 1/2 or ENABLE_SCANLINE_SS=1 yet -- the shader's own pass is needed");
+        if (st == 2 && DefAt(vals, "ENABLE_DECAY") && DefAt(vals, "ENABLE_INTERLACE"))
+            LOGI("BFI Presenter: CRT hand-off: ENABLE_DECAY's interlace timing isn't followed (each frame alternates the field)");
+    }
+    state = st;
+    if (st != 2) { sc->crtCurOk = false; return; }
+
+    float p[kCrtSlots * 4] = {};
+    bool presetRead = false;
+    for (int i = 0; i < kCrtParamN; i++)
+    {
+        float *o = &p[i * 4];
+        const char *name = kCrtParams[i].name;
+        if (!strcmp(name, "CRT_TIMER") || !strcmp(name, "crt_timer")) { o[0] = (float)(fmod(Now(), 86400.0) * 1000.0); continue; }
+        if (!strcmp(name, "FRAMECOUNT")) { static uint32_t fc = 0; o[0] = (float)(fc++ & 0xFFFFFF); continue; }
+        effect_uniform_variable v = FindUniform(rt, kEffect, name);
+        if (!v.handle)
+        {
+            if (!presetRead) { ReadPreset(rt); presetRead = true; }
+            auto it = presetVals.find(name);
+            for (int j = 0; j < 4; j++) o[j] = (it != presetVals.end() && j < (int)it->second.size()) ? it->second[j] : kCrtParams[i].def[j];
+            continue;
+        }
+        switch (kCrtParams[i].type)
+        {
+        case 'f': rt->get_uniform_value_float(v, o, 1); break;
+        case '2': rt->get_uniform_value_float(v, o, 2); break;
+        case '3': rt->get_uniform_value_float(v, o, 3); break;
+        case '4': rt->get_uniform_value_float(v, o, 4); break;
+        case 'i': { int32_t x = 0; rt->get_uniform_value_int(v, &x, 1); o[0] = (float)x; break; }
+        case 'u': { uint32_t x = 0; rt->get_uniform_value_uint(v, &x, 1); o[0] = (float)x; break; }
+        case 'b': { bool x = false; rt->get_uniform_value_bool(v, &x, 1); o[0] = x ? 1.0f : 0.0f; break; }
+        }
+    }
+    SwitchesOff(p, vals);
+    // the halation and glow textures: ReShade's own, rendered this frame (a texture compiled out: none, its strength is 0)
+    DeviceData *d = sc->d;
+    device *dev = rt->get_device();
+    VkCommandBuffer cb = (VkCommandBuffer)cmd->get_native();
+    bool ok = dev != nullptr && cb != VK_NULL_HANDLE;
+    bool has[3] = {};
+    for (int k = 0; ok && k < 3; k++)
+    {
+        effect_texture_variable tv = FindTexture(rt, kEffect, kTexName[k]);
+        resource_view srv = { 0 }, srgb = { 0 };
+        if (tv.handle) rt->get_texture_binding(tv, &srv, &srgb);
+        const resource r = srv.handle ? ResourceFromView(dev, srv) : resource{ 0 };
+        if (!r.handle) continue;
+        const resource_desc rd = ResourceDesc(dev, r);
+        const VkFormat f = VkFmt(rd.texture.format);
+        if (f == VK_FORMAT_UNDEFINED || rd.texture.samples > 1)
+        {
+            static bool logged = false;
+            if (!logged) { logged = true; LOGW("BFI Presenter: CRT hand-off: CRT-Standalone's %s has a format the hand-off doesn't copy yet (%u)", kTexName[k], (unsigned)rd.texture.format); }
+            ok = false; break;
+        }
+        has[k] = CopyCur(d, sc, cb, k, (VkImage)r.handle, f, rd.texture.width, rd.texture.height);
+        if (!has[k]) ok = false;
+    }
+    {
+        std::lock_guard<std::mutex> l(lk);
+        memcpy(params, p, sizeof(params) - 4 * sizeof(float) * (kCrtSlots - kCrtParamN));   // the frame size slots are the presenter's
+        beam = DefAt(vals, "ENABLE_BEAM_MODULATION") ? 1 : 0;
+        refH = DefAt(vals, "SCANLINE_REFERENCE_HEIGHT");
+    }
+    if (!sc->crtSlotsMade) for (int k = 0; k < 3; k++) sc->crtCurHas[k] = has[k];
+    static bool texLogged = false;
+    if (!texLogged && ok)
+    {
+        texLogged = true;
+        LOGI("BFI Presenter: CRT hand-off: CRT-Standalone's textures: halation %s, glow %s, wide glow %s", has[0] ? "found" : "none",
+             has[1] ? "found" : "none", has[2] ? "found" : "none");
+    }
+    sc->crtCurOk = ok;
+}
+#else
+static void on_finish(reshade::api::effect_runtime *, reshade::api::command_list *, reshade::api::resource_view, reshade::api::resource_view) {}
+#endif
+} // namespace crtvk
+
 static void on_osd(reshade::api::effect_runtime *rt)
 {
     // One runtime only (ImGui's context is shared between ReShade's runtimes; see the DX add-on): the first that draws,
@@ -8302,6 +8638,25 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                       "(a character, a car), which keep their stutter. With frame generation it works, with less to fill.\n"
                                                       "A filled flash is a guess: edges of things moving against the background can smear for that\n"
                                                       "flash, and a CRT shader's mask moves with the picture. Details: the settings guide.");
+        {
+            bool ch = s.crtHandoff != 0;
+            if (ImGui::Checkbox("Apply CRT-Standalone after frame warp (test)", &ch)) s.crtHandoff = ch ? 1 : 0;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("CRT-Standalone's mask, scanlines, halation and glow -- and its passes after them: sharpen,\n"
+                                                          "scanline soften, grain, noise floor, gamut expand, corner round -- are drawn by the presenter\n"
+                                                          "after frame warp, so a moved frame doesn't move them with the picture (moire, mostly in the\n"
+                                                          "sky). Needs BFI_PRESENTER_HANDOFF=1 in CRT-Standalone's preprocessor definitions too: its\n"
+                                                          "settings stay in its own window. Not with its PIPELINE 1/2 or ENABLE_SCANLINE_SS=1, nor\n"
+                                                          "10-bit or HDR games yet. Takes effect when the presenter next starts (the game's next swap\n"
+                                                          "chain). Costs GPU time (the CRT picture for every flash with a new picture) and about 230 MB\n"
+                                                          "of video memory at 4K: only turn it on in a game where the moire is visible.");
+            if (s.crtHandoff)
+            {
+                const int cs = crtvk::state.load();
+                ImGui::SameLine();
+                ImGui::TextDisabled(cs == 2 ? "(in use)" : cs == 1 ? "(CRT-Standalone doesn't hand off)" : cs == -1 ? "(not with this CRT-Standalone setup)" :
+                                    cs == -2 ? "(off: see BFIPresenterVK.log)" : "(waiting)");
+            }
+        }
         if (s.frameWarp)
         {
             ImGui::Indent(16.0f);
@@ -8640,6 +8995,7 @@ static void TryRegisterReShade()
     {
         ev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
         ev(reshade::addon_event::reshade_begin_effects, (void *)&on_begin_effects);   // FrameWarpStillBeforeEffects
+        ev(reshade::addon_event::reshade_finish_effects, (void *)&crtvk::on_finish);   // CRT hand-off
         ev(reshade::addon_event::reshade_open_overlay, (void *)&on_open_overlay);
     }
     static bool pinned = false;
@@ -8666,6 +9022,7 @@ static void UnregisterReShade()
     {
         uev(reshade::addon_event::reshade_overlay, (void *)&on_osd);
         uev(reshade::addon_event::reshade_begin_effects, (void *)&on_begin_effects);
+        uev(reshade::addon_event::reshade_finish_effects, (void *)&crtvk::on_finish);
         uev(reshade::addon_event::reshade_open_overlay, (void *)&on_open_overlay);
     }
     if (ureg) ureg(g_module);
