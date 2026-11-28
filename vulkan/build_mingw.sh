@@ -17,8 +17,8 @@ if command -v glslangValidator >/dev/null 2>&1; then
     glslangValidator -V -DOUT_FMT=rgba16f shaders/bfi.comp -o "$tmp/bfi16.comp.spv" >/dev/null
     # frame warp's passes (brightness, pyramid level, motion, evening out)
     for n in 0 1 2 3; do glslangValidator -V -DPASS=$n shaders/warp.comp -o "$tmp/warp$n.comp.spv" >/dev/null; done
-    # frame interpolation: the newer frame's motion pushed forward to the moment shown (clear, land, resolve)
-    for n in 0 1 2; do glslangValidator -V -DPASS=$n shaders/ipsplat.comp -o "$tmp/ipsplat$n.comp.spv" >/dev/null; done
+    # frame interpolation: the newer frame's motion pushed forward to the moment shown (clear, land, write, fill)
+    for n in 0 1 2 3; do glslangValidator -V -DPASS=$n shaders/ipsplat.comp -o "$tmp/ipsplat$n.comp.spv" >/dev/null; done
     python3 tools/genspv.py "$tmp" shaders_spv.h
     rm -rf "$tmp"
     echo "shaders recompiled into shaders_spv.h"

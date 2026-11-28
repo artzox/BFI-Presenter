@@ -1809,13 +1809,15 @@ static void DumpDeviceRemoved(ID3D12Device *device, const char *where)
 // shown, the nearer point winning where two land on one place, instead of searched for from the output pixel: with
 // frames far apart (35-45 fps) the search's three steps often missed the edge of something moving, and the pixel was
 // filled from the frame before with the background's motion -- an outline beside it, the further the faster it moved.
-// Clear; land (each point on the 2x2 texels around where it is at the moment shown); resolve (z = 1 the newer frame,
-// z = 0.25 what comes out from behind: the frame before with the background's motion, z = 0 not known: the search).
+// Clear; land (each point on the 2x2 texels around where it is at the moment shown); write (the winner's motion);
+// resolve the rest (z = 1 the newer frame, z = 0.25 what comes out from behind: the frame before with the background's
+// motion, z = 0 not known: the search).
 static const char kIpShader[] = R"HLSL(
 cbuffer P : register(b0) { float back; uint ip0, ip1, ip2; };   // back = 1 - f: how far the newer frame is moved back
 Texture2D<float4> gFlow : register(t0);
-RWTexture2D<uint> landX : register(u0);
-RWTexture2D<uint> landY : register(u1);
+RWTexture2D<uint> landX : register(u0);                         // the nearest point landed (its nearness's bits + 1)
+RWTexture2D<uint> landY : register(u1);                         // the winner's motion as two halves (s2: shader model 5 can't read
+                                                                // a float4 UAV back, only 32-bit single-component ones)
 RWTexture2D<float4> ipOut : register(u2);
 
 [numthreads(8, 8, 1)]
@@ -1823,11 +1825,13 @@ void CSIpClear(uint3 id : SV_DispatchThreadID)
 {
     uint w, h; landX.GetDimensions(w, h);
     if (id.x >= w || id.y >= h) return;
-    landX[id.xy] = 0u; landY[id.xy] = 0u;
+    landX[id.xy] = 0u;
 }
 
-[numthreads(8, 8, 1)]
-void CSIpLand(uint3 id : SV_DispatchThreadID)
+// Land (write = false): the nearest point's nearness kept (atomic max of its full 32 bits: s1 kept 15 bits and the x and
+// y of the motion apart, so two points at the same quantized distance could give a texel the x of one, the y of the
+// other). Write (write = true): the point that won each texel writes its motion there.
+void IpLand(uint3 id, bool write)
 {
     uint w, h; landX.GetDimensions(w, h);
     if (id.x >= w || id.y >= h) return;
@@ -1836,48 +1840,49 @@ void CSIpLand(uint3 id : SV_DispatchThreadID)
     float2 S = float2(w, h);
     float2 uvT = (float2(id.xy) + 0.5) / S - g.xy * back;    // where this point is at the moment shown
     int2 b = int2(floor(uvT * S - 0.5));
-    uint pr = (uint(saturate(g.w) * 32766.0) + 1u) << 16;     // nearer wins; 0 = nothing landed
-    uint hx = f32tof16(g.x) & 0xFFFFu, hy = f32tof16(g.y) & 0xFFFFu;
+    uint pr = asuint(saturate(g.w)) + 1u;                    // nearer wins (positive floats order as their bits); 0 = nothing
     [unroll] for (int y = 0; y < 2; y++)
         [unroll] for (int x = 0; x < 2; x++)
         {
             int2 t = b + int2(x, y);
             if (t.x < 0 || t.y < 0 || t.x >= (int)w || t.y >= (int)h) continue;
-            uint o;
-            InterlockedMax(landX[t], pr | hx, o);
-            InterlockedMax(landY[t], pr | hy, o);
+            if (!write) { uint o; InterlockedMax(landX[t], pr, o); }
+            else if (landX[t] == pr) { landY[t] = (f32tof16(g.x) & 0xFFFFu) | (f32tof16(g.y) << 16); ipOut[t] = float4(g.xy, 1.0, saturate(g.w)); }
         }
 }
+[numthreads(8, 8, 1)]
+void CSIpLand(uint3 id : SV_DispatchThreadID) { IpLand(id, false); }
+[numthreads(8, 8, 1)]
+void CSIpWrite(uint3 id : SV_DispatchThreadID) { IpLand(id, true); }
 
+// Where nothing landed: a gap in a stretched surface (filled all around: its own motion, z = 1), or what comes out from
+// behind something in front (z = 0.25: the frame before, with the background's motion -- the farthest point landed
+// nearby, looked for up to 256 texels away: s1 looked 32, and behind a character the camera turns past quickly the
+// band is wider; where nothing was found the search took over in the middle of it).
 static const int2 kIpDir[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1) };
 [numthreads(8, 8, 1)]
 void CSIpResolve(uint3 id : SV_DispatchThreadID)
 {
     uint w, h; landX.GetDimensions(w, h);
     if (id.x >= w || id.y >= h) return;
-    uint x = landX[id.xy], y = landY[id.xy];
-    if (x != 0u && y != 0u)
-    {
-        ipOut[id.xy] = float4(f16tof32(x & 0xFFFFu), f16tof32(y & 0xFFFFu), 1.0, float((x >> 16) - 1u) / 32766.0);
-        return;
-    }
-    // nothing landed: a gap in a stretched surface (filled all around: its own motion, from the newer frame), or what
-    // comes out from behind something in front (the farthest point nearby: the background's motion, the frame before)
-    uint bestP = 0xFFFFFFFFu, bx = 0u, by = 0u, p1 = 0xFFFFFFFFu, x1 = 0u, y1 = 0u;
+    if (landX[id.xy] != 0u) return;                          // landed: written by CSIpWrite
+    uint bestP = 0xFFFFFFFFu, p1 = 0xFFFFFFFFu;
+    int2 bt = int2(-1, -1), t1 = int2(-1, -1);
     int near1 = 0;
-    const int2 sz = int2(w, h);
-    for (int r = 1; r <= 32; r *= 2)
+    for (int r = 1; r <= 256; r *= 2)
         [unroll] for (int k = 0; k < 8; k++)
         {
-            int2 t = clamp(int2(id.xy) + kIpDir[k] * r, int2(0, 0), sz - 1);
-            uint tx = landX[t], ty = landY[t];
-            if (tx == 0u || ty == 0u) continue;
-            if (r == 1) { near1++; if ((tx >> 16) < p1) { p1 = tx >> 16; x1 = tx; y1 = ty; } }
-            if ((tx >> 16) < bestP) { bestP = tx >> 16; bx = tx; by = ty; }
+            int2 t = int2(id.xy) + kIpDir[k] * r;
+            if (t.x < 0 || t.y < 0 || t.x >= (int)w || t.y >= (int)h) continue;
+            uint tp = landX[t];
+            if (tp == 0u) continue;
+            if (r == 1) { near1++; if (tp < p1) { p1 = tp; t1 = t; } }
+            if (tp < bestP) { bestP = tp; bt = t; }
         }
-    if (near1 >= 6) { bx = x1; by = y1; bestP = p1; }
-    if (bx == 0u) { ipOut[id.xy] = float4(0.0, 0.0, 0.0, 0.0); return; }
-    ipOut[id.xy] = float4(f16tof32(bx & 0xFFFFu), f16tof32(by & 0xFFFFu), near1 >= 6 ? 1.0 : 0.25, float(bestP - 1u) / 32766.0);
+    if (near1 >= 6) { const uint m = landY[t1]; ipOut[id.xy] = float4(f16tof32(m & 0xFFFFu), f16tof32(m >> 16), 1.0, 0.0); return; }
+    if (bt.x < 0) { ipOut[id.xy] = float4(0.0, 0.0, 0.0, 0.0); return; }
+    const uint mb = landY[bt];
+    ipOut[id.xy] = float4(f16tof32(mb & 0xFFFFu), f16tof32(mb >> 16), 0.25, 0.0);
 }
 )HLSL";
 
@@ -2935,10 +2940,10 @@ static void Trace(const char *fmt, ...)
 // compile flags: from the second start of a version there is no compile at all.
 static const char *const kShEntry[]  = { "VSMain", "PSMain", "PSMeasure", "PSAplCells", "PSAplReduce",
                                          "PSWarpLuma", "PSWarpDown", "PSWarpFlow", "PSWarpSmooth", "PSWarpGame", "PSWarpHud",   // six: kWarpShader (dx/bfi_warp.h)
-                                         "CSIpClear", "CSIpLand", "CSIpResolve" };   // frame interpolation (kIpShader, 1.0.54 test)
+                                         "CSIpClear", "CSIpLand", "CSIpWrite", "CSIpResolve" };   // frame interpolation (kIpShader, 1.0.54 test)
 static const char *const kShTarget[] = { "vs_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0", "ps_5_0",
-                                         "cs_5_0", "cs_5_0", "cs_5_0" };
-static const int kShN = 14;
+                                         "cs_5_0", "cs_5_0", "cs_5_0", "cs_5_0" };
+static const int kShN = 15;
 static const int kShIp = 11;                     // first of frame interpolation's compute shaders
 static const int kShWarpGame = 9;                // frame warp from the game's own motion vectors and depth
 static const int kShWarpHud = 10;                // and its HUD mask from the game's HUD-less picture
@@ -4029,9 +4034,10 @@ static DWORD WINAPI PresenterThread(void *)
     ID3DBlob *psWarp[kWarpShN] = {};
     // Frame interpolation, the newer frame's motion pushed forward to the moment shown (kIpShader, 1.0.54 test): its own
     // compute root signature and passes; two r32 landing textures and the resolved motion (t13), the game motion's size
-    ID3DBlob *csIp[3] = {};
+    static const int kIpPasses = 4;   // clear, land, write, resolve (s2)
+    ID3DBlob *csIp[kIpPasses] = {};
     ID3D12RootSignature *ipRs = nullptr;
-    ID3D12PipelineState *ipPso[3] = {};
+    ID3D12PipelineState *ipPso[kIpPasses] = {};
     ID3D12Resource *ipRes[3] = {};
     UINT   ipW = 0, ipH = 0;
     UINT64 ipLastId = 0;
@@ -4196,7 +4202,7 @@ static DWORD WINAPI PresenterThread(void *)
         ok = ShaderGet(sh, &shStopped);
         vs = sh[0]; ps = sh[1]; psMeas = sh[2]; psAplC = sh[3]; psAplR = sh[4];   // ABL guard, APL Limiter optional
         for (int i = 0; i < kWarpShN; i++) psWarp[i] = sh[kShWarp + i];             // frame warp optional
-        for (int i = 0; i < 3; i++) csIp[i] = sh[kShIp + i];                        // frame interpolation's passes optional
+        for (int i = 0; i < kIpPasses; i++) csIp[i] = sh[kShIp + i];                        // frame interpolation's passes optional
         if (!ok && !shStopped) LOGE("BFI Presenter: the presenter's shaders are not available");
     }
 
@@ -4269,7 +4275,7 @@ static DWORD WINAPI PresenterThread(void *)
         ok = ok && SUCCEEDED(g_device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
                                                            IID_PPV_ARGS(&rootSig)));
     }
-    if (ok && csIp[0] && csIp[1] && csIp[2])
+    if (ok && csIp[0] && csIp[1] && csIp[2] && csIp[3])
     {
         // frame interpolation's passes: b0 4 constants, t0 the game's motion, u0-u2
         D3D12_DESCRIPTOR_RANGE rt = {}; rt.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rt.NumDescriptors = 1;
@@ -4283,7 +4289,7 @@ static DWORD WINAPI PresenterThread(void *)
         bool iok = SUCCEEDED(D3D12SerializeRootSignature(&ird, D3D_ROOT_SIGNATURE_VERSION_1, &ib, &ie)) &&
                    SUCCEEDED(g_device->CreateRootSignature(0, ib->GetBufferPointer(), ib->GetBufferSize(), IID_PPV_ARGS(&ipRs)));
         SafeRelease(ib); SafeRelease(ie);
-        for (int i = 0; iok && i < 3; i++)
+        for (int i = 0; iok && i < kIpPasses; i++)
         {
             D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
             cd.pRootSignature = ipRs;
@@ -4292,7 +4298,7 @@ static DWORD WINAPI PresenterThread(void *)
         }
         if (!iok)
         {
-            for (int i = 0; i < 3; i++) SafeRelease(ipPso[i]);
+            for (int i = 0; i < kIpPasses; i++) SafeRelease(ipPso[i]);
             SafeRelease(ipRs);
             LOGW("BFI Presenter: frame interpolation: the passes that push the motion forward could not be made -- the search is used");
         }
@@ -5795,7 +5801,7 @@ static DWORD WINAPI PresenterThread(void *)
                         ut.ptr += (UINT64)kIpSrv * srvStride;
                         list->SetComputeRootDescriptorTable(2, ut);
                         D3D12_RESOURCE_BARRIER ub = {}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;   // all UAVs
-                        for (int i = 0; i < 3; i++)
+                        for (int i = 0; i < kIpPasses; i++)
                         {
                             list->SetPipelineState(ipPso[i]);
                             list->Dispatch((ipW + 7) / 8, (ipH + 7) / 8, 1);
@@ -7917,7 +7923,8 @@ static DWORD WINAPI PresenterThread(void *)
     warp.Release();
     SafeRelease(chkRb[0]); SafeRelease(chkRb[1]);
     for (int i = 0; i < kWarpShN; i++) SafeRelease(psWarp[i]);
-    for (int i = 0; i < 3; i++) { SafeRelease(csIp[i]); SafeRelease(ipPso[i]); SafeRelease(ipRes[i]); }
+    for (int i = 0; i < kIpPasses; i++) { SafeRelease(csIp[i]); SafeRelease(ipPso[i]); }
+    for (int i = 0; i < 3; i++) SafeRelease(ipRes[i]);
     SafeRelease(ipRs);
     SafeRelease(rootSig);
     SafeRelease(rsBlob);

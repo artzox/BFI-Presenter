@@ -62,8 +62,9 @@ struct WarpVk
     uint32_t       ipW = 0, ipH = 0;
     VkDescriptorSetLayout dslI = VK_NULL_HANDLE;
     VkPipelineLayout      plI = VK_NULL_HANDLE;
-    VkShaderModule        csI[3] = {};
-    VkPipeline            psoI[3] = {};               // clear, land, resolve
+    static const int      kIpPasses = 4;
+    VkShaderModule        csI[kIpPasses] = {};
+    VkPipeline            psoI[kIpPasses] = {};       // clear, land, write, fill (s2)
     VkDescriptorPool      dpI = VK_NULL_HANDLE;
     VkDescriptorSet       setI[kStage] = {};          // gFlow = the game motion texture of slot s
     bool     ipOk = false;
@@ -124,9 +125,9 @@ struct WarpVk
         VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
         pli.setLayoutCount = 1; pli.pSetLayouts = &dslI; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pr;
         p = p && d->CreatePipelineLayout(dev, &pli, nullptr, &plI) == VK_SUCCESS;
-        const uint32_t *code[3] = { kIpSplat0Spv, kIpSplat1Spv, kIpSplat2Spv };
-        const size_t bytes[3] = { sizeof(kIpSplat0Spv), sizeof(kIpSplat1Spv), sizeof(kIpSplat2Spv) };
-        for (int i = 0; p && i < 3; i++)
+        const uint32_t *code[kIpPasses] = { kIpSplat0Spv, kIpSplat1Spv, kIpSplat2Spv, kIpSplat3Spv };
+        const size_t bytes[kIpPasses] = { sizeof(kIpSplat0Spv), sizeof(kIpSplat1Spv), sizeof(kIpSplat2Spv), sizeof(kIpSplat3Spv) };
+        for (int i = 0; p && i < kIpPasses; i++)
         {
             csI[i] = MakeShader(d, code[i], bytes[i]);
             psoI[i] = csI[i] ? MakeComputePipeline(d, plI, csI[i]) : VK_NULL_HANDLE;
@@ -371,14 +372,18 @@ struct WarpVk
             if (mem[i]) d->FreeMemory(dev, mem[i], nullptr);
             view[i] = VK_NULL_HANDLE; img[i] = VK_NULL_HANDLE; mem[i] = VK_NULL_HANDLE;
         }
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < kIpPasses; i++)
         {
             if (psoI[i]) d->DestroyPipeline(dev, psoI[i], nullptr);
             if (csI[i]) d->DestroyShaderModule(dev, csI[i], nullptr);
+            psoI[i] = VK_NULL_HANDLE; csI[i] = VK_NULL_HANDLE;
+        }
+        for (int i = 0; i < 3; i++)
+        {
             if (ipView[i]) d->DestroyImageView(dev, ipView[i], nullptr);
             if (ipImg[i]) d->DestroyImage(dev, ipImg[i], nullptr);
             if (ipMem[i]) d->FreeMemory(dev, ipMem[i], nullptr);
-            psoI[i] = VK_NULL_HANDLE; csI[i] = VK_NULL_HANDLE; ipView[i] = VK_NULL_HANDLE; ipImg[i] = VK_NULL_HANDLE; ipMem[i] = VK_NULL_HANDLE;
+            ipView[i] = VK_NULL_HANDLE; ipImg[i] = VK_NULL_HANDLE; ipMem[i] = VK_NULL_HANDLE;
         }
         if (dpI) d->DestroyDescriptorPool(dev, dpI, nullptr);
         if (plI) d->DestroyPipelineLayout(dev, plI, nullptr);
@@ -488,7 +493,7 @@ struct WarpVk
         d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                               0, 1, &mb, 0, nullptr, 0, nullptr);
         struct { float back; uint32_t pad[3]; } pc = { back, { 0, 0, 0 } };
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < kIpPasses; i++)
         {
             d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, psoI[i]);
             d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, plI, 0, 1, &setI[slot], 0, nullptr);
