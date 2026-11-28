@@ -167,7 +167,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.51"
+#define BFI_ADDON_VERSION "1.0.52"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -2906,6 +2906,12 @@ static void ShaderCacheSave(uint64_t key)
 static bool Compile(PFN_D3DCompile compile, const char *entry, const char *target, ID3DBlob **out);
 static DWORD WINAPI ShaderThread(void *self)
 {
+    // ShaderTestDelayMs (diagnostic, ini only, 0 = off): hold the shaders back this long, as a slow first compile would
+    // (to test a game that changes its swap chain while the presenter waits for them, #142)
+    {
+        const int d = (int)GetPrivateProfileIntA("BFI", "ShaderTestDelayMs", 0, g_iniPath);
+        if (d > 0) { LOGI("BFI Presenter: shaders held back %d ms (ShaderTestDelayMs)", d); Sleep((DWORD)std::min(d, 60000)); }
+    }
     const double t0 = Now();
     HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
     const uint64_t key = ShaderKey();
@@ -2941,16 +2947,29 @@ static void ShaderPrepare()
     if (!g_shThread) { if (self) FreeLibrary(self); ShaderThread(nullptr); }
 }
 
-// The presenter's copies (AddRef'd, released with its other objects). Waits for the thread if it is still at work.
-static bool ShaderGet(ID3DBlob **out)
+// The presenter's copies (AddRef'd, released with its other objects). Waits for the thread if it is still at work,
+// but not past a stop: the first start compiles them (5-8 s on a fast CPU, longer while a game loads), and a game that
+// resized its swap chain meanwhile waited 5 s for the presenter to stop, gave up, and its ResizeBuffers failed
+// (Cyberpunk 2077, 1.0.51: the GPU device was removed). *stopped: it returned because the presenter was stopped.
+static bool ShaderGet(ID3DBlob **out, bool *stopped)
 {
+    *stopped = false;
     ShaderPrepare();
     // Another thread may have just started it and not stored the handle yet.
     while (!g_shThread && !g_shDone) Sleep(1);
     if (g_shThread)
     {
         const double t0 = Now();
-        WaitForSingleObject(g_shThread, INFINITE);
+        bool told = false;
+        while (WaitForSingleObject(g_shThread, 50) == WAIT_TIMEOUT)
+        {
+            if (!g_running.load()) { *stopped = true; return false; }
+            if (!told && Now() - t0 > 2.0)
+            {
+                told = true;
+                LOGI("BFI Presenter: presenter waiting for its shaders (compiled on the first start, then kept in BFIPresenter_shaders.bin)");
+            }
+        }
         const double w = (Now() - t0) * 1000.0;
         if (w > 20.0) LOGI("BFI Presenter: presenter waited %.0f ms for its shaders", w);
     }
@@ -4038,14 +4057,15 @@ static DWORD WINAPI PresenterThread(void *)
         ok = SUCCEEDED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[0], nullptr, IID_PPV_ARGS(&list)));
     if (ok) { list->SetName(L"BFI present list"); list->Close(); }
 
+    bool shStopped = false;   // the presenter was stopped while waiting for its shaders (not a failure)
     // --- shaders (d3dcompiler_47 ships with Windows 10/11): compiled once per session, or loaded from the cache (above)
     if (ok)
     {
         ID3DBlob *sh[kShN] = {};
-        ok = ShaderGet(sh);
+        ok = ShaderGet(sh, &shStopped);
         vs = sh[0]; ps = sh[1]; psMeas = sh[2]; psAplC = sh[3]; psAplR = sh[4];   // ABL guard, APL Limiter optional
         for (int i = 0; i < kWarpShN; i++) psWarp[i] = sh[kShWarp + i];             // frame warp optional
-        if (!ok) LOGE("BFI Presenter: the presenter's shaders are not available");
+        if (!ok && !shStopped) LOGE("BFI Presenter: the presenter's shaders are not available");
     }
 
     if (ok)
@@ -4261,7 +4281,10 @@ static DWORD WINAPI PresenterThread(void *)
             modeHz = ExactRefreshHz(od.DeviceName, (double)dm.dmDisplayFrequency);
     }
 
-    if (!ok)
+    if (!ok && shStopped)
+        LOGI("BFI Presenter: presenter stopped while its shaders were still being prepared (the game changed its swap chain) -- "
+             "it starts again with the swap chain");
+    else if (!ok)
     {
         LOGE("BFI Presenter: presenter initialisation failed -- falling back to normal presentation");
         g_presenterFailed.store(true);
