@@ -62,10 +62,11 @@
 struct Swapchain; struct DeviceData;
 namespace gvk { static void Tick(double t); static int State(); static bool Letterboxed(); }
 
-#define BFI_VERSION "1.0.53"
+#define BFI_VERSION "1.0.54"
 #include <atomic>
 // ReShade's own window open (as DX 1.0.49): only then is frame warp's still test run on the finished frames as well
 static std::atomic<bool> g_rsOverlayOpen{false};
+static bool g_ipSplatLogged = false;   // frame interpolation pushed forward (1.0.54 test): logged once
 static const char *kLayerName = "VK_LAYER_BFI_presenter";
 
 // ---------------------------------------------------------------- platform
@@ -286,6 +287,8 @@ struct Settings
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many pixels
     int   warpEdge = 0;       // FrameWarpEdge (as DX): the screen-edge strip of a moved flash: 0 faded, 1 mirrored, 2 repeated
     int   warpInterpTime = 1; // FrameWarpInterpolateByTime (1.0.53): even pacing by the frames' times, not their numbers
+    int   warpInterpSplat = 1;  // FrameWarpInterpolateSplat (1.0.54 test): the newer frame's motion pushed forward to the moment shown
+    int   warpInterpDebug = 0;  // FrameWarpInterpolateDebug (1.0.54 test): tint -- magenta from the frame before, yellow searched
     int   warpInterp = 0;     // FrameWarpInterpolate (as DX, 1.0.51): 0 off (move the last frame), 1 only the missing frames, 2 even pacing, 3 automatic
     int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
@@ -424,6 +427,8 @@ static void LoadSettings(Settings &s)
     s.warpEdge = Clamp(KvInt(kv, "FrameWarpEdge", 0), 0, 2);
     s.warpInterp = Clamp(KvInt(kv, "FrameWarpInterpolate", 0), 0, 3);
     s.warpInterpTime = KvInt(kv, "FrameWarpInterpolateByTime", 1) ? 1 : 0;
+    s.warpInterpSplat = KvInt(kv, "FrameWarpInterpolateSplat", 1) ? 1 : 0;
+    s.warpInterpDebug = KvInt(kv, "FrameWarpInterpolateDebug", 0) ? 1 : 0;
     s.warpFgLag = Clamp(KvInt(kv, "FrameWarpGameMotionFGLag", 1), -1, 1);
     s.warpEase = KvInt(kv, "FrameWarpGameMotionEase", 1) ? 1 : 0;
     s.warpEaseNoFg = KvInt(kv, "FrameWarpGameMotionEaseNoFG", 1) ? 1 : 0;
@@ -514,7 +519,7 @@ static void LoadSettings(Settings &s)
     auto F = [&](const char *n, float v) { snprintf(b, sizeof(b), "%.3f", v); k.push_back({n, b}); };
     I("Enabled", s.enabled); I("Method", s.method); I("Frames", s.frames); F("Gain", s.gain);
     F("DarkFloor", s.dfloor); I("SineBFI", s.sine); I("InvertCycle", s.invert); I("HighlightRolloff", s.rolloff);
-    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpInterpolate", s.warpInterp); I("FrameWarpInterpolateByTime", s.warpInterpTime); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); F("FrameWarpGameMotionEaseStrength", s.warpEaseStr); I("FrameWarpGameDilate", s.warpDilate); I("FrameWarpStillBeforeEffects", s.warpStillPre); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
+    I("RollingScan", s.rolling); I("SplitCompare", s.split); I("SplitCompareSide", s.splitSide); I("SplitComparePosition", s.splitPos); I("SplitCompareSeamPx", s.splitSeam); I("Osd", s.osd); I("FrameWarp", s.frameWarp); F("FrameWarpMaxAhead", s.warpMax); I("FrameWarpMinRate", s.warpMinRate); I("FrameWarpGameMotion", s.warpGame); I("FrameWarpGameMotionWithFG", s.warpGameFg); F("FrameWarpGameMotionMaxAheadFG", s.warpMaxGameFg); F("FrameWarpSnapX", s.warpSnapX); F("FrameWarpSnapY", s.warpSnapY); I("FrameWarpEvenPacing", s.warpEven); I("FrameWarpEdge", s.warpEdge); I("FrameWarpInterpolate", s.warpInterp); I("FrameWarpInterpolateByTime", s.warpInterpTime); I("FrameWarpInterpolateSplat", s.warpInterpSplat); I("FrameWarpGameMotionEaseNoFG", s.warpEaseNoFg); F("FrameWarpGameMotionEaseStrength", s.warpEaseStr); I("FrameWarpGameDilate", s.warpDilate); I("FrameWarpStillBeforeEffects", s.warpStillPre); I("FrameWarpPauseCutscenes", s.warpPauseLb); I("OsdCorner", s.osdCorner); I("OsdGraph", s.osdGraph); I("OsdLoads", s.osdLoads); F("OsdScale", s.osdScale); I("LcdPhaseSwap", s.lcdSwap); I("LcdPhaseSwapSeconds", s.lcdSwapSec); I("LcdSaverGradual", s.lcdGradual); I("LcdGradualSeconds", s.lcdGradSec); I("LcdGradualHoldSeconds", s.lcdHoldSec); I("LcdGradualDriftSeconds", s.lcdDriftSec); F("RollingSeam", s.rollSeam); F("RollingPhosphorDecay", s.rollDecay);
     I("CapJustInTime", s.capJit); I("AutoFrameCap", s.autoCap); I("FrameGenDllCheck", s.fgDllCheck); I("SleepLimitGrid", s.sleepGrid); I("ReflexOwnLimit", s.reflexOwn); I("ReflexLimitAtSleep", s.reflexAtSleep); I("ReflexAlign", s.reflexAlign); I("LearnReflexStart", s.learnReflex); I("ReflexAlignCoarse", s.alignCoarse); I("AutoCapAtFrameStart", s.autoCapFrameStart); I("LearnPerGame", s.learnPerGame); I("PresenterThreadBoost", s.threadBoost); I("LaterRelease", s.laterRelease); F("LaterReleaseMarginMs", s.laterReleaseMs);
     F("RolloffKnee", s.knee); F("DisplayPeakNits", s.peakNits);
     k.push_back({"Output", s.output == 0 ? "sdr" : s.output == 1 ? "scrgb" : s.output == 2 ? "hdr10" : "auto"});
@@ -1828,6 +1833,7 @@ static bool CreatePresenterRes(Swapchain *sc, PresenterRes &R)
         // Frame warp: set 2 is needed by the BFI pipelines; its passes are optional.
         p = R.warp.Init(d, sc->stageView, sc->gFlowView, sc->preView, sc->extent.width, sc->extent.height);
         if (p && !R.warp.ok) LOGW("BFI Presenter: frame warp unavailable (its compute passes could not be created)");
+        if (p && R.warp.ok && !R.warp.ipOk) LOGW("BFI Presenter: frame interpolation: the passes that push the motion forward could not be made -- the search is used");
     }
     if (!p)
     {
@@ -3202,6 +3208,13 @@ static void PresenterThread(Swapchain *sc)
                         warpTouched = true;
                     }
                     if (c.warp != 0.0f && c.warpSrc == 0 && (R.warp.flowNew != pickId || R.warp.flowOld != warpOld)) { R.warp.RecordFlow(d, cb); warpTouched = true; }
+                    // frame interpolation (1.0.54 test): the newer frame's motion pushed forward to the moment shown
+                    if ((c.flags & 65536u) && c.warp < 0.0f && s.warpInterpSplat && R.warp.ipOk && sc->gSlotDepth[pick])
+                    {
+                        if (R.warp.RecordSplat(d, cb, (uint32_t)pick, pickId, -c.warp)) { c.flags |= 131072u; warpTouched = true; }
+                        if (!g_ipSplatLogged) { g_ipSplatLogged = true; LOGI("BFI Presenter: frame interpolation: the newer frame's motion is pushed forward to the moment shown (FrameWarpInterpolateSplat)"); }
+                    }
+                    if ((c.flags & 65536u) && s.warpInterpDebug) c.flags |= 262144u;
                     if (warpTouched) R.warp.ToShade(d, cb);
                 }
             }

@@ -1,0 +1,76 @@
+#version 450
+// Frame interpolation, motion at the in-between moment (1.0.54 test, FrameWarpInterpolateSplat): the newer frame's
+// motion texture (gameflow.comp: xy = how far each point moved from the frame before, z valid, w how near) is pushed
+// forward to where each point is at the moment shown, instead of searched for from the output pixel. Where two points
+// land on one place, the nearer wins (atomic max of nearness in the high bits). The search (bfi_shade.glsl,
+// WarpShiftGame) took three steps along the motion; with frames far apart (35-45 fps) they often missed the edge of
+// something moving, the pixel was taken as uncovered and filled from the frame before with the background's motion,
+// and an outline showed beside it, the further the faster it moved.
+//   PASS 0: clear the two landing textures
+//   PASS 1: every point of the newer frame lands at uv - m * back (back = 1 - f: how far the newer frame is moved back),
+//           on the 2x2 texels around it (so a stretched surface leaves no gaps)
+//   PASS 2: resolve: z = 1 the newer frame shows it (xy its motion); z = 0.25 nothing landed: the background's motion
+//           (the farthest point landed nearby) for the frame before; z = 0 nothing found (the search is used)
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D gFlow;
+layout(set = 0, binding = 1, r32ui) uniform uimage2D landX;
+layout(set = 0, binding = 2, r32ui) uniform uimage2D landY;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D outImg;
+layout(push_constant) uniform P { float back; uint pad0, pad1, pad2; } pc;
+
+void main()
+{
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(landX);
+    if (q.x >= sz.x || q.y >= sz.y) return;
+#if PASS == 0
+    imageStore(landX, q, uvec4(0u));
+    imageStore(landY, q, uvec4(0u));
+#elif PASS == 1
+    vec4 g = texelFetch(gFlow, q, 0);
+    if (g.z < 0.5) return;                                    // no vector here
+    vec2 S = vec2(sz);
+    vec2 uvT = (vec2(q) + 0.5) / S - g.xy * pc.back;          // where this point is at the moment shown
+    vec2 pT = uvT * S - 0.5;
+    ivec2 b = ivec2(floor(pT));
+    uint pr = (uint(clamp(g.w, 0.0, 1.0) * 32766.0) + 1u) << 16;   // nearer wins; 0 = nothing landed
+    uint hx = packHalf2x16(vec2(g.x, 0.0)) & 0xFFFFu;
+    uint hy = packHalf2x16(vec2(g.y, 0.0)) & 0xFFFFu;
+    for (int y = 0; y < 2; y++)
+        for (int x = 0; x < 2; x++)
+        {
+            ivec2 t = b + ivec2(x, y);
+            if (t.x < 0 || t.y < 0 || t.x >= sz.x || t.y >= sz.y) continue;
+            imageAtomicMax(landX, t, pr | hx);
+            imageAtomicMax(landY, t, pr | hy);
+        }
+#else
+    uint x = imageLoad(landX, q).r, y = imageLoad(landY, q).r;
+    if (x != 0u && y != 0u)
+    {
+        vec2 m = vec2(unpackHalf2x16(x & 0xFFFFu).x, unpackHalf2x16(y & 0xFFFFu).x);
+        imageStore(outImg, q, vec4(m, 1.0, float((x >> 16) - 1u) / 32766.0));
+        return;
+    }
+    // Nothing landed: either a gap inside a stretched surface (filled all around: the surface's motion, from the
+    // newer frame) or what comes out from behind something in front (the background's motion, from the frame before).
+    // The farthest point landed nearby, looked for in 8 directions at 1, 2, 4 .. 32 texels.
+    const ivec2 dirs[8] = ivec2[8](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1), ivec2(1, 1), ivec2(-1, 1), ivec2(1, -1), ivec2(-1, -1));
+    uint bestP = 0xFFFFFFFFu, bx = 0u, by = 0u, p1 = 0xFFFFFFFFu, x1 = 0u, y1 = 0u;
+    int near1 = 0;
+    for (int r = 1; r <= 32; r *= 2)
+        for (int k = 0; k < 8; k++)
+        {
+            ivec2 t = clamp(q + dirs[k] * r, ivec2(0), sz - 1);
+            uint tx = imageLoad(landX, t).r, ty = imageLoad(landY, t).r;
+            if (tx == 0u || ty == 0u) continue;
+            if (r == 1) { near1++; if ((tx >> 16) < p1) { p1 = tx >> 16; x1 = tx; y1 = ty; } }
+            if ((tx >> 16) < bestP) { bestP = tx >> 16; bx = tx; by = ty; }
+        }
+    // a gap in a surface: its own motion from the texels right around it
+    if (near1 >= 6) { bx = x1; by = y1; bestP = p1; }
+    if (bx == 0u) { imageStore(outImg, q, vec4(0.0)); return; }
+    vec2 m = vec2(unpackHalf2x16(bx & 0xFFFFu).x, unpackHalf2x16(by & 0xFFFFu).x);
+    imageStore(outImg, q, vec4(m, near1 >= 6 ? 1.0 : 0.25, float(bestP - 1u) / 32766.0));
+#endif
+}

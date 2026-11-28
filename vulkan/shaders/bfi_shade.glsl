@@ -13,6 +13,11 @@ layout(set = 2, binding = 3) uniform sampler2D gameFlow;   // the game's own mot
 // still is found (a CRT shader's blur and glow over a HUD made it look as if it moved). Otherwise the stage frames.
 layout(set = 2, binding = 4) uniform sampler2D preCur;
 layout(set = 2, binding = 5) uniform sampler2D prePrev;
+// Frame interpolation (1.0.54 test, flags & 131072): the newer frame's motion pushed forward to the moment shown
+// (ipsplat.comp, same size as gameFlow): z = 1 the newer frame shows it, z = 0.25 the frame before (with the
+// background's motion), z = 0 not known (the search below is used).
+layout(set = 2, binding = 6) uniform sampler2D ipFlow;
+int gIpDbg = 0;   // FrameWarpInterpolateDebug (flags & 262144): 1 from the newer frame, 2 from the frame before, 3 searched
 // 1.0.49 (as DX): and, while ReShade's window is open (flags & 32768), where it stands still in the finished frames too
 // -- ReShade's window, drawn after the effects, is only in those (it was moved with the scene in 1.0.48).
 bool gStillPre = false;
@@ -33,6 +38,16 @@ bool gFromPrev = false;   // interpolation (flags & 65536, as DX 1.0.51): this p
 vec2 WarpShiftGame(vec2 uv)
 {
     gFromPrev = false;
+    gIpDbg = 0;
+    if ((pc.flags & 131072u) != 0u)
+    {
+        ivec2 isz = textureSize(ipFlow, 0);
+        vec4 s = texelFetch(ipFlow, clamp(ivec2(uv * vec2(isz)), ivec2(0), isz - 1), 0);
+        // the newer frame is at uv + m * (1 - f) = uv - m * warp; the frame before at uv - m * f
+        if (s.z > 0.75) { gIpDbg = 1; return clamp(s.xy * pc.warp, -0.08, 0.08); }
+        if (s.z > 0.1) { gIpDbg = 2; gFromPrev = true; return clamp(s.xy * (1.0 + pc.warp), -0.08, 0.08); }
+        gIpDbg = 3;
+    }
     vec2 osz = vec2(textureSize(src, 0));
     float L = pc.warp - pc.warpLag;
     vec2 m[3];
@@ -166,7 +181,12 @@ bool FetchWarped(vec2 fc, out vec3 c)
     if (InOsd(p)) return false;                           // and nothing moved is taken from it
     p = clamp(p, vec2(0.5), size - 0.5);
     if (Still(ivec2(p), size)) return false;
-    if (gFromPrev) { c = textureLod(srcPrev, p * inv, 0.0).rgb; return true; }   // interpolation: from the frame before
+    if (gFromPrev)   // interpolation: from the frame before
+    {
+        c = textureLod(srcPrev, p * inv, 0.0).rgb;
+        if ((pc.flags & 262144u) != 0u && gIpDbg > 0) c = mix(c, gIpDbg == 2 ? vec3(1.0, 0.0, 1.0) : vec3(1.0, 1.0, 0.0), 0.5);
+        return true;
+    }
     vec2 tc = floor(p - 0.5) + 0.5;
     vec2 f = p - tc;
     vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
@@ -184,6 +204,7 @@ bool FetchWarped(vec2 fc, out vec3 c)
     c += textureLod(srcLin, vec2(t0.x,  t3.y),  0.0).rgb * (w0.x  * w3.y);
     c += textureLod(srcLin, vec2(t12.x, t3.y),  0.0).rgb * (w12.x * w3.y);
     c += textureLod(srcLin, vec2(t3.x,  t3.y),  0.0).rgb * (w3.x  * w3.y);
+    if ((pc.flags & 262144u) != 0u && gIpDbg == 3) c = mix(c, vec3(1.0, 1.0, 0.0), 0.5);   // searched: yellow
     return true;
 }
 // The game's frame at output pixel fc (same size), moved ahead on a filled strobe cycle.
