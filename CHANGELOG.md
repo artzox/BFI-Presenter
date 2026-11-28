@@ -11,7 +11,7 @@ Entries are tagged **[DX]**, **[Vulkan]**, or **[DX] [Vulkan]** when they apply 
 
 **Fixed: a game that changed its swap chain during the first start could crash.**
 
-- **[DX] Fixed: a crash on the first start in a game that changes its swap chain early.** The presenter's shaders are compiled the first time (5–8 s on a fast CPU, longer while a game loads, then kept in `BFIPresenter_shaders.bin`), and the presenter waited for them without being able to stop. Cyberpunk 2077 resized its swap chain twice within its first second: the presenter didn't stop within 5 s, BFI switched itself off, the game's resize failed and the GPU device was removed (issue #142). The presenter now stops while it waits, and starts again with the swap chain; the log says when it waits for its shaders. Thanks to Bashlator for the report and logs.
+- **[DX] Fixed: a crash on the first start in a game that changes its swap chain early.** The presenter's shaders are compiled the first time (5–8 s on a fast CPU, longer while a game loads, then kept in `BFIPresenter_shaders.bin`), and the presenter waited for them without being able to stop. Cyberpunk 2077 resized its swap chain twice within its first second: the presenter didn't stop within 5 s, BFI switched itself off, the game's resize failed and the GPU device was removed (issue #142). The presenter now stops while it waits, and starts again with the swap chain; the log says when it waits for its shaders. Reproduced in 007 First Light with the shaders held back 20 s (`ShaderTestDelayMs`, a diagnostic ini switch): 1.0.51 crashed on a black screen, 1.0.52 starts BFI once they are ready. Thanks to Bashlator for the report and logs.
 
 ## [1.0.51] — 2026-11-27
 
