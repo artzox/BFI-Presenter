@@ -159,8 +159,11 @@ inline void Draw(const OsdData &d, int corner, bool graph, bool loads, float sca
                        d.repeated, g_totRep.load(), d.missed, g_totMiss.load());
     if (d.paused) { ImGui::SameLine(); ImGui::TextColored(kBad, "  BFI paused"); }
     // frame warp: how many of the second's strobe cycles were shown moved ahead (the repeated ones among them are filled)
-    if (d.ipNow > 0) ImGui::TextColored(kGood, "frame interpolation: %d of %.0f cycles drawn between frames (%s, one frame behind)", d.ipBetween, cycles,
-                                        d.ipNow == 2 ? "even pacing" : "only the missing frames");
+    if (d.ipNow > 0)
+    {
+        ImGui::TextColored(kGood, "frame interpolation: %d of %.0f cycles drawn between frames", d.ipBetween, cycles);
+        ImGui::TextDisabled("  %s, one frame behind", d.ipNow == 2 ? "even pacing" : "only the missing frames");
+    }
     else if (d.warpOn == 2) ImGui::TextColored(kGood, "frame warp: %d of %.0f cycles moved (%.2f frames ahead)", d.warped, cycles, d.warpAhead);
     else if (d.warpOn == 1 && d.ipCan) ImGui::TextDisabled("frame interpolation: ready (for the first missing frame)");
     else if (d.warpOn == 1) ImGui::TextDisabled("frame warp: waiting (frame rate outside its range)");
