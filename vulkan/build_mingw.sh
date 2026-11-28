@@ -21,11 +21,11 @@ if command -v glslangValidator >/dev/null 2>&1; then
     glslangValidator -V shaders/crtwarp.comp -o "$tmp/crtwarp.comp.spv" >/dev/null
     python3 tools/crtgen.py ../dx/bfi_crt_gen.h shaders/crt_gen.hlsl
     for e in Sharpen Soften GrainRaw Tail; do
-        glslangValidator -V -D -S comp -e CS$e -DBEAM=1 shaders/crt.hlsl -o "$tmp/crt$e.spv" >/dev/null
+        glslangValidator -V -D -S comp -e main --source-entrypoint CS$e -DBEAM=1 shaders/crt.hlsl -o "$tmp/crt$e.spv" >/dev/null
         python3 tools/spvfmt.py "$tmp/crt$e.spv" 4 2>/dev/null
     done
     for b in 0 1; do
-        glslangValidator -V -D -S comp -e CSPattern -DBEAM=$b shaders/crt.hlsl -o "$tmp/crtPattern$b.spv" >/dev/null
+        glslangValidator -V -D -S comp -e main --source-entrypoint CSPattern -DBEAM=$b shaders/crt.hlsl -o "$tmp/crtPattern$b.spv" >/dev/null
         python3 tools/spvfmt.py "$tmp/crtPattern$b.spv" 4 2>/dev/null
     done
     # frame interpolation: the newer frame's motion pushed forward to the moment shown (clear, land, write, fill)
