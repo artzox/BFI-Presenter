@@ -48,8 +48,8 @@ int main()
     VkDescriptorSetLayoutBinding b0[3] = {}; for (int i = 0; i < 3; i++) { b0[i].binding = i; b0[i].descriptorCount = 1; b0[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; b0[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; }
     VkDescriptorSetLayoutBinding b1[1] = {}; b1[0].descriptorCount = 1; b1[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; b1[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     VkDescriptorSetLayoutBinding b2[8] = {}; for (int i = 0; i < 8; i++) { b2[i].binding = i; b2[i].descriptorCount = 1; b2[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; b2[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; }
-    VkDescriptorSetLayoutBinding b3[2] = {}; for (int i = 0; i < 2; i++) { b3[i].binding = i; b3[i].descriptorCount = 1; b3[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; b3[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; }
-    VkDescriptorSetLayout l[4]; VkDescriptorSetLayoutBinding *bb[4] = { b0, b1, b2, b3 }; uint32_t nb[4] = { 3, 1, 8, 2 };
+    VkDescriptorSetLayoutBinding b3[3] = {}; for (int i = 0; i < 3; i++) { b3[i].binding = i; b3[i].descriptorCount = 1; b3[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; b3[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; }
+    VkDescriptorSetLayout l[4]; VkDescriptorSetLayoutBinding *bb[4] = { b0, b1, b2, b3 }; uint32_t nb[4] = { 3, 1, 8, 3 };
     for (int k = 0; k < 4; k++) { VkDescriptorSetLayoutCreateInfo c = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO }; c.bindingCount = nb[k]; c.pBindings = bb[k]; CK(vkCreateDescriptorSetLayout(dev, &c, nullptr, &l[k])); }
     VkPushConstantRange pr2 = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 128 };
     VkPipelineLayoutCreateInfo p2 = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO }; p2.setLayoutCount = 4; p2.pSetLayouts = l; p2.pushConstantRangeCount = 1; p2.pPushConstantRanges = &pr2; VkPipelineLayout plw; CK(vkCreatePipelineLayout(dev, &p2, nullptr, &plw));
@@ -72,6 +72,8 @@ int main()
   p[kCrtParamN * 4] = W; p[kCrtParamN * 4 + 1] = H;
   uint8_t *rp; vkMapMemory(dev, rm, 0, VK_WHOLE_SIZE, 0, (void **)&rp);
   for (uint32_t i = 0; i < W * H; i++) { rp[i * 4] = rp[i * 4 + 1] = rp[i * 4 + 2] = 160; rp[i * 4 + 3] = 255; }
+  // S: no shift, and the first 64 columns marked as ReShade's window (h4: left as they are)
+  { uint32_t *sp = (uint32_t *)(rp + (size_t)W * H * 4); for (uint32_t i = 0; i < W * H; i++) sp[i] = (i % W) < 64 ? 0xFFFFFFFFu : 0u; }
   VkSamplerCreateInfo si = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO }; si.magFilter = si.minFilter = VK_FILTER_LINEAR; VkSampler smp; vkCreateSampler(dev, &si, nullptr, &smp);
   VkDescriptorPoolSize ps[4] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 7 }, { VK_DESCRIPTOR_TYPE_SAMPLER, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 } };
   VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO }; dpi.maxSets = 1; dpi.poolSizeCount = 4; dpi.pPoolSizes = ps; VkDescriptorPool dp; CK(vkCreateDescriptorPool(dev, &dpi, nullptr, &dp));
@@ -91,6 +93,7 @@ int main()
   bar(in.i, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL); bar(sh.i, VK_IMAGE_LAYOUT_UNDEFINED, G); bar(dm.i, VK_IMAGE_LAYOUT_UNDEFINED, G); bar(out.i, VK_IMAGE_LAYOUT_UNDEFINED, G);
   VkBufferImageCopy bc = {}; bc.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }; bc.imageExtent = { W, H, 1 };
   vkCmdCopyBufferToImage(cb, rb, in.i, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc); bar(in.i, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, G);
+  { bar(sh.i, G, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL); VkBufferImageCopy b2 = bc; b2.bufferOffset = (VkDeviceSize)W * H * 4; vkCmdCopyBufferToImage(cb, rb, sh.i, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b2); bar(sh.i, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, G); }
   VkClearColorValue zc = {}; VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }; (void)zc; (void)rr;
   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pso[1]); uint32_t off = 0; vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 1, &off);
   vkCmdDispatch(cb, (W + 7) / 8, (H + 7) / 8, 1);
@@ -101,5 +104,6 @@ int main()
   printf("rows (x=100, R G B):\n");
   for (uint32_t y = 100; y < 112; y++) { uint8_t *px = rp + (y * W + 100) * 4; printf("  y=%u: %3d %3d %3d\n", y, px[0], px[1], px[2]); }
   printf("cols (y=100):"); for (uint32_t x = 100; x < 112; x++) { uint8_t *px = rp + (100 * W + x) * 4; printf(" %d/%d/%d", px[0], px[1], px[2]); } printf("\n");
+  printf("window cols (y=100, x=60..67, 60-63 must be 160):"); for (uint32_t x = 60; x < 68; x++) { uint8_t *px = rp + (100 * W + x) * 4; printf(" %d/%d/%d", px[0], px[1], px[2]); } printf("\n");
   return 0;
 }

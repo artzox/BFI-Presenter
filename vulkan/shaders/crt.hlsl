@@ -55,6 +55,7 @@ void CSPattern(uint3 id : SV_DispatchThreadID)
     const float2 fc = float2(id.xy) + 0.5;
     const float3 c = inPic.Load(int3(id.xy, 0)).rgb;
     const uint sh = srcShift.Load(int3(id.xy, 0));
+    if (sh == 0xFFFFFFFFu) { outPic[id.xy] = float4(c, 1.0); return; }   // ReShade's window (crtwarp.comp): as it is
     const float2 from = fc + float2(f16tof32(sh & 0xFFFFu), f16tof32(sh >> 16));
     outPic[id.xy] = float4(CrtPattern(c, fc, from * CrtPixelSize), 1.0);
 }
@@ -70,6 +71,7 @@ void CSGrainRaw(uint3 id : SV_DispatchThreadID) { if (InFrame(id.xy)) outPic[id.
 void CSTail(uint3 id : SV_DispatchThreadID)
 {
     if (!InFrame(id.xy)) return;
+    if (srcShift.Load(int3(id.xy, 0)) == 0xFFFFFFFFu) { outPic[id.xy] = inPic.Load(int3(id.xy, 0)); return; }   // ReShade's window: as it is
     const float4 pos = float4(float2(id.xy) + 0.5, 0.0, 1.0);
     const float2 uv = pos.xy * CrtPixelSize;
     float4 o;

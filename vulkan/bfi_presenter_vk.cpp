@@ -975,6 +975,18 @@ struct Swapchain
     std::atomic<bool> crtSlotOk[kStage] = {};   // the slot's frame has its copies
     bool           crtSlotsMade = false, crtSlotsFailed = false, crtSlotsInit = false;
     std::atomic<uint32_t> crtSlotGen{0};
+    // h4: while ReShade's window is open, the finished frame before it is drawn (at reshade_finish_effects) -- where the
+    // frame shown differs from it is ReShade's window, shown without the pattern (as DX's CrtOverlay). Made when first needed.
+    VkImage        crtBaseCur = VK_NULL_HANDLE;
+    VkDeviceMemory crtBaseCurMem = VK_NULL_HANDLE;
+    bool           crtBaseCurFailed = false;
+    std::atomic<bool> crtBaseCurOk{false};
+    VkImage        crtBase[kStage] = {};
+    VkDeviceMemory crtBaseMem[kStage] = {};
+    VkImageView    crtBaseView[kStage] = {};
+    std::atomic<bool> crtBaseOk[kStage] = {};
+    bool           crtBaseMade = false, crtBaseFailed = false;
+    std::atomic<uint32_t> crtBaseGen{0};
 
     // presenter
     uint32_t       nReal = 0;
@@ -8124,6 +8136,58 @@ static void on_finish(effect_runtime *rt, command_list *cmd, resource_view, reso
         refH = DefAt(vals, "SCANLINE_REFERENCE_HEIGHT");
     }
     if (!sc->crtSlotsMade) for (int k = 0; k < 3; k++) sc->crtCurHas[k] = has[k];
+    // h4: ReShade's window open -- the finished frame as it is now (its window is drawn on it after this)
+    if (ok && g_rsOverlayOpen.load() && !sc->crtBaseCurFailed)
+    {
+        typedef resource *(*Fn)(effect_runtime *self, resource *ret, uint32_t index);
+        resource r = {};
+        void **vt = *reinterpret_cast<void ***>(rt);
+        reinterpret_cast<Fn>(vt[5])(rt, &r, rt->get_current_back_buffer_index());
+        const VkImage bb = (VkImage)r.handle;
+        bool ours = false;
+        for (uint32_t i = 0; i < sc->nVirt; i++) if (sc->virt[i] == bb) ours = true;
+        if (ours)
+        {
+            const bool fresh = !sc->crtBaseCur;
+            if (fresh)
+            {
+                VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+                ici.imageType = VK_IMAGE_TYPE_2D; ici.format = sc->format; ici.extent = { sc->extent.width, sc->extent.height, 1 };
+                ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+                ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                ici.sharingMode = d->families.size() > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+                ici.queueFamilyIndexCount = d->families.size() > 1 ? (uint32_t)d->families.size() : 0;
+                ici.pQueueFamilyIndices = d->families.size() > 1 ? d->families.data() : nullptr;
+                if (!CreateImageMem(d, ici, &sc->crtBaseCur, &sc->crtBaseCurMem))
+                {
+                    sc->crtBaseCurFailed = true;
+                    LOGW("BFI Presenter: CRT hand-off: no texture for the frame before ReShade's window -- it gets the pattern");
+                }
+            }
+            if (sc->crtBaseCur)
+            {
+                VkImageMemoryBarrier b[2] = {
+                    ImgBarrier(bb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT),
+                    ImgBarrier(sc->crtBaseCur, fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT) };
+                d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+                VkImageCopy ic = {};
+                ic.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                ic.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                ic.extent = { sc->extent.width, sc->extent.height, 1 };
+                d->CmdCopyImage(cb, bb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc->crtBaseCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+                b[0] = ImgBarrier(bb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+                                  VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+                b[1] = ImgBarrier(sc->crtBaseCur, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+                sc->crtBaseCurOk = true;
+            }
+        }
+        else
+        {
+            static bool logged = false;
+            if (!logged) { logged = true; LOGW("BFI Presenter: CRT hand-off: ReShade's back buffer isn't one of the layer's -- its window gets the pattern"); }
+        }
+    }
     static bool texLogged = false;
     if (!texLogged && ok)
     {

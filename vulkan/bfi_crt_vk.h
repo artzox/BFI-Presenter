@@ -20,9 +20,11 @@
 // The DX add-on compiles CRT-Standalone's code with its switches; the layer has no compiler with it, so its passes are
 // compiled when it is built with every switch on, and a switch that is off is given its off value instead (a strength
 // of 0: the shader's own test then leaves the picture as it is). ENABLE_BEAM_MODULATION changes the code: two builds.
+// h4: while ReShade's window is open, the frame before it is copied at reshade_finish_effects; where the frame shown
+// differs from it (ReShade's window), crtwarp.comp takes the frame as it is, unmoved, and marks it in S: the pattern and
+// the final pass pass it on as it is (as DX's CrtOverlay).
 // Not yet as the DX add-on: the CRT picture made with the frame on the game's queue (here every new picture is drawn by
-// the presenter), what is drawn after the effects shown without the pattern (ReShade's window gets the mask too), and
-// the realtime compute queue only (the graphics path draws without the hand-off). 64-bit, PIPELINE 0, ENABLE_SCANLINE_SS 0,
+// the presenter), and the realtime compute queue only (the graphics path draws without the hand-off). 64-bit, PIPELINE 0, ENABLE_SCANLINE_SS 0,
 // 8-bit frames (the passes are 8-bit, as ReShade's back buffer CRT-Standalone draws into for such a game).
 // ============================================================================
 #pragma once
@@ -59,7 +61,7 @@ static void ParamsFor(float *out, float w, float h, int *beamOut)
     }
     out[kCrtParamN * 4 + 0] = w;
     out[kCrtParamN * 4 + 1] = h;
-    out[kCrtParamN * 4 + 2] = 0.0f;                 // what is drawn after the effects: not told apart yet
+    out[kCrtParamN * 4 + 2] = 0.0f;                 // (DX's overlay check: here crtwarp.comp tells ReShade's window apart, h4)
     // SCANLINE_REFERENCE_HEIGHT (compiled as 0): the width it would give at this height
     const int sw = ParamIndex("crt_scanline_width");
     if (rh > 0 && sw >= 0) out[sw * 4] *= h / (float)rh;
@@ -87,12 +89,69 @@ static void DestroySlots(DeviceData *d, Swapchain *sc)
     }
     for (uint32_t s = 0; s < kStage; s++) sc->crtSlotOk[s] = false;
     sc->crtCurOk = false; sc->crtSlotsMade = false;
+    if (sc->crtBaseCur) d->DestroyImage(d->device, sc->crtBaseCur, nullptr);
+    if (sc->crtBaseCurMem) d->FreeMemory(d->device, sc->crtBaseCurMem, nullptr);
+    sc->crtBaseCur = VK_NULL_HANDLE; sc->crtBaseCurMem = VK_NULL_HANDLE; sc->crtBaseCurOk = false; sc->crtBaseCurFailed = false;
+    for (uint32_t s = 0; s < kStage; s++)
+    {
+        if (sc->crtBaseView[s]) d->DestroyImageView(d->device, sc->crtBaseView[s], nullptr);
+        if (sc->crtBase[s]) d->DestroyImage(d->device, sc->crtBase[s], nullptr);
+        if (sc->crtBaseMem[s]) d->FreeMemory(d->device, sc->crtBaseMem[s], nullptr);
+        sc->crtBaseView[s] = VK_NULL_HANDLE; sc->crtBase[s] = VK_NULL_HANDLE; sc->crtBaseMem[s] = VK_NULL_HANDLE; sc->crtBaseOk[s] = false;
+    }
+    sc->crtBaseMade = false; sc->crtBaseFailed = false;
+}
+// h4: the frame before ReShade's window (copied at reshade_finish_effects while it is open) into the slot. The slots'
+// copies are made the first time the window is opened (four frames' worth: not needed otherwise).
+static void CopyBaseAtPresent(DeviceData *d, Swapchain *sc, VkCommandBuffer cb, uint32_t slot)
+{
+    const bool have = sc->crtBaseCurOk.exchange(false);
+    sc->crtBaseOk[slot] = false;
+    if (!have || !sc->crtBaseCur || sc->crtBaseFailed) return;
+    if (!sc->crtBaseMade)
+    {
+        VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        ici.imageType = VK_IMAGE_TYPE_2D; ici.format = sc->format; ici.extent = { sc->extent.width, sc->extent.height, 1 };
+        ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL; ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ici.sharingMode = d->families.size() > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+        ici.queueFamilyIndexCount = d->families.size() > 1 ? (uint32_t)d->families.size() : 0;
+        ici.pQueueFamilyIndices = d->families.size() > 1 ? d->families.data() : nullptr;
+        bool ok = true;
+        for (uint32_t s = 0; ok && s < kStage; s++)
+        {
+            ok = CreateImageMem(d, ici, &sc->crtBase[s], &sc->crtBaseMem[s]);
+            VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+            vci.image = sc->crtBase[s]; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = ici.format;
+            vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            ok = ok && d->CreateImageView(d->device, &vci, nullptr, &sc->crtBaseView[s]) == VK_SUCCESS;
+        }
+        sc->crtBaseMade = true;
+        sc->crtBaseFailed = !ok;
+        if (!ok) { LOGW("BFI Presenter: CRT hand-off: the textures for the frame before ReShade's window could not be made -- it gets the pattern"); return; }
+        std::vector<VkImageMemoryBarrier> bs;
+        for (uint32_t s = 0; s < kStage; s++)
+            bs.push_back(ImgBarrier(sc->crtBase[s], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 0));
+        d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, (uint32_t)bs.size(), bs.data());
+        sc->crtBaseGen++;
+        LOGI("BFI Presenter: CRT hand-off: ReShade's window is shown without the pattern");
+    }
+    VkImageMemoryBarrier b = ImgBarrier(sc->crtBase[slot], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkImageCopy ic = {};
+    ic.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    ic.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    ic.extent = { sc->extent.width, sc->extent.height, 1 };
+    d->CmdCopyImage(cb, sc->crtBaseCur, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc->crtBase[slot], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    b = ImgBarrier(sc->crtBase[slot], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    sc->crtBaseOk[slot] = true;
 }
 static void CopyAtPresent(DeviceData *d, Swapchain *sc, VkCommandBuffer cb, uint32_t slot)
 {
     if (slot >= kStage) return;
     const bool have = sc->crtCurOk.exchange(false);
-    if (!have || state.load() != 2) { sc->crtSlotOk[slot] = false; return; }
+    if (!have || state.load() != 2) { sc->crtSlotOk[slot] = false; sc->crtBaseCurOk = false; sc->crtBaseOk[slot] = false; return; }
     if (!sc->crtSlotsMade)
     {
         // the slots' copies, once per swap chain (their sizes and formats are the shader's, known from its first frame)
@@ -122,7 +181,7 @@ static void CopyAtPresent(DeviceData *d, Swapchain *sc, VkCommandBuffer cb, uint
         sc->crtSlotGen++;
         if (!ok) LOGW("BFI Presenter: CRT hand-off: the textures for CRT-Standalone's halation and glow could not be made -- off for this swap chain");
     }
-    if (sc->crtSlotsFailed) { sc->crtSlotOk[slot] = false; return; }
+    if (sc->crtSlotsFailed) { sc->crtSlotOk[slot] = false; sc->crtBaseOk[slot] = false; return; }
     for (int k = 0; k < 3; k++)
     {
         if (!sc->crtCurHas[k] || !sc->crtSlot[k][slot]) continue;
@@ -150,6 +209,7 @@ static void CopyAtPresent(DeviceData *d, Swapchain *sc, VkCommandBuffer cb, uint
             d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, (uint32_t)bs.size(), bs.data());
         sc->crtSlotsInit = true;
     }
+    CopyBaseAtPresent(d, sc, cb, slot);
     sc->crtSlotOk[slot] = true;
 }
 } // namespace crtvk
@@ -177,7 +237,9 @@ struct CrtGpu
     VkShaderModule        cs[kPassN] = {};
     VkPipeline            pso[kPassN] = {};
     VkDescriptorPool      dp = VK_NULL_HANDLE;
-    VkDescriptorSet       dsCW = VK_NULL_HANDLE;
+    VkDescriptorSet       dsCW[2][kStage] = {};        // W, S out; the slot's frame before ReShade's window (two banks: h4)
+    int                   cwBank = 0;
+    uint32_t              baseGenSeen = ~0u;
     VkDescriptorSet       dsPat[kStage] = {};             // W, S, the slot's halation and glow -> A
     VkDescriptorSet       dsSharpen = VK_NULL_HANDLE;      // A -> B
     VkDescriptorSet       dsSoften[2] = {};                // [0] A -> B, [1] B -> A
@@ -254,10 +316,14 @@ struct CrtGpu
         VkDevice dev = d->device;
         bool p = true;
         {
-            VkDescriptorSetLayoutBinding b[2] = {};
-            for (int i = 0; i < 2; i++) { b[i].binding = (uint32_t)i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
+            VkDescriptorSetLayoutBinding b[3] = {};
+            for (int i = 0; i < 3; i++)
+            {
+                b[i].binding = (uint32_t)i; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+                b[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            }
             VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            dli.bindingCount = 2; dli.pBindings = b;
+            dli.bindingCount = 3; dli.pBindings = b;
             p = d->CreateDescriptorSetLayout(dev, &dli, nullptr, &dslCW) == VK_SUCCESS;
             VkDescriptorSetLayout sl[4] = { dslC, dslN, dslW, dslCW };
             VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize };
@@ -318,14 +384,15 @@ struct CrtGpu
         }
         if (p)
         {
-            const uint32_t nSets = 1 + kStage + 1 + 2 + 2 + 2;
-            VkDescriptorPoolSize ps[4] = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 + nSets }, { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 7 * nSets },
-                                           { VK_DESCRIPTOR_TYPE_SAMPLER, nSets }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, nSets } };
+            const uint32_t nCW = 2 * kStage, nSets = nCW + kStage + 1 + 2 + 2 + 2;
+            VkDescriptorPoolSize ps[5] = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * nCW + nSets }, { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 7 * nSets },
+                                           { VK_DESCRIPTOR_TYPE_SAMPLER, nSets }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, nSets },
+                                           { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nCW } };
             VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-            dpi.maxSets = nSets; dpi.poolSizeCount = 4; dpi.pPoolSizes = ps;
+            dpi.maxSets = nSets; dpi.poolSizeCount = 5; dpi.pPoolSizes = ps;
             p = d->CreateDescriptorPool(dev, &dpi, nullptr, &dp) == VK_SUCCESS;
             std::vector<VkDescriptorSetLayout> l(nSets, dslP);
-            l[0] = dslCW;
+            for (uint32_t i = 0; i < nCW; i++) l[i] = dslCW;
             std::vector<VkDescriptorSet> sets(nSets, VK_NULL_HANDLE);
             VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
             dai.descriptorPool = dp; dai.descriptorSetCount = nSets; dai.pSetLayouts = l.data();
@@ -333,39 +400,60 @@ struct CrtGpu
             if (p)
             {
                 uint32_t k = 0;
-                dsCW = sets[k++];
+                for (int bk = 0; bk < 2; bk++) for (uint32_t s = 0; s < kStage; s++) dsCW[bk][s] = sets[k++];
                 for (uint32_t s = 0; s < kStage; s++) dsPat[s] = sets[k++];
                 dsSharpen = sets[k++];
                 dsSoften[0] = sets[k++]; dsSoften[1] = sets[k++];
                 dsGrain[0] = sets[k++]; dsGrain[1] = sets[k++];
                 dsTail[0] = sets[k++]; dsTail[1] = sets[k++];
-                VkDescriptorImageInfo ii[2] = { { VK_NULL_HANDLE, view[kW], VK_IMAGE_LAYOUT_GENERAL }, { VK_NULL_HANDLE, view[kS], VK_IMAGE_LAYOUT_GENERAL } };
-                VkWriteDescriptorSet wr[2] = {};
-                for (int i = 0; i < 2; i++)
-                {
-                    wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[i].dstSet = dsCW; wr[i].dstBinding = (uint32_t)i;
-                    wr[i].descriptorCount = 1; wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[i].pImageInfo = &ii[i];
-                }
-                d->UpdateDescriptorSets(dev, 2, wr, 0, nullptr);
+                for (int bk = 0; bk < 2; bk++) WriteCW(d, bk, nullptr);
+                cwBank = 0;
                 for (uint32_t s = 0; s < kStage; s++) WriteP(d, dsPat[s], view[kW], VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, view[kA]);
                 WriteP(d, dsSharpen, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, view[kA], VK_NULL_HANDLE, view[kB]);
                 WriteP(d, dsSoften[0], VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, view[kA], VK_NULL_HANDLE, view[kB]);
                 WriteP(d, dsSoften[1], VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, view[kB], VK_NULL_HANDLE, view[kA]);
                 WriteP(d, dsGrain[0], VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, view[kA], VK_NULL_HANDLE, view[kG]);
                 WriteP(d, dsGrain[1], VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, view[kB], VK_NULL_HANDLE, view[kG]);
-                WriteP(d, dsTail[0], VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, view[kA], view[kG], view[kF]);
-                WriteP(d, dsTail[1], VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, view[kB], view[kG], view[kF]);
+                WriteP(d, dsTail[0], view[kW], VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, view[kA], view[kG], view[kF]);
+                WriteP(d, dsTail[1], view[kW], VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, view[kB], view[kG], view[kF]);
             }
         }
         ok = p;
-        slotGenSeen = ~0u; keyId = 0;
+        slotGenSeen = ~0u; baseGenSeen = ~0u; keyId = 0;
         return p;
     }
 
+    // crtwarp.comp's set 3 for each slot, in bank bk: W, S, and the slot's frame before ReShade's window (or a stand-in)
+    void WriteCW(DeviceData *d, int bk, const VkImageView *base)
+    {
+        for (uint32_t s = 0; s < kStage; s++)
+        {
+            const bool hb = base && base[s];
+            VkDescriptorImageInfo ii[3] = { { VK_NULL_HANDLE, view[kW], VK_IMAGE_LAYOUT_GENERAL }, { VK_NULL_HANDLE, view[kS], VK_IMAGE_LAYOUT_GENERAL },
+                                            { lin, hb ? base[s] : view[kDummy], hb ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL } };
+            VkWriteDescriptorSet wr[3] = {};
+            for (int i = 0; i < 3; i++)
+            {
+                wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[i].dstSet = dsCW[bk][s]; wr[i].dstBinding = (uint32_t)i;
+                wr[i].descriptorCount = 1; wr[i].pImageInfo = &ii[i];
+                wr[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            }
+            d->UpdateDescriptorSets(d->device, 3, wr, 0, nullptr);
+        }
+    }
     // The slots' halation and glow copies (made on the game's thread at its present): the pattern's sets pointed at them.
     // Only while no slot is ok for the hand-off yet (made once per swap chain), so no set written here is in use.
     void SeeSlots(DeviceData *d, Swapchain *sc)
     {
+        // h4: the frames before ReShade's window, made on the game's thread the first time it opens: written into the
+        // bank not in use (the other may still be in a command buffer in flight), then that bank used
+        const uint32_t bg = sc->crtBaseGen.load();
+        if (bg != baseGenSeen)
+        {
+            baseGenSeen = bg;
+            cwBank = 1 - cwBank;
+            WriteCW(d, cwBank, sc->crtBaseMade && !sc->crtBaseFailed ? sc->crtBaseView : nullptr);
+        }
         const uint32_t g = sc->crtSlotGen.load();
         if (g == slotGenSeen) return;
         slotGenSeen = g;
@@ -395,7 +483,10 @@ struct CrtGpu
     {
         if (!ok || pick >= kStage || !set2) return false;
         SeeSlots(d, sc);
-        const uint32_t keyF = c.flags & (65536u | 16384u | 32768u | 4096u | 8192u);
+        // h4: ReShade's window open and the frame before it copied with this one: told apart (crtwarp.comp, flags & 1048576)
+        const uint32_t ovl = (g_rsOverlayOpen.load() && sc->crtBaseOk[pick].load() && baseGenSeen == sc->crtBaseGen.load() &&
+                              sc->crtBaseMade && !sc->crtBaseFailed) ? 1048576u : 0u;
+        const uint32_t keyF = (c.flags & (65536u | 16384u | 32768u | 4096u | 8192u)) | ovl;
         if (pickId == keyId && c.warp == keyWarp && c.warpSrc == keySrc && keyF == keyFlags && prev == keyPrev && (int)pick == keyPick)
             return true;                                  // drawn already (this cycle's other refresh)
         if (!inGeneral)
@@ -410,9 +501,9 @@ struct CrtGpu
         Barrier(d, cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);   // (the compute queue only)
         // the frame as shown
         C cw = c;
-        cw.flags &= ~524288u;
+        cw.flags = (cw.flags & ~(524288u | 1048576u)) | ovl;
         d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, psoCW);
-        VkDescriptorSet sets[4] = { set0, set1, set2, dsCW };
+        VkDescriptorSet sets[4] = { set0, set1, set2, dsCW[cwBank][pick] };
         d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, plCW, 0, 4, sets, 0, nullptr);
         d->CmdPushConstants(cb, plCW, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cw), &cw);
         d->CmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);

@@ -8,6 +8,9 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 3, binding = 0, rgba8) uniform writeonly image2D outW;   // 8-bit, as the game's frame and ReShade's back buffer CRT-Standalone draws into
 layout(set = 3, binding = 1, r32ui) uniform writeonly uimage2D outS;
+// h4 (flags & 1048576): ReShade's window open -- the frame before it was drawn. Where the frame differs from it, the
+// window: taken as it is (not moved), S = 0xFFFFFFFF (the pattern and the final pass leave it as it is).
+layout(set = 3, binding = 2) uniform sampler2D baseImg;
 
 void main()
 {
@@ -15,6 +18,17 @@ void main()
     ivec2 sz = imageSize(outW);
     if (p.x >= sz.x || p.y >= sz.y) return;
     vec2 fc = vec2(p) + 0.5;
+    if ((pc.flags & 1048576u) != 0u)
+    {
+        vec3 now = texelFetch(src, p, 0).rgb;
+        vec3 d = abs(now - texelFetch(baseImg, p, 0).rgb);
+        if (max(max(d.r, d.g), d.b) > 0.0005)
+        {
+            imageStore(outW, p, vec4(now, 1.0));
+            imageStore(outS, p, uvec4(0xFFFFFFFFu));
+            return;
+        }
+    }
     vec3 c = Fetch(fc);
     imageStore(outW, p, vec4(c, 1.0));
     imageStore(outS, p, uvec4(packHalf2x16(gSrcPos - fc)));
