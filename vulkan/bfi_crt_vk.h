@@ -267,6 +267,7 @@ struct CrtGpu
             csCW = p ? MakeShader(d, kCrtWarpSpv, sizeof(kCrtWarpSpv)) : VK_NULL_HANDLE;
             psoCW = csCW ? MakeComputePipeline(d, plCW, csCW) : VK_NULL_HANDLE;
             p = psoCW != VK_NULL_HANDLE;
+            if (!p) LOGW("BFI Presenter: CRT hand-off: its warp pass could not be made");
         }
         if (p)
         {
@@ -291,6 +292,7 @@ struct CrtGpu
                 cs[i] = MakeShader(d, code[i], bytes[i]);
                 pso[i] = cs[i] ? MakeComputePipeline(d, plP, cs[i]) : VK_NULL_HANDLE;
                 p = pso[i] != VK_NULL_HANDLE;
+                if (!p) LOGW("BFI Presenter: CRT hand-off: its pass %d (pattern, pattern, sharpen, soften, grain, tail) could not be made", i);
             }
         }
         if (p)

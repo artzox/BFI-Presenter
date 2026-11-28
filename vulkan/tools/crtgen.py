@@ -13,4 +13,9 @@ for l in s[i:j].splitlines()[1:]:
 t = '\n'.join(lines) + '\n'
 t, n = re.subn(r'cbuffer CrtParams : register\(b1\)', '[[vk::binding(8, 0)]] cbuffer CrtParams', t)
 if n != 1: raise SystemExit('constant buffer not found')
+# Compute passes have no derivatives (the DX add-on draws these as pixel shaders): the two the mask takes are of the
+# screen pixel, which steps by one from pixel to pixel -- their values written out
+t = t.replace('fwidth(fc_clean.x / tw)', '(1.0 / abs(tw))').replace('fwidth(fc.y * 0.5)', '0.5')
+if re.search(r'\b(fwidth|ddx|ddy|ddx_fine|ddy_fine|ddx_coarse|ddy_coarse)\s*\(', t):
+    raise SystemExit('a derivative the compute passes can\'t take: ' + re.search(r'.*\b(fwidth|ddx|ddy)\s*\(.*', t).group(0))
 open(sys.argv[2], 'w', encoding='utf-8').write('// Written by vulkan/tools/crtgen.py from dx/bfi_crt_gen.h -- do not edit by hand.\n' + t)

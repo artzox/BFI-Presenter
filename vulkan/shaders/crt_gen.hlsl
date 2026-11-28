@@ -223,7 +223,7 @@ float3 crt_mask_apply(float2 fc, float tw_ref, float strength, float sharp,
     float tw     = tw_ref * (float(BUFFER_WIDTH) / CRT_REFERENCE_WIDTH);
     // Use fc_clean (without burn-in step offsets) for fwidth to prevent
     // discontinuities from integer triad steps from widening the AA edge
-    float fw     = fwidth(fc_clean.x / tw);
+    float fw     = (1.0 / abs(tw));
     float edge   = max(fw, 1.0 / max(sharp, 0.01));
 
     float3 mask  = 1.0;
@@ -261,7 +261,7 @@ float3 crt_mask_apply(float2 fc, float tw_ref, float strength, float sharp,
         mask = float3(r, g, b) * phcol;
         // Slot rows: fwidth-based AA on the vertical row boundary.
         // Smoothstep replaces the hard binary step for anti-aliased slot edges.
-        float  fw_y    = fwidth(fc.y * 0.5);
+        float  fw_y    = 0.5;
         float  row_t   = frac(floor(fc.y * 0.5) * 0.5); // 0 or 0.5
         float  slot_aa = smoothstep(0.0, fw_y, row_t) * smoothstep(0.5, 0.5 - fw_y, row_t);
         float  lane    = 1.0 - slot_dark * (1.0 - slot_aa);
