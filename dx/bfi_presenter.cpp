@@ -167,7 +167,7 @@ static double Now()
 
 template <class T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
-#define BFI_ADDON_VERSION "1.0.52"
+#define BFI_ADDON_VERSION "1.0.53"
 
 // ---------------------------------------------------------------- settings
 struct Settings
@@ -199,6 +199,7 @@ struct Settings
     int   warpInterp = 0;          // FrameWarpInterpolate: one frame behind while frames are missing (test, 1.0.51): 0 off,
                                    // 1 only the missing frames drawn between two (the rest as rendered), 2 even pacing (every cycle at its time),
                                    // 3 automatic: 1 near the strobe rate, 2 clearly below it (i4)
+    int   warpInterpTime = 1;      // FrameWarpInterpolateByTime (1.0.53): even pacing by the frames' times, not their numbers
     int   warpFillDebug = 0;       // FrameWarpFillUncoveredDebug: tint uncovered pixels (test)
     int   warpFillUncovered = 0;   // FrameWarpFillUncovered: with the game's motion, what is uncovered from the background beside it (1.0.51)
     int   warpEdge = 0;       // FrameWarpEdge: the strip at the screen edge a moved flash has no picture for: 0 the move faded
@@ -432,6 +433,7 @@ static void LoadSettings(Settings &s)
     s.warpFillUncovered = IniInt("FrameWarpFillUncovered", 0) ? 1 : 0;   // t1-t5: worse than without (a smear around a character as the camera turns)
     s.warpFillDebug = IniInt("FrameWarpFillUncoveredDebug", 0) ? 1 : 0;
     s.warpInterp = std::max(0, std::min(3, IniInt("FrameWarpInterpolate", 0)));   // 1 only the missing frames, 2 even pacing, 3 automatic
+    s.warpInterpTime = IniInt("FrameWarpInterpolateByTime", 1) ? 1 : 0;
     s.osd = IniInt("Osd", 0) ? 1 : 0;
     s.osdCorner = std::max(0, std::min(3, IniInt("OsdCorner", 1)));
     s.osdGraph = IniInt("OsdGraph", 1) ? 1 : 0;
@@ -689,6 +691,7 @@ static void SaveSettings(const Settings &s)
     IniWriteInt("FrameWarpEdge", s.warpEdge);
     IniWriteInt("FrameWarpFillUncovered", s.warpFillUncovered);
     IniWriteInt("FrameWarpInterpolate", s.warpInterp);
+    IniWriteInt("FrameWarpInterpolateByTime", s.warpInterpTime);
     IniWriteInt("Osd", s.osd);
     IniWriteInt("OsdCorner", s.osdCorner);
     IniWriteInt("OsdGraph", s.osdGraph);
@@ -778,6 +781,9 @@ struct Status
     double driftFps = 0.0, driftHz = 0.0, driftSuggest = 0.0, driftSlip = 0.0;
     int    late = 0, repeats = 0;
     int    frameRepeats = 0, frameSkips = 0;
+    int    ipBetween = 0;    // per second: strobe cycles frame interpolation drew between two frames (1.0.53)
+    int    picRepeats = 0;   // per second: strobe cycles that lit the same picture again (frame interpolation draws
+                             // a frame number twice at different points; 1.0.53)
     double alignSlackMs = -1.0, alignShiftMs = 0.0;   // ReflexAlign: frames ready before the pick (10th percentile), total shift
     int    unevenRep = 0, unevenSkip = 0;           // per second: strobe cycles one or more frames short / ahead of the expected step
     int    slotWaits = 0;                       // per second: game copies that waited for the presenter
@@ -3937,6 +3943,12 @@ static DWORD WINAPI PresenterThread(void *)
     double ipRateSlow = 1.0;                 // game frames per strobe cycle over about 3 s (Automatic decides on it)
     int    ipTwoBehind = 0;                  // only the missing frames: cycles in a row with two frames waiting
     int    ipCycles = 0, ipAsIs = 0, ipEnters = 0;
+    int    secIpBetween = 0, secIpAsIs = 0;   // this second, for the timing log (ip_between, ip_asis; 1.0.53)
+    // Even pacing by time (1.0.53, from the Vulkan layer's t6): each strobe cycle shows the moment ipD behind now, placed
+    // between the two frames the game presented around it. By frame number, Uncharted's frames 16 and 24 ms apart (the
+    // cap's 120 Hz grid) came out as steps of 12-22 ms of game time; by time every step was 16.7 ms.
+    double ipD = 0.0, ipT = 0.0, ipLagHist[120] = {}, ipDSum = 0.0, ipGapSum = 0.0, ipGapMax = 0.0;
+    int    ipLagN = 0, ipLagAt = 0, ipDN = 0, ipGapN = 0, ipStalls = 0, ipResyncs = 0;
     int    warpPrev = -1;                    // the staging slot of the frame shown before the current one
     UINT64 warpPrevId = 0;
     int    secWarpCycles = 0;
@@ -4314,6 +4326,7 @@ static DWORD WINAPI PresenterThread(void *)
     double   gradPhase = 0.0;        // LCD gradual saver: lit window start within the first sub-frame, 0..1
     double   gradHold = -1.0;        // LCD gradual saver at 2 frames: refreshes left to hold sharp (-1 = start a hold)
     int secFrameRepeats = 0, secFrameSkips = 0, extraCycles = 0;
+    int secPicRepeats = 0; double picShownP = -1.0;   // the same picture lit again (frame interpolation: the same point on its clock)
     // Strobe cycles whose step differs from the expected one: at the Refresh
     // cap at 120 fps every lit refresh moves on 2 frames (the one between is
     // never lit), at Half 1, at Quarter 1 every other cycle. Counting raw
@@ -4556,7 +4569,7 @@ static DWORD WINAPI PresenterThread(void *)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,present_count,sync_refresh_count,"
                               "bfi,method,frames,gain,floor,rolloff,pacing,cap,ahead,vblank,queue_ahead,queued,"
                               "wait_vblank_ms,wait_gpu_ms,submit_ms,present_ms,hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,"
-                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup,paired\n");
+                              "lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,smooth_catchup,paired,ip,ip_pos\n");
                 LOGI("BFI Presenter: timing log started: %s", path);
             }
             snprintf(path, sizeof(path), "%.*sBFIPresenter_reflex_%04u%02u%02u_%02u%02u%02u.csv",
@@ -4569,7 +4582,7 @@ static DWORD WINAPI PresenterThread(void *)
                               "rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,"
                               "rfx_gpu_active_ms,rfx_sim_ms,rfx_submit_ms,rfx_queue_ms,rendered_fps,align_slack_p10_ms,align_shift_ms,"
                               "frame_repeats,warp_state,warp_filled,warp_ahead,warp_pass_gpu_ms,warp_passes,draw_gpu_ms,draw_warped_gpu_ms,"
-                              "sec_block_ms,rfx_tick_ms,vram_ms,stats_max_ms\n");
+                              "sec_block_ms,rfx_tick_ms,vram_ms,stats_max_ms,ip_state,ip_between,ip_asis,pic_repeats\n");
         }
         else if (!s.log && logf)
         {
@@ -4747,7 +4760,7 @@ static DWORD WINAPI PresenterThread(void *)
                     // and from here the presenter stays one frame behind
                     ipOn = true; ipP = (double)lastShownId; ipRate = 0.9; ipRateSlow = 0.95; ipTwoBehind = 0; ipNewestSeen = newestId; ipFullT = ipOnT = Now(); ipEnters++;
                     ipEven = false; ipEvenT = Now();
-                    ipLeaving = false; ipBackT = Now();
+                    ipLeaving = false; ipBackT = Now(); ipD = 0.0; ipLagN = 0;
                     if (ipEvenStick && s.warpInterp == 3) ipEven = true;
                     if (ipExitT > 0.0 && Now() - ipExitT < 30.0 && ipExitNeed < 60.0)
                     {
@@ -4774,7 +4787,7 @@ static DWORD WINAPI PresenterThread(void *)
                         {
                             if (ipRateSlow < 0.88)
                             {
-                                ipEven = true; ipEvenT = ipBackT = Now(); ipToEven++;
+                                ipEven = true; ipEvenT = ipBackT = Now(); ipToEven++; ipD = 0.0; ipLagN = 0;
                                 if (ipToEven <= 20) LOGI("BFI Presenter: frame warp interpolation: even pacing (%.2f game frames per strobe cycle)", ipRateSlow);
                                 if (ipToEven == 3)
                                 {
@@ -4794,9 +4807,59 @@ static DWORD WINAPI PresenterThread(void *)
                     {
                         // even pacing: each cycle at its point in time, one frame behind the newest
                         const double was = ipP;
-                        ipP += ipRate;
-                        ipP += 0.15 * ((double)newestId - 1.0 - ipP);
-                        ipP = std::max((double)newestId - 3.0, std::min((double)newestId, ipP));
+                        if (s.warpInterpTime)
+                        {
+                            // by time: the delay (ipD) is the 95th percentile of the newest frame's age over the last
+                            // 2 s, so the next frame is there in time; it moves at most 0.15 ms a cycle (under 1% of
+                            // speed) unless frames are waited for, and after a hitch it jumps back in one step
+                            const double tn = Now();
+                            double tsNew = -1.0;
+                            for (UINT i = 0; i < kStage; i++)
+                                if (g_stageFence[i] <= done && g_stageId[i] == newestId) tsNew = g_stageTime[i];
+                            if (tsNew > 0.0) { ipLagHist[ipLagAt] = tn - tsNew; ipLagAt = (ipLagAt + 1) % 120; if (ipLagN < 120) ipLagN++; }
+                            double srt[120]; int ns = 0;
+                            for (int i = 0; i < ipLagN; i++) srt[ns++] = ipLagHist[i];
+                            std::sort(srt, srt + ns);
+                            const double lagP = ns ? srt[std::min(ns - 1, (int)(0.95 * ns))] : 0.0;
+                            const double target = std::min(0.1, lagP + 0.001);
+                            const bool waiting = tsNew > 0.0 && tn - ipD > tsNew;   // the picture would be past the newest frame
+                            if (ipD <= 0.0) { ipD = target; ipT = tn - ipD; }
+                            else if (ipD > target + 0.03) { ipD = target; ipResyncs++; }   // after a hitch: back in one step
+                            else if (waiting) ipD += 0.25 * std::max(0.0, (tn - tsNew) - ipD);
+                            else ipD += std::max(-0.00015, std::min(0.00015, target - ipD));
+                            const double T = std::max(ipT, tn - ipD);
+                            ipT = T;
+                            ipDSum += ipD; ipDN++;
+                            // the frames around T
+                            int sa2 = -1; UINT64 ia = 0; double ta = 0.0;
+                            UINT64 oldId = UINT64_MAX; double oldT = 0.0;
+                            for (UINT i = 0; i < kStage; i++)
+                            {
+                                if (g_stageFence[i] > done || !g_stageId[i]) continue;
+                                const UINT64 id = g_stageId[i]; const double ts = g_stageTime[i];
+                                if (id < oldId) { oldId = id; oldT = ts; }
+                                if (ts <= T && (sa2 < 0 || id > ia)) { sa2 = (int)i; ia = id; ta = ts; }
+                            }
+                            if (sa2 < 0 && oldId != UINT64_MAX) { ipP = (double)oldId; ipT = oldT; }   // behind everything kept: the oldest
+                            else if (sa2 >= 0)
+                            {
+                                double tb = -1.0;
+                                for (UINT i = 0; i < kStage; i++)
+                                    if (g_stageFence[i] <= done && g_stageId[i] == ia + 1) tb = g_stageTime[i];
+                                if (tb > ta)
+                                {
+                                    ipP = (double)ia + std::min(1.0, std::max(0.0, (T - ta) / (tb - ta)));
+                                    ipGapSum += tb - ta; ipGapN++; ipGapMax = std::max(ipGapMax, tb - ta);
+                                }
+                                else { ipP = (double)ia; if (ia == newestId) ipStalls++; }   // past the newest frame: it waits there
+                            }
+                        }
+                        else
+                        {
+                            ipP += ipRate;
+                            ipP += 0.15 * ((double)newestId - 1.0 - ipP);
+                            ipP = std::max((double)newestId - 3.0, std::min((double)newestId, ipP));
+                        }
                         ipP = std::max(ipP, std::min(was, (double)newestId));  // never back to an older picture
                         if (ipLeaving && (std::floor(ipP + 1e-6) > std::floor(was + 1e-6) || Now() - ipLeaveT > 1.0))
                         {
@@ -4847,11 +4910,11 @@ static DWORD WINAPI PresenterThread(void *)
                 else if (f < 1.0f / 32.0f || f > 31.0f / 32.0f || sb < 0)
                 {
                     pick = (f > 31.0f / 32.0f && sb >= 0) ? sb : sa;   // on a frame: as rendered
-                    ipPicked = true; ipAsIs++;
+                    ipPicked = true; ipAsIs++; secIpAsIs++;
                 }
                 else
                 {
-                    pick = sb; ipPicked = true; ipCycle = true; ipA = a; ipSlotA = sa; ipF = f; ipCycles++;
+                    pick = sb; ipPicked = true; ipCycle = true; ipA = a; ipSlotA = sa; ipF = f; ipCycles++; secIpBetween++;
                 }
             }
             else if (ipOn && !cycleStart && lastShown >= 0 && g_stageId[lastShown] == lastShownId && g_stageFence[lastShown] <= done)
@@ -4861,6 +4924,11 @@ static DWORD WINAPI PresenterThread(void *)
                 if (ipLogT > 0.0)
                     LOGI("BFI Presenter: frame warp interpolation: last 10 s, %d strobe cycles drawn between two frames, %d on a frame as rendered "
                          "(game frames per strobe cycle %.2f)", ipCycles, ipAsIs, ipRate);
+                if (ipLogT > 0.0 && ipDN > 0)
+                    LOGI("BFI Presenter: frame warp interpolation by time: %.1f ms behind on average, game frames %.1f ms apart (%.1f at most), "
+                         "%d cycles waited at the newest frame, %d jumps back after a hitch", ipDSum / ipDN * 1000.0, ipGapN ? ipGapSum / ipGapN * 1000.0 : 0.0,
+                         ipGapMax * 1000.0, ipStalls, ipResyncs);
+                ipDSum = ipGapSum = ipGapMax = 0.0; ipDN = ipGapN = ipStalls = ipResyncs = 0;
                 ipLogT = Now(); ipCycles = ipAsIs = 0;
             }
         }
@@ -4961,6 +5029,14 @@ static DWORD WINAPI PresenterThread(void *)
             if (pickId != lastShownId) pickNew0T = g_stageTime[pick];
             if (pickId == lastShownId) secFrameRepeats++;
             else if (lastShownId && pickId > lastShownId + 1) secFrameSkips += (int)(pickId - lastShownId - 1);
+            {
+                // The same picture as the cycle before: the same frame and, with frame interpolation, the same point
+                // between frames (two cycles between one pair of frames, or a half step and then the frame itself,
+                // are the same frame number but not a repeat).
+                const double p = ipOn ? ipP : (double)pickId;
+                if (pickId == lastShownId && std::fabs(p - picShownP) < 1e-6) secPicRepeats++;
+                picShownP = p;
+            }
         }
         pickTime = g_stageTime[pick];
         // Frame warp: how far ahead of its frame this strobe cycle shows it. Decided once per cycle, so the lit and
@@ -6339,6 +6415,8 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.late       = secLate;
             g_status.repeats    = rep > 0 ? rep : 0;
             g_status.frameRepeats = secFrameRepeats;
+            g_status.picRepeats = secPicRepeats;
+            g_status.ipBetween = secIpBetween;
             g_status.warpOn       = !s.frameWarp ? 0 : !warp.ok ? -1 : warpClock.engaged ? 2 : 1;
             g_status.warpCycles   = secWarpCycles;
             // CRT hand-off: when most cycles are shown moved (e.g. with frame generation), the picture made with each frame
@@ -6533,7 +6611,7 @@ static DWORD WINAPI PresenterThread(void *)
             }
             secReused = 0;
             g_status.frameSkips   = secFrameSkips;
-            Osd::AddSecond(g_status.frameSkips, g_status.frameRepeats, g_status.late, Now());
+            Osd::AddSecond(g_status.frameSkips, g_status.ipNow > 0 ? g_status.picRepeats : g_status.frameRepeats, g_status.late, Now());   // interpolation: real repeats only
             // Automatic frames ahead: 1 (least latency) normally; 2 while the
             // game keeps missing strobe cycles (CPU and GPU then overlap again,
             // South of Midnight: 55 -> 60 fps); back to 1 when the game waits
@@ -6978,6 +7056,7 @@ static DWORD WINAPI PresenterThread(void *)
                 g_status.relFlashMs = relN ? relSum / relN : -1.0;
             }
             secFrameRepeats = secFrameSkips = 0;
+            secPicRepeats = 0;
             secRepU = secSkipU = 0;
             g_status.outType    = (int)c.outType;
             const Status stNow = g_status;
@@ -7504,7 +7583,7 @@ static DWORD WINAPI PresenterThread(void *)
                 LeaveCriticalSection(&g_cfgLock);
                 if (rfxf)
                 {
-                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d\n",
                             t, stNow.gameFps, userCap, perNow, stNow.autoCapDown, stNow.autoCapProbe, stNow.fgActive, s.pacingMode,
                             s.capJit, stNow.lrState, stNow.lrEst, stNow.aheadInUse, rs.limitUs,
                             relN ? relSum / relN : -1.0, relN ? relMax : -1.0, relN, rs.frames, rs.simGpuMs, rs.simPresentMs,
@@ -7515,12 +7594,14 @@ static DWORD WINAPI PresenterThread(void *)
                             secWarpPassN ? secWarpPassMs / secWarpPassN : -1.0, secWarpPassN,
                             secDrawPlainN ? secDrawPlainMs / secDrawPlainN : -1.0,
                             secDrawWarpN ? secDrawWarpMs / secDrawWarpN : -1.0,
-                            (Now() - t) * 1000.0, g_rtMs.load(), secVramMs, secStatsMs);
+                            (Now() - t) * 1000.0, g_rtMs.load(), secVramMs, secStatsMs,
+                            !s.warpInterp ? -3 : stNow.ipNow, secIpBetween, secIpAsIs, stNow.picRepeats);
                     secWarpPassMs = secDrawWarpMs = secDrawPlainMs = 0.0;
                     secWarpPassN = secDrawWarpN = secDrawPlainN = 0;
                     fflush(rfxf);
                 }
                 relSum = relMax = 0.0; relN = 0;
+                secIpBetween = secIpAsIs = 0;
             }
             secStatsMs = 0.0;
             secStart = t; secPresents = 0; secLate = 0; ageSum = 0.0; secSlowPres = 0;
@@ -7537,14 +7618,15 @@ static DWORD WINAPI PresenterThread(void *)
             EnterCriticalSection(&g_cfgLock);
             lrLog.lrState = g_status.lrState; lrLog.lrEst = g_status.lrEst; lrLog.lrMargin = g_status.lrMargin;
             LeaveCriticalSection(&g_cfgLock);
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d\n", t * 1000.0,
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d,%d,%.4f\n", t * 1000.0,
                     (unsigned long long)presents, c.slot,
                     (unsigned long long)pickId, (t - pickTime) * 1000.0, (t - lastT) * 1000.0,
                     sok ? (int)st.PresentCount : -1, sok ? (int)st.SyncRefreshCount : -1,
                     s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     g_maxAhead.load(), s.pacing, s.queueAhead, queuedNow,
                     (tVb - tLoop0) * 1000.0, (tFence - tVb) * 1000.0, (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f, hotArea, rawAvg,
-                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp, pairIter ? 1 : 0);
+                    lrLog.lrState, g_lrLead.load() * 1000.0, lrLog.lrEst, lrLog.lrMargin, s.smoothCatchUp, pairIter ? 1 : 0,
+                    ipOn ? (ipCycle ? 2 : 1) : (s.warpInterp ? 0 : -3), ipOn ? ipP : -1.0);
         }
         // A queued refresh is shown one refresh after the lit one it follows: the next interval is counted from there
         // (or the lit refresh after it, two vblanks on, would read as a missed refresh).
@@ -14513,7 +14595,7 @@ static void on_osd(reshade::api::effect_runtime *rt)
     d.lost = g_status.frameSkips; d.repeated = g_status.frameRepeats; d.missed = g_status.late; d.now = Now();
     d.paused = g_status.hitchPaused; d.bfiOn = g_shared.enabled != 0 && g_status.running; d.relFlashMs = g_status.relFlashMs;
     d.warpOn = g_status.warpOn; d.warped = g_status.warpCycles; d.warpAhead = g_status.warpAvg;
-    d.ipNow = g_status.ipNow; d.ipCan = g_status.ipCan;
+    d.ipNow = g_status.ipNow; d.ipCan = g_status.ipCan; d.ipBetween = g_status.ipBetween;
     // which motion: what the last second's moved cycles used, or (none moved) what the game hands over -- unless frame
     // generation is on with the game's motion off for it, as in the settings window (Townfall, 2x: the OSD switched
     // between the game's vectors and the measured motion with each second that had no cycle to fill)
@@ -15151,7 +15233,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
             if (st.warpOn < 0) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Frame warp is not available (see ReShade.log).");
             else if (st.warpOn == 2) ImGui::Text("At work: game at %.0f%% of the strobe rate, %d cycles a second moved (%.2f frames ahead on average).",
                                                  st.warpRate * 100.0, st.warpCycles, st.warpAvg);
-            else if (st.ipNow > 0) ImGui::Text("At work: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
+            else if (st.ipNow > 0) ImGui::Text("At work: frame interpolation, game at %.0f%% of the strobe rate, %d cycles a second drawn between frames.", st.warpRate * 100.0, st.ipBetween);
             else if (st.ipCan && st.warpRate > 0.0) ImGui::Text("Ready: frame interpolation, game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else if (st.warpRate > 0.0) ImGui::Text("Waiting: game at %.0f%% of the strobe rate.", st.warpRate * 100.0);
             else ImGui::Text("Waiting for the game's frame rate.");
@@ -15193,7 +15275,7 @@ static void draw_overlay(reshade::api::effect_runtime *)
                                                               "Only the missing frames: frames as rendered, each missing one replaced by a picture between\n"
                                                               "the two around it (best near the strobe rate). Even pacing: every strobe cycle at its point in\n"
                                                               "time (smoothest well below it, a little softer). Automatic: the first near the strobe rate\n"
-                                                              "(the start), even pacing below about 88%, back after 10 s at 95% or more; from the third\n"
+                                                              "(the start), even pacing below about 88%%, back after 10 s at 95%% or more; from the third\n"
                                                               "switch it stays on even pacing (remembered per game). Best from about 45-50 fps up: further\n"
                                                               "below, errors of the game's motion at edges are moved far enough to show (outlines).");
                 if (s.warpInterp)
