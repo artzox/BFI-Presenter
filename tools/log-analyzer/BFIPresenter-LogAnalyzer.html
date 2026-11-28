@@ -371,7 +371,9 @@ function analyse(s){
   // 1.0.41: frame warp (fill missing frames) -- per second in the reflex CSV: repeated strobe cycles, how many it
   // filled, how far ahead, and (from 1.0.41) its GPU time on the presenter's queue.
   if(R && R.length && "warp_state" in R[0]){
-    const on=R.filter(r=>r.warp_state===2), wait=R.filter(r=>r.warp_state===1), na=R.filter(r=>r.warp_state<0);
+    // 1.0.53: seconds with frame interpolation in use are its own finding -- warp_filled counts its in-between
+    // cycles there, not repeats filled with the last frame moved on
+    const on=R.filter(r=>r.warp_state===2&&!(r.ip_state>0)), wait=R.filter(r=>r.warp_state===1), na=R.filter(r=>r.warp_state<0);
     const w={secs:R.length,on:on.length,wait:wait.length,na:na.length,
       repOn:on.reduce((a,r)=>a+(r.frame_repeats>0?r.frame_repeats:0),0), filled:on.reduce((a,r)=>a+(r.warp_filled>0?r.warp_filled:0),0),
       repAll:R.reduce((a,r)=>a+(r.frame_repeats>0?r.frame_repeats:0),0),
@@ -389,7 +391,7 @@ function analyse(s){
   if(vkW){
     const lit=L.filter(r=>r.slot===0); let prev=null, onT=0, waitT=0, repOn=0, filled=0, newOn=0; const ah=[];
     for(let i=0;i<lit.length;i++){ const b=lit[i]; const st=vkState(b.time_ms);
-      if(i>0 && !b.hitch_paused && !lit[i-1].hitch_paused){ const dt=(b.time_ms-lit[i-1].time_ms)/1000; if(dt<0.5){ if(st===2) onT+=dt; else if(st===1) waitT+=dt; }
+      if(i>0 && !b.hitch_paused && !lit[i-1].hitch_paused && !(b.ip>=1)){ const dt=(b.time_ms-lit[i-1].time_ms)/1000; if(dt<0.5){ if(st===2) onT+=dt; else if(st===1) waitT+=dt; }
         if(st===2){ if(b.frame_id===prev){ repOn++; if(b.warp_ahead>0){ filled++; ah.push(b.warp_ahead); } } else newOn++; } }
       prev=b.frame_id; }
     const ps=L.filter(r=>r.warp_pass_gpu_ms>=0).map(r=>r.warp_pass_gpu_ms);
