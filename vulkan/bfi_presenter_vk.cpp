@@ -546,6 +546,7 @@ struct Status
     int    driftOn = 0;                     // the game runs on a clock of its own, a little off the display (common/bfi_clockdrift.h)
     double driftFps = 0.0, driftHz = 0.0, driftSuggest = 0.0, driftSlip = 0.0;
     int    late = 0, frameRepeats = 0, frameSkips = 0, slotWaits = 0, reused = 0;
+    int    picRepeats = 0;              // per second: the same picture lit again (as DX, 1.0.53)
     int    unevenRep = 0, unevenSkip = 0;   // per second: strobe cycles short of / ahead of the expected step
     int    warpOn = 0;                      // frame warp: 0 off, 1 waiting (frame rate outside its range), 2 at work, -1 unavailable
     int    ipNow = 0;                       // frame interpolation (as DX): 0 off or not behind, 1 only the missing frames, 2 even pacing,
@@ -2283,6 +2284,7 @@ static void PresenterThread(Swapchain *sc)
     bool bufValid[kMaxImg] = {};
     uint32_t acqIdx = 0;
     int secFrameRepeats = 0, secFrameSkips = 0, extraCycles = 0, secReused = 0;
+    int secPicRepeats = 0, cycPicRep = 0; double picShownP = -1.0;   // the same picture lit again (as DX)
     int secRepU = 0, secSkipU = 0;      // strobe cycles short of / ahead of the expected step (DX12 add-on v0.78)
     // Frame start timing (automatic frame cap): new game frames lit this second, their release -> flash, and how long
     // each was ready before the pick.
@@ -2476,7 +2478,7 @@ static void PresenterThread(Swapchain *sc)
                 fprintf(logf, "time_ms,present,slot,frame_id,frame_age_ms,interval_ms,bfi,method,frames,gain,floor,rolloff,"
                               "pacing,cap,ahead,vblank,wait_vblank_ms,acquire_ms,wait_gpu_ms,submit_ms,present_ms,reused,"
                               "hitch_paused,ceiling_nits,lit_avg_nits,raw_avg_nits,lr_state,lr_lead_ms,lr_est_ms,lr_margin_ms,queue_ahead,smooth_catchup,"
-                              "release_to_flash_ms,ready_before_pick_ms,warp_ahead,warp_pass_gpu_ms,draw_gpu_ms,draw_was_warped,ip\n");
+                              "release_to_flash_ms,ready_before_pick_ms,warp_ahead,warp_pass_gpu_ms,draw_gpu_ms,draw_was_warped,ip,pic_rep\n");
                 LOGI("BFI Presenter: timing log started: %s", path.c_str());
             }
         }
@@ -2795,6 +2797,12 @@ static void PresenterThread(Swapchain *sc)
                 {
                     if (pickId == lastShownId) secFrameRepeats++;
                     else if (lastShownId && pickId > lastShownId + 1) secFrameSkips += (int)(pickId - lastShownId - 1);
+                    {
+                        const double p = ipOn ? ipP : (double)pickId;
+                        cycPicRep = (pickId == lastShownId && std::fabs(p - picShownP) < 1e-6) ? 1 : 0;
+                        secPicRepeats += cycPicRep;
+                        picShownP = p;
+                    }
                     if (lastShownId && pickId >= lastShownId)
                     {
                         const int step = (int)(pickId - lastShownId);
@@ -3727,6 +3735,7 @@ static void PresenterThread(Swapchain *sc)
                 g_status.limitSuspect = limitSecs >= 3;
             }
             g_status.frameRepeats = secFrameRepeats;
+            g_status.picRepeats = secPicRepeats;
             g_status.frameSkips   = secFrameSkips;
             {
                 const int wOn = !s.frameWarp ? 0 : !R.warp.ok ? -1 : warpClock.engaged ? 2 : 1;
@@ -3771,7 +3780,7 @@ static void PresenterThread(Swapchain *sc)
                 gvk::Tick(t);
                 secWarpCycles = 0; secWarpSum = 0.0; secWarpGame = 0; secWarpCut = 0; secWarpLb = 0; secWarpHeld = 0;
             }
-            Osd::AddSecond(secFrameSkips, secFrameRepeats, secLate, Now());
+            Osd::AddSecond(secFrameSkips, g_status.ipNow > 0 ? secPicRepeats : secFrameRepeats, secLate, Now());   // interpolation: real repeats only
             g_status.unevenRep    = secRepU;
             g_status.qaPrimes     = secQaPrimes;
             g_status.qaSkips      = secQaSkips;
@@ -4656,6 +4665,7 @@ static void PresenterThread(Swapchain *sc)
                 secRelN = secReadyN = 0; secRelSum = 0.0;
             }
             secFrameRepeats = secFrameSkips = secReused = 0;
+            secPicRepeats = 0;
             secRepU = secSkipU = 0;
             secStart = t; secPresents = 0; secLate = 0; ageSum = 0.0;
         }
@@ -4666,14 +4676,14 @@ static void PresenterThread(Swapchain *sc)
                 std::lock_guard<std::mutex> l(g_cfgLock);
                 lrSt = g_status.lrState; lrE = g_status.lrEst; lrM = g_status.lrMargin;
             }
-            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d\n",
+            fprintf(logf, "%.3f,%llu,%u,%llu,%.3f,%.3f,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.0f,%.1f,%.1f,%d,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d\n",
                     t * 1000.0, (unsigned long long)presents, c.slot, (unsigned long long)pickId, (t - pickTime) * 1000.0,
                     (t - lastT) * 1000.0, s.enabled, s.method, s.frames, s.gain, s.dfloor, s.rolloff, s.pacingMode, s.gameCap,
                     sc->maxAhead.load(), vblank ? 1 : 0, (tVb - tLoop0) * 1000.0, (tAcq - tVb) * 1000.0, (tFence - tAcq) * 1000.0,
                     (tSub - tFence) * 1000.0, (tPres - tSub) * 1000.0, reuse ? 1 : 0, hitchPaused ? 1 : 0, c.ceilLin * 80.0f,
                     litAvg, rawAvg, lrSt, sc->lrLead.load() * 1000.0, lrE, lrM, qa ? (primeIter ? 2 : qaPrimed ? 1 : 0) : -1, s.smoothCatchUp,
                     relFlashMs, pickReadyMs, c.warp != 0.0f ? warpAhead : 0.0, tsPassMs, tsDrawMs, tsDrawWarped,
-                    ipOn ? (ipCycle ? 2 : 1) : (s.warpInterp ? 0 : -3));   // ip (1.0.53): 2 drawn between two frames, 1 a frame as rendered, 0 not behind, -3 off
+                    ipOn ? (ipCycle ? 2 : 1) : (s.warpInterp ? 0 : -3), cycPicRep);   // ip (1.0.53): 2 drawn between two frames, 1 a frame as rendered, 0 not behind, -3 off
             tsPassMs = tsDrawMs = -1.0;
             if ((presents % 120) == 0) fflush(logf);
         }

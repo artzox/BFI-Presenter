@@ -304,7 +304,7 @@ function analyse(s){
       if(b.ready_before_pick_ms>=0){st.rdy=st.rdy||[]; st.rdy.push(b.ready_before_pick_ms);}
       const d=b.frame_id-a.frame_id;
       const E=per>0?a.frames/per:0;
-      if(vkW){ st.vkW=1; if(d===0 && b.warp_ahead>0) st.wfill=(st.wfill||0)+1; }
+      if(vkW){ st.vkW=1; if(d===0 && b.warp_ahead>0) st.wfill=(st.wfill||0)+1; if("pic_rep" in b){ st.hasPic=1; if(b.pic_rep===1) st.prep=(st.prep||0)+1; } }
       if(E>=1){ const e=Math.round(E); if(d!==e) st.off++; if(d===0) st.rep++; else if(d>e) st.skip++; }
       else if(E>0){ // several flashes per game frame expected
         const K=Math.round(1/E);
@@ -349,8 +349,10 @@ function analyse(s){
       if(armed.length){ const wr=rows.reduce((a,r)=>a+(r.frame_repeats>0?r.frame_repeats:0),0), wf=rows.reduce((a,r)=>a+(r.warp_filled>0?r.warp_filled:0),0);
         repAfter=isNaN(rep)?NaN:(wr>0?rep*Math.max(0,1-wf/wr):rep); }
       else if(wwait===1) repAfter=rep;   // waiting: nothing filled
-      if(ip>0) repAfter=NaN;          // interpolation: cycles are drawn between frames, not repeated or filled
-    } else if(ls && ls.vkW && ls.n && !isNaN(rep)) repAfter=Math.max(0,(ls.rep-(ls.wfill||0))/ls.n*100);   // Vulkan, per refresh
+      // interpolation: a frame number shown twice is usually two points between frames, not a repeat -- the real
+      // repeats (the same picture lit again) are pic_repeats from 1.0.53-t2; before that, not known
+      if(ip>0) repAfter="pic_repeats" in rows[0] && strobe>0 ? mean(rows.map(r=>r.pic_repeats>=0?r.pic_repeats:0))/strobe*100 : NaN;
+    } else if(ls && ls.vkW && ls.n && !isNaN(rep)) repAfter=ip>0 ? (ls.hasPic ? (ls.prep||0)/ls.n*100 : NaN) : Math.max(0,(ls.rep-(ls.wfill||0))/ls.n*100);   // Vulkan, per refresh (interpolation: real repeats, pic_rep)
     sg.m={cap,per,pac,fg,rl,hold,wwait,ip,repAfter,startMs,ready,presented,rendered,shown,ideal,r2f,s2p,i2f:(s2p>0&&r2f>0)?s2p+r2f:NaN,submit,gpu,autoCap,jitLimit,rep,skip,uneven,target:per>0?hz/per:hz};
     // Cadence as shown on screen: repeats frame warp filled no longer count (unevenRaw keeps the figure before it).
     if(!isNaN(repAfter) && !isNaN(uneven) && !isNaN(rep) && rep>repAfter){ sg.m.unevenRaw=uneven; sg.m.uneven=Math.max(0,uneven-(rep-repAfter)); }
@@ -521,7 +523,7 @@ function findings(out,hz,frames){
     if(ip.on>0){
       const tot=ip.between+ip.asis, d=ip.r2fOn-ip.r2fOff;
       add("info",`Frame interpolation was in use for ${ip.on} s${ip.vk?"":` (${ip.even} s even pacing, ${ip.miss} s only the missing frames${isNaN(ip.fpsOn)?"":", game at "+f0(ip.fpsOn)+" fps"})`}: ${ip.between} strobe cycles drawn between two frames, ${ip.asis} on a frame as rendered${tot?" ("+fp(ip.between/tot*100)+" drawn between)":""}.`+
-        (isNaN(d)?"":` Release to flash ${f1(ip.r2fOn)} ms with it, ${f1(ip.r2fOff)} ms without (${d>=0?f1(d)+" ms more":f1(-d)+" ms less"})${d>0?": its frame of latency":""}.`)+` Repeated and filled counts don't apply to those seconds.`);
+        (isNaN(d)?"":` Release to flash ${f1(ip.r2fOn)} ms with it, ${f1(ip.r2fOff)} ms without (${d>=0?f1(d)+" ms more":f1(-d)+" ms less"})${d>0?": its frame of latency":""}.`)+` In those rows Repeated counts strobe cycles without a new game frame, and Repeated after warp the ones that lit the same picture again.`);
     }
     if(!ip.vk && ip.fg>=10) add("info",`Frame interpolation couldn't run for ${ip.fg} s: frame generation was on (the last frame was moved instead).`);
     if(!ip.vk && ip.noMotion>=10) add("info",`Frame interpolation couldn't run for ${ip.noMotion} s: no game motion vectors (the last frame was moved instead).`);
@@ -545,7 +547,7 @@ function segRow(sg,isBest,extraFirst){
   <td class="num">${f0(m.r2f)}</td><td class="num">${f0(m.i2f)}</td>
   <td class="num">${f0(m.submit)} / ${f0(m.gpu)}</td></tr>`;
 }
-const THEAD=`<thead><tr><th>Mode</th><th>Time</th><th>Presented fps</th><th>Rendered fps</th><th>New frames / s (of ideal)</th><th>Repeated</th><th title="Repeated flashes left after frame warp filled them (DX: 1.0.41 reflex CSV; Vulkan: 1.0.42 log CSV with BFIPresenterVK.log)">Repeated after warp</th><th>Skipped</th><th>Cadence</th><th>Release → flash ms</th><th>Input → flash ms</th><th>Submit / GPU ms</th></tr></thead>`;
+const THEAD=`<thead><tr><th>Mode</th><th>Time</th><th>Presented fps</th><th>Rendered fps</th><th>New frames / s (of ideal)</th><th>Repeated</th><th title="Repeated flashes left after frame warp filled them (DX: 1.0.41 reflex CSV; Vulkan: 1.0.42 log CSV with BFIPresenterVK.log); with frame interpolation, strobe cycles that lit the same picture again (1.0.53)">Repeated after warp</th><th>Skipped</th><th>Cadence</th><th>Release → flash ms</th><th>Input → flash ms</th><th>Submit / GPU ms</th></tr></thead>`;
 
 function chart(tl,segments){
   if(!tl.length) return "";

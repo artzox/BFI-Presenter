@@ -778,6 +778,8 @@ struct Status
     double driftFps = 0.0, driftHz = 0.0, driftSuggest = 0.0, driftSlip = 0.0;
     int    late = 0, repeats = 0;
     int    frameRepeats = 0, frameSkips = 0;
+    int    picRepeats = 0;   // per second: strobe cycles that lit the same picture again (frame interpolation draws
+                             // a frame number twice at different points; 1.0.53)
     double alignSlackMs = -1.0, alignShiftMs = 0.0;   // ReflexAlign: frames ready before the pick (10th percentile), total shift
     int    unevenRep = 0, unevenSkip = 0;           // per second: strobe cycles one or more frames short / ahead of the expected step
     int    slotWaits = 0;                       // per second: game copies that waited for the presenter
@@ -4315,6 +4317,7 @@ static DWORD WINAPI PresenterThread(void *)
     double   gradPhase = 0.0;        // LCD gradual saver: lit window start within the first sub-frame, 0..1
     double   gradHold = -1.0;        // LCD gradual saver at 2 frames: refreshes left to hold sharp (-1 = start a hold)
     int secFrameRepeats = 0, secFrameSkips = 0, extraCycles = 0;
+    int secPicRepeats = 0; double picShownP = -1.0;   // the same picture lit again (frame interpolation: the same point on its clock)
     // Strobe cycles whose step differs from the expected one: at the Refresh
     // cap at 120 fps every lit refresh moves on 2 frames (the one between is
     // never lit), at Half 1, at Quarter 1 every other cycle. Counting raw
@@ -4570,7 +4573,7 @@ static DWORD WINAPI PresenterThread(void *)
                               "rfx_reports,rfx_sim_to_gpu_ms,rfx_sim_to_present_ms,rfx_input_to_gpu_ms,rfx_gpu_frame_ms,"
                               "rfx_gpu_active_ms,rfx_sim_ms,rfx_submit_ms,rfx_queue_ms,rendered_fps,align_slack_p10_ms,align_shift_ms,"
                               "frame_repeats,warp_state,warp_filled,warp_ahead,warp_pass_gpu_ms,warp_passes,draw_gpu_ms,draw_warped_gpu_ms,"
-                              "sec_block_ms,rfx_tick_ms,vram_ms,stats_max_ms,ip_state,ip_between,ip_asis\n");
+                              "sec_block_ms,rfx_tick_ms,vram_ms,stats_max_ms,ip_state,ip_between,ip_asis,pic_repeats\n");
         }
         else if (!s.log && logf)
         {
@@ -4962,6 +4965,14 @@ static DWORD WINAPI PresenterThread(void *)
             if (pickId != lastShownId) pickNew0T = g_stageTime[pick];
             if (pickId == lastShownId) secFrameRepeats++;
             else if (lastShownId && pickId > lastShownId + 1) secFrameSkips += (int)(pickId - lastShownId - 1);
+            {
+                // The same picture as the cycle before: the same frame and, with frame interpolation, the same point
+                // between frames (two cycles between one pair of frames, or a half step and then the frame itself,
+                // are the same frame number but not a repeat).
+                const double p = ipOn ? ipP : (double)pickId;
+                if (pickId == lastShownId && std::fabs(p - picShownP) < 1e-6) secPicRepeats++;
+                picShownP = p;
+            }
         }
         pickTime = g_stageTime[pick];
         // Frame warp: how far ahead of its frame this strobe cycle shows it. Decided once per cycle, so the lit and
@@ -6340,6 +6351,7 @@ static DWORD WINAPI PresenterThread(void *)
             g_status.late       = secLate;
             g_status.repeats    = rep > 0 ? rep : 0;
             g_status.frameRepeats = secFrameRepeats;
+            g_status.picRepeats = secPicRepeats;
             g_status.warpOn       = !s.frameWarp ? 0 : !warp.ok ? -1 : warpClock.engaged ? 2 : 1;
             g_status.warpCycles   = secWarpCycles;
             // CRT hand-off: when most cycles are shown moved (e.g. with frame generation), the picture made with each frame
@@ -6534,7 +6546,7 @@ static DWORD WINAPI PresenterThread(void *)
             }
             secReused = 0;
             g_status.frameSkips   = secFrameSkips;
-            Osd::AddSecond(g_status.frameSkips, g_status.frameRepeats, g_status.late, Now());
+            Osd::AddSecond(g_status.frameSkips, g_status.ipNow > 0 ? g_status.picRepeats : g_status.frameRepeats, g_status.late, Now());   // interpolation: real repeats only
             // Automatic frames ahead: 1 (least latency) normally; 2 while the
             // game keeps missing strobe cycles (CPU and GPU then overlap again,
             // South of Midnight: 55 -> 60 fps); back to 1 when the game waits
@@ -6979,6 +6991,7 @@ static DWORD WINAPI PresenterThread(void *)
                 g_status.relFlashMs = relN ? relSum / relN : -1.0;
             }
             secFrameRepeats = secFrameSkips = 0;
+            secPicRepeats = 0;
             secRepU = secSkipU = 0;
             g_status.outType    = (int)c.outType;
             const Status stNow = g_status;
@@ -7505,7 +7518,7 @@ static DWORD WINAPI PresenterThread(void *)
                 LeaveCriticalSection(&g_cfgLock);
                 if (rfxf)
                 {
-                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d\n",
+                    fprintf(rfxf, "%.3f,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%d,%d,%.2f,%.2f,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%d,%d,%d,%.2f,%.3f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d\n",
                             t, stNow.gameFps, userCap, perNow, stNow.autoCapDown, stNow.autoCapProbe, stNow.fgActive, s.pacingMode,
                             s.capJit, stNow.lrState, stNow.lrEst, stNow.aheadInUse, rs.limitUs,
                             relN ? relSum / relN : -1.0, relN ? relMax : -1.0, relN, rs.frames, rs.simGpuMs, rs.simPresentMs,
@@ -7517,7 +7530,7 @@ static DWORD WINAPI PresenterThread(void *)
                             secDrawPlainN ? secDrawPlainMs / secDrawPlainN : -1.0,
                             secDrawWarpN ? secDrawWarpMs / secDrawWarpN : -1.0,
                             (Now() - t) * 1000.0, g_rtMs.load(), secVramMs, secStatsMs,
-                            !s.warpInterp ? -3 : stNow.ipNow, secIpBetween, secIpAsIs);
+                            !s.warpInterp ? -3 : stNow.ipNow, secIpBetween, secIpAsIs, stNow.picRepeats);
                     secWarpPassMs = secDrawWarpMs = secDrawPlainMs = 0.0;
                     secWarpPassN = secDrawWarpN = secDrawPlainN = 0;
                     fflush(rfxf);
