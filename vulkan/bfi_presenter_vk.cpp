@@ -285,7 +285,7 @@ struct Settings
     float warpMaxGameFg = 0.10f;   // FrameWarpGameMotionMaxAheadFG: with the game's motion and frame generation, at most this many shown frames
     float warpSnapX = 0.0f, warpSnapY = 0.0f;   // FrameWarpSnapX / FrameWarpSnapY: moves rounded to whole steps of this many pixels
     int   warpEdge = 0;       // FrameWarpEdge (as DX): the screen-edge strip of a moved flash: 0 faded, 1 mirrored, 2 repeated
-    int   warpInterpTime = 1; // FrameWarpInterpolateByTime (test, 1.0.53): even pacing by the frames' times, not their numbers
+    int   warpInterpTime = 1; // FrameWarpInterpolateByTime (1.0.53): even pacing by the frames' times, not their numbers
     int   warpInterp = 0;     // FrameWarpInterpolate (as DX, 1.0.51): 0 off (move the last frame), 1 only the missing frames, 2 even pacing, 3 automatic
     int   warpEven = 0;       // FrameWarpEvenPacing (as DX): with the game's motion, every strobe cycle moved to where its motion is
     int   warpFgLag = 1;      // FrameWarpGameMotionFGLag (ini only, as DX): with frame generation, the vectors read where each point
@@ -2708,8 +2708,7 @@ static void PresenterThread(Swapchain *sc)
                             if (s.warpInterpTime)
                             {
                                 // by time: the newest frame's age at this cycle is how far behind the picture must be for
-                                // the next frame to be there in time; the delay follows the largest of the last 2 s (up
-                                // quickly, down slowly, so the clock runs at the speed of time)
+                                // the next frame to be there in time
                                 const double tn = Now();
                                 double tsNew = -1.0;
                                 for (uint32_t i = 0; i < kStage; i++)
